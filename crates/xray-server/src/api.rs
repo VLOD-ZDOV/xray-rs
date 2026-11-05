@@ -5,8 +5,8 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, RwLock};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use http::{HeaderMap, HeaderValue, Request, Response};
@@ -19,6 +19,7 @@ use prost::Message;
 use tokio::net::TcpListener;
 
 use crate::config::{user_id, User as InboundUser};
+use crate::routing::Router;
 use crate::vless::Context;
 use crate::{log, stats, xhttp::Body};
 
@@ -249,6 +250,305 @@ pub struct GetInboundUsersCountResponse {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct AddInboundRequest {
+    #[prost(message, optional, tag = "1")]
+    pub inbound: Option<InboundHandlerConfig>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct InboundHandlerConfig {
+    #[prost(string, tag = "1")]
+    pub tag: String,
+    #[prost(message, optional, tag = "2")]
+    pub receiver_settings: Option<TypedMessage>,
+    #[prost(message, optional, tag = "3")]
+    pub proxy_settings: Option<TypedMessage>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AddInboundResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemoveInboundRequest {
+    #[prost(string, tag = "1")]
+    pub tag: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemoveInboundResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AddOutboundRequest {
+    #[prost(message, optional, tag = "1")]
+    pub outbound: Option<OutboundHandlerConfig>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct OutboundHandlerConfig {
+    #[prost(string, tag = "1")]
+    pub tag: String,
+    #[prost(message, optional, tag = "2")]
+    pub sender_settings: Option<TypedMessage>,
+    #[prost(message, optional, tag = "3")]
+    pub proxy_settings: Option<TypedMessage>,
+    #[prost(int64, tag = "4")]
+    pub expire: i64,
+    #[prost(string, tag = "5")]
+    pub comment: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AddOutboundResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemoveOutboundRequest {
+    #[prost(string, tag = "1")]
+    pub tag: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemoveOutboundResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AddRuleRequest {
+    #[prost(message, optional, tag = "1")]
+    pub config: Option<TypedMessage>,
+    #[prost(bool, tag = "2")]
+    pub should_append: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AddRuleResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemoveRuleRequest {
+    #[prost(string, tag = "1")]
+    pub rule_tag: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RemoveRuleResponse {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListRuleRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListRuleItem {
+    #[prost(string, tag = "1")]
+    pub tag: String,
+    #[prost(string, tag = "2")]
+    pub rule_tag: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListRuleResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub rules: Vec<ListRuleItem>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RouterConfigProto {
+    #[prost(message, repeated, tag = "2")]
+    pub rule: Vec<RoutingRuleProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RoutingRuleProto {
+    #[prost(string, tag = "1")]
+    pub tag: String,
+    #[prost(string, tag = "19")]
+    pub rule_tag: String,
+    #[prost(message, repeated, tag = "2")]
+    pub domain: Vec<DomainRuleProto>,
+    #[prost(message, repeated, tag = "10")]
+    pub ip: Vec<IpRuleProto>,
+    #[prost(message, optional, tag = "14")]
+    pub port_list: Option<PortListProto>,
+    #[prost(int32, repeated, tag = "13")]
+    pub networks: Vec<i32>,
+    #[prost(message, repeated, tag = "11")]
+    pub source_ip: Vec<IpRuleProto>,
+    #[prost(message, optional, tag = "16")]
+    pub source_port_list: Option<PortListProto>,
+    #[prost(string, repeated, tag = "7")]
+    pub user_email: Vec<String>,
+    #[prost(string, repeated, tag = "8")]
+    pub inbound_tag: Vec<String>,
+    #[prost(string, repeated, tag = "9")]
+    pub protocol: Vec<String>,
+    #[prost(map = "string, string", tag = "15")]
+    pub attributes: HashMap<String, String>,
+    #[prost(message, repeated, tag = "17")]
+    pub local_ip: Vec<IpRuleProto>,
+    #[prost(message, optional, tag = "18")]
+    pub local_port_list: Option<PortListProto>,
+    #[prost(message, optional, tag = "20")]
+    pub vless_route_list: Option<PortListProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DomainRuleProto {
+    #[prost(message, optional, tag = "1")]
+    pub geosite: Option<GeoSiteRuleProto>,
+    #[prost(message, optional, tag = "2")]
+    pub custom: Option<DomainProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DomainProto {
+    #[prost(int32, tag = "1")]
+    pub r#type: i32,
+    #[prost(string, tag = "2")]
+    pub value: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GeoSiteRuleProto {
+    #[prost(string, tag = "1")]
+    pub file: String,
+    #[prost(string, tag = "2")]
+    pub code: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct IpRuleProto {
+    #[prost(message, optional, tag = "1")]
+    pub geoip: Option<GeoIpRuleProto>,
+    #[prost(message, optional, tag = "2")]
+    pub custom: Option<CidrProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GeoIpRuleProto {
+    #[prost(string, tag = "1")]
+    pub file: String,
+    #[prost(string, tag = "2")]
+    pub code: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct CidrProto {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub ip: Bytes,
+    #[prost(uint32, tag = "2")]
+    pub prefix: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PortRangeProto {
+    #[prost(uint32, tag = "1")]
+    pub from: u32,
+    #[prost(uint32, tag = "2")]
+    pub to: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PortListProto {
+    #[prost(message, repeated, tag = "1")]
+    pub range: Vec<PortRangeProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ReceiverConfig {
+    #[prost(message, optional, tag = "1")]
+    pub port_list: Option<PortListProto>,
+    #[prost(message, optional, tag = "2")]
+    pub listen: Option<IpOrDomainProto>,
+    #[prost(message, optional, tag = "3")]
+    pub stream_settings: Option<StreamConfigProto>,
+    #[prost(bool, tag = "4")]
+    pub receive_original_destination: bool,
+    #[prost(message, optional, tag = "6")]
+    pub sniffing_settings: Option<SniffingConfigProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct IpOrDomainProto {
+    #[prost(bytes = "bytes", optional, tag = "1")]
+    pub ip: Option<Bytes>,
+    #[prost(string, optional, tag = "2")]
+    pub domain: Option<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct StreamConfigProto {
+    #[prost(string, tag = "5")]
+    pub protocol_name: String,
+    #[prost(string, tag = "3")]
+    pub security_type: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SniffingConfigProto {
+    #[prost(bool, tag = "1")]
+    pub enabled: bool,
+    #[prost(string, repeated, tag = "2")]
+    pub destination_override: Vec<String>,
+    #[prost(bool, tag = "3")]
+    pub metadata_only: bool,
+    #[prost(bool, tag = "4")]
+    pub route_only: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ProxyUsersConfig {
+    #[prost(message, repeated, tag = "1")]
+    pub users: Vec<ProtocolUser>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RoutingContext {
+    #[prost(string, tag = "1")]
+    pub inbound_tag: String,
+    #[prost(enumeration = "Network", tag = "2")]
+    pub network: i32,
+    #[prost(bytes = "bytes", repeated, tag = "3")]
+    pub source_ips: Vec<Bytes>,
+    #[prost(bytes = "bytes", repeated, tag = "4")]
+    pub target_ips: Vec<Bytes>,
+    #[prost(uint32, tag = "5")]
+    pub source_port: u32,
+    #[prost(uint32, tag = "6")]
+    pub target_port: u32,
+    #[prost(string, tag = "7")]
+    pub target_domain: String,
+    #[prost(string, tag = "8")]
+    pub protocol: String,
+    #[prost(string, tag = "9")]
+    pub user: String,
+    #[prost(map = "string, string", tag = "10")]
+    pub attributes: HashMap<String, String>,
+    #[prost(string, repeated, tag = "11")]
+    pub outbound_group_tags: Vec<String>,
+    #[prost(string, tag = "12")]
+    pub outbound_tag: String,
+    #[prost(bytes = "bytes", repeated, tag = "13")]
+    pub local_ips: Vec<Bytes>,
+    #[prost(uint32, tag = "14")]
+    pub local_port: u32,
+    #[prost(uint32, tag = "15")]
+    pub vless_route: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+pub enum Network {
+    Unknown = 0,
+    Tcp = 2,
+    Udp = 3,
+    Unix = 4,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TestRouteRequest {
+    #[prost(message, optional, tag = "1")]
+    pub routing_context: Option<RoutingContext>,
+    #[prost(string, repeated, tag = "2")]
+    pub field_selectors: Vec<String>,
+    #[prost(bool, tag = "3")]
+    pub publish_result: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct RestartLoggerRequest {}
 
 #[derive(Clone, PartialEq, Message)]
@@ -264,13 +564,86 @@ enum ServiceType<'a> {
 #[derive(Clone, PartialEq, Message)]
 pub struct Empty {}
 
-type Inbounds = Arc<HashMap<String, Arc<Context>>>;
+pub struct InboundManager {
+    inbounds: RwLock<HashMap<String, InboundEntry>>,
+    router: Arc<Router>,
+}
+
+pub struct InboundEntry {
+    pub ctx: Arc<Context>,
+    pub tcp_abort: Option<tokio::task::AbortHandle>,
+    pub udp_abort: Option<tokio::task::AbortHandle>,
+}
+
+impl InboundManager {
+    pub fn new(router: Arc<Router>) -> Self {
+        Self {
+            inbounds: RwLock::new(HashMap::new()),
+            router,
+        }
+    }
+
+    pub fn insert_initial(
+        &self,
+        tag: String,
+        ctx: Arc<Context>,
+        tcp_abort: Option<tokio::task::AbortHandle>,
+        udp_abort: Option<tokio::task::AbortHandle>,
+    ) {
+        let mut map = self.inbounds.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(tag, InboundEntry { ctx, tcp_abort, udp_abort });
+    }
+
+    pub fn get_ctx(&self, tag: &str) -> Option<Arc<Context>> {
+        let map = self.inbounds.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(tag).map(|e| e.ctx.clone())
+    }
+
+    pub fn contains(&self, tag: &str) -> bool {
+        let map = self.inbounds.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.contains_key(tag)
+    }
+
+    pub fn remove(&self, tag: &str) -> bool {
+        let mut map = self.inbounds.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = map.remove(tag) {
+            if let Some(h) = entry.tcp_abort {
+                h.abort();
+            }
+            if let Some(h) = entry.udp_abort {
+                h.abort();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn router(&self) -> &Arc<Router> {
+        &self.router
+    }
+
+    pub fn add_entry(
+        &self,
+        tag: String,
+        ctx: Arc<Context>,
+        tcp_abort: Option<tokio::task::AbortHandle>,
+        udp_abort: Option<tokio::task::AbortHandle>,
+    ) -> Result<(), String> {
+        let mut map = self.inbounds.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if map.contains_key(&tag) {
+            return Err(format!("handler already exists: {tag}"));
+        }
+        map.insert(tag, InboundEntry { ctx, tcp_abort, udp_abort });
+        Ok(())
+    }
+}
 
 pub async fn serve(
     addr: SocketAddr,
-    inbounds: HashMap<String, Arc<Context>>,
+    inbound_manager: Arc<InboundManager>,
+    router: Arc<Router>,
 ) -> Result<(), String> {
-    let inbounds: Inbounds = Arc::new(inbounds);
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| format!("failed to listen on api {addr}: {e}"))?;
@@ -280,11 +653,13 @@ pub async fn serve(
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
-            let inbounds = inbounds.clone();
+            let inbound_manager = inbound_manager.clone();
+            let router = router.clone();
             tokio::spawn(async move {
                 let service = service_fn(|req| {
-                    let inbounds = inbounds.clone();
-                    async move { Ok::<_, Infallible>(handle(req, &inbounds).await) }
+                    let inbound_manager = inbound_manager.clone();
+                    let router = router.clone();
+                    async move { Ok::<_, Infallible>(handle(req, &inbound_manager, &router).await) }
                 });
                 let _ = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -295,7 +670,11 @@ pub async fn serve(
     Ok(())
 }
 
-async fn handle(req: Request<Incoming>, inbounds: &Inbounds) -> Response<Body> {
+async fn handle(
+    req: Request<Incoming>,
+    inbound_manager: &Arc<InboundManager>,
+    router: &Arc<Router>,
+) -> Response<Body> {
     let path = req.uri().path().to_owned();
     let svc = if let Some(m) = path.strip_prefix(STATS) {
         ServiceType::Stats(m)
@@ -319,7 +698,7 @@ async fn handle(req: Request<Incoming>, inbounds: &Inbounds) -> Response<Body> {
         return status(INVALID_ARGUMENT, "bad grpc frame");
     };
     match svc {
-        ServiceType::Handler(method) => handle_handler(method, message, inbounds),
+        ServiceType::Handler(method) => handle_handler(method, message, inbound_manager).await,
         ServiceType::Logger("RestartLogger") => {
             let Ok(_) = RestartLoggerRequest::decode(message) else {
                 return status(INVALID_ARGUMENT, "bad request");
@@ -330,8 +709,183 @@ async fn handle(req: Request<Incoming>, inbounds: &Inbounds) -> Response<Body> {
             }
         }
         ServiceType::Logger(_) => status(UNIMPLEMENTED, "unknown method"),
-        ServiceType::Router(_method) => status(UNIMPLEMENTED, "unknown method"),
+        ServiceType::Router(method) => handle_router(method, message, router).await,
         ServiceType::Stats(method) => handle_stats(method, message),
+    }
+}
+
+async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Response<Body> {
+    match method {
+        "AddRule" => match AddRuleRequest::decode(message) {
+            Ok(req) => {
+                let config = req.config.unwrap_or_default();
+                if config.r#type.contains("xray.app.router.Config") {
+                    if let Ok(cfg) = RouterConfigProto::decode(config.value) {
+                        for r in cfg.rule {
+                            let mut rule_obj = serde_json::Map::new();
+                            rule_obj.insert("type".into(), serde_json::json!("field"));
+                            if !r.tag.is_empty() {
+                                rule_obj.insert("outboundTag".into(), serde_json::json!(r.tag));
+                            }
+                            if !r.rule_tag.is_empty() {
+                                rule_obj.insert("ruleTag".into(), serde_json::json!(r.rule_tag));
+                            }
+                            let mut domains = Vec::new();
+                            for d in r.domain {
+                                if let Some(c) = d.custom {
+                                    match c.r#type {
+                                        0 => domains.push(c.value),
+                                        1 => domains.push(format!("regexp:{}", c.value)),
+                                        2 => domains.push(format!("domain:{}", c.value)),
+                                        3 => domains.push(format!("full:{}", c.value)),
+                                        _ => domains.push(c.value),
+                                    }
+                                } else if let Some(g) = d.geosite {
+                                    domains.push(format!("geosite:{}", g.code));
+                                }
+                            }
+                            if !domains.is_empty() {
+                                rule_obj.insert("domain".into(), serde_json::json!(domains));
+                            }
+                            let mut ips = Vec::new();
+                            for ip in r.ip {
+                                if let Some(c) = ip.custom {
+                                    if !c.ip.is_empty() {
+                                        let ip_str = if c.ip.len() == 4 {
+                                            format!("{}.{}.{}.{}/{}", c.ip[0], c.ip[1], c.ip[2], c.ip[3], c.prefix)
+                                        } else {
+                                            format!("{:?}/{}", c.ip, c.prefix)
+                                        };
+                                        ips.push(ip_str);
+                                    }
+                                } else if let Some(g) = ip.geoip {
+                                    ips.push(format!("geoip:{}", g.code));
+                                }
+                            }
+                            if !ips.is_empty() {
+                                rule_obj.insert("ip".into(), serde_json::json!(ips));
+                            }
+                            if !r.networks.is_empty() {
+                                let nets: Vec<&str> = r.networks.iter().filter_map(|n| match n {
+                                    2 => Some("tcp"),
+                                    3 => Some("udp"),
+                                    _ => None,
+                                }).collect();
+                                if !nets.is_empty() {
+                                    rule_obj.insert("network".into(), serde_json::json!(nets.join(",")));
+                                }
+                            }
+                            if !r.user_email.is_empty() {
+                                rule_obj.insert("user".into(), serde_json::json!(r.user_email));
+                            }
+                            if !r.inbound_tag.is_empty() {
+                                rule_obj.insert("inboundTag".into(), serde_json::json!(r.inbound_tag));
+                            }
+                            if !r.protocol.is_empty() {
+                                rule_obj.insert("protocol".into(), serde_json::json!(r.protocol));
+                            }
+                            if !r.attributes.is_empty() {
+                                rule_obj.insert("attrs".into(), serde_json::json!(r.attributes));
+                            }
+                            if let Some(pl) = r.port_list {
+                                let ports: Vec<String> = pl.range.iter().map(|p| if p.from == p.to { format!("{}", p.from) } else { format!("{}-{}", p.from, p.to) }).collect();
+                                if !ports.is_empty() {
+                                    rule_obj.insert("port".into(), serde_json::json!(ports.join(",")));
+                                }
+                            }
+                            match router.parse_rule(&serde_json::Value::Object(rule_obj)) {
+                                Ok(parsed_rule) => {
+                                    router.add_rule(parsed_rule, req.should_append);
+                                }
+                                Err(e) => return status(UNKNOWN, &e),
+                            }
+                        }
+                    }
+                }
+                reply(&AddRuleResponse {})
+            }
+            Err(e) => status(INVALID_ARGUMENT, &e.to_string()),
+        },
+        "RemoveRule" => match RemoveRuleRequest::decode(message) {
+            Ok(req) => {
+                let _count = router.remove_rule(&req.rule_tag);
+                reply(&RemoveRuleResponse {})
+            }
+            Err(e) => status(INVALID_ARGUMENT, &e.to_string()),
+        },
+        "ListRule" => match ListRuleRequest::decode(message) {
+            Ok(_) => {
+                let rules: Vec<_> = router
+                    .list_rules()
+                    .into_iter()
+                    .map(|(tag, rule_tag)| ListRuleItem { tag, rule_tag })
+                    .collect();
+                reply(&ListRuleResponse { rules })
+            }
+            Err(e) => status(INVALID_ARGUMENT, &e.to_string()),
+        },
+        "TestRoute" => match TestRouteRequest::decode(message) {
+            Ok(req) => {
+                let mut rc = req.routing_context.unwrap_or_else(|| RoutingContext {
+                    inbound_tag: String::new(),
+                    network: 0,
+                    source_ips: Vec::new(),
+                    target_ips: Vec::new(),
+                    source_port: 0,
+                    target_port: 0,
+                    target_domain: String::new(),
+                    protocol: String::new(),
+                    user: String::new(),
+                    attributes: HashMap::new(),
+                    outbound_group_tags: Vec::new(),
+                    outbound_tag: String::new(),
+                    local_ips: Vec::new(),
+                    local_port: 0,
+                    vless_route: 0,
+                });
+                let source_ip: IpAddr = rc.source_ips.first()
+                    .and_then(|b| if b.len() == 4 { Some(IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))) } else { None })
+                    .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+                let source = SocketAddr::new(source_ip, rc.source_port as u16);
+                let network = match rc.network {
+                    3 => xray_config::Network::Udp,
+                    _ => xray_config::Network::Tcp,
+                };
+                let target_ip: Option<IpAddr> = rc.target_ips.first()
+                    .and_then(|b| if b.len() == 4 { Some(IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))) } else { None });
+                let local_ip: Option<IpAddr> = rc.local_ips.first()
+                    .and_then(|b| if b.len() == 4 { Some(IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))) } else { None });
+                let domain = if rc.target_domain.is_empty() { None } else { Some(rc.target_domain.as_str()) };
+                let protocol = if rc.protocol.is_empty() { None } else {
+                    match rc.protocol.as_str() {
+                        "http" => Some("http"),
+                        "tls" => Some("tls"),
+                        "bittorrent" => Some("bittorrent"),
+                        _ => None,
+                    }
+                };
+                let vless_route = if rc.vless_route > 0 { Some(rc.vless_route) } else { None };
+                let query = crate::routing::Query {
+                    inbound: &rc.inbound_tag,
+                    inbound_port: rc.local_port as u16,
+                    user: &rc.user,
+                    source,
+                    network,
+                    domain,
+                    ip: target_ip,
+                    port: rc.target_port as u16,
+                    protocol,
+                    attributes: Some(&rc.attributes),
+                    local_ip,
+                    vless_route,
+                };
+                let decision = router.route(&query).await;
+                rc.outbound_tag = decision.tag;
+                reply(&rc)
+            }
+            Err(e) => status(INVALID_ARGUMENT, &e.to_string()),
+        },
+        _ => status(UNIMPLEMENTED, "unknown method"),
     }
 }
 
@@ -434,20 +988,24 @@ fn handle_stats(method: &str, message: Bytes) -> Response<Body> {
     }
 }
 
-fn handle_handler(method: &str, message: Bytes, inbounds: &Inbounds) -> Response<Body> {
+async fn handle_handler(
+    method: &str,
+    message: Bytes,
+    inbound_manager: &Arc<InboundManager>,
+) -> Response<Body> {
     match method {
         "AlterInbound" => {
             let Ok(r) = AlterInboundRequest::decode(message) else {
                 return status(INVALID_ARGUMENT, "bad request");
             };
-            let Some(ctx) = inbounds.get(&r.tag) else {
+            let Some(ctx) = inbound_manager.get_ctx(&r.tag) else {
                 return missing_handler(&r.tag);
             };
             let operation = r.operation.unwrap_or_default();
             let result = match operation.r#type.as_str() {
                 ADD_USER => AddUserOperation::decode(operation.value)
                     .map_err(|e| e.to_string())
-                    .and_then(|op| add_user_to_inbound(op.user.unwrap_or_default(), ctx)),
+                    .and_then(|op| add_user_to_inbound(op.user.unwrap_or_default(), &ctx)),
                 REMOVE_USER => RemoveUserOperation::decode(operation.value)
                     .map_err(|e| e.to_string())
                     .and_then(|op| ctx.remove_user(&op.email)),
@@ -469,7 +1027,7 @@ fn handle_handler(method: &str, message: Bytes, inbounds: &Inbounds) -> Response
             let Ok(r) = GetInboundUserRequest::decode(message) else {
                 return status(INVALID_ARGUMENT, "bad request");
             };
-            let Some(ctx) = inbounds.get(&r.tag) else {
+            let Some(ctx) = inbound_manager.get_ctx(&r.tag) else {
                 return missing_handler(&r.tag);
             };
             let users: Vec<_> = ctx
@@ -484,6 +1042,210 @@ fn handle_handler(method: &str, message: Bytes, inbounds: &Inbounds) -> Response
             }
             let users = users.into_iter().map(protocol_user).collect();
             reply(&GetInboundUserResponse { users })
+        }
+        "AddInbound" => {
+            let Ok(r) = AddInboundRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            let Some(inbound_cfg) = r.inbound else {
+                return status(INVALID_ARGUMENT, "missing inbound");
+            };
+            let tag = inbound_cfg.tag;
+            if inbound_manager.contains(&tag) {
+                return status(UNKNOWN, &format!("handler already exists: {tag}"));
+            }
+            let (port, listen, sniffing, transport) = if let Some(rec) = inbound_cfg.receiver_settings {
+                let rec = ReceiverConfig::decode(rec.value).unwrap_or(ReceiverConfig {
+                    port_list: None,
+                    listen: None,
+                    stream_settings: None,
+                    receive_original_destination: false,
+                    sniffing_settings: None,
+                });
+                let port = rec.port_list.and_then(|p| p.range.first().map(|r| r.from as u16)).unwrap_or(0);
+                let listen = if let Some(l) = rec.listen {
+                    if let Some(d) = l.domain {
+                        d
+                    } else if let Some(ip) = l.ip {
+                        if ip.len() == 4 {
+                            format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+                        } else {
+                            "127.0.0.1".into()
+                        }
+                    } else {
+                        "127.0.0.1".into()
+                    }
+                } else {
+                    "127.0.0.1".into()
+                };
+                let sniffing = if let Some(s) = rec.sniffing_settings {
+                    let http = s.destination_override.iter().any(|d| d.eq_ignore_ascii_case("http"));
+                    let tls = s.destination_override.iter().any(|d| d.eq_ignore_ascii_case("tls"));
+                    crate::vless::Sniffing {
+                        http: s.enabled && (http || s.destination_override.is_empty()),
+                        tls: s.enabled && (tls || s.destination_override.is_empty()),
+                        route_only: s.route_only,
+                        quic: false,
+                        domains_excluded: std::sync::Arc::new(Vec::new()),
+                        metadata_only: false,
+                    }
+                } else {
+                    crate::vless::Sniffing::default()
+                };
+                let transport = match rec.stream_settings.as_ref().map(|s| s.protocol_name.as_str()) {
+                    Some("ws") => crate::config::InboundTransport::Websocket(crate::ws::WsSettings {
+                        path: "/".into(),
+                        host: None,
+                    }),
+                    Some("grpc") => crate::config::InboundTransport::Grpc(crate::grpc::GrpcSettings {
+                        service_name: String::new(),
+                        multi_mode: false,
+                        authority: None,
+                    }),
+                    Some("httpupgrade") => crate::config::InboundTransport::HttpUpgrade(
+                        crate::httpupgrade::HttpUpgradeSettings {
+                            path: "/".into(),
+                            host: None,
+                        },
+                    ),
+                    _ => crate::config::InboundTransport::Tcp,
+                };
+                (port, listen, sniffing, transport)
+            } else {
+                (0, "127.0.0.1".into(), crate::vless::Sniffing::default(), crate::config::InboundTransport::Tcp)
+            };
+            let proxy_type = inbound_cfg.proxy_settings.as_ref().map(|p| p.r#type.as_str()).unwrap_or_default();
+            let protocol = if proxy_type.contains("trojan") {
+                crate::config::InboundProtocol::Trojan
+            } else if proxy_type.contains("vmess") {
+                crate::config::InboundProtocol::Vmess
+            } else if proxy_type.contains("shadowsocks") {
+                crate::config::InboundProtocol::Shadowsocks
+            } else if proxy_type.contains("dokodemo") {
+                crate::config::InboundProtocol::Dokodemo
+            } else if proxy_type.contains("socks") {
+                crate::config::InboundProtocol::Socks
+            } else if proxy_type.contains("http") {
+                crate::config::InboundProtocol::Http
+            } else {
+                crate::config::InboundProtocol::Vless
+            };
+            let mut parsed_users = Vec::new();
+            let mut parsed_ss_users = Vec::new();
+            let mut ss_method = None;
+            let mut ss_pass = None;
+            if let Some(ref ps) = inbound_cfg.proxy_settings {
+                if let Ok(u_cfg) = ProxyUsersConfig::decode(ps.value.clone()) {
+                    for u in u_cfg.users {
+                        let email = u.email.clone();
+                        let account = u.account.unwrap_or_default();
+                        match account.r#type.as_str() {
+                            VLESS_ACCOUNT | VMESS_ACCOUNT => {
+                                if let Ok(acc) = VlessAccount::decode(account.value) {
+                                    parsed_users.push(InboundUser {
+                                        id: user_id(&acc.id),
+                                        hash: crate::trojan::trojan_password_hash(&acc.id),
+                                        email,
+                                    });
+                                }
+                            }
+                            TROJAN_ACCOUNT => {
+                                if let Ok(acc) = TrojanAccount::decode(account.value) {
+                                    parsed_users.push(InboundUser {
+                                        id: user_id(&acc.password),
+                                        hash: crate::trojan::trojan_password_hash(&acc.password),
+                                        email,
+                                    });
+                                }
+                            }
+                            SHADOWSOCKS_ACCOUNT => {
+                                if let Ok(acc) = ShadowsocksAccount::decode(account.value) {
+                                    let m_name = match CipherType::try_from(acc.cipher_type) {
+                                        Ok(CipherType::Aes128Gcm) => "aes-128-gcm",
+                                        Ok(CipherType::Aes256Gcm) => "aes-256-gcm",
+                                        Ok(CipherType::Chacha20Poly1305) => "chacha20-ietf-poly1305",
+                                        Ok(CipherType::Xchacha20Poly1305) => "xchacha20-ietf-poly1305",
+                                        _ => "aes-256-gcm",
+                                    };
+                                    if let Ok(m) = xray_proxy::shadowsocks::aead2017::Method::new(m_name, &acc.password) {
+                                        parsed_ss_users.push(crate::config::ShadowsocksUser {
+                                            email,
+                                            method: crate::config::ShadowsocksMethod::Aead2017(Arc::new(m)),
+                                        });
+                                        ss_method = Some(m_name.to_owned());
+                                        ss_pass = Some(acc.password);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            let inbound = crate::config::Inbound {
+                tag: tag.clone(),
+                listen,
+                port,
+                protocol,
+                users: parsed_users,
+                shadowsocks_users: parsed_ss_users,
+                shadowsocks_top_method: ss_method,
+                shadowsocks_top_password: ss_pass,
+                fallbacks: Vec::new(),
+                socks_auth: xray_proxy::inbound::SocksInboundAuth::NoAuth,
+                udp: true,
+                sniffing,
+                dokodemo: None,
+                http_obfs: None,
+                tls: None,
+                reality: None,
+                transport,
+                accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept::None,
+            };
+            match crate::start_inbound(&inbound, None, inbound_manager.router().clone()).await {
+                Ok((ctx, tcp_abort, udp_abort)) => {
+                    let _ = inbound_manager.add_entry(tag, ctx, tcp_abort, udp_abort);
+                    reply(&AddInboundResponse {})
+                }
+                Err(e) => status(UNKNOWN, &e),
+            }
+        }
+        "RemoveInbound" => {
+            let Ok(r) = RemoveInboundRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            if !inbound_manager.remove(&r.tag) {
+                return missing_handler(&r.tag);
+            }
+            reply(&RemoveInboundResponse {})
+        }
+        "AddOutbound" => {
+            let Ok(r) = AddOutboundRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            let Some(outbound) = r.outbound else {
+                return status(INVALID_ARGUMENT, "missing outbound");
+            };
+            let tag = outbound.tag;
+            let proxy_type = outbound.proxy_settings.as_ref().map(|p| p.r#type.as_str()).unwrap_or_default();
+            let action = if proxy_type.contains("freedom") {
+                crate::routing::Action::Direct(crate::routing::FreedomStrategy::AsIs.into())
+            } else if proxy_type.contains("blackhole") {
+                crate::routing::Action::Block(crate::routing::BlockAction::Drop)
+            } else {
+                crate::routing::Action::Direct(crate::routing::FreedomStrategy::AsIs.into())
+            };
+            inbound_manager.router().add_outbound(tag, action);
+            reply(&AddOutboundResponse {})
+        }
+        "RemoveOutbound" => {
+            let Ok(r) = RemoveOutboundRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            if !inbound_manager.router().remove_outbound(&r.tag) {
+                return missing_handler(&r.tag);
+            }
+            reply(&RemoveOutboundResponse {})
         }
         _ => status(UNIMPLEMENTED, "unknown method"),
     }
@@ -751,5 +1513,181 @@ mod tests {
         // Remove non-existent user
         let err = ctx.remove_user("nonexistent").unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn routing_service_add_remove_list_test_route() {
+        let router = Arc::new(crate::routing::Router::build(&serde_json::json!({
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "proxy", "protocol": "freedom"}],
+            "routing": {"rules": []}
+        }), &[]).unwrap());
+
+        // 1. ListRule should be empty initially
+        let req = ListRuleRequest {};
+        let resp = handle_router("ListRule", req.encode_to_vec().into(), &router).await;
+        assert_eq!(resp.status(), 200);
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let list_resp = ListRuleResponse::decode(unframe(collected).unwrap()).unwrap();
+        assert_eq!(list_resp.rules.len(), 0);
+
+        // 2. AddRule with domain rule
+        let rule_proto = RoutingRuleProto {
+            tag: "proxy".into(),
+            rule_tag: "r-google".into(),
+            domain: vec![DomainRuleProto {
+                custom: Some(DomainProto {
+                    r#type: 0,
+                    value: "google.com".into(),
+                }),
+                geosite: None,
+            }],
+            ..Default::default()
+        };
+        let cfg_proto = RouterConfigProto {
+            rule: vec![rule_proto],
+        };
+        let add_req = AddRuleRequest {
+            config: Some(TypedMessage {
+                r#type: "xray.app.router.Config".into(),
+                value: cfg_proto.encode_to_vec().into(),
+            }),
+            should_append: false,
+        };
+        let resp = handle_router("AddRule", add_req.encode_to_vec().into(), &router).await;
+        assert_eq!(resp.status(), 200);
+
+        // 3. ListRule should now have 1 rule
+        let resp = handle_router("ListRule", ListRuleRequest {}.encode_to_vec().into(), &router).await;
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let list_resp = ListRuleResponse::decode(unframe(collected).unwrap()).unwrap();
+        assert_eq!(list_resp.rules.len(), 1);
+        assert_eq!(list_resp.rules[0].tag, "proxy");
+        assert_eq!(list_resp.rules[0].rule_tag, "r-google");
+
+        // 4. TestRoute for google.com should route to "proxy"
+        let test_req = TestRouteRequest {
+            routing_context: Some(RoutingContext {
+                target_domain: "google.com".into(),
+                target_port: 80,
+                ..Default::default()
+            }),
+            field_selectors: Vec::new(),
+            publish_result: false,
+        };
+        let resp = handle_router("TestRoute", test_req.encode_to_vec().into(), &router).await;
+        assert_eq!(resp.status(), 200);
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let route_ctx = RoutingContext::decode(unframe(collected).unwrap()).unwrap();
+        assert_eq!(route_ctx.outbound_tag, "proxy");
+
+        // TestRoute for example.com should fall back to "direct"
+        let test_req2 = TestRouteRequest {
+            routing_context: Some(RoutingContext {
+                target_domain: "example.com".into(),
+                target_port: 80,
+                ..Default::default()
+            }),
+            field_selectors: Vec::new(),
+            publish_result: false,
+        };
+        let resp = handle_router("TestRoute", test_req2.encode_to_vec().into(), &router).await;
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let route_ctx2 = RoutingContext::decode(unframe(collected).unwrap()).unwrap();
+        assert_eq!(route_ctx2.outbound_tag, "direct");
+
+        // 5. RemoveRule
+        let rm_req = RemoveRuleRequest {
+            rule_tag: "r-google".into(),
+        };
+        let resp = handle_router("RemoveRule", rm_req.encode_to_vec().into(), &router).await;
+        assert_eq!(resp.status(), 200);
+
+        // Verify rule is gone and route goes to "direct"
+        let resp = handle_router("TestRoute", test_req.encode_to_vec().into(), &router).await;
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let route_ctx3 = RoutingContext::decode(unframe(collected).unwrap()).unwrap();
+        assert_eq!(route_ctx3.outbound_tag, "direct");
+    }
+
+    #[tokio::test]
+    async fn handler_service_inbound_outbound_management() {
+        let router = Arc::new(crate::routing::Router::build(&serde_json::json!({
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": []}
+        }), &[]).unwrap());
+        let inbound_manager = Arc::new(InboundManager::new(router.clone()));
+
+        // Outbound: AddOutbound
+        let add_out_req = AddOutboundRequest {
+            outbound: Some(OutboundHandlerConfig {
+                tag: "dyn_out".into(),
+                sender_settings: None,
+                proxy_settings: Some(TypedMessage {
+                    r#type: "xray.app.proxyman.outbound.FreedomConfig".into(),
+                    value: Bytes::new(),
+                }),
+                expire: 0,
+                comment: String::new(),
+            }),
+        };
+        let resp = handle_handler("AddOutbound", add_out_req.encode_to_vec().into(), &inbound_manager).await;
+        assert_eq!(resp.status(), 200);
+
+        // Outbound: RemoveOutbound
+        let rm_out_req = RemoveOutboundRequest {
+            tag: "dyn_out".into(),
+        };
+        let resp = handle_handler("RemoveOutbound", rm_out_req.encode_to_vec().into(), &inbound_manager).await;
+        assert_eq!(resp.status(), 200);
+
+        // Outbound: Remove non-existent outbound returns error
+        let resp = handle_handler("RemoveOutbound", rm_out_req.encode_to_vec().into(), &inbound_manager).await;
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "2");
+
+        // Inbound: AddInbound (bind port 0)
+        let receiver = ReceiverConfig {
+            port_list: Some(PortListProto {
+                range: vec![PortRangeProto { from: 0, to: 0 }],
+            }),
+            listen: Some(IpOrDomainProto {
+                ip: Some(Bytes::from_static(&[127, 0, 0, 1])),
+                domain: None,
+            }),
+            stream_settings: None,
+            receive_original_destination: false,
+            sniffing_settings: None,
+        };
+        let add_in_req = AddInboundRequest {
+            inbound: Some(InboundHandlerConfig {
+                tag: "dyn_in".into(),
+                receiver_settings: Some(TypedMessage {
+                    r#type: "xray.app.proxyman.ReceiverConfig".into(),
+                    value: receiver.encode_to_vec().into(),
+                }),
+                proxy_settings: Some(TypedMessage {
+                    r#type: "xray.proxy.vless.inbound.Config".into(),
+                    value: Bytes::new(),
+                }),
+            }),
+        };
+        let resp = handle_handler("AddInbound", add_in_req.encode_to_vec().into(), &inbound_manager).await;
+        assert_eq!(resp.status(), 200);
+        assert!(inbound_manager.contains("dyn_in"));
+
+        // Inbound: Add duplicate inbound returns error
+        let resp = handle_handler("AddInbound", add_in_req.encode_to_vec().into(), &inbound_manager).await;
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "2");
+
+        // Inbound: RemoveInbound
+        let rm_in_req = RemoveInboundRequest {
+            tag: "dyn_in".into(),
+        };
+        let resp = handle_handler("RemoveInbound", rm_in_req.encode_to_vec().into(), &inbound_manager).await;
+        assert_eq!(resp.status(), 200);
+        assert!(!inbound_manager.contains("dyn_in"));
+
+        // Inbound: Remove non-existent inbound returns error
+        let resp = handle_handler("RemoveInbound", rm_in_req.encode_to_vec().into(), &inbound_manager).await;
+        assert_eq!(resp.headers().get("grpc-status").unwrap(), "2");
     }
 }

@@ -21,6 +21,8 @@ pub struct Config {
     pub stats: stats::Policy,
     pub inbounds: Vec<Inbound>,
     pub router: Router,
+    #[allow(dead_code)]
+    pub dns: Option<xray_config::DnsConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,12 +240,24 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         mask_address: str_field(section, "maskAddress").to_owned(),
         dns_log,
     };
+    let dns = if root.get("dns").is_some() {
+        let parsed = xray_config::parse_xray_json_with_geodata_dirs(raw, &asset_dirs())
+            .map_err(|e| {
+                let messages: Vec<String> =
+                    e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
+                format!("dns: {}", messages.join("; "))
+            })?;
+        Some(parsed.config.dns)
+    } else {
+        None
+    };
     Ok(Config {
         log,
         api,
         stats: stats::Policy::from_config(&root),
         inbounds,
         router,
+        dns,
     })
 }
 
@@ -1805,5 +1819,24 @@ mod tests {
         assert!(parse_short_id("abc").is_err());
         assert!(parse_short_id("0123456789abcdef01").is_err());
         assert!(parse_short_id("zz").is_err());
+    }
+
+    #[test]
+    fn parses_dns_config() {
+        let raw = r#"{
+          "inbounds": [],
+          "dns": {
+            "servers": ["8.8.8.8", "1.1.1.1"],
+            "hosts": {
+              "example.com": "127.0.0.1"
+            },
+            "queryStrategy": "UseIPv4"
+          }
+        }"#;
+        let config = parse(raw).unwrap();
+        let dns = config.dns.expect("dns config must be present");
+        assert_eq!(dns.servers.len(), 2);
+        assert_eq!(dns.query_strategy, xray_config::DnsQueryStrategy::UseIpv4);
+        assert!(!dns.hosts.is_empty());
     }
 }

@@ -32,7 +32,7 @@ mod wg;
 mod ws;
 mod xhttp;
 
-use std::collections::HashMap;
+use crate::routing::Router;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -185,174 +185,185 @@ enum InboundHandler {
 async fn run(
     config: Config,
     tls: Vec<Option<TlsAcceptor>>,
-    realities: Vec<Option<Arc<reality::RealityServer>>>,
+    _realities: Vec<Option<Arc<reality::RealityServer>>>,
 ) -> Result<(), String> {
     log::info(format!("xray-rs {} started", env!("CARGO_PKG_VERSION")));
     stats::init(config.stats);
     let router = Arc::new(config.router);
-    let mut inbounds = HashMap::new();
-    for (inbound, (acceptor, reality)) in config
-        .inbounds
-        .into_iter()
-        .zip(tls.into_iter().zip(realities))
-    {
-        let listener = bind(&inbound).await?;
-        log::info(format!(
-            "listening {} on {}",
-            inbound.tag,
-            listener.local_addr().map_err(|e| e.to_string())?
-        ));
-        let ctx = Arc::new(vless::Context {
-            tag: inbound.tag.clone(),
-            port: inbound.port,
-            users: RwLock::new(inbound.users),
-            ss_users: RwLock::new(inbound.shadowsocks_users),
-            ss_method: RwLock::new(inbound.shadowsocks_top_method),
-            ss_password: RwLock::new(inbound.shadowsocks_top_password),
-            router: router.clone(),
-            sniffing: inbound.sniffing,
-            fallbacks: inbound.fallbacks,
-        });
-        inbounds.insert(inbound.tag.clone(), ctx.clone());
-        let is_ss_udp = inbound.protocol == InboundProtocol::Shadowsocks && inbound.udp;
-        let is_dokodemo_udp = inbound.protocol == InboundProtocol::Dokodemo && inbound.udp;
-        let dokodemo_settings = inbound.dokodemo.clone();
-        let ss_inbound_tag = inbound.tag.clone();
-        let ss_listen = inbound.listen.clone();
-        let ss_port = inbound.port;
-
-        let handler = match (inbound.protocol, inbound.transport) {
-            (InboundProtocol::Vless, InboundTransport::Tcp) => {
-                InboundHandler::VlessTcp(ctx.clone())
-            }
-            (InboundProtocol::Vless, InboundTransport::Websocket(settings)) => {
-                InboundHandler::VlessWs(ctx.clone(), settings)
-            }
-            (InboundProtocol::Vless, InboundTransport::HttpUpgrade(settings)) => {
-                InboundHandler::VlessHttpUpgrade(ctx.clone(), settings)
-            }
-            (InboundProtocol::Vless, InboundTransport::Grpc(settings)) => {
-                InboundHandler::VlessGrpc(grpc::Handler::new(
-                    settings,
-                    grpc::GrpcProtocol::Vless(ctx.clone()),
-                ))
-            }
-            (InboundProtocol::Trojan, InboundTransport::Tcp) => {
-                InboundHandler::TrojanTcp(ctx.clone())
-            }
-            (InboundProtocol::Trojan, InboundTransport::Websocket(settings)) => {
-                InboundHandler::TrojanWs(ctx.clone(), settings)
-            }
-            (InboundProtocol::Trojan, InboundTransport::HttpUpgrade(settings)) => {
-                InboundHandler::TrojanHttpUpgrade(ctx.clone(), settings)
-            }
-            (InboundProtocol::Trojan, InboundTransport::Grpc(settings)) => {
-                InboundHandler::TrojanGrpc(grpc::Handler::new(
-                    settings,
-                    grpc::GrpcProtocol::Trojan(ctx.clone()),
-                ))
-            }
-            (InboundProtocol::Vmess, InboundTransport::Tcp) => {
-                InboundHandler::VmessTcp(ctx.clone())
-            }
-            (InboundProtocol::Vmess, InboundTransport::Websocket(settings)) => {
-                InboundHandler::VmessWs(ctx.clone(), settings)
-            }
-            (InboundProtocol::Vmess, InboundTransport::HttpUpgrade(settings)) => {
-                InboundHandler::VmessHttpUpgrade(ctx.clone(), settings)
-            }
-            (InboundProtocol::Socks, InboundTransport::Tcp) => {
-                InboundHandler::Socks(ctx.clone(), inbound.socks_auth, inbound.udp)
-            }
-            (InboundProtocol::Http, InboundTransport::Tcp) => {
-                InboundHandler::Http(ctx.clone(), inbound.socks_auth)
-            }
-            (InboundProtocol::Shadowsocks, InboundTransport::Tcp) => {
-                InboundHandler::Shadowsocks(ctx.clone())
-            }
-            (InboundProtocol::Dokodemo, InboundTransport::Tcp) => {
-                let settings = inbound
-                    .dokodemo
-                    .clone()
-                    .unwrap_or(config::DokodemoSettings {
-                        address: None,
-                        port: None,
-                        follow_redirect: false,
-                    });
-                InboundHandler::Dokodemo(ctx.clone(), Arc::new(settings))
-            }
-            (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
-                InboundHandler::VlessXhttp(xhttp::Handler::new(*settings, ctx.clone()))
-            }
-            (other, InboundTransport::Xhttp(_)) => {
-                return Err(format!(
-                    "inbound {}: {:?} over XHTTP is not supported",
-                    inbound.tag, other
-                ));
-            }
-            (other, InboundTransport::Websocket(_)) => {
-                return Err(format!(
-                    "inbound {}: {:?} over WebSocket is not supported",
-                    inbound.tag, other
-                ));
-            }
-            (other, InboundTransport::HttpUpgrade(_)) => {
-                return Err(format!(
-                    "inbound {}: {:?} over HTTPUpgrade is not supported",
-                    inbound.tag, other
-                ));
-            }
-            (other, InboundTransport::Grpc(_)) => {
-                return Err(format!(
-                    "inbound {}: {:?} over gRPC is not supported",
-                    inbound.tag, other
-                ));
-            }
-        };
-        let http_obfs = inbound.http_obfs.map(Arc::new);
-        tokio::spawn(accept_loop(
-            listener,
-            inbound.accept_proxy_protocol,
-            acceptor,
-            reality,
-            handler,
-            http_obfs,
-        ));
-        if is_ss_udp {
-            let udp_socket = bind_udp_addr(&ss_listen, ss_port).await?;
-            log::info(format!(
-                "listening udp {} on {}",
-                ss_inbound_tag,
-                udp_socket.local_addr().map_err(|e| e.to_string())?
-            ));
-            let udp_handler = shadowsocks::ShadowsocksUdpHandler::new(
-                Arc::new(udp_socket),
-                ctx.clone(),
-            );
-            tokio::spawn(udp_handler.run());
-        }
-        if is_dokodemo_udp {
-            if let Some(settings) = dokodemo_settings {
-                let udp_socket = bind_udp_addr(&inbound.listen, inbound.port).await?;
-                log::info(format!(
-                    "listening udp {} on {}",
-                    inbound.tag,
-                    udp_socket.local_addr().map_err(|e| e.to_string())?
-                ));
-                let udp_handler = dokodemo::DokodemoUdpHandler::new(
-                    Arc::new(udp_socket),
-                    Arc::new(settings),
-                    ctx.clone(),
-                );
-                tokio::spawn(udp_handler.run());
-            }
-        }
+    let inbound_manager = Arc::new(api::InboundManager::new(router.clone()));
+    for (inbound, acceptor) in config.inbounds.into_iter().zip(tls) {
+        let tag = inbound.tag.clone();
+        let (ctx, tcp_abort, udp_abort) = start_inbound(&inbound, acceptor, router.clone()).await?;
+        inbound_manager.insert_initial(tag, ctx, tcp_abort, udp_abort);
     }
     if let Some(addr) = config.api {
-        api::serve(addr, inbounds).await?;
+        api::serve(addr, inbound_manager, router.clone()).await?;
     }
     let _ = tokio::signal::ctrl_c().await;
     Ok(())
+}
+
+pub(crate) async fn start_inbound(
+    inbound: &Inbound,
+    acceptor: Option<TlsAcceptor>,
+    router: Arc<Router>,
+) -> Result<
+    (
+        Arc<vless::Context>,
+        Option<tokio::task::AbortHandle>,
+        Option<tokio::task::AbortHandle>,
+    ),
+    String,
+> {
+    let listener = bind(inbound).await?;
+    log::info(format!(
+        "listening {} on {}",
+        inbound.tag,
+        listener.local_addr().map_err(|e| e.to_string())?
+    ));
+    let ctx = Arc::new(vless::Context {
+        tag: inbound.tag.clone(),
+        port: inbound.port,
+        users: RwLock::new(inbound.users.clone()),
+        ss_users: RwLock::new(inbound.shadowsocks_users.clone()),
+        ss_method: RwLock::new(inbound.shadowsocks_top_method.clone()),
+        ss_password: RwLock::new(inbound.shadowsocks_top_password.clone()),
+        router: router.clone(),
+        sniffing: inbound.sniffing.clone(),
+        fallbacks: inbound.fallbacks.clone(),
+    });
+    let is_ss_udp = inbound.protocol == InboundProtocol::Shadowsocks && inbound.udp;
+    let is_dokodemo_udp = inbound.protocol == InboundProtocol::Dokodemo && inbound.udp;
+    let dokodemo_settings = inbound.dokodemo.clone();
+    let ss_inbound_tag = inbound.tag.clone();
+    let ss_listen = inbound.listen.clone();
+    let ss_port = inbound.port;
+
+    let handler = match (inbound.protocol, inbound.transport.clone()) {
+        (InboundProtocol::Vless, InboundTransport::Tcp) => InboundHandler::VlessTcp(ctx.clone()),
+        (InboundProtocol::Vless, InboundTransport::Websocket(settings)) => {
+            InboundHandler::VlessWs(ctx.clone(), settings)
+        }
+        (InboundProtocol::Vless, InboundTransport::HttpUpgrade(settings)) => {
+            InboundHandler::VlessHttpUpgrade(ctx.clone(), settings)
+        }
+        (InboundProtocol::Vless, InboundTransport::Grpc(settings)) => InboundHandler::VlessGrpc(
+            grpc::Handler::new(settings, grpc::GrpcProtocol::Vless(ctx.clone())),
+        ),
+        (InboundProtocol::Trojan, InboundTransport::Tcp) => InboundHandler::TrojanTcp(ctx.clone()),
+        (InboundProtocol::Trojan, InboundTransport::Websocket(settings)) => {
+            InboundHandler::TrojanWs(ctx.clone(), settings)
+        }
+        (InboundProtocol::Trojan, InboundTransport::HttpUpgrade(settings)) => {
+            InboundHandler::TrojanHttpUpgrade(ctx.clone(), settings)
+        }
+        (InboundProtocol::Trojan, InboundTransport::Grpc(settings)) => InboundHandler::TrojanGrpc(
+            grpc::Handler::new(settings, grpc::GrpcProtocol::Trojan(ctx.clone())),
+        ),
+        (InboundProtocol::Vmess, InboundTransport::Tcp) => InboundHandler::VmessTcp(ctx.clone()),
+        (InboundProtocol::Vmess, InboundTransport::Websocket(settings)) => {
+            InboundHandler::VmessWs(ctx.clone(), settings)
+        }
+        (InboundProtocol::Vmess, InboundTransport::HttpUpgrade(settings)) => {
+            InboundHandler::VmessHttpUpgrade(ctx.clone(), settings)
+        }
+        (InboundProtocol::Socks, InboundTransport::Tcp) => {
+            InboundHandler::Socks(ctx.clone(), inbound.socks_auth.clone(), inbound.udp)
+        }
+        (InboundProtocol::Http, InboundTransport::Tcp) => {
+            InboundHandler::Http(ctx.clone(), inbound.socks_auth.clone())
+        }
+        (InboundProtocol::Shadowsocks, InboundTransport::Tcp) => {
+            InboundHandler::Shadowsocks(ctx.clone())
+        }
+        (InboundProtocol::Dokodemo, InboundTransport::Tcp) => {
+            let settings = inbound.dokodemo.clone().unwrap_or(config::DokodemoSettings {
+                address: None,
+                port: None,
+                follow_redirect: false,
+            });
+            InboundHandler::Dokodemo(ctx.clone(), Arc::new(settings))
+        }
+        (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
+            InboundHandler::VlessXhttp(xhttp::Handler::new(*settings, ctx.clone()))
+        }
+        (other, InboundTransport::Xhttp(_)) => {
+            return Err(format!(
+                "inbound {}: {:?} over XHTTP is not supported",
+                inbound.tag, other
+            ));
+        }
+        (other, InboundTransport::Websocket(_)) => {
+            return Err(format!(
+                "inbound {}: {:?} over WebSocket is not supported",
+                inbound.tag, other
+            ));
+        }
+        (other, InboundTransport::HttpUpgrade(_)) => {
+            return Err(format!(
+                "inbound {}: {:?} over HTTPUpgrade is not supported",
+                inbound.tag, other
+            ));
+        }
+        (other, InboundTransport::Grpc(_)) => {
+            return Err(format!(
+                "inbound {}: {:?} over gRPC is not supported",
+                inbound.tag, other
+            ));
+        }
+    };
+    let reality = if let Some(reality_settings) = &inbound.reality {
+        let is_grpc = matches!(inbound.transport, InboundTransport::Grpc(_));
+        let is_xhttp = matches!(inbound.transport, InboundTransport::Xhttp(_));
+        Some(Arc::new(reality::RealityServer::new(
+            reality_settings.clone(),
+            inbound.port,
+            is_grpc,
+            is_xhttp,
+        )?))
+    } else {
+        None
+    };
+    let http_obfs = inbound.http_obfs.clone().map(Arc::new);
+    let tcp_task = tokio::spawn(accept_loop(
+        listener,
+        inbound.accept_proxy_protocol,
+        acceptor,
+        reality,
+        handler,
+        http_obfs,
+    ));
+    let mut udp_abort = None;
+    if is_ss_udp {
+        let udp_socket = bind_udp_addr(&ss_listen, ss_port).await?;
+        log::info(format!(
+            "listening udp {} on {}",
+            ss_inbound_tag,
+            udp_socket.local_addr().map_err(|e| e.to_string())?
+        ));
+        let udp_handler =
+            shadowsocks::ShadowsocksUdpHandler::new(Arc::new(udp_socket), ctx.clone());
+        let udp_task = tokio::spawn(udp_handler.run());
+        udp_abort = Some(udp_task.abort_handle());
+    }
+    if is_dokodemo_udp {
+        if let Some(settings) = dokodemo_settings {
+            let udp_socket = bind_udp_addr(&inbound.listen, inbound.port).await?;
+            log::info(format!(
+                "listening udp {} on {}",
+                inbound.tag,
+                udp_socket.local_addr().map_err(|e| e.to_string())?
+            ));
+            let udp_handler = dokodemo::DokodemoUdpHandler::new(
+                Arc::new(udp_socket),
+                Arc::new(settings),
+                ctx.clone(),
+            );
+            let udp_task = tokio::spawn(udp_handler.run());
+            udp_abort = Some(udp_task.abort_handle());
+        }
+    }
+    Ok((ctx, Some(tcp_task.abort_handle()), udp_abort))
 }
 
 async fn bind(inbound: &Inbound) -> Result<TcpListener, String> {

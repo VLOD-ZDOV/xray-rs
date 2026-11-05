@@ -201,6 +201,9 @@ impl DokodemoUdpHandler {
                     },
                     port,
                     protocol: None,
+                    attributes: None,
+                    local_ip: None,
+                    vless_route: None,
                 };
                 if self.ctx.router.route(&query).await.tag != decision.tag {
                     continue;

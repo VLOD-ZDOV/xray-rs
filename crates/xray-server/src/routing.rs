@@ -29,8 +29,17 @@ use crate::vmess_outbound::VmessOutbound;
 use crate::wg::WgOutbound;
 
 const STUB_TAG: &str = "rule";
-const SERVER_FIELDS: [&str; 5] = ["user", "source", "sourcePort", "protocol", "localPort"];
-const IGNORED_FIELDS: [&str; 1] = ["ruleTag"];
+const SERVER_FIELDS: [&str; 8] = [
+    "user",
+    "source",
+    "sourcePort",
+    "protocol",
+    "localPort",
+    "attrs",
+    "vlessRoute",
+    "localIP",
+];
+const IGNORED_FIELDS: [&str; 2] = ["ruleTag", "domainMatcher"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum FreedomStrategy {
@@ -371,35 +380,43 @@ pub struct Query<'a> {
     pub ip: Option<IpAddr>,
     pub port: u16,
     pub protocol: Option<&'static str>,
-}
-
-pub struct Router {
-    rules: Vec<Rule>,
-    strategy: RoutingDomainStrategy,
-    outbounds: HashMap<String, Action>,
-    balancers: HashMap<String, Arc<Balancer>>,
-    default_tag: String,
-    sniff: bool,
-    // freedom `finalRules`, checked against the resolved address.
-    final_rules: HashMap<String, Vec<(Action, RoutingRule)>>,
+    pub attributes: Option<&'a HashMap<String, String>>,
+    pub local_ip: Option<IpAddr>,
+    pub vless_route: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum RuleTarget {
+pub enum RuleTarget {
     Outbound(String),
     Balancer(String),
 }
 
-struct Rule {
-    target: RuleTarget,
-    matcher: RoutingRule,
-    source: Option<RoutingRule>,
-    users: Vec<UserMatcher>,
-    protocols: Vec<String>,
-    local_ports: Vec<(u16, u16)>,
+pub struct Router {
+    pub rules: std::sync::RwLock<Vec<Rule>>,
+    pub strategy: RoutingDomainStrategy,
+    pub outbounds: std::sync::RwLock<HashMap<String, Action>>,
+    pub balancers: HashMap<String, Arc<Balancer>>,
+    pub default_tag: std::sync::RwLock<String>,
+    pub sniff: bool,
+    pub final_rules: std::sync::RwLock<HashMap<String, Vec<(Action, RoutingRule)>>>,
+    pub asset_dirs: Vec<PathBuf>,
 }
 
-enum UserMatcher {
+pub struct Rule {
+    pub target: RuleTarget,
+    pub tag: String,
+    pub rule_tag: String,
+    pub matcher: RoutingRule,
+    pub source: Option<RoutingRule>,
+    pub users: Vec<UserMatcher>,
+    pub protocols: Vec<String>,
+    pub local_ports: Vec<(u16, u16)>,
+    pub attrs: HashMap<String, String>,
+    pub vless_routes: Vec<(u32, u32)>,
+    pub local_ip: Option<RoutingRule>,
+}
+
+pub enum UserMatcher {
     Exact(String),
     Regex(Regex),
 }
@@ -520,105 +537,12 @@ impl Router {
             balancers.insert(balancer.tag.clone(), Arc::new(balancer));
         }
 
-        let mut pending = Vec::new();
-        for (index, raw) in array(&routing, "rules").iter().enumerate() {
-            let Some(object) = raw.as_object() else {
-                return Err(format!("routing.rules[{index}] must be an object"));
-            };
-            let mut rule = object.clone();
-            let target = match (rule.remove("outboundTag"), rule.remove("balancerTag")) {
-                (Some(Value::String(tag)), _) if !tag.is_empty() => RuleTarget::Outbound(tag),
-                (_, Some(Value::String(tag))) if !tag.is_empty() => RuleTarget::Balancer(tag),
-                _ => {
-                    return Err(format!(
-                        "routing.rules[{index}] needs outboundTag or balancerTag"
-                    ))
-                }
-            };
-            let users = take_strings(&mut rule, "user")
-                .into_iter()
-                .map(|u| match u.strip_prefix("regexp:") {
-                    Some(pattern) => Regex::new(pattern)
-                        .map(UserMatcher::Regex)
-                        .map_err(|e| format!("routing.rules[{index}].user: {e}")),
-                    None => Ok(UserMatcher::Exact(u)),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let protocols = take_strings(&mut rule, "protocol");
-            let local_ports = take_port_ranges(&mut rule, "localPort")?;
-            let source = rule.remove("source").or_else(|| rule.remove("sourceIP"));
-            let source_port = rule.remove("sourcePort");
-            for key in IGNORED_FIELDS {
-                rule.remove(key);
-            }
-            let known = [
-                "type",
-                "inboundTag",
-                "network",
-                "port",
-                "domain",
-                "domains",
-                "ip",
-                "localOS",
-            ];
-            if let Some(unknown) = rule
-                .keys()
-                .find(|k| !known.contains(&k.as_str()) && !SERVER_FIELDS.contains(&k.as_str()))
-            {
-                return Err(format!(
-                    "routing.rules[{index}]: field {unknown:?} is not supported yet"
-                ));
-            }
-            // The parser rejects a rule without conditions; this one matches everything.
-            if !rule.keys().any(|k| k != "type") {
-                rule.insert("network".into(), json!("tcp,udp"));
-            }
-            rule.insert("outboundTag".into(), json!(STUB_TAG));
-            let main = synth_rules.len();
-            synth_rules.push(Value::Object(rule));
-            let helper = (source.is_some() || source_port.is_some()).then(|| {
-                let mut helper = json!({"type": "field", "outboundTag": STUB_TAG});
-                if let Some(source) = source {
-                    helper["ip"] = source;
-                }
-                if let Some(port) = source_port {
-                    helper["port"] = port;
-                }
-                synth_rules.push(helper);
-                synth_rules.len() - 1
-            });
-            pending.push((target, main, helper, users, protocols, local_ports));
-        }
-
-        let expected_rules = synth_rules.len();
-        let mut synth_routing = json!({"rules": synth_rules});
-        if let Some(strategy) = routing.get("domainStrategy") {
-            synth_routing["domainStrategy"] = strategy.clone();
-        }
-        let synth = json!({"outbounds": [{"tag": STUB_TAG, "protocol": "freedom"}], "routing": synth_routing});
-        let parsed = xray_config::parse_xray_json_with_geodata_dirs(&synth.to_string(), asset_dirs)
-            .map_err(|e| {
-                let messages: Vec<String> =
-                    e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
-                format!("routing: {}", messages.join("; "))
-            })?;
-        let parsed_rules = parsed.config.routing.rules;
-        if parsed_rules.len() != expected_rules {
-            return Err("routing: parser returned an unexpected number of rules".into());
-        }
-
-        let mut final_rules: HashMap<String, Vec<(Action, RoutingRule)>> = HashMap::new();
-        for (tag, action, index) in pending_final {
-            final_rules
-                .entry(tag)
-                .or_default()
-                .push((action, parsed_rules[index].clone()));
-        }
-
-        let mut rules = Vec::with_capacity(pending.len());
+        let mut rules = Vec::new();
         let mut sniff = false;
-        for (target, main, helper, users, protocols, local_ports) in pending {
-            match &target {
+        for (index, raw) in array(&routing, "rules").iter().enumerate() {
+            let rule = parse_single_rule(raw, asset_dirs)
+                .map_err(|e| format!("routing.rules[{index}]: {e}"))?;
+            match &rule.target {
                 RuleTarget::Outbound(tag) => {
                     if !outbounds.contains_key(tag) {
                         log::debug(format!(
@@ -635,26 +559,82 @@ impl Router {
                     }
                 }
             }
-            sniff |= !protocols.is_empty();
-            rules.push(Rule {
-                target,
-                matcher: parsed_rules[main].clone(),
-                source: helper.map(|i| parsed_rules[i].clone()),
-                users,
-                protocols,
-                local_ports,
-            });
+            sniff |= !rule.protocols.is_empty();
+            rules.push(rule);
         }
 
+        let mut final_rules: HashMap<String, Vec<(Action, RoutingRule)>> = HashMap::new();
+        if !pending_final.is_empty() {
+            let synth = json!({
+                "outbounds": [{"tag": STUB_TAG, "protocol": "freedom"}],
+                "routing": {"rules": synth_rules}
+            });
+            let parsed = xray_config::parse_xray_json_with_geodata_dirs(&synth.to_string(), asset_dirs)
+                .map_err(|e| {
+                    let messages: Vec<String> =
+                        e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
+                    format!("routing finalRules: {}", messages.join("; "))
+                })?;
+            for (tag, action, index) in pending_final {
+                final_rules
+                    .entry(tag)
+                    .or_default()
+                    .push((action, parsed.config.routing.rules[index].clone()));
+            }
+        }
+
+        let strategy = match str_field(&routing, "domainStrategy") {
+            "AsIs" | "" => RoutingDomainStrategy::AsIs,
+            "IPIfNonMatch" => RoutingDomainStrategy::IpIfNonMatch,
+            "IPOnDemand" => RoutingDomainStrategy::IpOnDemand,
+            _ => RoutingDomainStrategy::AsIs,
+        };
+
         Ok(Self {
-            rules,
-            strategy: parsed.config.routing.domain_strategy,
-            outbounds,
+            rules: std::sync::RwLock::new(rules),
+            strategy,
+            outbounds: std::sync::RwLock::new(outbounds),
             balancers,
-            default_tag: default_tag.unwrap_or_default(),
+            default_tag: std::sync::RwLock::new(default_tag.unwrap_or_default()),
             sniff,
-            final_rules,
+            final_rules: std::sync::RwLock::new(final_rules),
+            asset_dirs: asset_dirs.to_vec(),
         })
+    }
+
+    pub fn add_rule(&self, rule: Rule, should_append: bool) {
+        let mut rules = self.rules.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if should_append {
+            rules.push(rule);
+        } else {
+            rules.insert(0, rule);
+        }
+    }
+
+    pub fn remove_rule(&self, rule_tag: &str) -> usize {
+        let mut rules = self.rules.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = rules.len();
+        rules.retain(|r| r.rule_tag != rule_tag);
+        before - rules.len()
+    }
+
+    pub fn list_rules(&self) -> Vec<(String, String)> {
+        let rules = self.rules.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        rules.iter().map(|r| (r.tag.clone(), r.rule_tag.clone())).collect()
+    }
+
+    pub fn parse_rule(&self, raw: &Value) -> Result<Rule, String> {
+        parse_single_rule(raw, &self.asset_dirs)
+    }
+
+    pub fn add_outbound(&self, tag: String, action: Action) {
+        let mut outbounds = self.outbounds.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        outbounds.insert(tag, action);
+    }
+
+    pub fn remove_outbound(&self, tag: &str) -> bool {
+        let mut outbounds = self.outbounds.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        outbounds.remove(tag).is_some()
     }
 
     /// Freedom's last check on the resolved address: the first matching
@@ -662,12 +642,12 @@ impl Router {
     /// Xray does for VLESS inbounds.
     pub fn final_action(&self, outbound: &str, network: Network, addr: SocketAddr) -> Action {
         let ip = addr.ip();
-        let rules = self
-            .final_rules
+        let final_rules = self.final_rules.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outbounds = self.outbounds.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        final_rules
             .get(outbound)
-            .map_or(&[][..], Vec::as_slice);
-        rules
-            .iter()
+            .into_iter()
+            .flatten()
             .find(|(_, rule)| {
                 rule.matches_network(Some(network))
                     && rule.matches_port(Some(addr.port()))
@@ -677,7 +657,7 @@ impl Router {
                 if is_private(ip) {
                     Action::Block(BlockAction::Drop)
                 } else {
-                    self.outbounds
+                    outbounds
                         .get(outbound)
                         .cloned()
                         .unwrap_or_else(|| Action::Direct(FreedomStrategy::AsIs.into()))
@@ -710,6 +690,9 @@ impl Router {
                 ip: query.ip,
                 port: query.port,
                 protocol: query.protocol,
+                attributes: query.attributes,
+                local_ip: query.local_ip,
+                vless_route: query.vless_route,
             };
             let decision = self.route_once(&q, resolved).await;
             match decision.action {
@@ -736,8 +719,12 @@ impl Router {
     }
 
     async fn route_once(&self, query: &Query<'_>, resolved: Option<IpAddr>) -> Decision {
-        if let Some(target) = self.first_match(query, query.ip.or(resolved)) {
-            return self.resolve_target(target);
+        let matched = {
+            let rules = self.rules.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.first_match(&rules, query, query.ip.or(resolved)).cloned()
+        };
+        if let Some(target) = matched {
+            return self.resolve_target(&target).await;
         }
         if self.strategy == RoutingDomainStrategy::IpIfNonMatch && query.domain.is_some() {
             let ip = match resolved {
@@ -745,27 +732,34 @@ impl Router {
                 None => self.resolve(query).await,
             };
             if let Some(ip) = ip {
-                if let Some(target) = self.first_match(query, Some(ip)) {
-                    return self.resolve_target(target);
+                let matched = {
+                    let rules = self.rules.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    self.first_match(&rules, query, Some(ip)).cloned()
+                };
+                if let Some(target) = matched {
+                    return self.resolve_target(&target).await;
                 }
             }
         }
-        self.decision(&self.default_tag)
+        let default_tag = self.default_tag.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let outbounds = self.outbounds.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.decision(&outbounds, &default_tag)
     }
 
-    fn first_match(&self, query: &Query<'_>, ip: Option<IpAddr>) -> Option<&RuleTarget> {
-        self.rules
+    fn first_match<'a>(&'a self, rules: &'a [Rule], query: &Query<'_>, ip: Option<IpAddr>) -> Option<&'a RuleTarget> {
+        rules
             .iter()
             .find(|rule| rule.matches(query, ip))
             .map(|rule| &rule.target)
     }
 
-    fn resolve_target(&self, target: &RuleTarget) -> Decision {
+    async fn resolve_target(&self, target: &RuleTarget) -> Decision {
+        let outbounds = self.outbounds.read().unwrap_or_else(std::sync::PoisonError::into_inner);
         match target {
-            RuleTarget::Outbound(tag) => self.decision(tag),
+            RuleTarget::Outbound(tag) => self.decision(&outbounds, tag),
             RuleTarget::Balancer(balancer_tag) => {
                 if let Some(balancer) = self.balancers.get(balancer_tag) {
-                    if let Some((tag, action)) = balancer.select(&self.outbounds) {
+                    if let Some((tag, action)) = balancer.select(&outbounds) {
                         return Decision {
                             tag: tag.to_owned(),
                             action: action.clone(),
@@ -780,22 +774,210 @@ impl Router {
         }
     }
 
-    fn decision(&self, tag: &str) -> Decision {
-        // No outbounds at all behaves like a lone freedom outbound.
-        let action = if self.outbounds.is_empty() {
+    fn decision(&self, outbounds: &HashMap<String, Action>, tag: &str) -> Decision {
+        let action = if outbounds.is_empty() {
             Action::Direct(FreedomStrategy::AsIs.into())
         } else {
-            self.outbounds
+            outbounds
                 .get(tag)
                 .cloned()
                 .unwrap_or(Action::Block(BlockAction::Drop))
         };
-        // The tag stays as is, even empty: finalRules and stats are keyed by it.
         Decision {
             tag: tag.to_owned(),
             action,
         }
     }
+}
+
+pub fn parse_single_rule(raw: &Value, asset_dirs: &[PathBuf]) -> Result<Rule, String> {
+    let Some(object) = raw.as_object() else {
+        return Err("routing rule must be an object".into());
+    };
+    let mut rule = object.clone();
+    let rule_tag = rule
+        .remove("ruleTag")
+        .and_then(|v| match v {
+            Value::String(s) => Some(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let target = match (rule.remove("outboundTag"), rule.remove("balancerTag")) {
+        (Some(Value::String(tag)), _) => RuleTarget::Outbound(tag),
+        (_, Some(Value::String(tag))) => RuleTarget::Balancer(tag),
+        _ => return Err("routing rule needs outboundTag or balancerTag".into()),
+    };
+    let tag = match &target {
+        RuleTarget::Outbound(t) => t.clone(),
+        RuleTarget::Balancer(t) => format!("balancer:{t}"),
+    };
+    let users = take_strings(&mut rule, "user")
+        .into_iter()
+        .map(|u| match u.strip_prefix("regexp:") {
+            Some(pattern) => Regex::new(pattern)
+                .map(UserMatcher::Regex)
+                .map_err(|e| format!("rule.user: {e}")),
+            None => Ok(UserMatcher::Exact(u)),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let protocols = take_strings(&mut rule, "protocol");
+    let local_ports = take_port_ranges(&mut rule, "localPort")?;
+    let attrs = take_attrs(&mut rule, "attrs");
+    let vless_routes = take_vless_routes(&mut rule, "vlessRoute")?;
+    let local_ip = rule.remove("localIP");
+    let source = rule.remove("source").or_else(|| rule.remove("sourceIP"));
+    let source_port = rule.remove("sourcePort");
+    for key in IGNORED_FIELDS {
+        rule.remove(key);
+    }
+    let known = [
+        "type",
+        "inboundTag",
+        "network",
+        "port",
+        "domain",
+        "domains",
+        "ip",
+        "localOS",
+    ];
+    if let Some(unknown) = rule
+        .keys()
+        .find(|k| !known.contains(&k.as_str()) && !SERVER_FIELDS.contains(&k.as_str()))
+    {
+        return Err(format!("field {unknown:?} is not supported yet"));
+    }
+    // The parser rejects a rule without conditions; this one matches everything.
+    if !rule.keys().any(|k| k != "type") {
+        rule.insert("network".into(), json!("tcp,udp"));
+    }
+    rule.insert("outboundTag".into(), json!(STUB_TAG));
+    let mut synth_rules = vec![Value::Object(rule)];
+    let helper_source = (source.is_some() || source_port.is_some()).then(|| {
+        let mut helper = json!({"type": "field", "outboundTag": STUB_TAG});
+        if let Some(source) = source {
+            helper["ip"] = source;
+        }
+        if let Some(port) = source_port {
+            helper["port"] = port;
+        }
+        synth_rules.push(helper);
+        synth_rules.len() - 1
+    });
+    let helper_local_ip = local_ip.map(|lip| {
+        let mut helper = json!({"type": "field", "outboundTag": STUB_TAG});
+        helper["ip"] = lip;
+        synth_rules.push(helper);
+        synth_rules.len() - 1
+    });
+    let synth = json!({
+        "outbounds": [{"tag": STUB_TAG, "protocol": "freedom"}],
+        "routing": {"rules": synth_rules}
+    });
+    let parsed = xray_config::parse_xray_json_with_geodata_dirs(&synth.to_string(), asset_dirs)
+        .map_err(|e| {
+            let messages: Vec<String> = e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
+            format!("routing: {}", messages.join("; "))
+        })?;
+    let parsed_rules = parsed.config.routing.rules;
+    Ok(Rule {
+        target,
+        tag,
+        rule_tag,
+        matcher: parsed_rules[0].clone(),
+        source: helper_source.map(|i| parsed_rules[i].clone()),
+        users,
+        protocols,
+        local_ports,
+        attrs,
+        vless_routes,
+        local_ip: helper_local_ip.map(|i| parsed_rules[i].clone()),
+    })
+}
+
+fn take_attrs(rule: &mut serde_json::Map<String, Value>, key: &str) -> HashMap<String, String> {
+    let mut attrs = HashMap::new();
+    if let Some(val) = rule.remove(key) {
+        match val {
+            Value::Object(obj) => {
+                for (k, v) in obj {
+                    if let Some(s) = v.as_str() {
+                        attrs.insert(k, s.to_owned());
+                    } else {
+                        attrs.insert(k, v.to_string());
+                    }
+                }
+            }
+            Value::String(s) => {
+                for part in s.split(',') {
+                    if let Some((k, v)) = part.split_once(':') {
+                        attrs.insert(k.trim().to_owned(), v.trim().to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    attrs
+}
+
+fn take_vless_routes(
+    rule: &mut serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Vec<(u32, u32)>, String> {
+    let mut ranges = Vec::new();
+    if let Some(val) = rule.remove(key) {
+        match val {
+            Value::Number(n) => {
+                if let Some(u) = n.as_u64() {
+                    ranges.push((u as u32, u as u32));
+                }
+            }
+            Value::String(s) => {
+                for part in s.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    if let Some((from, to)) = part.split_once('-') {
+                        let from: u32 = from
+                            .trim()
+                            .parse()
+                            .map_err(|e| format!("{key} range {part:?}: {e}"))?;
+                        let to: u32 = to
+                            .trim()
+                            .parse()
+                            .map_err(|e| format!("{key} range {part:?}: {e}"))?;
+                        ranges.push((from, to));
+                    } else {
+                        let single: u32 = part
+                            .parse()
+                            .map_err(|e| format!("{key} value {part:?}: {e}"))?;
+                        ranges.push((single, single));
+                    }
+                }
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    match item {
+                        Value::Number(n) => {
+                            if let Some(u) = n.as_u64() {
+                                ranges.push((u as u32, u as u32));
+                            }
+                        }
+                        Value::String(s) => {
+                            let single: u32 = s
+                                .parse()
+                                .map_err(|e| format!("{key} value {s:?}: {e}"))?;
+                            ranges.push((single, single));
+                        }
+                        _ => return Err(format!("{key} array item must be number or string")),
+                    }
+                }
+            }
+            _ => return Err(format!("{key} must be a number, string or array")),
+        }
+    }
+    Ok(ranges)
 }
 
 impl Rule {
@@ -817,6 +999,17 @@ impl Rule {
                     .local_ports
                     .iter()
                     .any(|(from, to)| q.inbound_port >= *from && q.inbound_port <= *to))
+            && (self.attrs.is_empty()
+                || self.attrs.iter().all(|(k, v)| {
+                    q.attributes.and_then(|a| a.get(k)) == Some(v)
+                }))
+            && (self.vless_routes.is_empty()
+                || q.vless_route.is_some_and(|r| {
+                    self.vless_routes.iter().any(|(from, to)| r >= *from && r <= *to)
+                }))
+            && self.local_ip.as_ref().is_none_or(|lip_rule| {
+                q.local_ip.is_some_and(|ip| lip_rule.matches_ip(Some(&ip)))
+            })
     }
 }
 
@@ -1051,6 +1244,9 @@ mod tests {
             ip: ip.map(|i| i.parse().unwrap()),
             port,
             protocol: None,
+            attributes: None,
+            local_ip: None,
+            vless_route: None,
         }
     }
 
@@ -1225,7 +1421,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_rule_fields() {
-        let config = json!({"routing": {"rules": [{"type": "field", "outboundTag": "x", "attrs": {"a": "b"}}]}});
+        let config = json!({"routing": {"rules": [{"type": "field", "outboundTag": "x", "unknownField": {"a": "b"}}]}});
         assert!(Router::build(&config, &[]).is_err());
     }
 
@@ -1393,5 +1589,116 @@ mod tests {
         let r_empty_host = parse_redirect(":8080").unwrap().unwrap();
         assert_eq!(r_empty_host.host, None);
         assert_eq!(r_empty_host.port, 8080);
+    }
+
+    #[tokio::test]
+    async fn extended_routing_attrs_vless_route_local_ip() {
+        let r = router(json!({
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "attr-out", "protocol": "freedom"},
+                {"tag": "vless-out", "protocol": "freedom"},
+                {"tag": "local-out", "protocol": "freedom"}
+            ],
+            "routing": {
+                "domainMatcher": "hybrid",
+                "rules": [
+                    {
+                        "type": "field",
+                        "ruleTag": "rule-attr",
+                        "domainMatcher": "linear",
+                        "outboundTag": "attr-out",
+                        "attrs": {"region": "us", "tier": "gold"}
+                    },
+                    {
+                        "type": "field",
+                        "ruleTag": "rule-vless",
+                        "outboundTag": "vless-out",
+                        "vlessRoute": "1000-2000, 3000"
+                    },
+                    {
+                        "type": "field",
+                        "ruleTag": "rule-local",
+                        "outboundTag": "local-out",
+                        "localIP": ["127.0.0.1", "10.0.0.1"]
+                    }
+                ]
+            }
+        }));
+
+        // Test attrs matching
+        let mut q_attr = query(Some("example.com"), None, 443);
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert("region".to_string(), "us".to_string());
+        attrs.insert("tier".to_string(), "gold".to_string());
+        q_attr.attributes = Some(&attrs);
+        assert_eq!(r.route(&q_attr).await.tag, "attr-out");
+
+        let mut attrs_mismatch = std::collections::HashMap::new();
+        attrs_mismatch.insert("region".to_string(), "eu".to_string());
+        q_attr.attributes = Some(&attrs_mismatch);
+        assert_eq!(r.route(&q_attr).await.tag, "direct");
+
+        // Test vlessRoute matching
+        let mut q_vless = query(Some("example.com"), None, 443);
+        q_vless.vless_route = Some(1500);
+        assert_eq!(r.route(&q_vless).await.tag, "vless-out");
+        q_vless.vless_route = Some(3000);
+        assert_eq!(r.route(&q_vless).await.tag, "vless-out");
+        q_vless.vless_route = Some(2500);
+        assert_eq!(r.route(&q_vless).await.tag, "direct");
+
+        // Test localIP matching
+        let mut q_local = query(Some("example.com"), None, 443);
+        q_local.local_ip = Some("127.0.0.1".parse().unwrap());
+        assert_eq!(r.route(&q_local).await.tag, "local-out");
+        q_local.local_ip = Some("192.168.1.1".parse().unwrap());
+        assert_eq!(r.route(&q_local).await.tag, "direct");
+    }
+
+    #[tokio::test]
+    async fn dynamic_rules_manipulation() {
+        let r = router(json!({
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "proxy", "protocol": "freedom"}
+            ],
+            "routing": {
+                "rules": [
+                    {
+                        "type": "field",
+                        "ruleTag": "initial-rule",
+                        "outboundTag": "proxy",
+                        "domain": ["example.com"]
+                    }
+                ]
+            }
+        }));
+
+        let q = query(Some("example.com"), None, 80);
+        assert_eq!(r.route(&q).await.tag, "proxy");
+
+        let rules = r.list_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0], ("proxy".to_string(), "initial-rule".to_string()));
+
+        // Remove rule
+        let removed = r.remove_rule("initial-rule");
+        assert_eq!(removed, 1);
+        assert_eq!(r.route(&q).await.tag, "direct");
+        assert_eq!(r.list_rules().len(), 0);
+
+        // Add rule dynamically
+        let new_rule_json = json!({
+            "type": "field",
+            "ruleTag": "added-rule",
+            "outboundTag": "proxy",
+            "domain": ["example.com"]
+        });
+        let parsed = r.parse_rule(&new_rule_json).unwrap();
+        r.add_rule(parsed, false);
+
+        assert_eq!(r.route(&q).await.tag, "proxy");
+        assert_eq!(r.list_rules().len(), 1);
     }
 }

@@ -535,6 +535,9 @@ impl RouteRequest<'_> {
             ip,
             port: self.port,
             protocol,
+            attributes: None,
+            local_ip: None,
+            vless_route: None,
         };
         let decision = router.route(&query).await;
         let network = if self.network == Network::Tcp {
