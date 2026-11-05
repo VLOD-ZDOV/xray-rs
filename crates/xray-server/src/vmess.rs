@@ -88,7 +88,7 @@ where
         network,
         host: &route_host,
         port,
-        sniffing: ctx.sniffing,
+        sniffing: &ctx.sniffing,
     };
 
     let Some(decision) = route.allow(&ctx.router, &early).await else {

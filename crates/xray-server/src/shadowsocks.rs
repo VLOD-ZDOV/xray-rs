@@ -19,7 +19,7 @@ use crate::log;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, Query};
 use crate::stats;
-use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest, Sniffing};
+use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -108,7 +108,7 @@ where
         network: Network::Tcp,
         host: &host,
         port,
-        sniffing: ctx.sniffing,
+        sniffing: &ctx.sniffing,
     };
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());
@@ -274,7 +274,7 @@ impl ShadowsocksUdpHandler {
             network: Network::Udp,
             host: &host,
             port,
-            sniffing: Sniffing::default(),
+            sniffing: &self.ctx.sniffing,
         };
         let Some(decision) = route.allow(&self.ctx.router, &init.payload).await else {
             return Ok(());
@@ -444,7 +444,7 @@ impl ShadowsocksUdpHandler {
             network: Network::Udp,
             host: &host,
             port,
-            sniffing: Sniffing::default(),
+            sniffing: &self.ctx.sniffing,
         };
         let Some(decision) = route.allow(&self.ctx.router, &initial_payload).await else {
             return Ok(());

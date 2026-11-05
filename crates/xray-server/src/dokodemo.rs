@@ -51,7 +51,7 @@ where
         network: Network::Tcp,
         host: &route_host,
         port,
-        sniffing: ctx.sniffing,
+        sniffing: &ctx.sniffing,
     };
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());
@@ -170,7 +170,7 @@ impl DokodemoUdpHandler {
             network: Network::Udp,
             host: &host,
             port,
-            sniffing: Default::default(),
+            sniffing: &self.ctx.sniffing,
         };
         let Some(decision) = route.allow(&self.ctx.router, &initial_payload).await else {
             return Ok(());

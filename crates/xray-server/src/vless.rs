@@ -159,30 +159,46 @@ impl<'a> Cursor<'a> {
 }
 
 /// Inbound `sniffing`: which first-packet sniffers may name the destination.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Sniffing {
     pub http: bool,
     pub tls: bool,
+    pub quic: bool,
     pub route_only: bool,
+    pub metadata_only: bool,
+    pub domains_excluded: std::sync::Arc<Vec<String>>,
 }
 
 impl Sniffing {
-    pub fn enabled(self) -> bool {
-        self.http || self.tls
+    pub fn enabled(&self) -> bool {
+        (self.http || self.tls || self.quic) && !self.metadata_only
     }
 
-    pub fn domain(self, payload: &[u8]) -> Option<String> {
-        let tls = self.tls.then(|| routing::sniff_tls_sni(payload)).flatten();
-        tls.or_else(|| {
-            self.http
-                .then(|| routing::sniff_http_host(payload))
-                .flatten()
+    pub fn is_excluded(&self, domain: &str) -> bool {
+        self.domains_excluded.iter().any(|ex| {
+            domain.eq_ignore_ascii_case(ex)
+                || (domain.len() > ex.len()
+                    && domain.ends_with(ex)
+                    && domain.as_bytes()[domain.len() - ex.len() - 1] == b'.')
         })
     }
 
+    pub fn domain(&self, payload: &[u8]) -> Option<String> {
+        if self.metadata_only {
+            return None;
+        }
+        let tls = self.tls.then(|| routing::sniff_tls_sni(payload)).flatten();
+        let domain = tls.or_else(|| {
+            self.http
+                .then(|| routing::sniff_http_host(payload))
+                .flatten()
+        });
+        domain.filter(|d| !self.is_excluded(d))
+    }
+
     /// Like Xray, the sniffed domain replaces the destination unless `routeOnly` is set.
-    pub fn override_host(self, payload: &[u8], host: &mut Host) {
-        if !self.route_only {
+    pub fn override_host(&self, payload: &[u8], host: &mut Host) {
+        if !self.route_only && !self.metadata_only {
             if let Some(domain) = self.domain(payload) {
                 *host = Host::Domain(domain);
             }
@@ -312,7 +328,7 @@ where
             port: ctx.port,
             email: user.email.clone(),
             router: ctx.router.clone(),
-            sniffing: ctx.sniffing,
+            sniffing: ctx.sniffing.clone(),
         };
         let mut reader = PrefixedReader {
             early,
@@ -346,7 +362,7 @@ where
         network,
         host: &request.host,
         port: request.port,
-        sniffing: ctx.sniffing,
+        sniffing: &ctx.sniffing,
     };
     let Some(decision) = route.allow(&ctx.router, payload).await else {
         return Ok(());
@@ -458,7 +474,7 @@ pub(crate) struct RouteRequest<'a> {
     pub network: Network,
     pub host: &'a Host,
     pub port: u16,
-    pub sniffing: Sniffing,
+    pub sniffing: &'a Sniffing,
 }
 
 impl RouteRequest<'_> {
@@ -874,7 +890,19 @@ mod tests {
         let router = Router::build(&config, &[]).unwrap();
         let host = Host::Ip("10.0.0.1".parse().unwrap());
         let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let route = |route_only| RouteRequest {
+        let sniff_route_only = Sniffing {
+            http: true,
+            tls: false,
+            route_only: true,
+            ..Default::default()
+        };
+        let sniff_override = Sniffing {
+            http: true,
+            tls: false,
+            route_only: false,
+            ..Default::default()
+        };
+        let route = |sniffing| RouteRequest {
             ctx_tag: "in",
             inbound_port: 443,
             email: "u",
@@ -882,15 +910,37 @@ mod tests {
             network: Network::Tcp,
             host: &host,
             port: 80,
-            sniffing: Sniffing {
-                http: true,
-                tls: false,
-                route_only,
-            },
+            sniffing,
         };
         // routeOnly still dials 10.0.0.1; without it the sniffed domain is dialed instead.
-        assert!(route(true).allow(&router, payload).await.is_none());
-        let decision = route(false).allow(&router, payload).await.unwrap();
+        assert!(route(&sniff_route_only).allow(&router, payload).await.is_none());
+        let decision = route(&sniff_override).allow(&router, payload).await.unwrap();
         assert_eq!(decision.tag, "direct");
+    }
+
+    #[tokio::test]
+    async fn sniffing_domains_excluded_and_metadata_only() {
+        let sniffing = Sniffing {
+            http: true,
+            tls: true,
+            quic: false,
+            route_only: false,
+            metadata_only: false,
+            domains_excluded: std::sync::Arc::new(vec!["example.com".to_owned(), "test.org".to_owned()]),
+        };
+        let http_excluded = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert_eq!(sniffing.domain(http_excluded), None);
+
+        let sub_excluded = b"GET / HTTP/1.1\r\nHost: sub.example.com\r\n\r\n";
+        assert_eq!(sniffing.domain(sub_excluded), None);
+
+        let http_allowed = b"GET / HTTP/1.1\r\nHost: allowed.com\r\n\r\n";
+        assert_eq!(sniffing.domain(http_allowed), Some("allowed.com".to_string()));
+
+        let metadata_sniffing = Sniffing {
+            metadata_only: true,
+            ..sniffing
+        };
+        assert_eq!(metadata_sniffing.domain(http_allowed), None);
     }
 }

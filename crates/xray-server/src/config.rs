@@ -570,22 +570,26 @@ fn inline_or_file(cert: &Value, inline_key: &str, file_key: &str) -> Result<Vec<
 fn parse_sniffing(item: &Value, tag: &str) -> crate::vless::Sniffing {
     let mut sniffing = crate::vless::Sniffing::default();
     let flag = |key| item.get(key).and_then(Value::as_bool).unwrap_or(false);
-    // metadataOnly skips payload sniffing, leaving only fakedns, which is not supported.
-    if !flag("enabled") || flag("metadataOnly") {
+    if !flag("enabled") {
         return sniffing;
     }
+    sniffing.metadata_only = flag("metadataOnly");
     sniffing.route_only = flag("routeOnly");
     let mut ignored = Vec::new();
     for name in array(item, "destOverride").iter().filter_map(Value::as_str) {
         match name {
             "http" => sniffing.http = true,
             "tls" => sniffing.tls = true,
+            "quic" => sniffing.quic = true,
+            "fakedns" | "fakedns+others" => {} // reserved for future fakedns
             other => ignored.push(other),
         }
     }
-    if !array(item, "domainsExcluded").is_empty() {
-        ignored.push("domainsExcluded");
+    let mut excluded = Vec::new();
+    for ex in array(item, "domainsExcluded").iter().filter_map(Value::as_str) {
+        excluded.push(ex.to_owned());
     }
+    sniffing.domains_excluded = std::sync::Arc::new(excluded);
     if !ignored.is_empty() {
         log::warn(format!(
             "inbound {tag:?}: sniffing {} ignored",
@@ -1182,7 +1186,10 @@ mod tests {
         let sniffing = crate::vless::Sniffing {
             http: false,
             tls: true,
+            quic: true,
             route_only: true,
+            metadata_only: false,
+            domains_excluded: std::sync::Arc::new(Vec::new()),
         };
         assert_eq!(inbound.sniffing, sniffing);
         if let InboundTransport::HttpUpgrade(hu) = &inbound.transport {

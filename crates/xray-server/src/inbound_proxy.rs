@@ -19,7 +19,7 @@ use xray_routing::{Target, TargetAddr};
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, Query};
 use crate::vless::{
-    copy, host_label, read_first, relay, Activity, Context, Host, RouteRequest, Sniffing, CONN_IDLE,
+    copy, host_label, read_first, relay, Activity, Context, Host, RouteRequest, CONN_IDLE,
 };
 use crate::{log, stats};
 
@@ -117,7 +117,7 @@ async fn relay_udp(
         network: Network::Udp,
         host: &host,
         port,
-        sniffing: Sniffing::default(),
+        sniffing: &ctx.sniffing,
     };
     let Some(decision) = route.allow(&ctx.router, &first.payload).await else {
         return Ok(());
@@ -216,7 +216,7 @@ where
         network: Network::Tcp,
         host: &host,
         port,
-        sniffing: ctx.sniffing,
+        sniffing: &ctx.sniffing,
     };
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());

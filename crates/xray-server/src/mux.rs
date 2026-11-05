@@ -212,7 +212,7 @@ where
                         network: if udp { Network::Udp } else { Network::Tcp },
                         host: &host,
                         port,
-                        sniffing: info.sniffing,
+                        sniffing: &info.sniffing,
                     };
                     let Some(decision) = route
                         .allow(&info.router, frame.data.as_deref().unwrap_or_default())

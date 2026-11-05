@@ -232,7 +232,7 @@ where
         network,
         host: &request.host,
         port: request.port,
-        sniffing: ctx.sniffing,
+        sniffing: &ctx.sniffing,
     };
 
     let Some(decision) = route.allow(&ctx.router, payload).await else {
