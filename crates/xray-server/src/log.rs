@@ -6,8 +6,8 @@ use std::fmt::Display;
 use std::fs::OpenOptions;
 use std::io::{LineWriter, Write};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEBUG: u8 = 0;
@@ -18,6 +18,7 @@ const NONE: u8 = 4;
 
 static LEVEL: AtomicU8 = AtomicU8::new(WARNING);
 static MASK: AtomicU8 = AtomicU8::new(0);
+static DNS_LOG: AtomicBool = AtomicBool::new(false);
 static ERROR_SINK: RwLock<Option<Option<Sink>>> = RwLock::new(None);
 static ACCESS_SINK: RwLock<Option<Option<Sink>>> = RwLock::new(None);
 static SETTINGS: RwLock<Option<Settings>> = RwLock::new(None);
@@ -30,6 +31,7 @@ pub struct Settings {
     pub access: String,
     pub error: String,
     pub mask_address: String,
+    pub dns_log: bool,
 }
 
 pub fn init(settings: &Settings) -> Result<(), String> {
@@ -55,6 +57,7 @@ pub fn init(settings: &Settings) -> Result<(), String> {
         },
         Ordering::Relaxed,
     );
+    DNS_LOG.store(settings.dns_log, Ordering::Relaxed);
     let err = open_sink(&settings.error)?;
     let acc = open_sink(&settings.access)?;
     *ERROR_SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(err);
@@ -104,6 +107,12 @@ pub fn warn(message: impl Display) {
 
 pub fn error(message: impl Display) {
     write_error(ERROR, "Error", message);
+}
+
+pub fn dns(message: impl Display) {
+    if DNS_LOG.load(Ordering::Relaxed) || LEVEL.load(Ordering::Relaxed) <= INFO {
+        info(format!("[DNS] {message}"));
+    }
 }
 
 fn write_error(level: u8, label: &str, message: impl Display) {
@@ -185,13 +194,89 @@ fn write_line(sink: &Sink, line: std::fmt::Arguments<'_>) {
     let _ = writeln!(out, "{} {line}", timestamp());
 }
 
-/// `YYYY/MM/DD HH:MM:SS.micros` in UTC.
+fn local_offset_seconds() -> i64 {
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+    *OFFSET.get_or_init(|| {
+        if let Ok(tz) = std::env::var("TZ") {
+            if let Some(off) = parse_tz_string(&tz) {
+                return off;
+            }
+        }
+        if let Ok(data) = std::fs::read("/etc/localtime") {
+            if let Some(off) = parse_tzif_file(&data) {
+                return off;
+            }
+        }
+        0
+    })
+}
+
+fn parse_tz_string(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let s = if let Some(stripped) = s.strip_prefix('<') {
+        let end = stripped.find('>')?;
+        &stripped[end + 1..]
+    } else {
+        let non_alpha = s.find(|c: char| !c.is_alphabetic())?;
+        &s[non_alpha..]
+    };
+    let (sign, s) = match s.chars().next() {
+        Some('-') => (-1, &s[1..]),
+        Some('+') => (1, &s[1..]),
+        _ => (1, s),
+    };
+    let digit_end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    let hours: i64 = s[..digit_end].parse().ok()?;
+    let rest = &s[digit_end..];
+    let (mins, secs) = if let Some(rest) = rest.strip_prefix(':') {
+        let digit_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let mins: i64 = rest[..digit_end].parse().unwrap_or(0);
+        let rest2 = &rest[digit_end..];
+        let secs: i64 = if let Some(rest2) = rest2.strip_prefix(':') {
+            let digit_end = rest2
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(rest2.len());
+            rest2[..digit_end].parse().unwrap_or(0)
+        } else {
+            0
+        };
+        (mins, secs)
+    } else {
+        (0, 0)
+    };
+    let total = hours * 3600 + mins * 60 + secs;
+    // POSIX TZ sign convention is inverted: negative sign in POSIX string means ahead of UTC.
+    Some(-sign * total)
+}
+
+fn parse_tzif_file(data: &[u8]) -> Option<i64> {
+    if !data.starts_with(b"TZif") {
+        return None;
+    }
+    for line in data.rsplit(|&b| b == b'\n') {
+        let line = line.trim_ascii();
+        if !line.is_empty() {
+            if let Ok(s) = std::str::from_utf8(line) {
+                if let Some(off) = parse_tz_string(s) {
+                    return Some(off);
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
+/// `YYYY/MM/DD HH:MM:SS.micros` in local time.
 fn timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let secs = now.as_secs();
-    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let local_secs = (secs as i64 + local_offset_seconds()).max(0) as u64;
+    let (days, rem) = (local_secs / 86_400, local_secs % 86_400);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
@@ -229,5 +314,14 @@ mod tests {
         let ts = timestamp();
         assert_eq!(ts.len(), 26);
         assert_eq!(&ts[4..5], "/");
+    }
+
+    #[test]
+    fn parses_posix_tz_offsets() {
+        assert_eq!(parse_tz_string("<+07>-7"), Some(7 * 3600));
+        assert_eq!(parse_tz_string("MSK-3"), Some(3 * 3600));
+        assert_eq!(parse_tz_string("EST5EDT"), Some(-5 * 3600));
+        assert_eq!(parse_tz_string("UTC0"), Some(0));
+        assert_eq!(parse_tz_string("JST-9"), Some(9 * 3600));
     }
 }

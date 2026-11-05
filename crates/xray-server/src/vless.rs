@@ -551,9 +551,14 @@ pub(crate) fn host_label(host: &Host) -> String {
 pub(crate) async fn resolve_all(host: &Host, port: u16) -> io::Result<Vec<SocketAddr>> {
     let mut addrs = match host {
         Host::Ip(ip) => vec![SocketAddr::new(*ip, port)],
-        Host::Domain(name) => tokio::net::lookup_host((name.as_str(), port))
-            .await?
-            .collect(),
+        Host::Domain(name) => {
+            crate::log::dns(format!("resolving {name}:{port}"));
+            let list: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), port))
+                .await?
+                .collect();
+            crate::log::dns(format!("resolved {name}:{port} -> {list:?}"));
+            list
+        }
     };
     if addrs.is_empty() {
         return Err(io::Error::new(

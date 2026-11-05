@@ -210,11 +210,13 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     }
     let router = Router::build(&root, &asset_dirs())?;
     let section = root.get("log").unwrap_or(&Value::Null);
+    let dns_log = section.get("dnsLog").and_then(Value::as_bool).unwrap_or(false);
     let log = log::Settings {
         level: str_field(section, "loglevel").to_owned(),
         access: str_field(section, "access").to_owned(),
         error: str_field(section, "error").to_owned(),
         mask_address: str_field(section, "maskAddress").to_owned(),
+        dns_log,
     };
     Ok(Config {
         log,
