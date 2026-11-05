@@ -16,6 +16,8 @@ use tokio::time::timeout;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADER_SIZE: usize = 16 * 1024;
 const CHUNK_SIZE: usize = 4096;
+// Xray clients send one frame per write (a few KiB at most).
+const MAX_FRAME_SIZE: usize = 1 << 20;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 pub fn accept_key_for(client_key: &str) -> String {
@@ -111,10 +113,18 @@ impl ServerFrameDecoder {
                 }
                 let mut len_bytes = [0u8; 8];
                 len_bytes.copy_from_slice(&bytes[2..10]);
-                (u64::from_be_bytes(len_bytes) as usize, 10)
+                let len = u64::from_be_bytes(len_bytes);
+                (usize::try_from(len).unwrap_or(usize::MAX), 10)
             }
             len => (len as usize, 2),
         };
+        // Frames are buffered whole before unmasking, so their size must be bounded.
+        if payload_len > MAX_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "websocket frame too large",
+            ));
+        }
 
         let total_header = header_len + 4; // header + 4 bytes mask key
         if bytes.len() < total_header + payload_len {
@@ -345,10 +355,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
     }
 }
 
-pub async fn accept<S>(
-    mut stream: S,
-    settings: &WsSettings,
-) -> io::Result<WebSocketStream<S>>
+pub async fn accept<S>(mut stream: S, settings: &WsSettings) -> io::Result<WebSocketStream<S>>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
@@ -413,7 +420,10 @@ where
             .await;
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("websocket path mismatch: got {target_path}, expected {}", settings.path),
+            format!(
+                "websocket path mismatch: got {target_path}, expected {}",
+                settings.path
+            ),
         ));
     }
 
@@ -446,17 +456,16 @@ where
     }
 
     if let Some(expected_host) = &settings.host {
-        if let Some(h) = host_hdr {
-            let host_only = h.split(':').next().unwrap_or("");
-            if !host_only.eq_ignore_ascii_case(expected_host) {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-                    .await;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("websocket host mismatch: got {host_only}, expected {expected_host}"),
-                ));
-            }
+        let h = host_hdr.unwrap_or_default();
+        let host_only = h.split(':').next().unwrap_or("");
+        if !host_only.eq_ignore_ascii_case(expected_host) {
+            let _ = stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                .await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("websocket host mismatch: got {host_only}, expected {expected_host}"),
+            ));
         }
     }
 
@@ -536,7 +545,11 @@ mod tests {
         // "hello" masked with [1, 2, 3, 4]
         let mask = [1u8, 2, 3, 4];
         let plain = b"hello";
-        let masked_payload: Vec<u8> = plain.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]).collect();
+        let masked_payload: Vec<u8> = plain
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ mask[i % 4])
+            .collect();
 
         let mut frame = vec![0x82, 0x85];
         frame.extend_from_slice(&mask);
@@ -552,7 +565,16 @@ mod tests {
         let mut out = Vec::new();
         encode_server_binary_frames(&mut out, b"world");
         assert_eq!(out[0], 0x82); // FIN | BINARY
-        assert_eq!(out[1], 5);    // length 5, unmasked (bit 7 is 0)
+        assert_eq!(out[1], 5); // length 5, unmasked (bit 7 is 0)
         assert_eq!(&out[2..], b"world");
+    }
+
+    #[test]
+    fn rejects_oversized_frames() {
+        let mut decoder = ServerFrameDecoder::new();
+        let mut frame = vec![0x82, 0xFF];
+        frame.extend_from_slice(&u64::MAX.to_be_bytes());
+        decoder.extend(&frame);
+        assert!(decoder.next_event().is_err());
     }
 }

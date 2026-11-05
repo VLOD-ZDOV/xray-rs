@@ -164,9 +164,7 @@ where
         let key = key.trim();
         let val = val.trim();
 
-        if key.eq_ignore_ascii_case("connection")
-            && val.to_ascii_lowercase().contains("upgrade")
-        {
+        if key.eq_ignore_ascii_case("connection") && val.to_ascii_lowercase().contains("upgrade") {
             connection_ok = true;
         } else if key.eq_ignore_ascii_case("upgrade") {
             upgrade_hdr = Some(val.to_owned());
@@ -176,19 +174,16 @@ where
     }
 
     if let Some(expected_host) = &settings.host {
-        if let Some(h) = host_hdr {
-            let host_only = h.split(':').next().unwrap_or("");
-            if !host_only.eq_ignore_ascii_case(expected_host) {
-                let _ = stream
-                    .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-                    .await;
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "httpupgrade host mismatch: got {host_only}, expected {expected_host}"
-                    ),
-                ));
-            }
+        let h = host_hdr.unwrap_or_default();
+        let host_only = h.split(':').next().unwrap_or("");
+        if !host_only.eq_ignore_ascii_case(expected_host) {
+            let _ = stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                .await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("httpupgrade host mismatch: got {host_only}, expected {expected_host}"),
+            ));
         }
     }
 

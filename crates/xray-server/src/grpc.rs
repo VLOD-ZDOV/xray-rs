@@ -23,6 +23,8 @@ use crate::{log, trojan, vless};
 pub type Body = BoxBody<Bytes, io::Error>;
 
 const PIPE_SIZE: usize = 256 * 1024;
+// grpc-go's default receive limit, which Xray's server inherits.
+const MAX_MESSAGE_SIZE: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrpcSettings {
@@ -47,7 +49,11 @@ impl Handler {
         Arc::new(Self { settings, protocol })
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
+    pub async fn handle(
+        self: Arc<Self>,
+        req: Request<Incoming>,
+        peer: SocketAddr,
+    ) -> Response<Body> {
         if req.method() != Method::POST {
             log::debug(format!(
                 "grpc: non-POST method {:?} from {}",
@@ -109,7 +115,10 @@ impl Handler {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = trojan::serve(client_r, client_w, &ctx, peer).await {
-                        log::info(format!("trojan-grpc from {} rejected: {e}", log::mask(peer)));
+                        log::info(format!(
+                            "trojan-grpc from {} rejected: {e}",
+                            log::mask(peer)
+                        ));
                         err_status_clone.store(16, Ordering::Relaxed);
                     }
                 });
@@ -120,30 +129,33 @@ impl Handler {
             let mut incoming_buf = BytesMut::with_capacity(32 * 1024);
             let mut body = req.into_body();
 
-            while let Some(Ok(frame)) = body.frame().await {
-                if let Ok(data) = frame.into_data() {
-                    incoming_buf.extend_from_slice(&data);
-                    while incoming_buf.len() >= 5 {
-                        let compressed = incoming_buf[0];
-                        let msg_len = u32::from_be_bytes([
-                            incoming_buf[1],
-                            incoming_buf[2],
-                            incoming_buf[3],
-                            incoming_buf[4],
-                        ]) as usize;
-                        if incoming_buf.len() < 5 + msg_len {
-                            break;
-                        }
-                        incoming_buf.advance(5);
-                        let payload = incoming_buf.split_to(msg_len);
-                        if compressed != 0 {
-                            log::warn("compressed grpc frame is unsupported");
-                            break;
-                        }
-                        if let Err(e) = decode_hunk_payload(&payload, &mut duplex_w).await {
-                            log::debug(format!("error decoding hunk: {e}"));
-                            break;
-                        }
+            'read: while let Some(Ok(frame)) = body.frame().await {
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                incoming_buf.extend_from_slice(&data);
+                while incoming_buf.len() >= 5 {
+                    let compressed = incoming_buf[0];
+                    let msg_len = u32::from_be_bytes([
+                        incoming_buf[1],
+                        incoming_buf[2],
+                        incoming_buf[3],
+                        incoming_buf[4],
+                    ]) as usize;
+                    if compressed != 0 || msg_len > MAX_MESSAGE_SIZE {
+                        log::debug(format!(
+                            "grpc message rejected: compressed {compressed}, {msg_len} bytes"
+                        ));
+                        break 'read;
+                    }
+                    if incoming_buf.len() < 5 + msg_len {
+                        break;
+                    }
+                    incoming_buf.advance(5);
+                    let payload = incoming_buf.split_to(msg_len);
+                    if let Err(e) = decode_hunk_payload(&payload, &mut duplex_w).await {
+                        log::debug(format!("error decoding hunk: {e}"));
+                        break 'read;
                     }
                 }
             }
@@ -203,7 +215,10 @@ where
         .initial_connection_window_size(16 * 1024 * 1024)
         .max_concurrent_streams(1024);
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
-        log::debug(format!("grpc connection from {} ended: {e}", log::mask(peer)));
+        log::debug(format!(
+            "grpc connection from {} ended: {e}",
+            log::mask(peer)
+        ));
     }
 }
 
@@ -290,7 +305,10 @@ fn decode_varint(data: &[u8]) -> io::Result<(usize, usize)> {
     let mut shift = 0;
     for (i, &byte) in data.iter().enumerate() {
         if i >= 10 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "varint overflow"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "varint overflow",
+            ));
         }
         val |= ((byte & 0x7f) as usize) << shift;
         if byte & 0x80 == 0 {
@@ -410,7 +428,10 @@ mod tests {
         assert!(path_matches("GunService/Tun", "GunService"));
         assert!(path_matches("/Tun", ""));
         assert!(path_matches("/TunMulti", ""));
-        assert!(path_matches("/xray.transport.internet.grpc.encoding.GRPCService/Tun", ""));
+        assert!(path_matches(
+            "/xray.transport.internet.grpc.encoding.GRPCService/Tun",
+            ""
+        ));
         assert!(!path_matches("/OtherService/Tun", "GunService"));
     }
 
