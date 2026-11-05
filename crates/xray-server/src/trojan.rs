@@ -3,7 +3,6 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::PoisonError;
-use std::time::Duration;
 
 use sha2::{Digest, Sha224};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -18,7 +17,6 @@ use crate::routing::{Action, BlockAction};
 use crate::stats;
 use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest, CONN_IDLE};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADER: usize = 56 + 2 + 1 + 1 + 255 + 2 + 2;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -156,7 +154,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut buf = Vec::with_capacity(512);
-    let handshake_res = timeout(HANDSHAKE_TIMEOUT, async {
+    let handshake_res = timeout(crate::policy::get().handshake, async {
         let mut chunk = [0u8; 512];
         loop {
             let parsed = {
@@ -190,13 +188,19 @@ where
 
     let (mut request, header_len, user) = match handshake_res {
         Ok(Ok(parsed)) => parsed,
-        Err(_) | Ok(Err(_)) => {
+        Ok(Err(_)) => {
             if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, &buf) {
                 return crate::fallback::serve(uplink, downlink, fb, buf, peer, ctx.port).await;
             }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "trojan handshake failed",
+            ));
+        }
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "trojan handshake timeout",
             ));
         }
     };

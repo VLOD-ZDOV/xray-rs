@@ -21,8 +21,6 @@ use crate::routing::{Action, Query};
 use crate::stats;
 use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
 pub async fn serve_tcp<S>(stream: S, ctx: &Context, peer: SocketAddr) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -48,7 +46,7 @@ where
                 })
                 .collect();
             let (server_stream, idx, target, early) = timeout(
-                HANDSHAKE_TIMEOUT,
+                crate::policy::get().handshake,
                 xray_proxy::shadowsocks2022::ServerStream::handshake_methods_with_pool(
                     stream,
                     &methods,
@@ -77,7 +75,7 @@ where
                 })
                 .collect();
             let (server_stream, idx, target, early) = timeout(
-                HANDSHAKE_TIMEOUT,
+                crate::policy::get().handshake,
                 xray_proxy::shadowsocks::aead2017::ServerStream::handshake_methods(
                     stream, &methods,
                 ),

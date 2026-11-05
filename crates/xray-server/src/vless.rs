@@ -25,7 +25,6 @@ pub struct Addons {
     pub flow: String,
 }
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // Xray policy level 0 defaults.
 pub(crate) const CONN_IDLE: Duration = Duration::from_secs(300);
@@ -310,7 +309,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut buf = Vec::with_capacity(512);
-    let handshake_res = timeout(HANDSHAKE_TIMEOUT, async {
+    let handshake_res = timeout(crate::policy::get().handshake, async {
         let mut chunk = [0u8; 512];
         loop {
             // The user is copied out so a concurrent removal cannot shift the index.
@@ -345,13 +344,19 @@ where
 
     let (mut request, header_len, user) = match handshake_res {
         Ok(Ok(parsed)) => parsed,
-        Err(_) | Ok(Err(_)) => {
+        Ok(Err(_)) => {
             if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, &buf) {
                 return crate::fallback::serve(uplink, downlink, fb, buf, peer, ctx.port).await;
             }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "vless handshake failed",
+            ));
+        }
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "vless handshake timeout",
             ));
         }
     };
@@ -997,5 +1002,40 @@ mod tests {
             ..sniffing
         };
         assert_eq!(metadata_sniffing.domain(http_allowed), None);
+    }
+
+    #[tokio::test]
+    async fn handshake_times_out_when_client_sends_no_data() {
+        let (_client, server) = tokio::io::duplex(64);
+        let ctx = Context {
+            tag: "vless-in".into(),
+            port: 443,
+            users: RwLock::new(vec![]),
+            ss_users: RwLock::new(vec![]),
+            ss_method: RwLock::new(None),
+            ss_password: RwLock::new(None),
+            router: Arc::new(Router::build(&serde_json::json!({}), &[]).unwrap()),
+            sniffing: Sniffing::default(),
+            fallbacks: vec![],
+            vmess_filter: Arc::new(std::sync::Mutex::new(
+                xray_proxy::vmess::server::AuthIdFilter::new(120, 65536),
+            )),
+            ss2022_salt_pool: Arc::new(std::sync::Mutex::new(
+                xray_proxy::shadowsocks2022::SaltPool::new(60, 65536),
+            )),
+        };
+
+        crate::policy::init(crate::policy::PolicySettings {
+            handshake: Duration::from_millis(50),
+            ..Default::default()
+        });
+
+        let (r, w) = tokio::io::split(server);
+        let err = serve(r, w, &ctx, "127.0.0.1:12345".parse().unwrap())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        crate::policy::init(crate::policy::PolicySettings::default());
     }
 }

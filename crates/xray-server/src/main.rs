@@ -446,18 +446,27 @@ async fn accept_loop(
             http_obfs.clone(),
         );
         tokio::spawn(async move {
+            let handshake_timeout = policy::get().handshake;
             let leftover = if accept_proxy_protocol.is_enabled() {
-                match proxy_proto::read_proxy_header(&mut stream, accept_proxy_protocol, peer).await
+                match tokio::time::timeout(
+                    handshake_timeout,
+                    proxy_proto::read_proxy_header(&mut stream, accept_proxy_protocol, peer),
+                )
+                .await
                 {
-                    Ok((new_peer, leftover)) => {
+                    Ok(Ok((new_peer, leftover))) => {
                         peer = new_peer;
                         leftover
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         log::info(format!(
                             "proxy protocol from {} rejected: {e}",
                             log::mask(peer)
                         ));
+                        return;
+                    }
+                    Err(_) => {
+                        log::info(format!("proxy protocol from {} timed out", log::mask(peer)));
                         return;
                     }
                 }
@@ -477,19 +486,37 @@ async fn accept_loop(
                 }
             } else {
                 match (tls, http_obfs) {
-                    (Some(acceptor), _) => match acceptor.accept(stream).await {
-                        Ok(stream) => dispatch(stream, peer, local, handler).await,
-                        Err(e) => log::debug(format!(
-                            "tls handshake from {} failed: {e}",
-                            log::mask(peer)
-                        )),
-                    },
-                    (None, Some(obfs)) => match http_obfs::accept(stream, &obfs).await {
-                        Ok(stream) => dispatch(stream, peer, local, handler).await,
-                        Err(e) => {
-                            log::debug(format!("http obfs from {} failed: {e}", log::mask(peer)))
+                    (Some(acceptor), _) => {
+                        match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
+                        {
+                            Ok(Ok(stream)) => dispatch(stream, peer, local, handler).await,
+                            Ok(Err(e)) => log::debug(format!(
+                                "tls handshake from {} failed: {e}",
+                                log::mask(peer)
+                            )),
+                            Err(_) => log::debug(format!(
+                                "tls handshake from {} timed out",
+                                log::mask(peer)
+                            )),
                         }
-                    },
+                    }
+                    (None, Some(obfs)) => {
+                        match tokio::time::timeout(
+                            handshake_timeout,
+                            http_obfs::accept(stream, &obfs),
+                        )
+                        .await
+                        {
+                            Ok(Ok(stream)) => dispatch(stream, peer, local, handler).await,
+                            Ok(Err(e)) => log::debug(format!(
+                                "http obfs from {} failed: {e}",
+                                log::mask(peer)
+                            )),
+                            Err(_) => {
+                                log::debug(format!("http obfs from {} timed out", log::mask(peer)))
+                            }
+                        }
+                    }
                     (None, None) => dispatch(stream, peer, local, handler).await,
                 }
             }

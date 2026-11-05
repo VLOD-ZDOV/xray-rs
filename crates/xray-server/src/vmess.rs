@@ -3,7 +3,6 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::PoisonError;
-use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
@@ -15,8 +14,6 @@ use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, BlockAction};
 use crate::stats;
 use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest, CONN_IDLE};
-
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn serve<R, W>(
     mut uplink: R,
@@ -37,7 +34,7 @@ where
     };
 
     let hs_res = timeout(
-        HANDSHAKE_TIMEOUT,
+        crate::policy::get().handshake,
         server::handshake_with_filter(&mut uplink, &server_users, Some(&ctx.vmess_filter)),
     )
     .await;

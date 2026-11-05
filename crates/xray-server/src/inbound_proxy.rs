@@ -2,7 +2,6 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -23,8 +22,6 @@ use crate::vless::{
 };
 use crate::{log, stats};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-
 pub async fn serve_socks<S>(
     mut stream: S,
     auth: &SocksInboundAuth,
@@ -36,10 +33,13 @@ pub async fn serve_socks<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let auth_user = timeout(HANDSHAKE_TIMEOUT, negotiate_socks5(&mut stream, auth))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks handshake timeout"))?
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("socks auth: {e}")))?;
+    let auth_user = timeout(
+        crate::policy::get().handshake,
+        negotiate_socks5(&mut stream, auth),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks handshake timeout"))?
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("socks auth: {e}")))?;
 
     let email = auth_user
         .as_ref()
@@ -47,10 +47,13 @@ where
         .unwrap_or_default();
     let _online = stats::get().connect(&email, peer.ip());
 
-    let req = timeout(HANDSHAKE_TIMEOUT, parse_socks5_request_message(&mut stream))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks request timeout"))?
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("socks request: {e}")))?;
+    let req = timeout(
+        crate::policy::get().handshake,
+        parse_socks5_request_message(&mut stream),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks request timeout"))?
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("socks request: {e}")))?;
 
     match req.command {
         SocksCommand::Connect => {
@@ -253,10 +256,13 @@ pub async fn serve_http<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let req = timeout(HANDSHAKE_TIMEOUT, parse_http_inbound_request(&mut stream))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http request timeout"))?
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("http request: {e}")))?;
+    let req = timeout(
+        crate::policy::get().handshake,
+        parse_http_inbound_request(&mut stream),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http request timeout"))?
+    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("http request: {e}")))?;
 
     if !auth.admits_http_basic(req.proxy_authorization()) {
         stream

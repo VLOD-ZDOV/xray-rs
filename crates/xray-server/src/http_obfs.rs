@@ -3,12 +3,10 @@
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::timeout;
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_HEADER_SIZE: usize = 16 * 1024;
 
 #[derive(Clone, Debug)]
@@ -103,7 +101,7 @@ where
                 "tcp http obfs header too large",
             ));
         }
-        let n = match timeout(HANDSHAKE_TIMEOUT, stream.read(&mut temp)).await {
+        let n = match timeout(crate::policy::get().handshake, stream.read(&mut temp)).await {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "handshake timeout")),

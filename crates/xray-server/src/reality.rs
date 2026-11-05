@@ -310,11 +310,22 @@ impl RealityServer {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        let handshake_timeout = crate::policy::get().handshake;
         // 1. Read 5-byte TLS record header
         let mut record_header = [0u8; 5];
-        if stream.read_exact(&mut record_header).await.is_err() {
-            self.fallback(stream, &[], peer).await?;
-            return Ok(None);
+        match tokio::time::timeout(handshake_timeout, stream.read_exact(&mut record_header)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                self.fallback(stream, &[], peer).await?;
+                return Ok(None);
+            }
+            Err(_) => {
+                log::debug(format!(
+                    "reality handshake from {} timed out",
+                    log::mask(peer)
+                ));
+                return Ok(None);
+            }
         }
 
         let content_type = record_header[0];
@@ -326,11 +337,21 @@ impl RealityServer {
 
         // 2. Read ClientHello payload
         let mut payload = vec![0u8; payload_len];
-        if stream.read_exact(&mut payload).await.is_err() {
-            let mut early = record_header.to_vec();
-            early.extend_from_slice(&payload);
-            self.fallback(stream, &early, peer).await?;
-            return Ok(None);
+        match tokio::time::timeout(handshake_timeout, stream.read_exact(&mut payload)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => {
+                let mut early = record_header.to_vec();
+                early.extend_from_slice(&payload);
+                self.fallback(stream, &early, peer).await?;
+                return Ok(None);
+            }
+            Err(_) => {
+                log::debug(format!(
+                    "reality handshake from {} timed out",
+                    log::mask(peer)
+                ));
+                return Ok(None);
+            }
         }
 
         let mut full_record = Vec::with_capacity(5 + payload_len);
@@ -491,7 +512,7 @@ impl RealityServer {
         let mut buf = [0u8; 8192];
         let mut handshake_lens = [0usize; 7];
 
-        let timeout = std::time::Duration::from_secs(4);
+        let timeout = crate::policy::get().handshake;
         let read_future = async {
             loop {
                 let n = dest.read(&mut buf).await.map_err(|_| "read error")?;
