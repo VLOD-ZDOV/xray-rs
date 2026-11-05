@@ -49,7 +49,7 @@ fn main() -> ExitCode {
         match arg.trim_start_matches('-') {
             "version" => {
                 println!(
-                    "Xray {COMPAT_VERSION} (xray-server {}, VLESS/XHTTP only)",
+                    "Xray {COMPAT_VERSION} (xray-rs {})",
                     env!("CARGO_PKG_VERSION")
                 );
                 return ExitCode::SUCCESS;
@@ -148,7 +148,7 @@ enum InboundHandler {
 }
 
 async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String> {
-    log::info(format!("xray-server {} started", env!("CARGO_PKG_VERSION")));
+    log::info(format!("xray-rs {} started", env!("CARGO_PKG_VERSION")));
     stats::init(config.stats);
     let router = Arc::new(config.router);
     let mut inbounds = HashMap::new();
