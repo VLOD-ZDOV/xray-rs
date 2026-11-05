@@ -195,7 +195,8 @@ check_environment
 
 log_info "Validating new binary against $CONFIG_FILE ..."
 chmod +x "$SOURCE_BIN"
-if ! "$SOURCE_BIN" run -test -c "$CONFIG_FILE"; then
+# The candidate runs from a temporary path, so point it at the panel's geo files.
+if ! XRAY_LOCATION_ASSET="$XUI_BIN_DIR" "$SOURCE_BIN" run -test -c "$CONFIG_FILE"; then
     log_error "Config test failed with $SOURCE_BIN."
     log_error "Aborting installation without touching the running service."
     exit 1
