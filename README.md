@@ -51,7 +51,10 @@ newer (Ubuntu 24.04 works, Ubuntu 22.04 and Debian 12 do not).
 Safe installation or update with automated config testing and backups:
 
 ```bash
-# Build and install directly on the host:
+# Quick install / update from the latest GitHub release:
+curl -fsSL https://raw.githubusercontent.com/VLOD-ZDOV/xray-rs/main/scripts/install-3x-ui.sh | sudo bash
+
+# Or build from source on the host:
 sudo ./scripts/install-3x-ui.sh --build
 
 # Or install from an existing binary:

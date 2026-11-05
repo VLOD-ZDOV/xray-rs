@@ -1,0 +1,27 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - run: cargo build --release -p xray-server
+      - name: Prepare binaries
+        run: |
+          cp target/release/xray-server xray-server-linux-amd64
+          cp target/release/xray-server xray-linux-amd64
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            xray-server-linux-amd64
+            xray-linux-amd64

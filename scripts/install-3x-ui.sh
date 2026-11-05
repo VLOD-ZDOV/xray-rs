@@ -4,6 +4,7 @@
 #
 set -euo pipefail
 
+GITHUB_REPO="${GITHUB_REPO:-VLOD-ZDOV/xray-rs}"
 XUI_DIR="/usr/local/x-ui"
 XUI_BIN_DIR="${XUI_DIR}/bin"
 TARGET_BIN="${XUI_BIN_DIR}/xray-linux-amd64"
@@ -11,18 +12,32 @@ CONFIG_FILE="${XUI_BIN_DIR}/config.json"
 ORIG_BIN="${XUI_BIN_DIR}/xray-linux-amd64.orig"
 BAK_BIN="${XUI_BIN_DIR}/xray-linux-amd64.bak"
 
+TMP_DIR=""
+cleanup() {
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+        rm -rf "$TMP_DIR"
+    fi
+}
+trap cleanup EXIT
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [OPTIONS] [PATH_TO_XRAY_SERVER_BINARY]
 
 Installs or updates xray-server into 3x-ui safely with config test and automatic backup.
+By default, downloads the latest release binary from GitHub (${GITHUB_REPO}).
 
 Options:
-    --build         Compile release binary first with cargo build --release -p xray-server
+    --build         Compile release binary from source (cargo build --release -p xray-server)
+    --repo <REPO>   GitHub repository to download from (default: ${GITHUB_REPO})
     --rollback      Restore original or previous binary and restart 3x-ui
     -h, --help      Show this help message
 
 Examples:
+    # One-liner to install / update from latest GitHub release:
+    curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPO}/main/scripts/install-3x-ui.sh | sudo bash
+
+    # Local usage:
     sudo ./scripts/install-3x-ui.sh
     sudo ./scripts/install-3x-ui.sh --build
     sudo ./scripts/install-3x-ui.sh /path/to/xray-server
@@ -103,6 +118,53 @@ do_rollback() {
     exit 0
 }
 
+download_latest_release() {
+    TMP_DIR="$(mktemp -d -t xray-rs-XXXXXX)"
+    local out_bin="${TMP_DIR}/xray-server"
+
+    log_info "Fetching latest release from https://github.com/${GITHUB_REPO}..."
+
+    local asset_names=("xray-server-linux-amd64" "xray-linux-amd64" "xray-server")
+    local download_url=""
+
+    # 1. Try resolving asset url via GitHub API
+    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    local json
+    if json="$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$api_url" 2>/dev/null)"; then
+        for name in "${asset_names[@]}"; do
+            local url
+            url="$(echo "$json" | grep -o "\"browser_download_url\": *\"[^\"]*${name}[^\"]*\"" | head -n 1 | cut -d '"' -f 4 || true)"
+            if [ -n "$url" ]; then
+                download_url="$url"
+                break
+            fi
+        done
+    fi
+
+    # 2. Fallback to direct latest release download URL
+    if [ -z "$download_url" ]; then
+        for name in "${asset_names[@]}"; do
+            local test_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${name}"
+            if curl -fsSL -I "$test_url" &>/dev/null; then
+                download_url="$test_url"
+                break
+            fi
+        done
+    fi
+
+    if [ -n "$download_url" ]; then
+        log_info "Downloading prebuilt core from $download_url ..."
+        if curl -fL --progress-bar -o "$out_bin" "$download_url"; then
+            chmod +x "$out_bin"
+            SOURCE_BIN="$out_bin"
+            return 0
+        fi
+    fi
+
+    log_warn "Could not download prebuilt release from https://github.com/${GITHUB_REPO}/releases."
+    return 1
+}
+
 BUILD_FLAG=0
 SOURCE_BIN=""
 
@@ -111,6 +173,10 @@ while [ $# -gt 0 ]; do
         --build)
             BUILD_FLAG=1
             shift
+            ;;
+        --repo)
+            GITHUB_REPO="$2"
+            shift 2
             ;;
         --rollback)
             do_rollback
@@ -130,18 +196,25 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$BUILD_FLAG" -eq 1 ]; then
-    log_info "Building release binary..."
+    log_info "Building release binary from source..."
     if ! command -v cargo &>/dev/null; then
-        log_error "Cargo is not found in PATH. Please install Rust or specify prebuilt binary."
+        log_error "Cargo is not found in PATH. Please install Rust or omit --build to download prebuilt binary."
         exit 1
     fi
     nice cargo build --release -p xray-server
     SOURCE_BIN="target/release/xray-server"
 fi
 
+# If no path specified and not building, try downloading latest release from GitHub
 if [ -z "$SOURCE_BIN" ]; then
+    download_latest_release || true
+fi
+
+# Fallback: check local candidates if download was unavailable (e.g. offline dev or unreleased repo)
+if [ -z "$SOURCE_BIN" ] || [ ! -f "$SOURCE_BIN" ]; then
     for candidate in "target/release/xray-server" "./xray-server" "./xray-linux-amd64"; do
         if [ -f "$candidate" ]; then
+            log_info "Using local binary candidate: $candidate"
             SOURCE_BIN="$candidate"
             break
         fi
@@ -149,8 +222,9 @@ if [ -z "$SOURCE_BIN" ]; then
 fi
 
 if [ -z "$SOURCE_BIN" ] || [ ! -f "$SOURCE_BIN" ]; then
-    log_error "xray-server binary not found."
-    log_error "Specify path: $(basename "$0") /path/to/xray-server or use --build."
+    log_error "No xray-server binary available."
+    log_error "No GitHub release found for ${GITHUB_REPO}, and no local binary was specified."
+    log_error "Usage: $(basename "$0") /path/to/xray-server or use --build."
     exit 1
 fi
 
@@ -166,7 +240,7 @@ if ! "$SOURCE_BIN" run -test -c "$CONFIG_FILE"; then
 fi
 log_info "Config test passed."
 
-# Preserve original binary if not already backed up
+# Preserve original official binary if not already backed up
 if [ -f "$TARGET_BIN" ] && [ ! -f "$ORIG_BIN" ]; then
     log_info "Backing up original core to $ORIG_BIN ..."
     cp -a "$TARGET_BIN" "$ORIG_BIN"
