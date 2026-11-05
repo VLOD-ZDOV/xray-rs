@@ -43,6 +43,16 @@ min and max.
   <img alt="Server memory (RSS), lower is better. Idle: xray-rs 8.6 MiB, Xray-core 42.2. 100 open flows: 15.7 and 51.0. 1000 open flows: 60.2 and 125." src="assets/server-memory-light.svg">
 </picture>
 
+Throughput over an emulated link (network namespace with netem: 50 ms RTT,
+MTU 1500, 0, 1 and 5% packet loss). Without loss xray-rs is 8 to 20% faster.
+With loss the kernel's TCP recovery dominates and both cores land within run
+to run noise.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/server-throughput-dark.svg">
+  <img alt="Download through the tunnel in Mbit/s, higher is better. No loss: XHTTP xray-rs 592, Xray-core 550; raw 612 and 560; WebSocket 607 and 504. 1% loss: XHTTP 230 and 196; raw 299 and 292; WebSocket 366 and 388. 5% loss: XHTTP 148 and 142; raw 252 and 251; WebSocket 247 and 245." src="assets/server-throughput-light.svg">
+</picture>
+
 ## Not supported yet
 
 - Outbounds other than the four above (`vless`, `vmess`, ...) and balancers.
