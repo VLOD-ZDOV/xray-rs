@@ -122,3 +122,61 @@ fn vmess_invalid_ciphers_and_destinations_fail_closed() {
     let account = Account::new(&[0x55; 16], Cipher::Aes128Gcm, Options::default());
     assert!(!format!("{account:?}").contains("5555"));
 }
+
+#[tokio::test]
+async fn vmess_server_and_client_stream_interop() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let id = [0x42u8; 16];
+    let user = server::ServerUser::new(&id, "alice@example.com".to_string());
+    let users = vec![user];
+
+    for cipher in [Cipher::Aes128Gcm, Cipher::ChaCha20Poly1305] {
+        for auth_len in [false, true] {
+            for net in [Network::Tcp, Network::Udp] {
+                let options = Options {
+                    authenticated_length: auth_len,
+                    no_termination_signal: false,
+                };
+                let account = Account::new(&id, cipher, options);
+                let target = Target::new(
+                    TargetAddr::Domain("example.com".to_string()),
+                    8443,
+                    net,
+                );
+
+                let (client_io, mut server_io) = tokio::io::duplex(65536);
+                let mut client = ClientStream::new(client_io, &account, &target).unwrap();
+
+                // Client writes initial message (forces header to be flushed)
+                let client_task = tokio::spawn(async move {
+                    let req_msg = b"Hello from VMess client!";
+                    client.write_all(req_msg).await.unwrap();
+                    client.flush().await.unwrap();
+
+                    let mut resp = vec![0u8; 24];
+                    client.read_exact(&mut resp).await.unwrap();
+                    assert_eq!(&resp, b"Hello from VMess server!");
+                });
+
+                let hs = server::handshake(&mut server_io, &users).await.unwrap();
+                assert_eq!(hs.user_index, 0);
+                assert_eq!(hs.network, net);
+                assert_eq!(hs.cipher, cipher);
+                assert_eq!(hs.options.authenticated_length, auth_len);
+                assert_eq!(hs.target.port, 8443);
+
+                let mut server = server::ServerStream::from_handshake(server_io, &hs);
+                let mut req = vec![0u8; 24];
+                server.read_exact(&mut req).await.unwrap();
+                assert_eq!(&req, b"Hello from VMess client!");
+
+                let resp_msg = b"Hello from VMess server!";
+                server.write_all(resp_msg).await.unwrap();
+                server.flush().await.unwrap();
+
+                client_task.await.unwrap();
+            }
+        }
+    }
+}

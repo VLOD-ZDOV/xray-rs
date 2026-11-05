@@ -18,6 +18,7 @@ mod stats;
 mod trojan;
 mod vless;
 mod vless_outbound;
+mod vmess;
 mod wg;
 mod ws;
 mod xhttp;
@@ -139,6 +140,9 @@ enum InboundHandler {
     TrojanWs(Arc<vless::Context>, ws::WsSettings),
     TrojanHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
     TrojanGrpc(Arc<grpc::Handler>),
+    VmessTcp(Arc<vless::Context>),
+    VmessWs(Arc<vless::Context>, ws::WsSettings),
+    VmessHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
     Socks(
         Arc<vless::Context>,
         xray_proxy::inbound::SocksInboundAuth,
@@ -213,6 +217,15 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
                     settings,
                     grpc::GrpcProtocol::Trojan(ctx.clone()),
                 ))
+            }
+            (InboundProtocol::Vmess, InboundTransport::Tcp) => {
+                InboundHandler::VmessTcp(ctx.clone())
+            }
+            (InboundProtocol::Vmess, InboundTransport::Websocket(settings)) => {
+                InboundHandler::VmessWs(ctx.clone(), settings)
+            }
+            (InboundProtocol::Vmess, InboundTransport::HttpUpgrade(settings)) => {
+                InboundHandler::VmessHttpUpgrade(ctx.clone(), settings)
             }
             (InboundProtocol::Socks, InboundTransport::Tcp) => {
                 InboundHandler::Socks(ctx.clone(), inbound.socks_auth, inbound.udp)
@@ -436,6 +449,44 @@ async fn dispatch<I>(
                     if let Err(e) = trojan::serve(uplink, downlink, &ctx, peer).await {
                         log::info(format!(
                             "trojan-httpupgrade from {} rejected: {e}",
+                            log::mask(peer)
+                        ));
+                    }
+                }
+                Err(e) => {
+                    log::info(format!(
+                        "httpupgrade handshake from {} failed: {e}",
+                        log::mask(peer)
+                    ));
+                }
+            }
+        }
+        InboundHandler::VmessTcp(ctx) => {
+            let (r, w) = tokio::io::split(stream);
+            if let Err(e) = vmess::serve(r, w, &ctx, peer).await {
+                log::info(format!("vmess from {} rejected: {e}", log::mask(peer)));
+            }
+        }
+        InboundHandler::VmessWs(ctx, ws_settings) => {
+            match ws::accept(stream, &ws_settings).await {
+                Ok(ws_stream) => {
+                    let (uplink, downlink) = tokio::io::split(ws_stream);
+                    if let Err(e) = vmess::serve(uplink, downlink, &ctx, peer).await {
+                        log::info(format!("vmess-ws from {} rejected: {e}", log::mask(peer)));
+                    }
+                }
+                Err(e) => {
+                    log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
+                }
+            }
+        }
+        InboundHandler::VmessHttpUpgrade(ctx, hu_settings) => {
+            match httpupgrade::accept(stream, &hu_settings).await {
+                Ok(prefixed_stream) => {
+                    let (uplink, downlink) = tokio::io::split(prefixed_stream);
+                    if let Err(e) = vmess::serve(uplink, downlink, &ctx, peer).await {
+                        log::info(format!(
+                            "vmess-httpupgrade from {} rejected: {e}",
                             log::mask(peer)
                         ));
                     }

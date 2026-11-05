@@ -40,6 +40,36 @@ pub(super) struct ReadState {
     read_error: Option<io::Error>,
     eof: bool,
 }
+
+impl ReadState {
+    pub(super) fn new_server(reader: Records, options: Options, packet: bool) -> Self {
+        let size = reader.size_bytes();
+        Self {
+            keys: None,
+            reader,
+            options,
+            packet,
+            body: crate::record_buffer::RecordBuffer::new(size, size),
+            plain_len: 0,
+            plain_pos: 0,
+            bulk_read_remaining: BULK_READ_THRESHOLD,
+            phase: Phase::Length,
+            padding: 0,
+            failed: false,
+            read_error: None,
+            eof: false,
+        }
+    }
+
+    pub(super) fn is_failed(&self) -> bool {
+        self.failed
+    }
+
+    pub(super) fn set_failed(&mut self) {
+        self.failed = true;
+    }
+}
+
 pub(super) struct WriteState {
     writer: Records,
     options: Options,
@@ -48,6 +78,29 @@ pub(super) struct WriteState {
     pending_pos: usize,
     failed: bool,
     closing: bool,
+}
+
+impl WriteState {
+    pub(super) fn new_server(
+        writer: Records,
+        options: Options,
+        packet: bool,
+        response_header: Vec<u8>,
+    ) -> Self {
+        Self {
+            writer,
+            options,
+            packet,
+            pending: Zeroizing::new(response_header),
+            pending_pos: 0,
+            failed: false,
+            closing: false,
+        }
+    }
+
+    pub(super) fn is_failed(&self) -> bool {
+        self.failed
+    }
 }
 impl<S> ClientStream<S> {
     pub fn new(inner: S, account: &Account, target: &Target) -> io::Result<Self> {

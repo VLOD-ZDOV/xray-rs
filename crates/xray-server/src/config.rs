@@ -36,6 +36,7 @@ pub enum InboundTransport {
 pub enum InboundProtocol {
     Vless,
     Trojan,
+    Vmess,
     Socks,
     Http,
     Shadowsocks,
@@ -224,6 +225,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let protocol = match str_field(item, "protocol") {
         "vless" => InboundProtocol::Vless,
         "trojan" => InboundProtocol::Trojan,
+        "vmess" => InboundProtocol::Vmess,
         "socks" => InboundProtocol::Socks,
         "http" => InboundProtocol::Http,
         "shadowsocks" => InboundProtocol::Shadowsocks,
@@ -1223,5 +1225,20 @@ mod tests {
             Some(crate::vless::Host::Ip("1.1.1.1".parse().unwrap()))
         );
         assert_eq!(doko.port, Some(53));
+    }
+
+    #[test]
+    fn parses_vmess_inbound() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "vmess-in", "port": 10086, "protocol": "vmess",
+             "settings": {"clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "email": "alice@xray.com", "alterId": 0}]}}
+          ]
+        }"#;
+        let inbounds = parse(raw).unwrap().inbounds;
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0].protocol, InboundProtocol::Vmess);
+        assert_eq!(inbounds[0].users.len(), 1);
+        assert_eq!(inbounds[0].users[0].email, "alice@xray.com");
     }
 }
