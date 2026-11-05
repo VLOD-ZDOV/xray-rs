@@ -231,6 +231,9 @@ impl Handler {
     fn response_headers(&self, req: &Request<Incoming>) -> http::response::Builder {
         let s = &self.settings;
         let mut response = Response::builder().header("Access-Control-Allow-Origin", origin(req));
+        for (name, val) in &s.response_headers {
+            response = response.header(name, val);
+        }
         let cookie_used = [&s.session, &s.seq, &s.uplink_data]
             .iter()
             .any(|m| m.placement == Placement::Cookie)

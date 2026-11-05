@@ -5,6 +5,7 @@ use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use http::{HeaderName, HeaderValue};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -66,6 +67,7 @@ pub struct XhttpSettings {
     pub no_sse_header: bool,
     pub max_each_post: usize,
     pub max_buffered_posts: usize,
+    pub response_headers: Vec<(HeaderName, HeaderValue)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,6 +403,23 @@ fn parse_xhttp(x: &Value) -> Result<XhttpSettings, String> {
         .and_then(Value::as_u64)
         .filter(|n| *n > 0)
         .unwrap_or(30) as usize;
+    let mut response_headers = Vec::new();
+    if let Some(headers) = x.get("responseHeaders").and_then(Value::as_object) {
+        for (name, val) in headers {
+            let Ok(header_name) = HeaderName::try_from(name.as_str()) else {
+                return Err(format!("invalid header name in responseHeaders: {name:?}"));
+            };
+            let Some(val_str) = val.as_str() else {
+                return Err(format!("header value for {name:?} must be a string"));
+            };
+            let Ok(header_value) = HeaderValue::try_from(val_str) else {
+                return Err(format!(
+                    "invalid header value in responseHeaders for {name:?}"
+                ));
+            };
+            response_headers.push((header_name, header_value));
+        }
+    }
     Ok(XhttpSettings {
         path,
         host: str_field(x, "host").to_owned(),
@@ -420,6 +439,7 @@ fn parse_xhttp(x: &Value) -> Result<XhttpSettings, String> {
             .unwrap_or(false),
         max_each_post,
         max_buffered_posts,
+        response_headers,
     })
 }
 
@@ -516,6 +536,23 @@ mod tests {
         assert_eq!(inbound.xhttp.padding, (100, 1000));
         assert_eq!(inbound.users[0].email, "user1");
         assert_eq!(inbound.tls.as_ref().unwrap().cert_pem, b"CERT");
+    }
+
+    #[test]
+    fn parses_custom_response_headers() {
+        let raw = serde_json::json!({
+            "path": "/xh",
+            "responseHeaders": {
+                "Server": "nginx/1.24.0",
+                "X-Frame-Options": "SAMEORIGIN"
+            }
+        });
+        let settings = parse_xhttp(&raw).unwrap();
+        assert_eq!(settings.response_headers.len(), 2);
+        assert!(settings.response_headers.contains(&(
+            HeaderName::from_static("server"),
+            HeaderValue::from_static("nginx/1.24.0")
+        )));
     }
 
     #[test]
