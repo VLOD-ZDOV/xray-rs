@@ -8,20 +8,28 @@ on:
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   release:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      # rustup installs the toolchain pinned in rust-toolchain.toml.
       - run: rustup show active-toolchain
-      - run: cargo build --release -p xray-server
-      - name: Prepare binaries
+      - run: cargo test -p xray-server
+      - name: Build
+        # Keep the runner's home and checkout paths out of the binary.
+        run: >-
+          RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=."
+          cargo build --release -p xray-server
+      - name: Package
         run: |
-          cp target/release/xray-server xray-server-linux-amd64
           cp target/release/xray-server xray-linux-amd64
-      - name: Publish Release
-        uses: softprops/action-gh-release@v2
+          sha256sum xray-linux-amd64 > xray-linux-amd64.sha256
+      - uses: softprops/action-gh-release@v2
         with:
           files: |
-            xray-server-linux-amd64
             xray-linux-amd64
+            xray-linux-amd64.sha256

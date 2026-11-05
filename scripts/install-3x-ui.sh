@@ -88,6 +88,12 @@ check_environment() {
     fi
 }
 
+# x-ui stays active even when the core it runs keeps failing, so check the core too.
+core_running() {
+    sleep 5
+    systemctl is-active --quiet x-ui && pidof xray-linux-amd64 >/dev/null
+}
+
 do_rollback() {
     require_root
     check_environment
@@ -108,7 +114,7 @@ do_rollback() {
     chmod 755 "$TARGET_BIN"
     systemctl start x-ui
 
-    if systemctl is-active --quiet x-ui; then
+    if core_running; then
         log_info "Rollback successful. x-ui is active."
         "$TARGET_BIN" -version || true
     else
@@ -120,49 +126,19 @@ do_rollback() {
 
 download_latest_release() {
     TMP_DIR="$(mktemp -d -t xray-rs-XXXXXX)"
-    local out_bin="${TMP_DIR}/xray-server"
-
-    log_info "Fetching latest release from https://github.com/${GITHUB_REPO}..."
-
-    local asset_names=("xray-server-linux-amd64" "xray-linux-amd64" "xray-server")
-    local download_url=""
-
-    # 1. Try resolving asset url via GitHub API
-    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
-    local json
-    if json="$(curl -fsSL -H "Accept: application/vnd.github.v3+json" "$api_url" 2>/dev/null)"; then
-        for name in "${asset_names[@]}"; do
-            local url
-            url="$(echo "$json" | grep -o "\"browser_download_url\": *\"[^\"]*${name}[^\"]*\"" | head -n 1 | cut -d '"' -f 4 || true)"
-            if [ -n "$url" ]; then
-                download_url="$url"
-                break
-            fi
-        done
+    local base="https://github.com/${GITHUB_REPO}/releases/latest/download"
+    log_info "Downloading the latest release from ${base} ..."
+    if ! curl -fL --progress-bar -o "${TMP_DIR}/xray-linux-amd64" "${base}/xray-linux-amd64" ||
+        ! curl -fsSL -o "${TMP_DIR}/xray-linux-amd64.sha256" "${base}/xray-linux-amd64.sha256"; then
+        log_error "No release found in https://github.com/${GITHUB_REPO}/releases."
+        log_error "Pass a binary path or use --build."
+        exit 1
     fi
-
-    # 2. Fallback to direct latest release download URL
-    if [ -z "$download_url" ]; then
-        for name in "${asset_names[@]}"; do
-            local test_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${name}"
-            if curl -fsSL -I "$test_url" &>/dev/null; then
-                download_url="$test_url"
-                break
-            fi
-        done
+    if ! (cd "$TMP_DIR" && sha256sum --check --quiet xray-linux-amd64.sha256); then
+        log_error "Checksum mismatch, the download is corrupted."
+        exit 1
     fi
-
-    if [ -n "$download_url" ]; then
-        log_info "Downloading prebuilt core from $download_url ..."
-        if curl -fL --progress-bar -o "$out_bin" "$download_url"; then
-            chmod +x "$out_bin"
-            SOURCE_BIN="$out_bin"
-            return 0
-        fi
-    fi
-
-    log_warn "Could not download prebuilt release from https://github.com/${GITHUB_REPO}/releases."
-    return 1
+    SOURCE_BIN="${TMP_DIR}/xray-linux-amd64"
 }
 
 BUILD_FLAG=0
@@ -205,26 +181,12 @@ if [ "$BUILD_FLAG" -eq 1 ]; then
     SOURCE_BIN="target/release/xray-server"
 fi
 
-# If no path specified and not building, try downloading latest release from GitHub
 if [ -z "$SOURCE_BIN" ]; then
-    download_latest_release || true
+    download_latest_release
 fi
 
-# Fallback: check local candidates if download was unavailable (e.g. offline dev or unreleased repo)
-if [ -z "$SOURCE_BIN" ] || [ ! -f "$SOURCE_BIN" ]; then
-    for candidate in "target/release/xray-server" "./xray-server" "./xray-linux-amd64"; do
-        if [ -f "$candidate" ]; then
-            log_info "Using local binary candidate: $candidate"
-            SOURCE_BIN="$candidate"
-            break
-        fi
-    done
-fi
-
-if [ -z "$SOURCE_BIN" ] || [ ! -f "$SOURCE_BIN" ]; then
-    log_error "No xray-server binary available."
-    log_error "No GitHub release found for ${GITHUB_REPO}, and no local binary was specified."
-    log_error "Usage: $(basename "$0") /path/to/xray-server or use --build."
+if [ ! -f "$SOURCE_BIN" ]; then
+    log_error "Binary not found: $SOURCE_BIN"
     exit 1
 fi
 
@@ -260,12 +222,13 @@ systemctl stop x-ui
 mv -f "${TARGET_BIN}.new" "$TARGET_BIN"
 systemctl start x-ui
 
-if systemctl is-active --quiet x-ui; then
+if core_running; then
     log_info "Successfully installed and started xray-rs in 3x-ui!"
     "$TARGET_BIN" -version || true
 else
-    log_error "x-ui service failed to start. Automatically rolling back..."
+    log_error "The core is not running under x-ui. Rolling back..."
     if [ -f "$BAK_BIN" ]; then
+        systemctl stop x-ui || true
         cp -f "$BAK_BIN" "$TARGET_BIN"
         systemctl start x-ui || true
     fi
