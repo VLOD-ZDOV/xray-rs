@@ -31,3 +31,6 @@ uuid = { workspace = true, features = ["v5"] }
 xray-config = { path = "../xray-config" }
 xray-proxy = { path = "../xray-proxy" }
 xray-wireguard = { path = "../xray-wireguard" }
+
+[build-dependencies]
+cc = "1.2"
