@@ -5,6 +5,7 @@ mod config;
 mod dokodemo;
 mod fallback;
 mod grpc;
+mod http_obfs;
 mod httpupgrade;
 mod inbound_proxy;
 mod log;
@@ -272,7 +273,8 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
                 ));
             }
         };
-        tokio::spawn(accept_loop(listener, acceptor, handler));
+        let http_obfs = inbound.http_obfs.map(Arc::new);
+        tokio::spawn(accept_loop(listener, acceptor, handler, http_obfs));
         if is_ss_udp {
             let udp_socket = bind_udp_addr(&ss_listen, ss_port).await?;
             log::info(format!(
@@ -350,7 +352,12 @@ fn bracket(host: &str) -> String {
     }
 }
 
-async fn accept_loop(listener: TcpListener, tls: Option<TlsAcceptor>, handler: InboundHandler) {
+async fn accept_loop(
+    listener: TcpListener,
+    tls: Option<TlsAcceptor>,
+    handler: InboundHandler,
+    http_obfs: Option<Arc<http_obfs::HttpObfsSettings>>,
+) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -362,17 +369,24 @@ async fn accept_loop(listener: TcpListener, tls: Option<TlsAcceptor>, handler: I
         };
         let _ = stream.set_nodelay(true);
         let local = stream.local_addr().ok();
-        let (tls, handler) = (tls.clone(), handler.clone());
+        let (tls, handler, http_obfs) = (tls.clone(), handler.clone(), http_obfs.clone());
         tokio::spawn(async move {
-            match tls {
-                Some(acceptor) => match acceptor.accept(stream).await {
+            match (tls, http_obfs) {
+                (Some(acceptor), _) => match acceptor.accept(stream).await {
                     Ok(stream) => dispatch(stream, peer, local, handler).await,
                     Err(e) => log::debug(format!(
                         "tls handshake from {} failed: {e}",
                         log::mask(peer)
                     )),
                 },
-                None => dispatch(stream, peer, local, handler).await,
+                (None, Some(obfs)) => match http_obfs::accept(stream, &obfs).await {
+                    Ok(stream) => dispatch(stream, peer, local, handler).await,
+                    Err(e) => log::debug(format!(
+                        "http obfs from {} failed: {e}",
+                        log::mask(peer)
+                    )),
+                },
+                (None, None) => dispatch(stream, peer, local, handler).await,
             }
         });
     }

@@ -90,6 +90,7 @@ pub struct Inbound {
     pub udp: bool,
     pub sniffing: crate::vless::Sniffing,
     pub dokodemo: Option<DokodemoSettings>,
+    pub http_obfs: Option<crate::http_obfs::HttpObfsSettings>,
     pub tls: Option<TlsSettings>,
     pub transport: InboundTransport,
 }
@@ -264,12 +265,17 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         .get("rawSettings")
         .or_else(|| stream.get("tcpSettings"));
     let header = raw.and_then(|r| r.get("header")).unwrap_or(&Value::Null);
-    if is_tcp && !matches!(str_field(header, "type"), "" | "none") {
+    let header_type = str_field(header, "type");
+    let http_obfs = if is_tcp && header_type == "http" {
+        Some(parse_http_obfs(header))
+    } else if is_tcp && !matches!(header_type, "" | "none") {
         log::warn(format!(
-            "skipping inbound {tag:?}: tcp header obfuscation is not supported yet"
+            "skipping inbound {tag:?}: tcp header obfuscation {header_type:?} is not supported yet"
         ));
         return Ok(None);
-    }
+    } else {
+        None
+    };
 
     let port = parse_port(item.get("port")).ok_or("invalid or missing port")?;
     let listen = match str_field(item, "listen") {
@@ -483,9 +489,49 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         udp,
         sniffing,
         dokodemo,
+        http_obfs,
         tls,
         transport,
     }))
+}
+
+fn parse_http_obfs(header: &Value) -> crate::http_obfs::HttpObfsSettings {
+    let response = header.get("response").unwrap_or(&Value::Null);
+    if response.is_null() {
+        return crate::http_obfs::HttpObfsSettings::default();
+    }
+    let version = match str_field(response, "version") {
+        "" => "1.1",
+        v => v,
+    };
+    let status = match str_field(response, "status") {
+        "" => "200",
+        s => s,
+    };
+    let reason = match str_field(response, "reason") {
+        "" => "OK",
+        r => r,
+    };
+    let mut resp = format!("HTTP/{version} {status} {reason}\r\n");
+    if let Some(headers) = response.get("headers").and_then(Value::as_object) {
+        for (k, v) in headers {
+            if let Some(arr) = v.as_array() {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        resp.push_str(&format!("{k}: {s}\r\n"));
+                    }
+                }
+            } else if let Some(s) = v.as_str() {
+                resp.push_str(&format!("{k}: {s}\r\n"));
+            }
+        }
+    } else {
+        resp.push_str("Content-Type: application/octet-stream\r\nConnection: keep-alive\r\nPragma: no-cache\r\n");
+    }
+    resp.push_str("\r\n");
+    crate::http_obfs::HttpObfsSettings {
+        response: resp.into_bytes(),
+    }
 }
 
 fn parse_tls(tls: &Value) -> Result<TlsSettings, String> {
@@ -1240,5 +1286,31 @@ mod tests {
         assert_eq!(inbounds[0].protocol, InboundProtocol::Vmess);
         assert_eq!(inbounds[0].users.len(), 1);
         assert_eq!(inbounds[0].users[0].email, "alice@xray.com");
+    }
+
+    #[test]
+    fn parses_tcp_http_obfs_inbound() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "vless-obfs", "port": 8080, "protocol": "vless",
+             "settings": {"clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811"}]},
+             "streamSettings": {
+               "network": "tcp",
+               "tcpSettings": {
+                 "header": {
+                   "type": "http",
+                   "response": {"version": "1.1", "status": "200", "reason": "OK"}
+                 }
+               }
+             }}
+          ]
+        }"#;
+        let inbounds = parse(raw).unwrap().inbounds;
+        assert_eq!(inbounds.len(), 1);
+        assert!(inbounds[0].http_obfs.is_some());
+        let obfs = inbounds[0].http_obfs.as_ref().unwrap();
+        assert!(std::str::from_utf8(&obfs.response)
+            .unwrap()
+            .starts_with("HTTP/1.1 200 OK"));
     }
 }
