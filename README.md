@@ -1,4 +1,4 @@
-# xray-rust server
+# xray-rs
 
 A Rust server core that can stand in for `xray-linux-amd64` in the 3x-ui panel.
 Clients keep using the regular Xray core.
