@@ -3,7 +3,8 @@ mod socks;
 
 pub use http::{
     decode_http_basic_credentials, parse_http_connect, parse_http_connect_request,
-    HttpBasicCredentials, HttpConnectRequest, HttpParseError,
+    parse_http_inbound_request, HttpBasicCredentials, HttpConnectRequest, HttpInboundRequest,
+    HttpParseError,
 };
 pub use socks::{
     encode_socks5_udp_datagram, negotiate_socks5, negotiate_socks5_no_auth, parse_socks4_connect,

@@ -9,9 +9,10 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use xray_config::Network;
 use xray_proxy::inbound::{
-    encode_socks5_udp_datagram, negotiate_socks5, parse_http_connect_request,
+    encode_socks5_udp_datagram, negotiate_socks5, parse_http_inbound_request,
     parse_socks5_request_message, parse_socks5_udp_datagram, write_socks5_command_not_supported,
-    write_socks5_success, write_socks5_success_with_bind, SocksCommand, SocksInboundAuth,
+    write_socks5_success, write_socks5_success_with_bind, HttpInboundRequest, SocksCommand,
+    SocksInboundAuth,
 };
 use xray_routing::{Target, TargetAddr};
 
@@ -59,7 +60,7 @@ where
                 .map_err(|e| io::Error::other(format!("{e}")))?;
             stream.flush().await?;
             let (host, port) = target_to_host_port(&req.target);
-            relay_tcp(stream, ctx, &email, peer, host, port).await
+            relay_tcp(stream, ctx, &email, peer, host, port, Vec::new()).await
         }
         SocksCommand::UdpAssociate => {
             if !udp_enabled {
@@ -198,13 +199,13 @@ async fn relay_tcp<S>(
     peer: SocketAddr,
     mut host: Host,
     port: u16,
+    mut early: Vec<u8>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut uplink, mut downlink) = tokio::io::split(stream);
-    let mut early = Vec::new();
-    if ctx.router.needs_sniff() || ctx.sniffing.enabled() {
+    if early.is_empty() && (ctx.router.needs_sniff() || ctx.sniffing.enabled()) {
         read_first(&mut uplink, &mut early).await;
     }
     let route = RouteRequest {
@@ -249,12 +250,12 @@ pub async fn serve_http<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let req = timeout(HANDSHAKE_TIMEOUT, parse_http_connect_request(&mut stream))
+    let req = timeout(HANDSHAKE_TIMEOUT, parse_http_inbound_request(&mut stream))
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http connect timeout"))?
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("http connect: {e}")))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http request timeout"))?
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("http request: {e}")))?;
 
-    if !auth.admits_http_basic(req.proxy_authorization.as_deref().map(|v| v.as_slice())) {
+    if !auth.admits_http_basic(req.proxy_authorization()) {
         stream
             .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n")
             .await?;
@@ -262,21 +263,31 @@ where
         return Ok(());
     }
 
-    let user = auth
-        .http_basic_user(req.proxy_authorization.as_deref().map(|v| v.as_slice()))
-        .flatten();
+    let user = auth.http_basic_user(req.proxy_authorization()).flatten();
     let email = user
         .as_ref()
         .map(|u| u.as_str().to_owned())
         .unwrap_or_default();
     let _online = stats::get().connect(&email, peer.ip());
 
-    stream
-        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        .await?;
-    stream.flush().await?;
-    let (host, port) = target_to_host_port(&req.target);
-    relay_tcp(stream, ctx, &email, peer, host, port).await
+    match req {
+        HttpInboundRequest::Connect(connect) => {
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .await?;
+            stream.flush().await?;
+            let (host, port) = target_to_host_port(&connect.target);
+            relay_tcp(stream, ctx, &email, peer, host, port, Vec::new()).await
+        }
+        HttpInboundRequest::Plain {
+            target,
+            forwarded_request,
+            ..
+        } => {
+            let (host, port) = target_to_host_port(&target);
+            relay_tcp(stream, ctx, &email, peer, host, port, forwarded_request).await
+        }
+    }
 }
 
 fn target_to_host_port(target: &Target) -> (Host, u16) {
