@@ -16,14 +16,32 @@ The server crate and every workspace crate it is built from (`xray-config`,
 
 | Area | Supported |
 |---|---|
-| Inbound | VLESS over XHTTP (packet-up, stream-up, stream-one), HTTP/1.1 and HTTP/2, TLS or plain (behind nginx) |
-| VLESS | TCP, UDP, Mux.Cool and XUDP |
-| Outbound | `freedom` (with `finalRules`, `domainStrategy`, private addresses blocked by default), `blackhole`, `wireguard` (Cloudflare WARP, including `reserved`), `socks` (SOCKS5 with optional login, TCP and UDP) |
-| Routing | `domain`, `geosite`, `ip`, `geoip`, `port`, `network`, `inboundTag`, `user`, `source`, `sourcePort`, `protocol`; `domainStrategy` AsIs, IPIfNonMatch, IPOnDemand |
-| 3x-ui | `-c`, `run -test -c`, `-version`, gRPC `StatsService` (traffic, online users and IPs), `HandlerService` user operations (clients are added and removed without a restart), the `log` section (`loglevel`, `access`, `error`, `maskAddress`) |
+| Inbound protocols | VLESS, Trojan, Shadowsocks (AEAD: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`), SOCKS5, HTTP `CONNECT` |
+| Transports | XHTTP (packet-up, stream-up, stream-one, Xray 26 obfuscation settings, `responseHeaders`), raw TCP, WebSocket (with early data), HTTPUpgrade, gRPC (gun and multi mode); TLS or plain (behind nginx) |
+| VLESS / Trojan | TCP, UDP, Mux.Cool and XUDP; `fallbacks` by `path` with PROXY protocol v1/v2 |
+| Sniffing | `destOverride` `http` and `tls`, `routeOnly` |
+| Outbound | `freedom` (`finalRules`, `domainStrategy`, private addresses blocked by default), `blackhole` (including the `http` response), `wireguard` (Cloudflare WARP, including `reserved`), `socks` (SOCKS5 with optional login, TCP and UDP) |
+| Routing | `domain`, `geosite`, `ip`, `geoip`, `port`, `network`, `inboundTag`, `user`, `source`, `sourcePort`, `localPort`, `protocol`; `domainStrategy` AsIs, IPIfNonMatch, IPOnDemand |
+| 3x-ui | `-c`, `run -test -c`, `-version`, gRPC `StatsService` (traffic, online users and IPs), `HandlerService` user operations for VLESS and Trojan (clients are added and removed without a restart), the `log` section (`loglevel`, `access`, `error`, `maskAddress`) |
 
-Tested against the official Xray-core 26.10.31 as client, WireGuard peer and
+Tested against the official Xray-core 26.10.21 as client, WireGuard peer and
 `xray api` client.
+
+## Resource use
+
+Same server config for both cores, the official Xray-core as the client, only
+the server process measured, on loopback. Median of 5 runs, whiskers show
+min and max.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/server-cpu-dark.svg">
+  <img alt="Server CPU time per GiB, lower is better. XHTTP+TLS download: xray-rs 1.18 s, Xray-core 2.00. XHTTP+TLS upload: 1.26 and 2.42. Raw TLS download: 0.22 and 0.36. WebSocket+TLS download: 0.26 and 0.46." src="assets/server-cpu-light.svg">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/server-memory-dark.svg">
+  <img alt="Server memory (RSS), lower is better. Idle: xray-rs 8.6 MiB, Xray-core 42.2. 100 open flows: 15.7 and 51.0. 1000 open flows: 60.2 and 125." src="assets/server-memory-light.svg">
+</picture>
 
 ## Not supported yet
 
@@ -31,11 +49,14 @@ Tested against the official Xray-core 26.10.31 as client, WireGuard peer and
   Traffic routed to them is blocked with a warning.
 - Changing routing rules, inbounds or outbounds in the panel still restarts
   the core (no `RoutingService`, `AddInbound`, `AddOutbound`).
-- Inbounds other than VLESS + XHTTP: REALITY, XHTTP over HTTP/3, socks,
-  wireguard. They are skipped with a warning.
+- Skipped with a warning: REALITY, XTLS Vision (`flow` is ignored, so Vision
+  clients cannot connect), XHTTP over HTTP/3, Shadowsocks 2022, VMess,
+  WireGuard and dokodemo-door inbounds, raw TCP header obfuscation, fallbacks
+  selected by `name` or `alpn`, sniffing `quic` and `fakedns`.
+- The HTTP inbound only accepts `CONNECT`, not plain proxy requests.
 - DNS for WireGuard traffic goes through the system resolver, not the tunnel.
-- Routing fields `attrs`, `vlessRoute`, `localPort`, `localIP`, `process`,
-  `webhook` stop the core at startup with an error.
+- Routing fields `attrs`, `vlessRoute`, `localIP`, `process`, `webhook` stop
+  the core at startup with an error.
 
 ## Build
 
@@ -43,24 +64,20 @@ Tested against the official Xray-core 26.10.31 as client, WireGuard peer and
 cargo build --release -p xray-server
 ```
 
-The binary is `target/release/xray-server`. Compatible with Ubuntu 22.04+, Debian 12+ and modern Linux distributions.
+The binary is `target/release/xray-server`. It runs on glibc 2.34 or newer
+(Ubuntu 22.04, Debian 12 and later).
 
 ## Install into 3x-ui
 
-Safe installation or update with automated config testing and backups:
+`scripts/install-3x-ui.sh` tests the current panel config with the new core,
+keeps the original core as `xray-linux-amd64.orig` and rolls back if the core
+does not come up:
 
 ```bash
-# Quick install / update from the latest GitHub release:
-curl -fsSL https://raw.githubusercontent.com/VLOD-ZDOV/xray-rs/main/scripts/install-3x-ui.sh | sudo bash
-
-# Or build from source on the host:
-sudo ./scripts/install-3x-ui.sh --build
-
-# Or install from an existing binary:
-sudo ./scripts/install-3x-ui.sh target/release/xray-server
-
-# To roll back to the original Xray binary:
-sudo ./scripts/install-3x-ui.sh --rollback
+sudo ./scripts/install-3x-ui.sh                      # latest release
+sudo ./scripts/install-3x-ui.sh --build              # build from source here
+sudo ./scripts/install-3x-ui.sh path/to/xray-server  # a binary you have
+sudo ./scripts/install-3x-ui.sh --rollback           # back to the original core
 ```
 
 Manual steps:

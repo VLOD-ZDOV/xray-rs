@@ -5,8 +5,8 @@
 - The server core lives in `crates/xray-server`. Upstream crates (`xray-config`,
   `xray-proxy`, `xray-transport`, `xray-wireguard`, ...) change only when the
   server needs it, with the smallest possible diff and unchanged defaults.
-- The client-side crates (`xray-ffi`, `xray-core-rs`, `xray-cli`, `platform/`)
-  are upstream code. Leave them alone unless asked.
+- The client-side crates (`xray-ffi`, `xray-core-rs`, `xray-cli`,
+  `xray-bench`) are upstream code. Leave them alone unless asked.
 
 ## Compatibility
 
@@ -33,6 +33,10 @@
   `cargo test -p xray-server` must pass (warnings are errors workspace-wide).
 - Protocol changes need an end-to-end check with the official Xray-core as
   the client (and as the peer, for outbounds).
+- Match Xray's behaviour, not your own guess at it: tests assert what the
+  official server does (status lines, path matching, defaults).
+- Anything that reads untrusted input before authentication must bound its
+  buffers.
 - Use low priority and limited parallelism for heavy builds.
 
 ## Privacy

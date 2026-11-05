@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="440" viewBox="0 0 760 440" role="img" aria-label="Server CPU time per GiB (s), lower is better">
+<rect width="760" height="440" fill="#fcfcfb" rx="8"/>
+<text x="24" y="34" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="17" font-weight="600" fill="#0b0b0b">Server CPU time per GiB (s), lower is better</text>
+<rect x="24" y="52" width="12" height="12" rx="3" fill="#2a78d6"/>
+<text x="42" y="62" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12.5" fill="#52514e">xray-rs (this fork)</text>
+<rect x="218" y="52" width="12" height="12" rx="3" fill="#eb6834"/>
+<text x="236" y="62" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12.5" fill="#52514e">Xray-core</text>
+<text x="54" y="334.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781" text-anchor="end">0.00</text>
+<line x1="64" y1="270.50" x2="736" y2="270.50" stroke="#e1e0d9" stroke-width="1"/>
+<text x="54" y="274.50" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781" text-anchor="end">1.00</text>
+<line x1="64" y1="211.00" x2="736" y2="211.00" stroke="#e1e0d9" stroke-width="1"/>
+<text x="54" y="215.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781" text-anchor="end">2.00</text>
+<line x1="64" y1="151.50" x2="736" y2="151.50" stroke="#e1e0d9" stroke-width="1"/>
+<text x="54" y="155.50" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781" text-anchor="end">3.00</text>
+<line x1="64" y1="92.00" x2="736" y2="92.00" stroke="#e1e0d9" stroke-width="1"/>
+<text x="54" y="96.00" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781" text-anchor="end">4.00</text>
+<line x1="64" y1="330" x2="736" y2="330" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M 103.00 330.00 L 103.00 263.79 Q 103.00 259.79 107.00 259.79 L 143.00 259.79 Q 147.00 259.79 147.00 263.79 L 147.00 330.00 Z" fill="#2a78d6"/>
+<line x1="125.00" y1="270.50" x2="125.00" y2="253.84" stroke="#52514e" stroke-width="1.5"/>
+<line x1="120.00" y1="270.50" x2="130.00" y2="270.50" stroke="#52514e" stroke-width="1.5"/>
+<line x1="120.00" y1="253.84" x2="130.00" y2="253.84" stroke="#52514e" stroke-width="1.5"/>
+<text x="125.00" y="245.84" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#0b0b0b" text-anchor="middle">1.18</text>
+<path d="M 149.00 330.00 L 149.00 215.00 Q 149.00 211.00 153.00 211.00 L 189.00 211.00 Q 193.00 211.00 193.00 215.00 L 193.00 330.00 Z" fill="#eb6834"/>
+<line x1="171.00" y1="220.52" x2="171.00" y2="180.06" stroke="#52514e" stroke-width="1.5"/>
+<line x1="166.00" y1="220.52" x2="176.00" y2="220.52" stroke="#52514e" stroke-width="1.5"/>
+<line x1="166.00" y1="180.06" x2="176.00" y2="180.06" stroke="#52514e" stroke-width="1.5"/>
+<text x="171.00" y="172.06" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#0b0b0b" text-anchor="middle">2.00</text>
+<text x="148.00" y="354" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12.5" fill="#52514e" text-anchor="middle">XHTTP+TLS down</text>
+<path d="M 271.00 330.00 L 271.00 259.03 Q 271.00 255.03 275.00 255.03 L 311.00 255.03 Q 315.00 255.03 315.00 259.03 L 315.00 330.00 Z" fill="#2a78d6"/>
+<line x1="293.00" y1="257.41" x2="293.00" y2="252.65" stroke="#52514e" stroke-width="1.5"/>
+<line x1="288.00" y1="257.41" x2="298.00" y2="257.41" stroke="#52514e" stroke-width="1.5"/>
+<line x1="288.00" y1="252.65" x2="298.00" y2="252.65" stroke="#52514e" stroke-width="1.5"/>
+<text x="293.00" y="244.65" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#0b0b0b" text-anchor="middle">1.26</text>
+<path d="M 317.00 330.00 L 317.00 190.01 Q 317.00 186.01 321.00 186.01 L 357.00 186.01 Q 361.00 186.01 361.00 190.01 L 361.00 330.00 Z" fill="#eb6834"/>
+<line x1="339.00" y1="188.39" x2="339.00" y2="158.64" stroke="#52514e" stroke-width="1.5"/>
+<line x1="334.00" y1="188.39" x2="344.00" y2="188.39" stroke="#52514e" stroke-width="1.5"/>
+<line x1="334.00" y1="158.64" x2="344.00" y2="158.64" stroke="#52514e" stroke-width="1.5"/>
+<text x="339.00" y="150.64" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#0b0b0b" text-anchor="middle">2.42</text>
+<text x="316.00" y="354" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12.5" fill="#52514e" text-anchor="middle">XHTTP+TLS up</text>
+<path d="M 439.00 330.00 L 439.00 320.91 Q 439.00 316.91 443.00 316.91 L 479.00 316.91 Q 483.00 316.91 483.00 320.91 L 483.00 330.00 Z" fill="#2a78d6"/>
+<line x1="461.00" y1="316.91" x2="461.00" y2="315.72" stroke="#52514e" stroke-width="1.5"/>
+<line x1="456.00" y1="316.91" x2="466.00" y2="316.91" stroke="#52514e" stroke-width="1.5"/>
+<line x1="456.00" y1="315.72" x2="466.00" y2="315.72" stroke="#52514e" stroke-width="1.5"/>
+<text x="461.00" y="307.72" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#0b0b0b" text-anchor="middle">0.22</text>
+<path d="M 485.00 330.00 L 485.00 312.58 Q 485.00 308.58 489.00 308.58 L 525.00 308.58 Q 529.00 308.58 529.00 312.58 L 529.00 330.00 Z" fill="#eb6834"/>
+<line x1="507.00" y1="309.77" x2="507.00" y2="306.20" stroke="#52514e" stroke-width="1.5"/>
+<line x1="502.00" y1="309.77" x2="512.00" y2="309.77" stroke="#52514e" stroke-width="1.5"/>
+<line x1="502.00" y1="306.20" x2="512.00" y2="306.20" stroke="#52514e" stroke-width="1.5"/>
+<text x="507.00" y="298.20" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#0b0b0b" text-anchor="middle">0.36</text>
+<text x="484.00" y="354" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12.5" fill="#52514e" text-anchor="middle">raw TLS down</text>
+<path d="M 607.00 330.00 L 607.00 318.53 Q 607.00 314.53 611.00 314.53 L 647.00 314.53 Q 651.00 314.53 651.00 318.53 L 651.00 330.00 Z" fill="#2a78d6"/>
+<line x1="629.00" y1="318.10" x2="629.00" y2="314.53" stroke="#52514e" stroke-width="1.5"/>
+<line x1="624.00" y1="318.10" x2="634.00" y2="318.10" stroke="#52514e" stroke-width="1.5"/>
+<line x1="624.00" y1="314.53" x2="634.00" y2="314.53" stroke="#52514e" stroke-width="1.5"/>
+<text x="629.00" y="306.53" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#0b0b0b" text-anchor="middle">0.26</text>
+<path d="M 653.00 330.00 L 653.00 306.63 Q 653.00 302.63 657.00 302.63 L 693.00 302.63 Q 697.00 302.63 697.00 306.63 L 697.00 330.00 Z" fill="#eb6834"/>
+<line x1="675.00" y1="302.63" x2="675.00" y2="299.06" stroke="#52514e" stroke-width="1.5"/>
+<line x1="670.00" y1="302.63" x2="680.00" y2="302.63" stroke="#52514e" stroke-width="1.5"/>
+<line x1="670.00" y1="299.06" x2="680.00" y2="299.06" stroke="#52514e" stroke-width="1.5"/>
+<text x="675.00" y="291.06" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="600" fill="#0b0b0b" text-anchor="middle">0.46</text>
+<text x="652.00" y="354" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12.5" fill="#52514e" text-anchor="middle">WebSocket+TLS down</text>
+<text x="24" y="386" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781">VLESS, 512 MiB bulk transfer per run</text>
+<text x="24" y="404" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781">server process only · official Xray-core as the client · median of 5 runs, whiskers min–max · synthetic localhost benchmark</text>
+<text x="24" y="422" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#898781">xray-rs v0.1.0 · Xray-core 26.10.21</text>
+</svg>
