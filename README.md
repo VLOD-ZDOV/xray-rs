@@ -18,7 +18,7 @@ The server crate and every workspace crate it is built from (`xray-config`,
 |---|---|
 | Inbound | VLESS over XHTTP (packet-up, stream-up, stream-one), HTTP/1.1 and HTTP/2, TLS or plain (behind nginx) |
 | VLESS | TCP, UDP, Mux.Cool and XUDP |
-| Outbound | `freedom` (with `finalRules`, private addresses blocked by default), `blackhole`, `wireguard` (Cloudflare WARP, including `reserved`), `socks` (SOCKS5 with optional login, TCP and UDP) |
+| Outbound | `freedom` (with `finalRules`, `domainStrategy`, private addresses blocked by default), `blackhole`, `wireguard` (Cloudflare WARP, including `reserved`), `socks` (SOCKS5 with optional login, TCP and UDP) |
 | Routing | `domain`, `geosite`, `ip`, `geoip`, `port`, `network`, `inboundTag`, `user`, `source`, `sourcePort`, `protocol`; `domainStrategy` AsIs, IPIfNonMatch, IPOnDemand |
 | 3x-ui | `-c`, `run -test -c`, `-version`, gRPC `StatsService` (traffic, online users and IPs), `HandlerService` user operations (clients are added and removed without a restart), the `log` section (`loglevel`, `access`, `error`, `maskAddress`) |
 
@@ -47,6 +47,21 @@ The binary is `target/release/xray-server`. A glibc build needs glibc 2.38 or
 newer (Ubuntu 24.04 works, Ubuntu 22.04 and Debian 12 do not).
 
 ## Install into 3x-ui
+
+Safe installation or update with automated config testing and backups:
+
+```bash
+# Build and install directly on the host:
+sudo ./scripts/install-3x-ui.sh --build
+
+# Or install from an existing binary:
+sudo ./scripts/install-3x-ui.sh target/release/xray-server
+
+# To roll back to the original Xray binary:
+sudo ./scripts/install-3x-ui.sh --rollback
+```
+
+Manual steps:
 
 ```bash
 systemctl stop x-ui
