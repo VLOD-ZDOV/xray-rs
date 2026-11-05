@@ -49,7 +49,11 @@ where
                 .collect();
             let (server_stream, idx, target, early) = timeout(
                 HANDSHAKE_TIMEOUT,
-                xray_proxy::shadowsocks2022::ServerStream::handshake_methods(stream, &methods),
+                xray_proxy::shadowsocks2022::ServerStream::handshake_methods_with_pool(
+                    stream,
+                    &methods,
+                    Some(&ctx.ss2022_salt_pool),
+                ),
             )
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "shadowsocks handshake timeout"))?
@@ -547,4 +551,63 @@ fn target_to_host_port(target: &Target) -> (Host, u16) {
         TargetAddr::Domain(d) => Host::Domain(d.clone()),
     };
     (host, target.port)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use tokio::io::AsyncReadExt;
+    use xray_proxy::shadowsocks2022::{
+        ClientStream as ClientStream2022, Method as Method2022, SaltPool,
+        ServerStream as ServerStream2022,
+    };
+    use xray_routing::{Network, Target, TargetAddr};
+
+    #[tokio::test]
+    async fn test_ss2022_replayed_first_packet_rejected() {
+        let method = Arc::new(
+            Method2022::new("2022-blake3-aes-128-gcm", "YXNkZmFzZGZhc2RmYXNkZg==").unwrap(),
+        );
+        let methods = vec![method.clone()];
+        let salt_pool = Mutex::new(SaltPool::default_ss2022());
+
+        let target = Target::new(TargetAddr::Domain("example.test".into()), 443, Network::Tcp);
+
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        let mut client = ClientStream2022::new(client_io, method.clone(), &target).unwrap();
+
+        let client_task = tokio::spawn(async move {
+            client.write_all(b"initial payload").await.unwrap();
+            client.flush().await.unwrap();
+        });
+
+        // Capture client handshake bytes
+        let mut client_bytes = vec![0u8; 4096];
+        let n = server_io.read(&mut client_bytes).await.unwrap();
+        client_bytes.truncate(n);
+        drop(client_task);
+
+        // First handshake succeeds
+        let mut first = std::io::Cursor::new(client_bytes.clone());
+        let res1 =
+            ServerStream2022::handshake_methods_with_pool(&mut first, &methods, Some(&salt_pool))
+                .await;
+        assert!(res1.is_ok(), "First handshake must succeed");
+
+        // Replayed handshake with exact same salt and packet must fail
+        let mut second = std::io::Cursor::new(client_bytes);
+        let res2 =
+            ServerStream2022::handshake_methods_with_pool(&mut second, &methods, Some(&salt_pool))
+                .await;
+        let err = match res2 {
+            Err(e) => e,
+            Ok(_) => panic!("Replayed handshake must be rejected"),
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("repeated salt"),
+            "Error message should mention repeated salt: {err_msg}"
+        );
+    }
 }

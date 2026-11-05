@@ -222,6 +222,8 @@ pub struct Context {
     pub router: Arc<Router>,
     pub sniffing: Sniffing,
     pub fallbacks: Vec<crate::config::Fallback>,
+    pub vmess_filter: Arc<std::sync::Mutex<xray_proxy::vmess::server::AuthIdFilter>>,
+    pub ss2022_salt_pool: Arc<std::sync::Mutex<xray_proxy::shadowsocks2022::SaltPool>>,
 }
 
 impl Context {

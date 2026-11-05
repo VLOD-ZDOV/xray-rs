@@ -237,6 +237,12 @@ pub(crate) async fn start_inbound(
         router: router.clone(),
         sniffing: inbound.sniffing.clone(),
         fallbacks: inbound.fallbacks.clone(),
+        vmess_filter: Arc::new(std::sync::Mutex::new(
+            xray_proxy::vmess::server::AuthIdFilter::default_vmess(),
+        )),
+        ss2022_salt_pool: Arc::new(std::sync::Mutex::new(
+            xray_proxy::shadowsocks2022::SaltPool::default_ss2022(),
+        )),
     });
     let is_ss_udp = inbound.protocol == InboundProtocol::Shadowsocks && inbound.udp;
     let is_dokodemo_udp = inbound.protocol == InboundProtocol::Dokodemo && inbound.udp;

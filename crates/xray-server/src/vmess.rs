@@ -38,7 +38,7 @@ where
 
     let hs_res = timeout(
         HANDSHAKE_TIMEOUT,
-        server::handshake(&mut uplink, &server_users),
+        server::handshake_with_filter(&mut uplink, &server_users, Some(&ctx.vmess_filter)),
     )
     .await;
     let hs: ServerHandshake = match hs_res {
@@ -165,5 +165,60 @@ where
 
             relay(up, down, &activity).await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+    use xray_proxy::vmess::server::{AuthIdFilter, ServerUser};
+    use xray_proxy::vmess::{Account, Cipher, ClientStream, Options};
+    use xray_routing::{Network, Target, TargetAddr};
+
+    #[tokio::test]
+    async fn test_vmess_replayed_first_packet_rejected() {
+        let user_id = [0x42u8; 16];
+        let users = vec![ServerUser::new(&user_id, "test@vmess".to_string())];
+        let filter = Mutex::new(AuthIdFilter::default_vmess());
+
+        let account = Account::new(&user_id, Cipher::Aes128Gcm, Options::default());
+        let target = Target::new(
+            TargetAddr::Domain("example.com".to_string()),
+            80,
+            Network::Tcp,
+        );
+
+        let (client_io, mut server_io) = tokio::io::duplex(4096);
+        let mut client = ClientStream::new(client_io, &account, &target).unwrap();
+
+        let client_task = tokio::spawn(async move {
+            client.write_all(b"test request").await.unwrap();
+            client.flush().await.unwrap();
+        });
+
+        // Capture what the client sends in the initial handshake
+        let mut client_bytes = vec![0u8; 4096];
+        let n = server_io.read(&mut client_bytes).await.unwrap();
+        client_bytes.truncate(n);
+        drop(client_task);
+
+        // First attempt with these bytes
+        let mut first_attempt = std::io::Cursor::new(client_bytes.clone());
+        let res1 = server::handshake_with_filter(&mut first_attempt, &users, Some(&filter)).await;
+        assert!(res1.is_ok(), "First handshake must succeed");
+
+        // Replayed attempt with the exact same bytes and same filter
+        let mut second_attempt = std::io::Cursor::new(client_bytes);
+        let res2 = server::handshake_with_filter(&mut second_attempt, &users, Some(&filter)).await;
+        let err = match res2 {
+            Err(e) => e,
+            Ok(_) => panic!("Replayed handshake must be rejected"),
+        };
+        let err_msg = err.to_string();
+        assert!(
+            err_msg.contains("replayed"),
+            "Error message should mention replay: {err_msg}"
+        );
     }
 }

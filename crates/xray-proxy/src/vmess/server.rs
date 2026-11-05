@@ -1,5 +1,6 @@
 //! Inbound VMess server handshake, codecs, and connection stream.
 
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -14,6 +15,57 @@ use zeroize::{Zeroize, Zeroizing};
 use super::records::Records;
 use super::stream::{ReadState, WriteState};
 use super::{crypto, invalid, Cipher, Options};
+
+/// Memory-bounded sliding-window cache of observed VMess AEAD authIDs to prevent replay attacks.
+pub struct AuthIdFilter {
+    window_secs: u64,
+    max_capacity: usize,
+    entries: HashMap<[u8; 16], u64>,
+    queue: VecDeque<([u8; 16], u64)>,
+}
+
+impl AuthIdFilter {
+    pub fn new(window_secs: u64, max_capacity: usize) -> Self {
+        Self {
+            window_secs,
+            max_capacity,
+            entries: HashMap::with_capacity(1024),
+            queue: VecDeque::with_capacity(1024),
+        }
+    }
+
+    pub fn default_vmess() -> Self {
+        Self::new(120, 65536)
+    }
+
+    /// Checks if the auth_id is fresh within the sliding window.
+    /// Returns true if accepted (and registers it), or false if replayed.
+    pub fn check_and_insert(&mut self, auth_id: &[u8; 16], now: u64) -> bool {
+        while let Some(&(old_id, expire_at)) = self.queue.front() {
+            if expire_at <= now {
+                self.entries.remove(&old_id);
+                self.queue.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if self.entries.contains_key(auth_id) {
+            return false;
+        }
+
+        if self.entries.len() >= self.max_capacity {
+            if let Some((old_id, _)) = self.queue.pop_front() {
+                self.entries.remove(&old_id);
+            }
+        }
+
+        let expire_at = now + self.window_secs;
+        self.entries.insert(*auth_id, expire_at);
+        self.queue.push_back((*auth_id, expire_at));
+        true
+    }
+}
 
 /// Precomputed user cryptographic credentials for VMess inbound authentication.
 #[derive(Clone)]
@@ -65,6 +117,15 @@ pub async fn handshake<S: AsyncRead + Unpin>(
     stream: &mut S,
     users: &[ServerUser],
 ) -> io::Result<ServerHandshake> {
+    handshake_with_filter(stream, users, None).await
+}
+
+/// Performs a VMess AEAD inbound handshake with optional replay protection filter.
+pub async fn handshake_with_filter<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    users: &[ServerUser],
+    replay_filter: Option<&std::sync::Mutex<AuthIdFilter>>,
+) -> io::Result<ServerHandshake> {
     if users.is_empty() {
         return Err(invalid("no VMess users configured"));
     }
@@ -91,6 +152,15 @@ pub async fn handshake<S: AsyncRead + Unpin>(
     }
 
     let (user_index, user) = matched.ok_or_else(|| invalid("VMess auth_id mismatch or expired"))?;
+
+    if let Some(filter) = replay_filter {
+        let mut guard = filter
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !guard.check_and_insert(&auth_id, now) {
+            return Err(invalid("VMess auth_id replayed"));
+        }
+    }
 
     // Step 2: Read Length (18 bytes) and Connection Nonce (8 bytes) = 26 bytes
     let mut length_and_nonce = [0u8; 26];

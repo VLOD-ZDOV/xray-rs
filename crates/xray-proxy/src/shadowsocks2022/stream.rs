@@ -4,11 +4,61 @@ use super::{
 };
 use rand::RngCore;
 use std::{
+    collections::{HashMap, VecDeque},
     pin::Pin,
     sync::Arc,
     task::{ready, Context, Poll},
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
+
+/// Memory-bounded sliding-window pool of observed Shadowsocks 2022 TCP salts to reject replay attacks.
+pub struct SaltPool {
+    window_secs: u64,
+    max_capacity: usize,
+    entries: HashMap<Vec<u8>, u64>,
+    queue: VecDeque<(Vec<u8>, u64)>,
+}
+
+impl SaltPool {
+    pub fn new(window_secs: u64, max_capacity: usize) -> Self {
+        Self {
+            window_secs,
+            max_capacity,
+            entries: HashMap::with_capacity(1024),
+            queue: VecDeque::with_capacity(1024),
+        }
+    }
+
+    pub fn default_ss2022() -> Self {
+        Self::new(60, 65536)
+    }
+
+    pub fn check_and_insert(&mut self, salt: &[u8], now: u64) -> bool {
+        while let Some((old_salt, expire_at)) = self.queue.front() {
+            if *expire_at <= now {
+                self.entries.remove(old_salt);
+                self.queue.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        if self.entries.contains_key(salt) {
+            return false;
+        }
+
+        if self.entries.len() >= self.max_capacity {
+            if let Some((old_salt, _)) = self.queue.pop_front() {
+                self.entries.remove(&old_salt);
+            }
+        }
+
+        let expire_at = now + self.window_secs;
+        self.entries.insert(salt.to_vec(), expire_at);
+        self.queue.push_back((salt.to_vec(), expire_at));
+        true
+    }
+}
 
 /// One bounded stream, with no background tasks. A successful write owns its
 /// complete plaintext; cancellation cannot duplicate a nonce or a partial record.
@@ -309,8 +359,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerStream<S> {
     }
 
     pub async fn handshake_methods(
+        inner: S,
+        methods: &[Arc<Method>],
+    ) -> io::Result<(Self, usize, Target, Vec<u8>)> {
+        Self::handshake_methods_with_pool(inner, methods, None).await
+    }
+
+    pub async fn handshake_methods_with_pool(
         mut inner: S,
         methods: &[Arc<Method>],
+        salt_pool: Option<&std::sync::Mutex<SaltPool>>,
     ) -> io::Result<(Self, usize, Target, Vec<u8>)> {
         if methods.is_empty() {
             return Err(invalid("no Shadowsocks 2022 methods provided"));
@@ -377,7 +435,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerStream<S> {
         if cursor.u8()? != 0 {
             return Err(invalid("invalid Shadowsocks 2022 request type"));
         }
-        check_time(cursor.u64()?, now()?)?;
+        let req_timestamp = cursor.u64()?;
+        let now_sec = now()?;
+        check_time(req_timestamp, now_sec)?;
+
+        if let Some(pool) = salt_pool {
+            let mut guard = pool
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !guard.check_and_insert(&salt, now_sec) {
+                return Err(invalid("Shadowsocks 2022 repeated salt in TCP handshake"));
+            }
+        }
         let variable_len = cursor.u16()? as usize;
         if variable_len > MAX_RECORD_LENGTH {
             return Err(invalid(

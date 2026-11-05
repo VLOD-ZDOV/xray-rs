@@ -1590,6 +1590,12 @@ mod tests {
             router,
             sniffing: Default::default(),
             fallbacks: Vec::new(),
+            vmess_filter: Arc::new(std::sync::Mutex::new(
+                xray_proxy::vmess::server::AuthIdFilter::default_vmess(),
+            )),
+            ss2022_salt_pool: Arc::new(std::sync::Mutex::new(
+                xray_proxy::shadowsocks2022::SaltPool::default_ss2022(),
+            )),
         };
 
         // Add VMess user

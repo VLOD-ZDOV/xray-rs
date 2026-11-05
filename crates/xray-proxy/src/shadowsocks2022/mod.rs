@@ -4,7 +4,7 @@
 mod crypto;
 mod stream;
 mod udp;
-pub use stream::{ClientStream, ServerStream};
+pub use stream::{ClientStream, SaltPool, ServerStream};
 pub use udp::{ServerUdpSession, UdpSession};
 
 use crate::shadowsocks::address::encode as encode_address;
