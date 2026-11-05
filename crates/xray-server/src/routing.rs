@@ -18,6 +18,7 @@ use xray_config::{Network, RoutingDomainStrategy, RoutingRule};
 use crate::log;
 use crate::socks::SocksOutbound;
 use crate::vless::is_private;
+use crate::vless_outbound::VlessOutbound;
 use crate::wg::WgOutbound;
 
 const STUB_TAG: &str = "rule";
@@ -46,6 +47,7 @@ pub enum Action {
     Block(BlockAction),
     Wireguard(Arc<WgOutbound>),
     Socks(Arc<SocksOutbound>),
+    Vless(Arc<VlessOutbound>),
 }
 
 impl PartialEq for Action {
@@ -55,6 +57,7 @@ impl PartialEq for Action {
             (Self::Block(a), Self::Block(b)) => a == b,
             (Self::Wireguard(a), Self::Wireguard(b)) => Arc::ptr_eq(a, b),
             (Self::Socks(a), Self::Socks(b)) => Arc::ptr_eq(a, b),
+            (Self::Vless(a), Self::Vless(b)) => Arc::ptr_eq(a, b),
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
         }
     }
@@ -172,6 +175,7 @@ impl Router {
                     &tag,
                     outbound.get("settings").unwrap_or(&Value::Null),
                 )?)),
+                "vless" => Action::Vless(Arc::new(VlessOutbound::parse(&tag, outbound)?)),
                 other => {
                     log::warn(format!("outbound {tag:?} ({other}) is not supported yet; traffic routed to it will be blocked"));
                     Action::Block(BlockAction::Drop)

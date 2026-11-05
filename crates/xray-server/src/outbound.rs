@@ -17,6 +17,7 @@ use xray_wireguard::UdpSession;
 use crate::routing::{Action, Decision, FreedomStrategy, Router};
 use crate::socks::SocksUdp;
 use crate::vless::{resolve, resolve_all, Host, CONNECT_TIMEOUT};
+use crate::vless_outbound::{VlessConeUdp, VlessUdpLink};
 use crate::wg::{to_io, WgOutbound};
 
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -34,6 +35,7 @@ pub async fn connect(
         )),
         Action::Wireguard(wg) => Ok(Box::new(wg.connect(host, port).await?)),
         Action::Socks(socks) => Ok(Box::new(socks.connect(host, port).await?)),
+        Action::Vless(vless) => Ok(vless.connect(host, port).await?),
         Action::Block(_) => Err(blocked(&decision.tag)),
     }
 }
@@ -111,6 +113,7 @@ pub enum UdpLink {
     Direct(UdpSocket),
     Wireguard(UdpSession),
     Socks(SocksUdp, SocketAddr),
+    Vless(VlessUdpLink),
 }
 
 impl UdpLink {
@@ -142,6 +145,7 @@ impl UdpLink {
                 socks.associate().await?,
                 resolve(host, port).await?,
             )),
+            Action::Vless(vless) => Ok(Self::Vless(vless.open_udp(host, port).await?)),
             Action::Block(_) => Err(blocked(&decision.tag)),
         }
     }
@@ -151,6 +155,7 @@ impl UdpLink {
             Self::Direct(socket) => socket.send(data).await.map(|_| ()),
             Self::Wireguard(session) => session.send(data).await.map_err(to_io),
             Self::Socks(udp, target) => udp.send_to(data, *target).await,
+            Self::Vless(vless) => vless.send(data).await,
         }
     }
 
@@ -169,6 +174,7 @@ impl UdpLink {
                     break Ok(n);
                 }
             },
+            Self::Vless(vless) => vless.recv(buf).await,
         }
     }
 }
@@ -192,6 +198,7 @@ pub enum ConeUdp {
         rx: Mutex<mpsc::Receiver<(SocketAddr, Bytes)>>,
     },
     Socks(SocksUdp),
+    Vless(VlessConeUdp),
 }
 
 impl ConeUdp {
@@ -221,6 +228,7 @@ impl ConeUdp {
                 })
             }
             Action::Socks(socks) => Ok(Self::Socks(socks.associate().await?)),
+            Action::Vless(vless) => Ok(Self::Vless(vless.open_cone_udp())),
             Action::Block(_) => Err(blocked(&decision.tag)),
         }
     }
@@ -242,6 +250,7 @@ impl ConeUdp {
             }
             Self::Wireguard { wg, .. } => wg.udp_target(host, port).await,
             Self::Socks(_) => resolve(host, port).await,
+            Self::Vless(vless) => vless.udp_target(host, port).await,
         }
     }
 
@@ -284,6 +293,7 @@ impl ConeUdp {
                 session.send(data).await.map_err(to_io)
             }
             Self::Socks(udp) => udp.send_to(data, addr).await,
+            Self::Vless(vless) => vless.send_to(data, addr).await,
         }
     }
 
@@ -313,16 +323,23 @@ impl ConeUdp {
                 Ok((n, from))
             }
             Self::Socks(udp) => udp.recv_from(buf).await,
+            Self::Vless(vless) => vless.recv_from(buf).await,
         }
     }
 }
 
 impl Drop for ConeUdp {
     fn drop(&mut self) {
-        if let Self::Wireguard { sessions, .. } = self {
-            for (_, task) in sessions.get_mut().values() {
-                task.abort();
+        match self {
+            Self::Wireguard { sessions, .. } => {
+                for (_, task) in sessions.get_mut().values() {
+                    task.abort();
+                }
             }
+            Self::Vless(vless) => {
+                vless.abort_all();
+            }
+            _ => {}
         }
     }
 }

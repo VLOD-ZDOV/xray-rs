@@ -33,6 +33,7 @@ uuid = { workspace = true, features = ["v5"] }
 xray-config = { path = "../xray-config" }
 xray-proxy = { path = "../xray-proxy" }
 xray-routing = { path = "../xray-routing" }
+xray-transport = { path = "../xray-transport" }
 xray-wireguard = { path = "../xray-wireguard" }
 
 [build-dependencies]

@@ -3214,6 +3214,7 @@ dependencies = [
  "xray-config",
  "xray-proxy",
  "xray-routing",
+ "xray-transport",
  "xray-wireguard",
 ]
 

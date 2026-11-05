@@ -16,6 +16,7 @@ mod socks;
 mod stats;
 mod trojan;
 mod vless;
+mod vless_outbound;
 mod wg;
 mod ws;
 mod xhttp;
