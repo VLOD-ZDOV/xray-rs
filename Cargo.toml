@@ -12,6 +12,7 @@ members = [
     "crates/xray-core-rs",
     "crates/xray-ffi",
     "crates/xray-cli",
+    "crates/xray-server",
     "crates/xray-bench",
     "fuzz",
 ]
@@ -55,6 +56,8 @@ idna = "1"
 libc = "0.2"
 loom = "0.7"
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc"] }
+# Unix fd handling; "fs" also covers sys::stat and unistd::mkfifo.
+nix = { version = "0.31", default-features = false, features = ["fs"] }
 polyval = { version = "0.7", features = ["zeroize"] }
 prost = "0.14"
 rand = "0.8"
