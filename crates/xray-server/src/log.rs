@@ -7,7 +7,7 @@ use std::fs::OpenOptions;
 use std::io::{LineWriter, Write};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEBUG: u8 = 0;
@@ -18,8 +18,9 @@ const NONE: u8 = 4;
 
 static LEVEL: AtomicU8 = AtomicU8::new(WARNING);
 static MASK: AtomicU8 = AtomicU8::new(0);
-static ERROR_SINK: OnceLock<Option<Sink>> = OnceLock::new();
-static ACCESS_SINK: OnceLock<Option<Sink>> = OnceLock::new();
+static ERROR_SINK: RwLock<Option<Option<Sink>>> = RwLock::new(None);
+static ACCESS_SINK: RwLock<Option<Option<Sink>>> = RwLock::new(None);
+static SETTINGS: RwLock<Option<Settings>> = RwLock::new(None);
 
 type Sink = Mutex<Box<dyn Write + Send>>;
 
@@ -54,8 +55,22 @@ pub fn init(settings: &Settings) -> Result<(), String> {
         },
         Ordering::Relaxed,
     );
-    let _ = ERROR_SINK.set(open_sink(&settings.error)?);
-    let _ = ACCESS_SINK.set(open_sink(&settings.access)?);
+    let err = open_sink(&settings.error)?;
+    let acc = open_sink(&settings.access)?;
+    *ERROR_SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(err);
+    *ACCESS_SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(acc);
+    *SETTINGS.write().unwrap_or_else(|e| e.into_inner()) = Some(settings.clone());
+    Ok(())
+}
+
+pub fn restart() -> Result<(), String> {
+    let settings = SETTINGS.read().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(settings) = settings {
+        let err = open_sink(&settings.error)?;
+        let acc = open_sink(&settings.access)?;
+        *ERROR_SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(err);
+        *ACCESS_SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(acc);
+    }
     Ok(())
 }
 
@@ -96,7 +111,8 @@ fn write_error(level: u8, label: &str, message: impl Display) {
         return;
     }
     // Before init (config parsing) messages go to stdout.
-    match ERROR_SINK.get() {
+    let guard = ERROR_SINK.read().unwrap_or_else(|e| e.into_inner());
+    match &*guard {
         Some(Some(sink)) => write_line(sink, format_args!("[{label}] {message}")),
         Some(None) => {}
         None => println!("{} [{label}] {message}", timestamp()),
@@ -113,7 +129,8 @@ pub fn access(
     outbound: &str,
     email: &str,
 ) {
-    let Some(Some(sink)) = ACCESS_SINK.get() else {
+    let guard = ACCESS_SINK.read().unwrap_or_else(|e| e.into_inner());
+    let Some(Some(sink)) = &*guard else {
         return;
     };
     let status = if accepted { "accepted" } else { "rejected" };

@@ -24,6 +24,8 @@ use crate::{log, stats, xhttp::Body};
 
 const STATS: &str = "/xray.app.stats.command.StatsService/";
 const HANDLER: &str = "/xray.app.proxyman.command.HandlerService/";
+const LOGGER: &str = "/xray.app.log.command.LoggerService/";
+const ROUTER: &str = "/xray.app.router.command.RoutingService/";
 const ADD_USER: &str = "xray.app.proxyman.command.AddUserOperation";
 const REMOVE_USER: &str = "xray.app.proxyman.command.RemoveUserOperation";
 const VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
@@ -209,6 +211,19 @@ pub struct GetInboundUsersCountResponse {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct RestartLoggerRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RestartLoggerResponse {}
+
+enum ServiceType<'a> {
+    Stats(&'a str),
+    Handler(&'a str),
+    Logger(&'a str),
+    Router(&'a str),
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct Empty {}
 
 type Inbounds = Arc<HashMap<String, Arc<Context>>>;
@@ -244,10 +259,16 @@ pub async fn serve(
 
 async fn handle(req: Request<Incoming>, inbounds: &Inbounds) -> Response<Body> {
     let path = req.uri().path().to_owned();
-    let (handler, method) = match (path.strip_prefix(STATS), path.strip_prefix(HANDLER)) {
-        (Some(method), _) => (false, method),
-        (_, Some(method)) => (true, method),
-        _ => return status(UNIMPLEMENTED, "unknown service"),
+    let svc = if let Some(m) = path.strip_prefix(STATS) {
+        ServiceType::Stats(m)
+    } else if let Some(m) = path.strip_prefix(HANDLER) {
+        ServiceType::Handler(m)
+    } else if let Some(m) = path.strip_prefix(LOGGER) {
+        ServiceType::Logger(m)
+    } else if let Some(m) = path.strip_prefix(ROUTER) {
+        ServiceType::Router(m)
+    } else {
+        return status(UNIMPLEMENTED, "unknown service");
     };
     let body = match http_body_util::Limited::new(req.into_body(), MAX_REQUEST)
         .collect()
@@ -259,9 +280,24 @@ async fn handle(req: Request<Incoming>, inbounds: &Inbounds) -> Response<Body> {
     let Some(message) = unframe(body) else {
         return status(INVALID_ARGUMENT, "bad grpc frame");
     };
-    if handler {
-        return handle_handler(method, message, inbounds);
+    match svc {
+        ServiceType::Handler(method) => handle_handler(method, message, inbounds),
+        ServiceType::Logger("RestartLogger") => {
+            let Ok(_) = RestartLoggerRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            match log::restart() {
+                Ok(()) => reply(&RestartLoggerResponse {}),
+                Err(e) => status(UNKNOWN, &e),
+            }
+        }
+        ServiceType::Logger(_) => status(UNIMPLEMENTED, "unknown method"),
+        ServiceType::Router(_method) => status(UNIMPLEMENTED, "unknown method"),
+        ServiceType::Stats(method) => handle_stats(method, message),
     }
+}
+
+fn handle_stats(method: &str, message: Bytes) -> Response<Body> {
     let stats = stats::get();
     match method {
         "QueryStats" => {
@@ -537,5 +573,17 @@ mod tests {
         let inner = unframe(framed.freeze()).unwrap();
         assert_eq!(QueryStatsRequest::decode(inner).unwrap(), message);
         assert!(unframe(Bytes::from_static(&[1, 0, 0, 0, 0])).is_none());
+    }
+
+    #[test]
+    fn restart_logger_request_decodes() {
+        let req = RestartLoggerRequest {};
+        let mut framed = BytesMut::new();
+        framed.put_u8(0);
+        framed.put_u32(req.encoded_len() as u32);
+        req.encode(&mut framed).unwrap();
+        let inner = unframe(framed.freeze()).unwrap();
+        assert_eq!(RestartLoggerRequest::decode(inner).unwrap(), req);
+        assert!(log::restart().is_ok());
     }
 }
