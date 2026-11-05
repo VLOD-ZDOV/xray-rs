@@ -596,6 +596,89 @@ where
 
 const MAX_HEADERS: usize = 1024;
 
+fn extract_cert_names(cert_der: &[u8]) -> Vec<String> {
+    use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
+    let mut names = Vec::new();
+    if let Ok((_, cert)) = X509Certificate::from_der(cert_der) {
+        for rdn in cert.subject().iter() {
+            for attr in rdn.iter() {
+                if attr.attr_type() == &x509_parser::oid_registry::OID_X509_COMMON_NAME {
+                    if let Ok(cn) = attr.as_str() {
+                        names.push(cn.to_ascii_lowercase());
+                    }
+                }
+            }
+        }
+        for ext in cert.extensions() {
+            if let ParsedExtension::SubjectAlternativeName(san) = ext.parsed_extension() {
+                for name in &san.general_names {
+                    match name {
+                        GeneralName::DNSName(dns) => names.push(dns.to_ascii_lowercase()),
+                        GeneralName::IPAddress(ip) => {
+                            if ip.len() == 4 {
+                                names.push(
+                                    std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]).to_string(),
+                                );
+                            } else if ip.len() == 16 {
+                                let mut octets = [0u8; 16];
+                                octets.copy_from_slice(ip);
+                                names.push(std::net::Ipv6Addr::from(octets).to_string());
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
+fn match_sni(pattern: &str, sni: &str) -> bool {
+    let pattern = pattern.to_ascii_lowercase();
+    let sni = sni.to_ascii_lowercase();
+    if pattern == sni {
+        return true;
+    }
+    if let Some(suffix) = pattern.strip_prefix("*.") {
+        if let Some((prefix, domain)) = sni.split_once('.') {
+            if !prefix.is_empty() && domain == suffix {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[derive(Debug)]
+struct SniCheckingResolver {
+    certified_key: Arc<rustls::sign::CertifiedKey>,
+    allowed_names: Vec<String>,
+    reject_unknown_sni: bool,
+}
+
+impl rustls::server::ResolvesServerCert for SniCheckingResolver {
+    fn resolve(
+        &self,
+        client_hello: rustls::server::ClientHello,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        if !self.reject_unknown_sni {
+            return Some(self.certified_key.clone());
+        }
+        let sni = client_hello.server_name()?;
+        let sni_lower = sni.to_ascii_lowercase();
+        if self
+            .allowed_names
+            .iter()
+            .any(|allowed| match_sni(allowed, &sni_lower))
+        {
+            Some(self.certified_key.clone())
+        } else {
+            None
+        }
+    }
+}
+
 fn tls_acceptor(
     settings: &TlsSettings,
     is_xhttp: bool,
@@ -610,12 +693,26 @@ fn tls_acceptor(
     let key = PrivateKeyDer::from_pem_slice(&settings.key_pem)
         .map_err(|e| format!("invalid private key: {e}"))?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let signing_key = provider
+        .key_provider
+        .load_private_key(key)
+        .map_err(|e| format!("invalid private key: {e}"))?;
+    let cert_names = extract_cert_names(certs[0].as_ref());
+    let mut allowed_names = settings.server_names.clone();
+    allowed_names.extend(cert_names);
+
+    let certified_key = Arc::new(rustls::sign::CertifiedKey::new(certs, signing_key));
+    let resolver = Arc::new(SniCheckingResolver {
+        certified_key,
+        allowed_names,
+        reject_unknown_sni: settings.reject_unknown_sni,
+    });
+
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| e.to_string())?
         .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("invalid certificate/key pair: {e}"))?;
+        .with_cert_resolver(resolver);
     let alpn: Vec<Vec<u8>> = settings
         .alpn
         .iter()
@@ -632,4 +729,35 @@ fn tls_acceptor(
         Vec::new()
     };
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_match_sni() {
+        assert!(match_sni("example.com", "example.com"));
+        assert!(match_sni("example.com", "EXAMPLE.COM"));
+        assert!(!match_sni("example.com", "other.com"));
+        assert!(match_sni("*.example.com", "api.example.com"));
+        assert!(match_sni("*.example.com", "WWW.EXAMPLE.COM"));
+        assert!(!match_sni("*.example.com", "example.com"));
+        assert!(!match_sni("*.example.com", "deep.sub.example.com"));
+    }
+
+    #[test]
+    fn test_extract_cert_names() {
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "example.org".to_owned(),
+            "*.sub.example.org".to_owned(),
+            "127.0.0.1".to_owned(),
+        ])
+        .unwrap();
+        let cert_der = cert.cert.der();
+        let names = extract_cert_names(cert_der);
+        assert!(names.contains(&"example.org".to_string()));
+        assert!(names.contains(&"*.sub.example.org".to_string()));
+        assert!(names.contains(&"127.0.0.1".to_string()));
+    }
 }

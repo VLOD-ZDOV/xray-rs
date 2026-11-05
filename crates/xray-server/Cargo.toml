@@ -30,6 +30,8 @@ sha2.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tokio-rustls.workspace = true
 uuid = { workspace = true, features = ["v5"] }
+rcgen = { workspace = true }
+x509-parser = { workspace = true }
 xray-config = { path = "../xray-config" }
 xray-proxy = { path = "../xray-proxy" }
 xray-routing = { path = "../xray-routing" }

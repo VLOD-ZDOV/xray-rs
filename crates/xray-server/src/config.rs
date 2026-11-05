@@ -110,11 +110,13 @@ pub fn user_id(id: &str) -> [u8; 16] {
         .as_bytes()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TlsSettings {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
     pub alpn: Vec<String>,
+    pub reject_unknown_sni: bool,
+    pub server_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -565,10 +567,27 @@ fn parse_tls(tls: &Value) -> Result<TlsSettings, String> {
         .filter_map(Value::as_str)
         .map(str::to_owned)
         .collect();
+    let reject_unknown_sni = tls
+        .get("rejectUnknownSni")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let mut server_names = Vec::new();
+    if let Some(sn) = tls.get("serverName").and_then(Value::as_str) {
+        if !sn.is_empty() {
+            server_names.push(sn.to_ascii_lowercase());
+        }
+    }
+    for name in array(tls, "serverNames").iter().filter_map(Value::as_str) {
+        if !name.is_empty() {
+            server_names.push(name.to_ascii_lowercase());
+        }
+    }
     Ok(TlsSettings {
         cert_pem,
         key_pem,
         alpn,
+        reject_unknown_sni,
+        server_names,
     })
 }
 
@@ -1371,6 +1390,28 @@ mod tests {
         assert_eq!(
             inbounds[3].accept_proxy_protocol,
             crate::proxy_proto::ProxyProtocolAccept::None
+        );
+    }
+
+    #[test]
+    fn parses_tls_reject_unknown_sni() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "tls-sni", "port": 10443, "protocol": "vless",
+             "streamSettings": {"security": "tls", "tlsSettings": {
+               "certificates": [{"certificate": ["CERT"], "key": ["KEY"]}],
+               "rejectUnknownSni": true,
+               "serverName": "example.com",
+               "serverNames": ["api.example.com", "*.internal.net"]
+             }}}
+          ]
+        }"#;
+        let inbounds = parse(raw).unwrap().inbounds;
+        let tls = inbounds[0].tls.as_ref().unwrap();
+        assert!(tls.reject_unknown_sni);
+        assert_eq!(
+            tls.server_names,
+            vec!["example.com", "api.example.com", "*.internal.net"]
         );
     }
 }
