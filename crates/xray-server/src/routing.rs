@@ -219,7 +219,6 @@ pub enum BalancerStrategy {
     #[default]
     Random,
     RoundRobin,
-    LeastPing,
 }
 
 pub struct Balancer {
@@ -266,7 +265,11 @@ impl Balancer {
             match strat_str.to_ascii_lowercase().as_str() {
                 "random" | "" => BalancerStrategy::Random,
                 "roundrobin" => BalancerStrategy::RoundRobin,
-                "leastping" => BalancerStrategy::LeastPing,
+                "leastping" | "leastload" => {
+                    return Err(err(&format!(
+                        "balancer strategy {strat_str:?} is not supported without observatory"
+                    )));
+                }
                 other => return Err(err(&format!("unsupported strategy {other:?}"))),
             }
         } else {
@@ -313,7 +316,7 @@ impl Balancer {
                 let r = rand::random::<usize>();
                 r % candidates.len()
             }
-            BalancerStrategy::RoundRobin | BalancerStrategy::LeastPing => {
+            BalancerStrategy::RoundRobin => {
                 self.counter.fetch_add(1, Ordering::Relaxed) % candidates.len()
             }
         };
@@ -1572,6 +1575,34 @@ mod tests {
         let q443 = query(Some("example.com"), None, 443);
         let fb = r.route(&q443).await;
         assert_eq!(fb.tag, "fallback-node");
+    }
+
+    #[test]
+    fn rejects_leastping_and_leastload_balancer_strategies() {
+        let val = json!({
+            "tag": "b1",
+            "selector": ["node-"],
+            "strategy": "leastPing"
+        });
+        let err = match Balancer::parse(0, &val) {
+            Err(e) => e,
+            Ok(_) => panic!("Expected error for leastPing"),
+        };
+        assert!(err.contains("not supported without observatory"), "{err}");
+
+        let val_obj = json!({
+            "tag": "b2",
+            "selector": ["node-"],
+            "strategy": { "type": "leastLoad" }
+        });
+        let err_obj = match Balancer::parse(1, &val_obj) {
+            Err(e) => e,
+            Ok(_) => panic!("Expected error for leastLoad"),
+        };
+        assert!(
+            err_obj.contains("not supported without observatory"),
+            "{err_obj}"
+        );
     }
 
     #[tokio::test]
