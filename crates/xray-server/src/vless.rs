@@ -218,6 +218,9 @@ pub struct Context {
     pub tag: String,
     pub port: u16,
     pub users: RwLock<Vec<User>>,
+    pub ss_users: RwLock<Vec<crate::config::ShadowsocksUser>>,
+    pub ss_method: RwLock<Option<String>>,
+    pub ss_password: RwLock<Option<String>>,
     pub router: Arc<Router>,
     pub sniffing: Sniffing,
     pub fallbacks: Vec<crate::config::Fallback>,
@@ -239,14 +242,41 @@ impl Context {
         Ok(())
     }
 
+    pub fn add_ss_user(
+        &self,
+        email: String,
+        ss_user: crate::config::ShadowsocksUser,
+    ) -> Result<(), String> {
+        if email.is_empty() {
+            return Err("Email must not be empty.".into());
+        }
+        let mut ss_users = self.ss_users.write().unwrap_or_else(PoisonError::into_inner);
+        if ss_users.iter().any(|u| u.email.eq_ignore_ascii_case(&email)) {
+            return Err(format!("User {email} already exists."));
+        }
+        ss_users.push(ss_user);
+        let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
+        if !users.iter().any(|u| u.email.eq_ignore_ascii_case(&email)) {
+            users.push(User {
+                id: crate::config::user_id(&email),
+                hash: [0u8; 56],
+                email,
+            });
+        }
+        Ok(())
+    }
+
     pub fn remove_user(&self, email: &str) -> Result<(), String> {
         if email.is_empty() {
             return Err("Email must not be empty.".into());
         }
         let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
-        let before = users.len();
+        let mut ss_users = self.ss_users.write().unwrap_or_else(PoisonError::into_inner);
+        let before_u = users.len();
         users.retain(|u| !u.email.eq_ignore_ascii_case(email));
-        if users.len() == before {
+        let before_ss = ss_users.len();
+        ss_users.retain(|u| !u.email.eq_ignore_ascii_case(email));
+        if users.len() == before_u && ss_users.len() == before_ss {
             return Err(format!("User {email} not found."));
         }
         Ok(())

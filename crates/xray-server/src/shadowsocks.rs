@@ -25,13 +25,13 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn serve_tcp<S>(
     stream: S,
-    users: Arc<Vec<ShadowsocksUser>>,
     ctx: &Context,
     peer: SocketAddr,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let users = ctx.ss_users.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     if users.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -150,7 +150,6 @@ struct UdpInit2022 {
 #[derive(Clone)]
 pub struct ShadowsocksUdpHandler {
     socket: Arc<UdpSocket>,
-    users: Arc<Vec<ShadowsocksUser>>,
     ctx: Arc<Context>,
     sessions: SessionsMap,
 }
@@ -158,22 +157,21 @@ pub struct ShadowsocksUdpHandler {
 impl ShadowsocksUdpHandler {
     pub fn new(
         socket: Arc<UdpSocket>,
-        users: Arc<Vec<ShadowsocksUser>>,
         ctx: Arc<Context>,
     ) -> Self {
         Self {
             socket,
-            users,
             ctx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     pub async fn run(self) {
-        if self.users.is_empty() {
-            return;
-        }
-        if matches!(self.users[0].method, ShadowsocksMethod::Ss2022(_)) {
+        let is_2022 = {
+            let users = self.ctx.ss_users.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+            users.first().is_some_and(|u| matches!(u.method, ShadowsocksMethod::Ss2022(_)))
+        };
+        if is_2022 {
             self.run_2022().await;
         } else {
             self.run_2017().await;
@@ -181,14 +179,6 @@ impl ShadowsocksUdpHandler {
     }
 
     async fn run_2022(self) {
-        let methods: Vec<Arc<xray_proxy::shadowsocks2022::Method>> = self
-            .users
-            .iter()
-            .filter_map(|u| match &u.method {
-                ShadowsocksMethod::Ss2022(m) => Some(m.clone()),
-                _ => None,
-            })
-            .collect();
         let mut buf = vec![0u8; 65535];
         loop {
             let (n, peer) = match self.socket.recv_from(&mut buf).await {
@@ -199,6 +189,14 @@ impl ShadowsocksUdpHandler {
                     continue;
                 }
             };
+            let users = self.ctx.ss_users.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let methods: Vec<Arc<xray_proxy::shadowsocks2022::Method>> = users
+                .iter()
+                .filter_map(|u| match &u.method {
+                    ShadowsocksMethod::Ss2022(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect();
             let mut sessions = self.sessions.lock().await;
             let packet = buf[..n].to_vec();
             let packet = if let Some(tx) = sessions.get(&peer) {
@@ -220,7 +218,7 @@ impl ShadowsocksUdpHandler {
                 continue;
             };
 
-            let Some(user) = self.users.get(user_idx).cloned() else {
+            let Some(user) = users.get(user_idx).cloned() else {
                 continue;
             };
 
@@ -357,14 +355,6 @@ impl ShadowsocksUdpHandler {
     }
 
     async fn run_2017(self) {
-        let methods: Vec<Arc<xray_proxy::shadowsocks::aead2017::Method>> = self
-            .users
-            .iter()
-            .filter_map(|u| match &u.method {
-                ShadowsocksMethod::Aead2017(m) => Some(m.clone()),
-                _ => None,
-            })
-            .collect();
         let mut buf = vec![0u8; 65535];
         loop {
             let (n, peer) = match self.socket.recv_from(&mut buf).await {
@@ -375,6 +365,14 @@ impl ShadowsocksUdpHandler {
                     continue;
                 }
             };
+            let users = self.ctx.ss_users.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let methods: Vec<Arc<xray_proxy::shadowsocks::aead2017::Method>> = users
+                .iter()
+                .filter_map(|u| match &u.method {
+                    ShadowsocksMethod::Aead2017(m) => Some(m.clone()),
+                    _ => None,
+                })
+                .collect();
             let mut sessions = self.sessions.lock().await;
             let packet = buf[..n].to_vec();
             let packet = if let Some(tx) = sessions.get(&peer) {
@@ -395,8 +393,10 @@ impl ShadowsocksUdpHandler {
             for (idx, m) in methods.iter().enumerate() {
                 let mut session = UdpSession::new(m.clone());
                 if let Ok((target, payload)) = session.decode(&packet) {
-                    matched = Some((idx, self.users[idx].clone(), target, payload));
-                    break;
+                    if let Some(user) = users.get(idx).cloned() {
+                        matched = Some((idx, user, target, payload));
+                        break;
+                    }
                 }
             }
 

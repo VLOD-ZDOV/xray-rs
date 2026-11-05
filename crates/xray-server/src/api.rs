@@ -30,6 +30,9 @@ const ADD_USER: &str = "xray.app.proxyman.command.AddUserOperation";
 const REMOVE_USER: &str = "xray.app.proxyman.command.RemoveUserOperation";
 const VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
 const TROJAN_ACCOUNT: &str = "xray.proxy.trojan.Account";
+const VMESS_ACCOUNT: &str = "xray.proxy.vmess.Account";
+const SHADOWSOCKS_ACCOUNT: &str = "xray.proxy.shadowsocks.Account";
+const SHADOWSOCKS_2022_ACCOUNT: &str = "xray.proxy.shadowsocks_2022.Account";
 const MAX_REQUEST: usize = 1 << 20;
 
 // grpc-status codes.
@@ -188,6 +191,41 @@ pub struct VlessAccount {
 pub struct TrojanAccount {
     #[prost(string, tag = "1")]
     pub password: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct VmessAccount {
+    #[prost(string, tag = "1")]
+    pub id: String,
+    #[prost(uint32, tag = "2")]
+    pub alter_id: u32,
+    #[prost(string, tag = "4")]
+    pub tests_enabled: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ShadowsocksAccount {
+    #[prost(string, tag = "1")]
+    pub password: String,
+    #[prost(enumeration = "CipherType", tag = "2")]
+    pub cipher_type: i32,
+    #[prost(bool, tag = "3")]
+    pub iv_check: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
+pub enum CipherType {
+    Unknown = 0,
+    Aes128Gcm = 5,
+    Aes256Gcm = 6,
+    Chacha20Poly1305 = 7,
+    Xchacha20Poly1305 = 8,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct Shadowsocks2022Account {
+    #[prost(string, tag = "1")]
+    pub key: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -409,8 +447,7 @@ fn handle_handler(method: &str, message: Bytes, inbounds: &Inbounds) -> Response
             let result = match operation.r#type.as_str() {
                 ADD_USER => AddUserOperation::decode(operation.value)
                     .map_err(|e| e.to_string())
-                    .and_then(|op| inbound_user(op.user.unwrap_or_default()))
-                    .and_then(|user| ctx.add_user(user)),
+                    .and_then(|op| add_user_to_inbound(op.user.unwrap_or_default(), ctx)),
                 REMOVE_USER => RemoveUserOperation::decode(operation.value)
                     .map_err(|e| e.to_string())
                     .and_then(|op| ctx.remove_user(&op.email)),
@@ -460,7 +497,7 @@ fn missing_handler(tag: &str) -> Response<Body> {
     )
 }
 
-fn inbound_user(user: ProtocolUser) -> Result<InboundUser, String> {
+fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> {
     let account = user.account.unwrap_or_default();
     match account.r#type.as_str() {
         VLESS_ACCOUNT => {
@@ -468,7 +505,7 @@ fn inbound_user(user: ProtocolUser) -> Result<InboundUser, String> {
             if !account.encryption.is_empty() && account.encryption != "none" {
                 return Err("VLESS encryption is not supported".into());
             }
-            Ok(InboundUser {
+            ctx.add_user(InboundUser {
                 id: user_id(&account.id),
                 hash: crate::trojan::trojan_password_hash(&account.id),
                 email: user.email,
@@ -476,14 +513,79 @@ fn inbound_user(user: ProtocolUser) -> Result<InboundUser, String> {
         }
         TROJAN_ACCOUNT => {
             let account = TrojanAccount::decode(account.value).map_err(|e| e.to_string())?;
-            Ok(InboundUser {
+            ctx.add_user(InboundUser {
                 id: user_id(&account.password),
                 hash: crate::trojan::trojan_password_hash(&account.password),
                 email: user.email,
             })
         }
+        VMESS_ACCOUNT => {
+            let account = VmessAccount::decode(account.value).map_err(|e| e.to_string())?;
+            ctx.add_user(InboundUser {
+                id: user_id(&account.id),
+                hash: crate::trojan::trojan_password_hash(&account.id),
+                email: user.email,
+            })
+        }
+        SHADOWSOCKS_ACCOUNT => {
+            let account = ShadowsocksAccount::decode(account.value).map_err(|e| e.to_string())?;
+            let top = ctx
+                .ss_method
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let method_name = match CipherType::try_from(account.cipher_type) {
+                Ok(CipherType::Aes128Gcm) => "aes-128-gcm",
+                Ok(CipherType::Aes256Gcm) => "aes-256-gcm",
+                Ok(CipherType::Chacha20Poly1305) => "chacha20-ietf-poly1305",
+                Ok(CipherType::Xchacha20Poly1305) => "xchacha20-ietf-poly1305",
+                _ => match &top {
+                    Some(m) => m.as_str(),
+                    None => return Err(format!("unknown cipher_type {}", account.cipher_type)),
+                },
+            };
+            let m = xray_proxy::shadowsocks::aead2017::Method::new(method_name, &account.password)
+                .map_err(|e| format!("shadowsocks auth: {e}"))?;
+            ctx.add_ss_user(
+                user.email.clone(),
+                crate::config::ShadowsocksUser {
+                    method: crate::config::ShadowsocksMethod::Aead2017(Arc::new(m)),
+                    email: user.email,
+                },
+            )
+        }
+        SHADOWSOCKS_2022_ACCOUNT => {
+            let account =
+                Shadowsocks2022Account::decode(account.value).map_err(|e| e.to_string())?;
+            let top_method = ctx
+                .ss_method
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or_else(|| "2022-blake3-aes-128-gcm".to_string());
+            let top_pass = ctx
+                .ss_password
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or_default();
+            let full_key = if top_pass.is_empty() {
+                account.key
+            } else {
+                format!("{top_pass}:{}", account.key)
+            };
+            let m = xray_proxy::shadowsocks2022::Method::new(&top_method, &full_key)
+                .map_err(|e| format!("shadowsocks 2022 auth: {e}"))?;
+            ctx.add_ss_user(
+                user.email.clone(),
+                crate::config::ShadowsocksUser {
+                    method: crate::config::ShadowsocksMethod::Ss2022(Arc::new(m)),
+                    email: user.email,
+                },
+            )
+        }
         other => Err(format!(
-            "account type {other:?} is not supported, only VLESS and Trojan"
+            "account type {other:?} is not supported"
         )),
     }
 }
@@ -585,5 +687,69 @@ mod tests {
         let inner = unframe(framed.freeze()).unwrap();
         assert_eq!(RestartLoggerRequest::decode(inner).unwrap(), req);
         assert!(log::restart().is_ok());
+    }
+
+    #[test]
+    fn alter_inbound_vmess_and_shadowsocks() {
+        let router = Arc::new(crate::routing::Router::build(&serde_json::json!({
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+            "routing": {"rules": []}
+        }), &[]).unwrap());
+        let ctx = Context {
+            tag: "test_in".into(),
+            port: 1234,
+            users: std::sync::RwLock::new(Vec::new()),
+            ss_users: std::sync::RwLock::new(Vec::new()),
+            ss_method: std::sync::RwLock::new(Some("aes-128-gcm".into())),
+            ss_password: std::sync::RwLock::new(None),
+            router,
+            sniffing: Default::default(),
+            fallbacks: Vec::new(),
+        };
+
+        // Add VMess user
+        let vmess_acc = VmessAccount {
+            id: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+            alter_id: 0,
+            tests_enabled: String::new(),
+        };
+        let p_user = ProtocolUser {
+            level: 0,
+            email: "vmess_user@test".into(),
+            account: Some(TypedMessage {
+                r#type: VMESS_ACCOUNT.into(),
+                value: vmess_acc.encode_to_vec().into(),
+            }),
+        };
+        assert!(add_user_to_inbound(p_user.clone(), &ctx).is_ok());
+        // Duplicate VMess user
+        let err = add_user_to_inbound(p_user, &ctx).unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+
+        // Add Shadowsocks user
+        let ss_acc = ShadowsocksAccount {
+            password: "password123".into(),
+            cipher_type: CipherType::Aes128Gcm as i32,
+            iv_check: false,
+        };
+        let p_user_ss = ProtocolUser {
+            level: 0,
+            email: "ss_user@test".into(),
+            account: Some(TypedMessage {
+                r#type: SHADOWSOCKS_ACCOUNT.into(),
+                value: ss_acc.encode_to_vec().into(),
+            }),
+        };
+        assert!(add_user_to_inbound(p_user_ss.clone(), &ctx).is_ok());
+        // Duplicate SS user
+        let err = add_user_to_inbound(p_user_ss, &ctx).unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+
+        // Remove users
+        assert!(ctx.remove_user("vmess_user@test").is_ok());
+        assert!(ctx.remove_user("ss_user@test").is_ok());
+        // Remove non-existent user
+        let err = ctx.remove_user("nonexistent").unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
     }
 }

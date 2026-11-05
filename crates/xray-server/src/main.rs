@@ -151,7 +151,7 @@ enum InboundHandler {
         bool,
     ),
     Http(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth),
-    Shadowsocks(Arc<vless::Context>, Arc<Vec<config::ShadowsocksUser>>),
+    Shadowsocks(Arc<vless::Context>),
     Dokodemo(Arc<vless::Context>, Arc<config::DokodemoSettings>),
     VlessXhttp(Arc<xhttp::Handler>),
 }
@@ -172,6 +172,9 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             tag: inbound.tag.clone(),
             port: inbound.port,
             users: RwLock::new(inbound.users),
+            ss_users: RwLock::new(inbound.shadowsocks_users),
+            ss_method: RwLock::new(inbound.shadowsocks_top_method),
+            ss_password: RwLock::new(inbound.shadowsocks_top_password),
             router: router.clone(),
             sniffing: inbound.sniffing,
             fallbacks: inbound.fallbacks,
@@ -180,11 +183,6 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
         let is_ss_udp = inbound.protocol == InboundProtocol::Shadowsocks && inbound.udp;
         let is_dokodemo_udp = inbound.protocol == InboundProtocol::Dokodemo && inbound.udp;
         let dokodemo_settings = inbound.dokodemo.clone();
-        let ss_users = if is_ss_udp {
-            Arc::new(inbound.shadowsocks_users.clone())
-        } else {
-            Arc::new(Vec::new())
-        };
         let ss_inbound_tag = inbound.tag.clone();
         let ss_listen = inbound.listen.clone();
         let ss_port = inbound.port;
@@ -236,7 +234,7 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
                 InboundHandler::Http(ctx.clone(), inbound.socks_auth)
             }
             (InboundProtocol::Shadowsocks, InboundTransport::Tcp) => {
-                InboundHandler::Shadowsocks(ctx.clone(), Arc::new(inbound.shadowsocks_users))
+                InboundHandler::Shadowsocks(ctx.clone())
             }
             (InboundProtocol::Dokodemo, InboundTransport::Tcp) => {
                 let settings = inbound.dokodemo.clone().unwrap_or(config::DokodemoSettings {
@@ -291,7 +289,6 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             ));
             let udp_handler = shadowsocks::ShadowsocksUdpHandler::new(
                 Arc::new(udp_socket),
-                ss_users,
                 ctx.clone(),
             );
             tokio::spawn(udp_handler.run());
@@ -548,8 +545,8 @@ async fn dispatch<I>(
                 log::info(format!("http from {} rejected: {e}", log::mask(peer)));
             }
         }
-        InboundHandler::Shadowsocks(ctx, users) => {
-            if let Err(e) = shadowsocks::serve_tcp(stream, users, &ctx, peer).await {
+        InboundHandler::Shadowsocks(ctx) => {
+            if let Err(e) = shadowsocks::serve_tcp(stream, &ctx, peer).await {
                 log::info(format!(
                     "shadowsocks from {} rejected: {e}",
                     log::mask(peer)

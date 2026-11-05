@@ -85,6 +85,8 @@ pub struct Inbound {
     pub protocol: InboundProtocol,
     pub users: Vec<User>,
     pub shadowsocks_users: Vec<ShadowsocksUser>,
+    pub shadowsocks_top_method: Option<String>,
+    pub shadowsocks_top_password: Option<String>,
     pub fallbacks: Vec<Fallback>,
     pub socks_auth: xray_proxy::inbound::SocksInboundAuth,
     pub udp: bool,
@@ -488,6 +490,15 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         .unwrap_or(&Value::Null);
     let accept_proxy_protocol = parse_accept_proxy_protocol(sockopt.get("acceptProxyProtocol"));
 
+    let (shadowsocks_top_method, shadowsocks_top_password) = if protocol == InboundProtocol::Shadowsocks {
+        (
+            Some(str_field(settings, "method").to_owned()).filter(|s| !s.is_empty()),
+            Some(str_field(settings, "password").to_owned()).filter(|s| !s.is_empty()),
+        )
+    } else {
+        (None, None)
+    };
+
     Ok(Some(Inbound {
         tag,
         listen,
@@ -495,6 +506,8 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         protocol,
         users,
         shadowsocks_users,
+        shadowsocks_top_method,
+        shadowsocks_top_password,
         fallbacks,
         socks_auth,
         udp,
