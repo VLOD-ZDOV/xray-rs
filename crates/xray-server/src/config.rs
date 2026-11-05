@@ -120,6 +120,9 @@ pub struct TlsSettings {
     pub alpn: Vec<String>,
     pub reject_unknown_sni: bool,
     pub server_names: Vec<String>,
+    pub min_version: Option<String>,
+    pub max_version: Option<String>,
+    pub cipher_suites: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -622,12 +625,33 @@ fn parse_tls(tls: &Value) -> Result<TlsSettings, String> {
             server_names.push(name.to_ascii_lowercase());
         }
     }
+    let min_version = tls
+        .get("minVersion")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let max_version = tls
+        .get("maxVersion")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let mut cipher_suites = Vec::new();
+    if let Some(cs) = tls.get("cipherSuites").and_then(Value::as_str) {
+        for s in cs.split(':').map(str::trim).filter(|s| !s.is_empty()) {
+            cipher_suites.push(s.to_owned());
+        }
+    } else if let Some(arr) = tls.get("cipherSuites").and_then(Value::as_array) {
+        for item in arr.iter().filter_map(Value::as_str) {
+            cipher_suites.push(item.to_owned());
+        }
+    }
     Ok(TlsSettings {
         cert_pem,
         key_pem,
         alpn,
         reject_unknown_sni,
         server_names,
+        min_version,
+        max_version,
+        cipher_suites,
     })
 }
 
@@ -1601,6 +1625,29 @@ mod tests {
         assert_eq!(
             tls.server_names,
             vec!["example.com", "api.example.com", "*.internal.net"]
+        );
+    }
+
+    #[test]
+    fn parses_tls_versions_and_ciphers() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "tls-vers", "port": 10444, "protocol": "vless",
+             "streamSettings": {"security": "tls", "tlsSettings": {
+               "certificates": [{"certificate": ["CERT"], "key": ["KEY"]}],
+               "minVersion": "1.3",
+               "maxVersion": "1.3",
+               "cipherSuites": "TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384"
+             }}}
+          ]
+        }"#;
+        let inbounds = parse(raw).unwrap().inbounds;
+        let tls = inbounds[0].tls.as_ref().unwrap();
+        assert_eq!(tls.min_version.as_deref(), Some("1.3"));
+        assert_eq!(tls.max_version.as_deref(), Some("1.3"));
+        assert_eq!(
+            tls.cipher_suites,
+            vec!["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384"]
         );
     }
 

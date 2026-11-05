@@ -734,7 +734,18 @@ fn tls_acceptor(
     }
     let key = PrivateKeyDer::from_pem_slice(&settings.key_pem)
         .map_err(|e| format!("invalid private key: {e}"))?;
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut provider_builder = rustls::crypto::ring::default_provider();
+    if !settings.cipher_suites.is_empty() {
+        provider_builder.cipher_suites.retain(|cs| {
+            let name = format!("{:?}", cs.suite());
+            settings.cipher_suites.iter().any(|wanted| {
+                wanted.eq_ignore_ascii_case(&name)
+                    || wanted.eq_ignore_ascii_case(name.strip_prefix("TLS13_").unwrap_or(&name))
+                    || wanted.eq_ignore_ascii_case(name.strip_prefix("TLS_").unwrap_or(&name))
+            })
+        });
+    }
+    let provider = Arc::new(provider_builder);
     let signing_key = provider
         .key_provider
         .load_private_key(key)
@@ -750,8 +761,15 @@ fn tls_acceptor(
         reject_unknown_sni: settings.reject_unknown_sni,
     });
 
+    let versions: &[&'static rustls::SupportedProtocolVersion] =
+        match (settings.min_version.as_deref(), settings.max_version.as_deref()) {
+            (Some("1.3"), _) => &[&rustls::version::TLS13],
+            (_, Some("1.2")) => &[&rustls::version::TLS12],
+            _ => rustls::ALL_VERSIONS,
+        };
+
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(versions)
         .map_err(|e| e.to_string())?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
