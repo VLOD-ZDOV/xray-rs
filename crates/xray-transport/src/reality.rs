@@ -21,6 +21,7 @@ type HmacSha512 = Hmac<Sha512>;
 const REALITY_SESSION_ID_LEN: usize = 32;
 const REALITY_MAX_SHORT_ID_LEN: usize = 8;
 const TLS_HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
+const TLS_EXTENSION_SERVER_NAME: u16 = 0x0000;
 const TLS_EXTENSION_KEY_SHARE: u16 = 0x0033;
 const TLS_GROUP_X25519: u16 = 0x001d;
 const TLS_GROUP_X25519_MLKEM768: u16 = 0x11ec;
@@ -340,83 +341,128 @@ impl<'a> ClientHelloCursor<'a> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealityClientHello {
+    pub random: [u8; 32],
+    pub session_id_offset: usize,
+    pub session_id: [u8; 32],
+    pub server_name: Option<String>,
+    pub key_share: Option<RealityClientHelloKeyShare>,
+}
+
+pub fn parse_reality_client_hello(raw: &[u8]) -> Result<RealityClientHello, RealityError> {
+    let mut cursor = ClientHelloCursor::new(raw);
+
+    let handshake_type = cursor.read_u8("missing handshake type")?;
+    if handshake_type != TLS_HANDSHAKE_CLIENT_HELLO {
+        return Err(RealityError::InvalidClientHello {
+            reason: "unexpected handshake type",
+        });
+    }
+
+    let handshake_len = cursor.read_u24("missing handshake length")?;
+    let expected_handshake_len =
+        raw.len()
+            .checked_sub(4)
+            .ok_or(RealityError::InvalidClientHello {
+                reason: "missing handshake header",
+            })?;
+    if handshake_len != expected_handshake_len {
+        return Err(RealityError::InvalidClientHello {
+            reason: "handshake length mismatch",
+        });
+    }
+
+    cursor.take(2, "missing legacy version")?;
+    let mut random = [0u8; 32];
+    random.copy_from_slice(cursor.take(32, "missing random")?);
+
+    let session_id_len = usize::from(cursor.read_u8("missing session id length")?);
+    if session_id_len != REALITY_SESSION_ID_LEN {
+        return Err(RealityError::MissingClientHelloSessionId);
+    }
+    let session_id_offset = cursor.absolute_offset();
+    let mut session_id = [0u8; 32];
+    session_id.copy_from_slice(cursor.take(REALITY_SESSION_ID_LEN, "truncated session id")?);
+
+    let cipher_suites_len = usize::from(cursor.read_u16("missing cipher suites length")?);
+    if cipher_suites_len % 2 != 0 {
+        return Err(RealityError::InvalidClientHello {
+            reason: "cipher suites length is not even",
+        });
+    }
+    cursor.take(cipher_suites_len, "truncated cipher suites")?;
+
+    let compression_methods_len =
+        usize::from(cursor.read_u8("missing compression methods length")?);
+    cursor.take(compression_methods_len, "truncated compression methods")?;
+
+    let extensions_len = usize::from(cursor.read_u16("missing extensions length")?);
+    let extensions_start = cursor.absolute_offset();
+    if cursor.checked_end(extensions_len, "truncated extensions")? != raw.len() {
+        return Err(RealityError::InvalidClientHello {
+            reason: "extensions length mismatch",
+        });
+    }
+    let extensions = cursor.take(extensions_len, "truncated extensions")?;
+
+    let mut extensions_cursor = ClientHelloCursor::with_base(extensions, extensions_start);
+    let mut key_share = None;
+    let mut server_name = None;
+
+    while extensions_cursor.offset < extensions.len() {
+        let extension_type = extensions_cursor.read_u16("missing extension type")?;
+        let extension_len =
+            usize::from(extensions_cursor.read_u16("missing extension length")?);
+        let extension_offset = extensions_cursor.absolute_offset();
+        let extension_data =
+            extensions_cursor.take(extension_len, "truncated extension data")?;
+        if extension_type == TLS_EXTENSION_KEY_SHARE {
+            if let Some(share) = parse_key_share_extension(extension_data, extension_offset)? {
+                key_share = Some(share);
+            }
+        } else if extension_type == TLS_EXTENSION_SERVER_NAME {
+            server_name = parse_sni_extension(extension_data);
+        }
+    }
+
+    Ok(RealityClientHello {
+        random,
+        session_id_offset,
+        session_id,
+        server_name,
+        key_share,
+    })
+}
+
+fn parse_sni_extension(data: &[u8]) -> Option<String> {
+    if data.len() < 2 {
+        return None;
+    }
+    let list_len = usize::from(u16::from_be_bytes([data[0], data[1]]));
+    let mut cursor = 2;
+    let end = (2 + list_len).min(data.len());
+    while cursor + 3 <= end {
+        let name_type = data[cursor];
+        let name_len = usize::from(u16::from_be_bytes([data[cursor + 1], data[cursor + 2]]));
+        cursor += 3;
+        if name_type == 0 && cursor + name_len <= end {
+            return std::str::from_utf8(&data[cursor..cursor + name_len])
+                .ok()
+                .map(|s| s.to_ascii_lowercase());
+        }
+        cursor += name_len;
+    }
+    None
+}
+
 impl ParsedClientHello {
     fn parse(raw: &[u8]) -> Result<Self, RealityError> {
-        let mut cursor = ClientHelloCursor::new(raw);
-
-        let handshake_type = cursor.read_u8("missing handshake type")?;
-        if handshake_type != TLS_HANDSHAKE_CLIENT_HELLO {
-            return Err(RealityError::InvalidClientHello {
-                reason: "unexpected handshake type",
-            });
-        }
-
-        let handshake_len = cursor.read_u24("missing handshake length")?;
-        let expected_handshake_len =
-            raw.len()
-                .checked_sub(4)
-                .ok_or(RealityError::InvalidClientHello {
-                    reason: "missing handshake header",
-                })?;
-        if handshake_len != expected_handshake_len {
-            return Err(RealityError::InvalidClientHello {
-                reason: "handshake length mismatch",
-            });
-        }
-
-        cursor.take(2, "missing legacy version")?;
-        let mut random = [0u8; 32];
-        random.copy_from_slice(cursor.take(32, "missing random")?);
-
-        let session_id_len = usize::from(cursor.read_u8("missing session id length")?);
-        if session_id_len != REALITY_SESSION_ID_LEN {
-            return Err(RealityError::MissingClientHelloSessionId);
-        }
-        let session_id_offset = cursor.absolute_offset();
-        cursor.take(REALITY_SESSION_ID_LEN, "truncated session id")?;
-
-        let cipher_suites_len = usize::from(cursor.read_u16("missing cipher suites length")?);
-        if cipher_suites_len % 2 != 0 {
-            return Err(RealityError::InvalidClientHello {
-                reason: "cipher suites length is not even",
-            });
-        }
-        cursor.take(cipher_suites_len, "truncated cipher suites")?;
-
-        let compression_methods_len =
-            usize::from(cursor.read_u8("missing compression methods length")?);
-        cursor.take(compression_methods_len, "truncated compression methods")?;
-
-        let extensions_len = usize::from(cursor.read_u16("missing extensions length")?);
-        let extensions_start = cursor.absolute_offset();
-        if cursor.checked_end(extensions_len, "truncated extensions")? != raw.len() {
-            return Err(RealityError::InvalidClientHello {
-                reason: "extensions length mismatch",
-            });
-        }
-        let extensions = cursor.take(extensions_len, "truncated extensions")?;
-
-        let mut extensions_cursor = ClientHelloCursor::with_base(extensions, extensions_start);
-        let mut key_share = None;
-        while extensions_cursor.offset < extensions.len() {
-            let extension_type = extensions_cursor.read_u16("missing extension type")?;
-            let extension_len =
-                usize::from(extensions_cursor.read_u16("missing extension length")?);
-            let extension_offset = extensions_cursor.absolute_offset();
-            let extension_data =
-                extensions_cursor.take(extension_len, "truncated extension data")?;
-            if extension_type == TLS_EXTENSION_KEY_SHARE {
-                key_share = parse_key_share_extension(extension_data, extension_offset)?;
-                if key_share.is_some() {
-                    break;
-                }
-            }
-        }
-
+        let hello = parse_reality_client_hello(raw)?;
         Ok(Self {
-            random,
-            session_id_offset,
-            key_share,
+            random: hello.random,
+            session_id_offset: hello.session_id_offset,
+            key_share: hello.key_share,
         })
     }
 }
@@ -797,4 +843,161 @@ pub(crate) fn validate_reality_short_id_len(short_id: &[u8]) -> Result<(), Reali
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecryptedRealitySessionId {
+    pub version: [u8; 3],
+    pub unix_time: u32,
+    pub short_id: [u8; 8],
+    pub auth_key: [u8; 32],
+}
+
+impl Drop for DecryptedRealitySessionId {
+    fn drop(&mut self) {
+        self.auth_key.zeroize();
+    }
+}
+
+pub fn decrypt_reality_session_id(
+    server_private_key: &[u8; 32],
+    client_public_key: &[u8; 32],
+    hello_random: &[u8; 32],
+    raw_client_hello: &[u8],
+    session_id_offset: usize,
+    sealed_session_id: &[u8; 32],
+) -> Result<DecryptedRealitySessionId, RealityError> {
+    let server_secret = StaticSecret::from(*server_private_key);
+    let client_pub = PublicKey::from(*client_public_key);
+    let shared_secret = server_secret.diffie_hellman(&client_pub);
+    if !shared_secret.was_contributory() {
+        return Err(RealityError::AllZeroSharedSecret);
+    }
+    let shared_secret = Zeroizing::new(shared_secret.to_bytes());
+    let auth_key = derive_reality_auth_key(&shared_secret, hello_random)?;
+    let cipher = Aes256Gcm::new_from_slice(&auth_key).map_err(|_| RealityError::Aead)?;
+    let nonce = <&Nonce<_>>::try_from(&hello_random[20..]).map_err(|_| RealityError::Aead)?;
+
+    let end = session_id_offset
+        .checked_add(REALITY_SESSION_ID_LEN)
+        .ok_or(RealityError::InvalidSessionIdRange {
+            offset: session_id_offset,
+            end: usize::MAX,
+            len: raw_client_hello.len(),
+        })?;
+    if end > raw_client_hello.len() {
+        return Err(RealityError::InvalidSessionIdRange {
+            offset: session_id_offset,
+            end,
+            len: raw_client_hello.len(),
+        });
+    }
+
+    let mut zeroed_hello = raw_client_hello.to_vec();
+    zeroed_hello[session_id_offset..end].fill(0);
+
+    let mut plaintext = [0u8; 16];
+    plaintext.copy_from_slice(&sealed_session_id[..16]);
+    let tag = aes_gcm::Tag::try_from(&sealed_session_id[16..]).map_err(|_| RealityError::Aead)?;
+
+    cipher
+        .decrypt_inout_detached(nonce, &zeroed_hello, plaintext.as_mut_slice().into(), &tag)
+        .map_err(|_| RealityError::Aead)?;
+
+    let mut version = [0u8; 3];
+    version.copy_from_slice(&plaintext[0..3]);
+    let unix_time = u32::from_be_bytes([plaintext[4], plaintext[5], plaintext[6], plaintext[7]]);
+    let mut short_id = [0u8; 8];
+    short_id.copy_from_slice(&plaintext[8..16]);
+
+    Ok(DecryptedRealitySessionId {
+        version,
+        unix_time,
+        short_id,
+        auth_key,
+    })
+}
+
+fn push_der_length(out: &mut Vec<u8>, len: usize) {
+    match len {
+        0..=127 => out.push(len as u8),
+        128..=255 => {
+            out.push(0x81);
+            out.push(len as u8);
+        }
+        256..=65535 => {
+            out.push(0x82);
+            out.extend_from_slice(&(len as u16).to_be_bytes());
+        }
+        _ => panic!("DER length exceeds 65535"),
+    }
+}
+
+fn push_der_tlv(out: &mut Vec<u8>, tag: u8, content: &[u8]) {
+    out.push(tag);
+    push_der_length(out, content.len());
+    out.extend_from_slice(content);
+}
+
+fn der_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    push_der_tlv(&mut out, tag, content);
+    out
+}
+
+fn der_sequence(content: &[u8]) -> Vec<u8> {
+    der_tlv(0x30, content)
+}
+
+fn der_bit_string(unused_bits: u8, bytes: &[u8]) -> Vec<u8> {
+    let mut content = Vec::with_capacity(bytes.len() + 1);
+    content.push(unused_bits);
+    content.extend_from_slice(bytes);
+    der_tlv(0x03, &content)
+}
+
+fn der_utc_time(value: &[u8; 13]) -> Vec<u8> {
+    der_tlv(0x17, value)
+}
+
+fn ed25519_algorithm_identifier() -> Vec<u8> {
+    vec![0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]
+}
+
+pub fn generate_reality_certificate_der(
+    auth_key: &[u8; 32],
+    ed25519_public_key: &[u8; 32],
+) -> Vec<u8> {
+    let mut mac = <HmacSha512 as KeyInit>::new_from_slice(auth_key)
+        .expect("HMAC-SHA512 accepts any key length");
+    mac.update(ed25519_public_key);
+    let signature = mac.finalize().into_bytes();
+
+    let algorithm = ed25519_algorithm_identifier();
+
+    let mut validity_content = Vec::new();
+    validity_content.extend_from_slice(&der_utc_time(b"250101000000Z"));
+    validity_content.extend_from_slice(&der_utc_time(b"260101000000Z"));
+    let validity = der_sequence(&validity_content);
+
+    let mut spki_content = Vec::new();
+    spki_content.extend_from_slice(&algorithm);
+    spki_content.extend_from_slice(&der_bit_string(0, ed25519_public_key));
+    let spki = der_sequence(&spki_content);
+
+    let mut tbs_content = Vec::new();
+    tbs_content.extend_from_slice(&[0xa0, 0x03, 0x02, 0x01, 0x02]); // version v3
+    tbs_content.extend_from_slice(&[0x02, 0x01, 0x01]); // serial number 1
+    tbs_content.extend_from_slice(&algorithm);
+    tbs_content.extend_from_slice(&[0x30, 0x00]); // empty issuer
+    tbs_content.extend_from_slice(&validity);
+    tbs_content.extend_from_slice(&[0x30, 0x00]); // empty subject
+    tbs_content.extend_from_slice(&spki);
+    let tbs = der_sequence(&tbs_content);
+
+    let mut cert_content = Vec::new();
+    cert_content.extend_from_slice(&tbs);
+    cert_content.extend_from_slice(&algorithm);
+    cert_content.extend_from_slice(&der_bit_string(0, &signature));
+    der_sequence(&cert_content)
 }

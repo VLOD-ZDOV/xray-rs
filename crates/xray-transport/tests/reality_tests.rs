@@ -5,7 +5,8 @@ mod reality_tests {
     use serde::Deserialize;
     use sha2::Sha512;
     use xray_transport::reality::{
-        build_reality_session_id, derive_reality_auth_key, prepare_reality_handshake,
+        build_reality_session_id, decrypt_reality_session_id, derive_reality_auth_key,
+        generate_reality_certificate_der, parse_reality_client_hello, prepare_reality_handshake,
         seal_reality_client_hello, verify_reality_certificate_binding,
         verify_reality_certificate_der, verify_reality_certificate_der_with_mldsa65,
         RealityCertificateInput, RealityCertificateVerification, RealityClientHelloPatch,
@@ -996,5 +997,68 @@ mod reality_tests {
             .expect_err("signature unused bits should fail");
 
         assert_eq!(err, RealityError::InvalidRealityCertificateBitString);
+    }
+
+    #[test]
+    fn test_generate_and_verify_reality_certificate() {
+        let auth_key = [0x55; 32];
+        let ed25519_pub = [0x66; 32];
+        let cert_der = generate_reality_certificate_der(&auth_key, &ed25519_pub);
+        let res = verify_reality_certificate_der(&auth_key, &cert_der).unwrap();
+        assert_eq!(res, RealityCertificateVerification::Verified);
+    }
+
+    #[test]
+    fn test_decrypt_reality_session_id_roundtrip() {
+        use x25519_dalek::{PublicKey, StaticSecret};
+        let server_secret = StaticSecret::from([0x22; 32]);
+        let server_pub = PublicKey::from(&server_secret).to_bytes();
+
+        let client_secret = StaticSecret::from([0x33; 32]);
+        let client_pub = PublicKey::from(&client_secret).to_bytes();
+
+        let shared_secret = client_secret
+            .diffie_hellman(&PublicKey::from(server_pub))
+            .to_bytes();
+        let hello_random = [0x77; 32];
+        let version = [26, 10, 21];
+        let unix_time = 1730000000;
+        let short_id = vec![1, 2, 3, 4, 5, 6, 7, 8];
+
+        let mut raw_hello = vec![0u8; 100];
+        let session_id_offset = 39;
+        let session_input = RealitySessionIdInput {
+            version,
+            unix_time,
+            short_id: short_id.clone(),
+            shared_secret,
+            hello_random,
+        };
+        let sealed_session_id = seal_reality_client_hello(
+            &session_input,
+            RealityClientHelloPatch { session_id_offset },
+            &mut raw_hello,
+        )
+        .unwrap();
+
+        let decrypted = decrypt_reality_session_id(
+            &[0x22; 32],
+            &client_pub,
+            &hello_random,
+            &raw_hello,
+            session_id_offset,
+            &sealed_session_id,
+        )
+        .unwrap();
+
+        assert_eq!(decrypted.version, version);
+        assert_eq!(decrypted.unix_time, unix_time);
+        assert_eq!(&decrypted.short_id[..], short_id.as_slice());
+    }
+
+    #[test]
+    fn test_parse_reality_client_hello_invalid() {
+        let empty = [];
+        assert!(parse_reality_client_hello(&empty).is_err());
     }
 }
