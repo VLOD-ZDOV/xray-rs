@@ -49,8 +49,6 @@ pub struct ShadowsocksUser {
 
 #[derive(Clone, Debug)]
 pub struct Fallback {
-    #[allow(dead_code)]
-    pub alpn: String,
     pub path: String,
     pub dest: FallbackDest,
     pub xver: u8,
@@ -59,7 +57,7 @@ pub struct Fallback {
 #[derive(Clone, Debug)]
 pub enum FallbackDest {
     Tcp(crate::vless::Host, u16),
-    #[cfg(unix)]
+    /// A socket path; `@name` is abstract and `@@name` abstract padded like Xray.
     Unix(String),
 }
 
@@ -74,7 +72,7 @@ pub struct Inbound {
     pub fallbacks: Vec<Fallback>,
     pub socks_auth: xray_proxy::inbound::SocksInboundAuth,
     pub udp: bool,
-    pub sniffing: bool,
+    pub sniffing: crate::vless::Sniffing,
     pub tls: Option<TlsSettings>,
     pub transport: InboundTransport,
 }
@@ -224,7 +222,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let network = str_field(stream, "network");
     let security = str_field(stream, "security");
 
-    let is_tcp = network.is_empty() || network == "tcp";
+    let is_tcp = matches!(network, "" | "tcp" | "raw");
     let is_ws = matches!(network, "ws" | "websocket");
     let is_httpupgrade = network == "httpupgrade";
     let is_grpc = matches!(network, "grpc" | "gun");
@@ -240,6 +238,16 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             } else {
                 security
             },
+        ));
+        return Ok(None);
+    }
+    let raw = stream
+        .get("rawSettings")
+        .or_else(|| stream.get("tcpSettings"));
+    let header = raw.and_then(|r| r.get("header")).unwrap_or(&Value::Null);
+    if is_tcp && !matches!(str_field(header, "type"), "" | "none") {
+        log::warn(format!(
+            "skipping inbound {tag:?}: tcp header obfuscation is not supported yet"
         ));
         return Ok(None);
     }
@@ -295,37 +303,42 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         xray_proxy::inbound::SocksInboundAuth::NoAuth
     };
     let net_str = str_field(settings, "network");
-    let udp = settings.get("udp").and_then(Value::as_bool).unwrap_or(false) || net_str.contains("udp");
+    let udp = settings
+        .get("udp")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || net_str.contains("udp");
 
     let mut shadowsocks_users = Vec::new();
     if protocol == InboundProtocol::Shadowsocks {
         let top_method = str_field(settings, "method");
-        let top_password = str_field(settings, "password");
-        let top_email = str_field(settings, "email");
-        if !top_method.is_empty() && !top_password.is_empty() {
-            let m = xray_proxy::shadowsocks::aead2017::Method::new(top_method, top_password)
-                .map_err(|e| format!("inbound {tag:?}: {e}"))?;
+        // Like Xray, the top-level password is the single user only when there are no clients.
+        let clients = array(settings, "clients");
+        let entries: Vec<&Value> = if clients.is_empty() {
+            vec![settings]
+        } else {
+            clients.iter().collect()
+        };
+        for entry in entries {
+            let method = match str_field(entry, "method") {
+                "" => top_method,
+                m => m,
+            };
+            let password = str_field(entry, "password");
+            let m = match xray_proxy::shadowsocks::aead2017::Method::new(method, password) {
+                Ok(m) => m,
+                Err(e) => {
+                    // 3x-ui defaults to 2022-blake3 methods, so skip rather than refuse to start.
+                    log::warn(format!(
+                        "skipping inbound {tag:?}: shadowsocks {method:?}: {e}"
+                    ));
+                    return Ok(None);
+                }
+            };
             shadowsocks_users.push(ShadowsocksUser {
                 method: Arc::new(m),
-                email: top_email.to_owned(),
+                email: str_field(entry, "email").to_owned(),
             });
-        }
-        for client in array(settings, "clients") {
-            let m_str = str_field(client, "method");
-            let method_name = if !m_str.is_empty() { m_str } else { top_method };
-            let pass = str_field(client, "password");
-            let email = str_field(client, "email");
-            if !method_name.is_empty() && !pass.is_empty() {
-                let m = xray_proxy::shadowsocks::aead2017::Method::new(method_name, pass)
-                    .map_err(|e| format!("inbound {tag:?}: {e}"))?;
-                shadowsocks_users.push(ShadowsocksUser {
-                    method: Arc::new(m),
-                    email: email.to_owned(),
-                });
-            }
-        }
-        if shadowsocks_users.is_empty() {
-            return Err(format!("inbound {tag:?}: shadowsocks requires method and password"));
         }
     }
 
@@ -339,14 +352,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let transport = if is_tcp {
         InboundTransport::Tcp
     } else if is_ws {
-        InboundTransport::Websocket(parse_ws(
-            stream.get("wsSettings").unwrap_or(&Value::Null),
-        )?)
+        InboundTransport::Websocket(parse_ws(stream.get("wsSettings").unwrap_or(&Value::Null))?)
     } else if is_httpupgrade {
         InboundTransport::HttpUpgrade(parse_httpupgrade(
-            stream
-                .get("httpupgradeSettings")
-                .unwrap_or(&Value::Null),
+            stream.get("httpupgradeSettings").unwrap_or(&Value::Null),
         )?)
     } else if is_grpc {
         InboundTransport::Grpc(parse_grpc(
@@ -364,16 +373,13 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         )?))
     };
 
-    let sniffing = item
-        .get("sniffing")
-        .and_then(|s| s.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let sniffing = parse_sniffing(item.get("sniffing").unwrap_or(&Value::Null), &tag);
 
     let mut fallbacks = Vec::new();
-    for fb in array(settings, "fallbacks") {
-        if let Some(f) = parse_fallback(fb) {
-            fallbacks.push(f);
+    for (i, fb) in array(settings, "fallbacks").iter().enumerate() {
+        match parse_fallback(fb) {
+            Ok(f) => fallbacks.push(f),
+            Err(e) => log::warn(format!("inbound {tag:?}: fallback {i} skipped: {e}")),
         }
     }
 
@@ -426,53 +432,76 @@ fn inline_or_file(cert: &Value, inline_key: &str, file_key: &str) -> Result<Vec<
     fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))
 }
 
-fn parse_fallback(item: &Value) -> Option<Fallback> {
-    let dest_val = item.get("dest")?;
-    let dest = if let Some(p) = dest_val.as_u64() {
-        FallbackDest::Tcp(
-            crate::vless::Host::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-            u16::try_from(p).ok()?,
-        )
-    } else if let Some(s) = dest_val.as_str() {
-        if s.starts_with('/') || s.starts_with('@') {
-            #[cfg(unix)]
-            {
-                FallbackDest::Unix(s.to_owned())
-            }
-            #[cfg(not(unix))]
-            {
-                return None;
-            }
-        } else if let Ok(p) = s.parse::<u16>() {
-            FallbackDest::Tcp(
-                crate::vless::Host::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
-                p,
-            )
-        } else if let Some((h_str, p_str)) = s.rsplit_once(':') {
-            let port = p_str.parse::<u16>().ok()?;
-            let host = match h_str
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<std::net::IpAddr>()
-            {
-                Ok(ip) => crate::vless::Host::Ip(ip),
-                Err(_) => crate::vless::Host::Domain(h_str.to_owned()),
-            };
-            FallbackDest::Tcp(host, port)
-        } else {
-            return None;
+fn parse_sniffing(item: &Value, tag: &str) -> crate::vless::Sniffing {
+    let mut sniffing = crate::vless::Sniffing::default();
+    let flag = |key| item.get(key).and_then(Value::as_bool).unwrap_or(false);
+    // metadataOnly skips payload sniffing, leaving only fakedns, which is not supported.
+    if !flag("enabled") || flag("metadataOnly") {
+        return sniffing;
+    }
+    sniffing.route_only = flag("routeOnly");
+    let mut ignored = Vec::new();
+    for name in array(item, "destOverride").iter().filter_map(Value::as_str) {
+        match name {
+            "http" => sniffing.http = true,
+            "tls" => sniffing.tls = true,
+            other => ignored.push(other),
         }
-    } else {
-        return None;
+    }
+    if !array(item, "domainsExcluded").is_empty() {
+        ignored.push("domainsExcluded");
+    }
+    if !ignored.is_empty() {
+        log::warn(format!(
+            "inbound {tag:?}: sniffing {} ignored",
+            ignored.join(", ")
+        ));
+    }
+    sniffing
+}
+
+fn parse_fallback(item: &Value) -> Result<Fallback, String> {
+    // name and alpn select a fallback by the TLS handshake, which is not tracked here.
+    for key in ["name", "alpn"] {
+        if !str_field(item, key).is_empty() {
+            return Err(format!("{key} is not supported"));
+        }
+    }
+    let localhost = |port| FallbackDest::Tcp(crate::vless::Host::Domain("localhost".into()), port);
+    let dest = match item.get("dest") {
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .map(localhost)
+            .ok_or("invalid dest port")?,
+        Some(Value::String(s)) if s.starts_with('/') || s.starts_with('@') => {
+            if cfg!(unix) {
+                FallbackDest::Unix(s.clone())
+            } else {
+                return Err("unix sockets are not supported on this platform".into());
+            }
+        }
+        Some(Value::String(s)) => match s.parse::<u16>() {
+            Ok(port) => localhost(port),
+            Err(_) => {
+                let (host, port) = s.rsplit_once(':').ok_or("dest needs host:port")?;
+                let port = port.parse::<u16>().map_err(|_| "invalid dest port")?;
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                let host = match host.parse::<std::net::IpAddr>() {
+                    Ok(ip) => crate::vless::Host::Ip(ip),
+                    Err(_) => crate::vless::Host::Domain(host.to_owned()),
+                };
+                FallbackDest::Tcp(host, port)
+            }
+        },
+        _ => return Err("missing dest".into()),
     };
-
-    let alpn = str_field(item, "alpn").to_owned();
-    let path = str_field(item, "path").to_owned();
-    let xver = item.get("xver").and_then(Value::as_u64).unwrap_or(0) as u8;
-
-    Some(Fallback {
-        alpn,
-        path,
+    let xver = match item.get("xver").and_then(Value::as_u64).unwrap_or(0) {
+        x @ 0..=2 => x as u8,
+        x => return Err(format!("xver {x} is not 0, 1 or 2")),
+    };
+    Ok(Fallback {
+        path: str_field(item, "path").to_owned(),
         dest,
         xver,
     })
@@ -673,9 +702,7 @@ fn parse_ws(settings: &Value) -> Result<crate::ws::WsSettings, String> {
     Ok(crate::ws::WsSettings { path, host })
 }
 
-fn parse_httpupgrade(
-    settings: &Value,
-) -> Result<crate::httpupgrade::HttpUpgradeSettings, String> {
+fn parse_httpupgrade(settings: &Value) -> Result<crate::httpupgrade::HttpUpgradeSettings, String> {
     let mut path = str_field(settings, "path").to_owned();
     if path.is_empty() {
         path = "/".to_owned();
@@ -1008,7 +1035,7 @@ mod tests {
         let raw = r#"{
           "inbounds": [
             {"tag": "vless-hu", "port": 80, "protocol": "vless",
-             "sniffing": {"enabled": true, "destOverride": ["http", "tls"]},
+             "sniffing": {"enabled": true, "destOverride": ["tls", "quic"], "routeOnly": true},
              "settings": {"clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "email": "alice"}]},
              "streamSettings": {"network": "httpupgrade", "security": "none", "httpupgradeSettings": {"path": "/hu", "host": "upgrade.example.com"}}}
           ]
@@ -1017,7 +1044,12 @@ mod tests {
         assert_eq!(config.inbounds.len(), 1);
         let inbound = &config.inbounds[0];
         assert_eq!(inbound.protocol, InboundProtocol::Vless);
-        assert!(inbound.sniffing);
+        let sniffing = crate::vless::Sniffing {
+            http: false,
+            tls: true,
+            route_only: true,
+        };
+        assert_eq!(inbound.sniffing, sniffing);
         if let InboundTransport::HttpUpgrade(hu) = &inbound.transport {
             assert_eq!(hu.path, "/hu");
             assert_eq!(hu.host.as_deref(), Some("upgrade.example.com"));
@@ -1069,5 +1101,17 @@ mod tests {
             parse_range(Some(&serde_json::json!({"from": 1, "to": 2}))),
             Some((1, 2))
         );
+    }
+
+    #[test]
+    fn skips_shadowsocks_2022_inbound() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "ss", "port": 8388, "protocol": "shadowsocks",
+             "settings": {"method": "2022-blake3-aes-256-gcm", "password": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+                          "clients": [{"password": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "email": "a"}]}}
+          ]
+        }"#;
+        assert!(parse(raw).unwrap().inbounds.is_empty());
     }
 }

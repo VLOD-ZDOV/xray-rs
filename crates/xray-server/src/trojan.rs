@@ -14,14 +14,11 @@ use xray_routing::{Target, TargetAddr};
 
 use crate::config::User;
 use crate::outbound::{self, ConeUdp};
-use crate::routing::{self, Action, BlockAction};
+use crate::routing::{Action, BlockAction};
 use crate::stats;
-use crate::vless::{
-    copy, relay, Activity, Context, Host, RouteRequest, CONN_IDLE,
-};
+use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest, CONN_IDLE};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
 const MAX_HEADER: usize = 56 + 2 + 1 + 1 + 255 + 2 + 2;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -197,7 +194,10 @@ where
             if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, &buf) {
                 return crate::fallback::serve(uplink, downlink, fb, buf, peer, ctx.port).await;
             }
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "trojan handshake failed"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "trojan handshake failed",
+            ));
         }
     };
 
@@ -209,15 +209,17 @@ where
         Command::Udp => Network::Udp,
     };
 
-    if network == Network::Tcp && early.is_empty() && (ctx.router.needs_sniff() || ctx.sniffing) {
-        let mut chunk = vec![0u8; 4096];
-        if let Ok(Ok(n)) = timeout(SNIFF_TIMEOUT, uplink.read(&mut chunk)).await {
-            early.extend_from_slice(&chunk[..n]);
-        }
+    if network == Network::Tcp
+        && early.is_empty()
+        && (ctx.router.needs_sniff() || ctx.sniffing.enabled())
+    {
+        read_first(&mut uplink, &mut early).await;
     }
 
     let payload = if network == Network::Udp {
-        early.get(2..).unwrap_or_default()
+        decode_udp_packet(&early)
+            .map(|(packet, _)| packet.payload)
+            .unwrap_or_default()
     } else {
         &early[..]
     };
@@ -237,13 +239,7 @@ where
         return Ok(());
     };
 
-    if ctx.sniffing {
-        if let Some(sniffed) =
-            routing::sniff_tls_sni(payload).or_else(|| routing::sniff_http_host(payload))
-        {
-            request.host = Host::Domain(sniffed);
-        }
-    }
+    ctx.sniffing.override_host(payload, &mut request.host);
 
     if let Action::Block(BlockAction::Http403) = decision.action {
         if request.command == Command::Tcp {
@@ -333,7 +329,10 @@ where
                         payload: &buf[..n],
                     })
                     .map_err(|e| {
-                        io::Error::new(io::ErrorKind::InvalidData, format!("trojan udp encode: {e}"))
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("trojan udp encode: {e}"),
+                        )
                     })?;
                     downlink.write_all(&wire).await?;
                     downlink.flush().await?;

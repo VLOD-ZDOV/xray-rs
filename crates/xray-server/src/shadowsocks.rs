@@ -19,10 +19,9 @@ use crate::log;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, Query};
 use crate::stats;
-use crate::vless::{copy, relay, Activity, Context, Host, RouteRequest};
+use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest, Sniffing};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const UDP_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 pub async fn serve_tcp<S>(
     stream: S,
@@ -34,7 +33,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let methods: Vec<Arc<Method>> = users.iter().map(|u| u.method.clone()).collect();
-    let (server_stream, user_idx, target, early) = timeout(
+    let (mut server_stream, user_idx, target, mut early) = timeout(
         HANDSHAKE_TIMEOUT,
         ServerStream::handshake_methods(stream, &methods),
     )
@@ -48,7 +47,10 @@ where
         .unwrap_or_default();
     let _online = stats::get().connect(email, peer.ip());
 
-    let (host, port) = target_to_host_port(&target);
+    if early.is_empty() && (ctx.router.needs_sniff() || ctx.sniffing.enabled()) {
+        read_first(&mut server_stream, &mut early).await;
+    }
+    let (mut host, port) = target_to_host_port(&target);
     let route = RouteRequest {
         ctx_tag: &ctx.tag,
         inbound_port: ctx.port,
@@ -65,9 +67,9 @@ where
     if let Action::Block(_) = decision.action {
         return Ok(());
     }
+    ctx.sniffing.override_host(&early, &mut host);
 
-    let mut outbound_stream =
-        outbound::connect(&ctx.router, &decision, route.host, route.port).await?;
+    let mut outbound_stream = outbound::connect(&ctx.router, &decision, &host, port).await?;
     let traffic = stats::get().traffic(&ctx.tag, email, &decision.tag);
     if !early.is_empty() {
         outbound_stream.write_all(&early).await?;
@@ -97,7 +99,11 @@ pub struct ShadowsocksUdpHandler {
 }
 
 impl ShadowsocksUdpHandler {
-    pub fn new(socket: Arc<UdpSocket>, users: Arc<Vec<ShadowsocksUser>>, ctx: Arc<Context>) -> Self {
+    pub fn new(
+        socket: Arc<UdpSocket>,
+        users: Arc<Vec<ShadowsocksUser>>,
+        ctx: Arc<Context>,
+    ) -> Self {
         Self {
             socket,
             users,
@@ -117,15 +123,20 @@ impl ShadowsocksUdpHandler {
                     continue;
                 }
             };
-            let packet = buf[..n].to_vec();
-
             let mut sessions = self.sessions.lock().await;
-            if let Some(tx) = sessions.get(&peer) {
-                if tx.send(packet.clone()).await.is_ok() {
-                    continue;
+            let packet = buf[..n].to_vec();
+            let packet = if let Some(tx) = sessions.get(&peer) {
+                // A full queue drops the datagram rather than stalling every session.
+                match tx.try_send(packet) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
+                    Err(mpsc::error::TrySendError::Closed(packet)) => {
+                        sessions.remove(&peer);
+                        packet
+                    }
                 }
-                sessions.remove(&peer);
-            }
+            } else {
+                packet
+            };
 
             // Find matching user for new session
             let mut matched = None;
@@ -147,7 +158,10 @@ impl ShadowsocksUdpHandler {
 
             let handler = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = handler.serve_udp_session(peer, user, target, payload, rx).await {
+                if let Err(e) = handler
+                    .serve_udp_session(peer, user, target, payload, rx)
+                    .await
+                {
                     log::debug(format!("shadowsocks udp session {peer} ended: {e}"));
                 }
                 handler.sessions.lock().await.remove(&peer);
@@ -166,87 +180,83 @@ impl ShadowsocksUdpHandler {
         let _online = stats::get().connect(&user.email, peer.ip());
 
         let (host, port) = target_to_host_port(&initial_target);
-        let query = Query {
-            inbound: &self.ctx.tag,
+        let route = RouteRequest {
+            ctx_tag: &self.ctx.tag,
             inbound_port: self.ctx.port,
-            user: &user.email,
-            source: peer,
+            email: &user.email,
+            peer,
             network: Network::Udp,
-            domain: match &host {
-                Host::Domain(d) => Some(d.as_str()),
-                Host::Ip(_) => None,
-            },
-            ip: match &host {
-                Host::Ip(ip) => Some(*ip),
-                Host::Domain(_) => None,
-            },
+            host: &host,
             port,
-            protocol: None,
+            sniffing: Sniffing::default(),
         };
-        let decision = self.ctx.router.route(&query).await;
+        let Some(decision) = route.allow(&self.ctx.router, &initial_payload).await else {
+            return Ok(());
+        };
         if let Action::Block(_) = decision.action {
             return Ok(());
         }
-
         let cone = ConeUdp::open(self.ctx.router.clone(), &decision).await?;
         let traffic = stats::get().traffic(&self.ctx.tag, &user.email, &decision.tag);
-        let activity = Arc::new(Activity::new());
+        let activity = Activity::new();
+        if let Ok(target) = cone.target(&host, port).await {
+            cone.send_to(&initial_payload, target).await?;
+            traffic.up(initial_payload.len());
+        }
 
-        // Send initial datagram
-        let target_addr = cone.target(&host, port).await?;
-        let _ = cone.send_to(&initial_payload, target_addr).await;
-        traffic.up(initial_payload.len());
-
-        let mut up_session = UdpSession::new(user.method.clone());
-        let mut down_session = UdpSession::new(user.method.clone());
-
-        let socket = self.socket.clone();
-        let cone = Arc::new(cone);
-        let cone_c = cone.clone();
-        let act = activity.clone();
-        let traffic_up = traffic.clone();
-        let traffic_down = traffic.clone();
-
-        let up = async move {
+        let up = async {
+            let mut session = UdpSession::new(user.method.clone());
             while let Some(packet) = rx.recv().await {
-                act.touch();
-                if let Ok((target, payload)) = up_session.decode(&packet) {
-                    let (h, p) = target_to_host_port(&target);
-                    if let Ok(addr) = cone_c.target(&h, p).await {
-                        let _ = cone_c.send_to(&payload, addr).await;
-                        traffic_up.up(payload.len());
-                    }
+                activity.touch();
+                let Ok((target, payload)) = session.decode(&packet) else {
+                    continue;
+                };
+                let (host, port) = target_to_host_port(&target);
+                let query = Query {
+                    inbound: &self.ctx.tag,
+                    inbound_port: self.ctx.port,
+                    user: &user.email,
+                    source: peer,
+                    network: Network::Udp,
+                    domain: match &host {
+                        Host::Domain(d) => Some(d.as_str()),
+                        Host::Ip(_) => None,
+                    },
+                    ip: match &host {
+                        Host::Ip(ip) => Some(*ip),
+                        Host::Domain(_) => None,
+                    },
+                    port,
+                    protocol: None,
+                };
+                if self.ctx.router.route(&query).await.tag != decision.tag {
+                    continue;
+                }
+                if let Ok(addr) = cone.target(&host, port).await {
+                    let _ = cone.send_to(&payload, addr).await;
+                    traffic.up(payload.len());
                 }
             }
-            Ok::<(), io::Error>(())
+            Ok(())
         };
-
-        let down = async move {
+        let down = async {
+            let mut session = UdpSession::new(user.method.clone());
             let mut buf = vec![0u8; 65535];
             loop {
+                let (n, from) = cone.recv_from(&mut buf).await?;
                 activity.touch();
-                let (n, from) = timeout(UDP_SESSION_TIMEOUT, cone.recv_from(&mut buf))
-                    .await
-                    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "udp idle timeout"))??;
-
                 let target = Target::new(
                     TargetAddr::Ip(from.ip()),
                     from.port(),
                     xray_routing::Network::Udp,
                 );
-                if let Ok(wire) = down_session.encode(&target, &buf[..n]) {
-                    let _ = socket.send_to(&wire, peer).await;
-                    traffic_down.down(n);
+                if let Ok(wire) = session.encode(&target, &buf[..n]) {
+                    let _ = self.socket.send_to(&wire, peer).await;
+                    traffic.down(n);
                 }
             }
-            #[allow(unreachable_code)]
-            Ok::<(), io::Error>(())
         };
-
-        tokio::select! {
-            res = up => res,
-            res = down => res,
-        }
+        relay(up, down, &activity).await
     }
 }
 

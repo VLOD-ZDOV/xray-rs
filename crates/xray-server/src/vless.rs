@@ -140,12 +140,52 @@ impl<'a> Cursor<'a> {
     }
 }
 
+/// Inbound `sniffing`: which first-packet sniffers may name the destination.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sniffing {
+    pub http: bool,
+    pub tls: bool,
+    pub route_only: bool,
+}
+
+impl Sniffing {
+    pub fn enabled(self) -> bool {
+        self.http || self.tls
+    }
+
+    pub fn domain(self, payload: &[u8]) -> Option<String> {
+        let tls = self.tls.then(|| routing::sniff_tls_sni(payload)).flatten();
+        tls.or_else(|| {
+            self.http
+                .then(|| routing::sniff_http_host(payload))
+                .flatten()
+        })
+    }
+
+    /// Like Xray, the sniffed domain replaces the destination unless `routeOnly` is set.
+    pub fn override_host(self, payload: &[u8], host: &mut Host) {
+        if !self.route_only {
+            if let Some(domain) = self.domain(payload) {
+                *host = Host::Domain(domain);
+            }
+        }
+    }
+}
+
+/// Waits briefly for the client's first bytes, which routing and sniffing inspect.
+pub(crate) async fn read_first<R: AsyncRead + Unpin>(reader: &mut R, early: &mut Vec<u8>) {
+    let mut chunk = vec![0u8; 4096];
+    if let Ok(Ok(n)) = timeout(SNIFF_TIMEOUT, reader.read(&mut chunk)).await {
+        early.extend_from_slice(&chunk[..n]);
+    }
+}
+
 pub struct Context {
     pub tag: String,
     pub port: u16,
     pub users: RwLock<Vec<User>>,
     pub router: Arc<Router>,
-    pub sniffing: bool,
+    pub sniffing: Sniffing,
     pub fallbacks: Vec<crate::config::Fallback>,
 }
 
@@ -236,7 +276,10 @@ where
             if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, &buf) {
                 return crate::fallback::serve(uplink, downlink, fb, buf, peer, ctx.port).await;
             }
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "vless handshake failed"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "vless handshake failed",
+            ));
         }
     };
     let mut early = buf.split_off(header_len);
@@ -265,11 +308,11 @@ where
     } else {
         Network::Udp
     };
-    if network == Network::Tcp && early.is_empty() && (ctx.router.needs_sniff() || ctx.sniffing) {
-        let mut chunk = vec![0u8; 4096];
-        if let Ok(Ok(n)) = timeout(SNIFF_TIMEOUT, uplink.read(&mut chunk)).await {
-            early.extend_from_slice(&chunk[..n]);
-        }
+    if network == Network::Tcp
+        && early.is_empty()
+        && (ctx.router.needs_sniff() || ctx.sniffing.enabled())
+    {
+        read_first(&mut uplink, &mut early).await;
     }
     // UDP early data is length-prefixed packets.
     let payload = if network == Network::Udp {
@@ -290,11 +333,7 @@ where
     let Some(decision) = route.allow(&ctx.router, payload).await else {
         return Ok(());
     };
-    if ctx.sniffing {
-        if let Some(sniffed) = routing::sniff_tls_sni(payload).or_else(|| routing::sniff_http_host(payload)) {
-            request.host = Host::Domain(sniffed);
-        }
-    }
+    ctx.sniffing.override_host(payload, &mut request.host);
     if let Action::Block(BlockAction::Http403) = decision.action {
         if request.command == Command::Tcp {
             downlink.write_all(&[request.version, 0]).await?;
@@ -353,17 +392,13 @@ pub(crate) struct RouteRequest<'a> {
     pub network: Network,
     pub host: &'a Host,
     pub port: u16,
-    pub sniffing: bool,
+    pub sniffing: Sniffing,
 }
 
 impl RouteRequest<'_> {
     /// Routes the request and writes the access log line. None means blocked.
     pub(crate) async fn allow(&self, router: &Router, first_payload: &[u8]) -> Option<Decision> {
-        let sniffed_domain = if self.sniffing {
-            routing::sniff_tls_sni(first_payload).or_else(|| routing::sniff_http_host(first_payload))
-        } else {
-            None
-        };
+        let sniffed_domain = self.sniffing.domain(first_payload);
         let (domain, ip) = if let Some(ref d) = sniffed_domain {
             (Some(d.as_str()), None)
         } else {

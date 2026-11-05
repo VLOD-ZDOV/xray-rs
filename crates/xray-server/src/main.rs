@@ -137,7 +137,11 @@ enum InboundHandler {
     TrojanWs(Arc<vless::Context>, ws::WsSettings),
     TrojanHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
     TrojanGrpc(Arc<grpc::Handler>),
-    Socks(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth, bool),
+    Socks(
+        Arc<vless::Context>,
+        xray_proxy::inbound::SocksInboundAuth,
+        bool,
+    ),
     Http(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth),
     Shadowsocks(Arc<vless::Context>, Arc<Vec<config::ShadowsocksUser>>),
     VlessXhttp(Arc<xhttp::Handler>),
@@ -175,7 +179,9 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
         let ss_port = inbound.port;
 
         let handler = match (inbound.protocol, inbound.transport) {
-            (InboundProtocol::Vless, InboundTransport::Tcp) => InboundHandler::VlessTcp(ctx.clone()),
+            (InboundProtocol::Vless, InboundTransport::Tcp) => {
+                InboundHandler::VlessTcp(ctx.clone())
+            }
             (InboundProtocol::Vless, InboundTransport::Websocket(settings)) => {
                 InboundHandler::VlessWs(ctx.clone(), settings)
             }
@@ -188,7 +194,9 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
                     grpc::GrpcProtocol::Vless(ctx.clone()),
                 ))
             }
-            (InboundProtocol::Trojan, InboundTransport::Tcp) => InboundHandler::TrojanTcp(ctx.clone()),
+            (InboundProtocol::Trojan, InboundTransport::Tcp) => {
+                InboundHandler::TrojanTcp(ctx.clone())
+            }
             (InboundProtocol::Trojan, InboundTransport::Websocket(settings)) => {
                 InboundHandler::TrojanWs(ctx.clone(), settings)
             }
@@ -300,11 +308,7 @@ fn bracket(host: &str) -> String {
     }
 }
 
-async fn accept_loop(
-    listener: TcpListener,
-    tls: Option<TlsAcceptor>,
-    handler: InboundHandler,
-) {
+async fn accept_loop(listener: TcpListener, tls: Option<TlsAcceptor>, handler: InboundHandler) {
     loop {
         let (stream, peer) = match listener.accept().await {
             Ok(accepted) => accepted,
@@ -315,24 +319,29 @@ async fn accept_loop(
             }
         };
         let _ = stream.set_nodelay(true);
+        let local = stream.local_addr().ok();
         let (tls, handler) = (tls.clone(), handler.clone());
         tokio::spawn(async move {
             match tls {
                 Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(stream) => dispatch(stream, peer, handler).await,
+                    Ok(stream) => dispatch(stream, peer, local, handler).await,
                     Err(e) => log::debug(format!(
                         "tls handshake from {} failed: {e}",
                         log::mask(peer)
                     )),
                 },
-                None => dispatch(stream, peer, handler).await,
+                None => dispatch(stream, peer, local, handler).await,
             }
         });
     }
 }
 
-async fn dispatch<I>(stream: I, peer: SocketAddr, handler: InboundHandler)
-where
+async fn dispatch<I>(
+    stream: I,
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+    handler: InboundHandler,
+) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match handler {
@@ -342,29 +351,33 @@ where
                 log::info(format!("vless from {} rejected: {e}", log::mask(peer)));
             }
         }
-        InboundHandler::VlessWs(ctx, ws_settings) => {
-            match ws::accept(stream, &ws_settings).await {
-                Ok(ws_stream) => {
-                    let (uplink, downlink) = tokio::io::split(ws_stream);
-                    if let Err(e) = vless::serve(uplink, downlink, &ctx, peer).await {
-                        log::info(format!("vless-ws from {} rejected: {e}", log::mask(peer)));
-                    }
-                }
-                Err(e) => {
-                    log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
+        InboundHandler::VlessWs(ctx, ws_settings) => match ws::accept(stream, &ws_settings).await {
+            Ok(ws_stream) => {
+                let (uplink, downlink) = tokio::io::split(ws_stream);
+                if let Err(e) = vless::serve(uplink, downlink, &ctx, peer).await {
+                    log::info(format!("vless-ws from {} rejected: {e}", log::mask(peer)));
                 }
             }
-        }
+            Err(e) => {
+                log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
+            }
+        },
         InboundHandler::VlessHttpUpgrade(ctx, hu_settings) => {
             match httpupgrade::accept(stream, &hu_settings).await {
                 Ok(prefixed_stream) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
                     if let Err(e) = vless::serve(uplink, downlink, &ctx, peer).await {
-                        log::info(format!("vless-httpupgrade from {} rejected: {e}", log::mask(peer)));
+                        log::info(format!(
+                            "vless-httpupgrade from {} rejected: {e}",
+                            log::mask(peer)
+                        ));
                     }
                 }
                 Err(e) => {
-                    log::info(format!("httpupgrade handshake from {} failed: {e}", log::mask(peer)));
+                    log::info(format!(
+                        "httpupgrade handshake from {} failed: {e}",
+                        log::mask(peer)
+                    ));
                 }
             }
         }
@@ -392,16 +405,23 @@ where
                 Ok(prefixed_stream) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
                     if let Err(e) = trojan::serve(uplink, downlink, &ctx, peer).await {
-                        log::info(format!("trojan-httpupgrade from {} rejected: {e}", log::mask(peer)));
+                        log::info(format!(
+                            "trojan-httpupgrade from {} rejected: {e}",
+                            log::mask(peer)
+                        ));
                     }
                 }
                 Err(e) => {
-                    log::info(format!("httpupgrade handshake from {} failed: {e}", log::mask(peer)));
+                    log::info(format!(
+                        "httpupgrade handshake from {} failed: {e}",
+                        log::mask(peer)
+                    ));
                 }
             }
         }
         InboundHandler::Socks(ctx, auth, udp) => {
-            if let Err(e) = inbound_proxy::serve_socks(stream, &auth, udp, &ctx, peer).await {
+            if let Err(e) = inbound_proxy::serve_socks(stream, &auth, udp, &ctx, peer, local).await
+            {
                 log::info(format!("socks from {} rejected: {e}", log::mask(peer)));
             }
         }
@@ -412,7 +432,10 @@ where
         }
         InboundHandler::Shadowsocks(ctx, users) => {
             if let Err(e) = shadowsocks::serve_tcp(stream, users, &ctx, peer).await {
-                log::info(format!("shadowsocks from {} rejected: {e}", log::mask(peer)));
+                log::info(format!(
+                    "shadowsocks from {} rejected: {e}",
+                    log::mask(peer)
+                ));
             }
         }
         InboundHandler::VlessGrpc(h) | InboundHandler::TrojanGrpc(h) => {

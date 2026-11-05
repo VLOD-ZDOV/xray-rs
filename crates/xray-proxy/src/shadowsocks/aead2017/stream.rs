@@ -285,10 +285,7 @@ enum ServerPhase {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> ServerStream<S> {
-    pub async fn handshake(
-        inner: S,
-        method: Arc<Method>,
-    ) -> io::Result<(Self, Target, Vec<u8>)> {
+    pub async fn handshake(inner: S, method: Arc<Method>) -> io::Result<(Self, Target, Vec<u8>)> {
         let (stream, _, target, early) = Self::handshake_methods(inner, &[method]).await?;
         Ok((stream, target, early))
     }
@@ -323,8 +320,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerStream<S> {
             }
         }
 
-        let (user_idx, method, mut reader, addr_len) = matched
-            .ok_or_else(|| invalid("Shadowsocks AEAD authentication failed"))?;
+        let (user_idx, method, mut reader, addr_len) =
+            matched.ok_or_else(|| invalid("Shadowsocks AEAD authentication failed"))?;
 
         let mut addr_buf = Zeroizing::new(vec![0u8; addr_len + TAG_LENGTH]);
         inner.read_exact(&mut addr_buf).await?;
@@ -686,13 +683,15 @@ mod tests {
     async fn server_stream_and_client_stream_interop() {
         for case in fixtures() {
             let m = method(&case);
-            let target = Target::new(TargetAddr::Domain("example.test".into()), 8080, Network::Tcp);
+            let target = Target::new(
+                TargetAddr::Domain("example.test".into()),
+                8080,
+                Network::Tcp,
+            );
             let (client_io, server_io) = tokio::io::duplex(65536);
 
             let mut client = ClientStream::new(client_io, m.clone(), &target).unwrap();
-            let handle = tokio::spawn(async move {
-                ServerStream::handshake(server_io, m).await
-            });
+            let handle = tokio::spawn(async move { ServerStream::handshake(server_io, m).await });
             client.flush().await.unwrap();
             let (mut server, decoded_target, early) = handle.await.unwrap().unwrap();
             assert_eq!(decoded_target, target);

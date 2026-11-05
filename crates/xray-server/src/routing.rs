@@ -156,7 +156,9 @@ impl Router {
                         "" | "none" => BlockAction::Drop,
                         "http" => BlockAction::Http403,
                         other => {
-                            log::warn(format!("outbound {tag:?}: unsupported blackhole response type {other:?}"));
+                            log::warn(format!(
+                                "outbound {tag:?}: unsupported blackhole response type {other:?}"
+                            ));
                             BlockAction::Drop
                         }
                     };

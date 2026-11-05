@@ -4,45 +4,32 @@ use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::TcpStream;
-#[cfg(unix)]
-use tokio::net::UnixStream;
+use tokio::net::{TcpStream, UnixStream};
 
 use crate::config::{Fallback, FallbackDest};
 use crate::vless::{copy, relay, Activity, Host};
 
-pub fn find_fallback<'a>(fallbacks: &'a [Fallback], buf: &[u8]) -> Option<&'a Fallback> {
-    if fallbacks.is_empty() {
-        return None;
-    }
-    let req_path = extract_http_path(buf);
-    if let Some(path) = req_path {
-        for fb in fallbacks {
-            if !fb.path.is_empty() && path.starts_with(&fb.path) {
-                return Some(fb);
-            }
-        }
-    }
-    for fb in fallbacks {
-        if fb.path.is_empty() {
-            return Some(fb);
-        }
-    }
-    fallbacks.first()
+/// Picks the fallback the way Xray does: an exact `path` match on an HTTP/1 request
+/// line, else the entry without a path.
+pub fn find_fallback<'a>(fallbacks: &'a [Fallback], first: &[u8]) -> Option<&'a Fallback> {
+    request_path(first)
+        .and_then(|path| fallbacks.iter().find(|fb| fb.path == path))
+        .or_else(|| fallbacks.iter().find(|fb| fb.path.is_empty()))
 }
 
-fn extract_http_path(buf: &[u8]) -> Option<&str> {
-    let s = std::str::from_utf8(buf).ok()?;
-    let line = s.lines().next()?;
-    let mut parts = line.split_whitespace();
-    let method = parts.next()?;
-    if matches!(
-        method,
-        "GET" | "POST" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "PATCH" | "CONNECT"
-    ) {
-        return parts.next();
+/// Xray's scan: the path starts within bytes 5..=9 and ends at ' ' or '?' before byte 64.
+fn request_path(first: &[u8]) -> Option<&str> {
+    if first.len() < 18 || first[4] == b'*' {
+        return None;
     }
-    None
+    let start = (4..=8).find(|&i| first[i] == b'/' && first[i - 1] == b' ')?;
+    let end = first[start + 1..first.len().min(64)]
+        .iter()
+        .take_while(|&&k| k != b'\r' && k != b'\n')
+        .position(|&k| k == b' ' || k == b'?')?
+        + start
+        + 1;
+    std::str::from_utf8(&first[start..end]).ok()
 }
 
 pub async fn serve<R, W>(
@@ -57,44 +44,55 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    match &fallback.dest {
+    let mut dest: Box<dyn Stream> = match &fallback.dest {
         FallbackDest::Tcp(host, port) => {
-            let addr_str = match host {
-                Host::Ip(ip) => format!("{}:{}", ip, port),
-                Host::Domain(d) => format!("{}:{}", d, port),
+            let stream = match host {
+                Host::Ip(ip) => TcpStream::connect((*ip, *port)).await?,
+                Host::Domain(name) => TcpStream::connect((name.as_str(), *port)).await?,
             };
-            let mut dest_stream = TcpStream::connect(&addr_str).await?;
-            dest_stream.set_nodelay(true)?;
-            write_proxy_header(&mut dest_stream, fallback.xver, peer, inbound_port).await?;
-            if !early.is_empty() {
-                dest_stream.write_all(&early).await?;
-            }
-            let (mut dest_r, mut dest_w) = tokio::io::split(dest_stream);
-            let activity = Activity::new();
-            relay(
-                copy(&mut client_r, &mut dest_w, &activity, |_| ()),
-                copy(&mut dest_r, &mut client_w, &activity, |_| ()),
-                &activity,
-            )
-            .await
+            stream.set_nodelay(true)?;
+            Box::new(stream)
         }
-        #[cfg(unix)]
-        FallbackDest::Unix(path) => {
-            let mut dest_stream = UnixStream::connect(path).await?;
-            write_proxy_header(&mut dest_stream, fallback.xver, peer, inbound_port).await?;
-            if !early.is_empty() {
-                dest_stream.write_all(&early).await?;
-            }
-            let (mut dest_r, mut dest_w) = tokio::io::split(dest_stream);
-            let activity = Activity::new();
-            relay(
-                copy(&mut client_r, &mut dest_w, &activity, |_| ()),
-                copy(&mut dest_r, &mut client_w, &activity, |_| ()),
-                &activity,
-            )
-            .await
-        }
-    }
+        FallbackDest::Unix(path) => Box::new(connect_unix(path).await?),
+    };
+    write_proxy_header(&mut dest, fallback.xver, peer, inbound_port).await?;
+    dest.write_all(&early).await?;
+    let (mut dest_r, mut dest_w) = tokio::io::split(dest);
+    let activity = Activity::new();
+    relay(
+        copy(&mut client_r, &mut dest_w, &activity, |_| ()),
+        copy(&mut dest_r, &mut client_w, &activity, |_| ()),
+        &activity,
+    )
+    .await
+}
+
+trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
+
+#[cfg(target_os = "linux")]
+async fn connect_unix(path: &str) -> io::Result<UnixStream> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr as UnixAddr, UnixStream as StdUnixStream};
+
+    let name = if let Some(name) = path.strip_prefix("@@") {
+        // Go pads the name to the full sun_path, and Xray keeps that for "@@".
+        let mut padded = name.as_bytes().to_vec();
+        padded.resize(107, 0);
+        padded
+    } else if let Some(name) = path.strip_prefix('@') {
+        name.as_bytes().to_vec()
+    } else {
+        return UnixStream::connect(path).await;
+    };
+    let stream = StdUnixStream::connect_addr(&UnixAddr::from_abstract_name(name)?)?;
+    stream.set_nonblocking(true)?;
+    UnixStream::from_std(stream)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+async fn connect_unix(path: &str) -> io::Result<UnixStream> {
+    UnixStream::connect(path).await
 }
 
 async fn write_proxy_header<W: AsyncWrite + Unpin>(
@@ -146,4 +144,29 @@ async fn write_proxy_header<W: AsyncWrite + Unpin>(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fallback(path: &str, port: u16) -> Fallback {
+        Fallback {
+            path: path.to_owned(),
+            dest: FallbackDest::Tcp(Host::Domain("localhost".into()), port),
+            xver: 0,
+        }
+    }
+
+    #[test]
+    fn matches_paths_like_xray() {
+        let fbs = [fallback("/ws", 1), fallback("", 2)];
+        let pick = |first: &[u8]| find_fallback(&fbs, first).map(|fb| fb.path.as_str());
+        assert_eq!(pick(b"GET /ws HTTP/1.1\r\nHost: a\r\n"), Some("/ws"));
+        assert_eq!(pick(b"POST /ws?x=1 HTTP/1.1\r\nHost: a\r\n"), Some("/ws"));
+        assert_eq!(pick(b"GET /wsx HTTP/1.1\r\nHost: a\r\n"), Some(""));
+        assert_eq!(pick(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), Some(""));
+        assert_eq!(pick(b"\x16\x03\x01\x02\x00"), Some(""));
+        assert!(find_fallback(&fbs[..1], b"GET /other HTTP/1.1\r\n\r\n").is_none());
+    }
 }

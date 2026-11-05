@@ -20,7 +20,7 @@ use crate::log;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, BlockAction, Decision, Router};
 use crate::stats::{self, Traffic};
-use crate::vless::{host_label, Host, RouteRequest, CONN_IDLE};
+use crate::vless::{host_label, Host, RouteRequest, Sniffing, CONN_IDLE};
 
 const STATUS_NEW: u8 = 1;
 const STATUS_KEEP: u8 = 2;
@@ -159,7 +159,7 @@ pub struct Info {
     pub port: u16,
     pub email: String,
     pub router: Arc<Router>,
-    pub sniffing: bool,
+    pub sniffing: Sniffing,
 }
 
 struct Packet {
@@ -196,7 +196,7 @@ where
             };
             match frame.status {
                 STATUS_NEW => {
-                    let Some((network, host, port)) = frame.target else {
+                    let Some((network, mut host, port)) = frame.target else {
                         return Err(invalid("mux new frame without target"));
                     };
                     if sessions.len() >= MAX_SESSIONS {
@@ -236,6 +236,10 @@ where
                         }
                         let _ = out_tx.send(end_frame(frame.id, false)).await;
                         continue;
+                    }
+                    if !udp {
+                        let data = frame.data.as_deref().unwrap_or_default();
+                        info.sniffing.override_host(data, &mut host);
                     }
                     let traffic = stats::get().traffic(&info.tag, &info.email, &decision.tag);
                     let dial = Dial {
