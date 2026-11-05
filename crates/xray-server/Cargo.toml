@@ -27,6 +27,12 @@ rustls = { workspace = true }
 serde_json.workspace = true
 sha1.workspace = true
 sha2.workspace = true
+aws-lc-rs.workspace = true
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+x25519-dalek.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tokio-rustls.workspace = true
 uuid = { workspace = true, features = ["v5"] }

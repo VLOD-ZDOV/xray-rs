@@ -17,7 +17,7 @@ The server crate and every workspace crate it is built from (`xray-config`,
 | Area | Supported |
 |---|---|
 | Inbound protocols | VLESS (including XTLS Vision), VMess (AEAD), Trojan, Shadowsocks (AEAD and 2022, multi-user), SOCKS5, HTTP proxy, dokodemo-door |
-| Security | TLS (`minVersion`, `maxVersion`, `cipherSuites`, `rejectUnknownSni`), REALITY (see the note below), or plain behind nginx |
+| Security | TLS (`minVersion`, `maxVersion`, `cipherSuites`, `rejectUnknownSni`), REALITY (dest mirroring and padding), or plain behind nginx |
 | Transports | XHTTP (packet-up, stream-up, stream-one, Xray 26 obfuscation settings, `responseHeaders`), raw TCP (including `header: http`), WebSocket (with early data), HTTPUpgrade, gRPC (gun and multi mode); `acceptProxyProtocol` |
 | VLESS / Trojan | TCP, UDP, Mux.Cool and XUDP; `fallbacks` by `path` with PROXY protocol v1/v2 |
 | Sniffing | `destOverride` `http`, `tls`, `quic`; `routeOnly`, `metadataOnly`, `domainsExcluded` |
@@ -57,9 +57,6 @@ to run noise.
 
 ## Not supported yet
 
-- REALITY answers with its own TLS handshake instead of mirroring the `dest`
-  site the way XTLS/REALITY does. Clients connect, but an observer may tell the
-  server apart from the site. Keep the original core for REALITY for now.
 - UDP through `vmess`, `trojan` and `shadowsocks` outbounds is blocked; TCP
   works.
 - No replay protection for VMess and Shadowsocks 2022 TCP yet.
