@@ -28,6 +28,7 @@ pub enum InboundTransport {
     Tcp,
     Websocket(crate::ws::WsSettings),
     HttpUpgrade(crate::httpupgrade::HttpUpgradeSettings),
+    Grpc(crate::grpc::GrpcSettings),
     Xhttp(Box<XhttpSettings>),
 }
 
@@ -226,9 +227,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let is_tcp = network.is_empty() || network == "tcp";
     let is_ws = matches!(network, "ws" | "websocket");
     let is_httpupgrade = network == "httpupgrade";
+    let is_grpc = matches!(network, "grpc" | "gun");
     let is_xhttp = matches!(network, "xhttp" | "splithttp");
     let supported_security = matches!(security, "" | "none" | "tls");
-    if (!is_tcp && !is_ws && !is_httpupgrade && !is_xhttp) || !supported_security {
+    if (!is_tcp && !is_ws && !is_httpupgrade && !is_grpc && !is_xhttp) || !supported_security {
         log::warn(format!(
             "skipping inbound {tag:?}: {:?}/{}/{} is not supported yet",
             protocol,
@@ -344,6 +346,13 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         InboundTransport::HttpUpgrade(parse_httpupgrade(
             stream
                 .get("httpupgradeSettings")
+                .unwrap_or(&Value::Null),
+        )?)
+    } else if is_grpc {
+        InboundTransport::Grpc(parse_grpc(
+            stream
+                .get("grpcSettings")
+                .or_else(|| stream.get("gunSettings"))
                 .unwrap_or(&Value::Null),
         )?)
     } else {
@@ -682,6 +691,40 @@ fn parse_httpupgrade(
     Ok(crate::httpupgrade::HttpUpgradeSettings { path, host })
 }
 
+fn parse_grpc(value: &Value) -> Result<crate::grpc::GrpcSettings, String> {
+    if value.is_null() {
+        return Ok(crate::grpc::GrpcSettings {
+            service_name: String::new(),
+            multi_mode: false,
+            authority: None,
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "grpcSettings must be an object".to_string())?;
+    let service_name = obj
+        .get("serviceName")
+        .or_else(|| obj.get("service_name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let multi_mode = obj
+        .get("multiMode")
+        .or_else(|| obj.get("multi_mode"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let authority = obj
+        .get("authority")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Ok(crate::grpc::GrpcSettings {
+        service_name,
+        multi_mode,
+        authority,
+    })
+}
+
 fn placement_of(value: &str) -> Placement {
     match value {
         "query" => Placement::Query,
@@ -980,6 +1023,38 @@ mod tests {
             assert_eq!(hu.host.as_deref(), Some("upgrade.example.com"));
         } else {
             panic!("expected httpupgrade transport");
+        }
+    }
+
+    #[test]
+    fn parses_grpc_inbounds() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "vless-grpc", "port": 443, "protocol": "vless",
+             "settings": {"clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "email": "alice"}]},
+             "streamSettings": {"network": "grpc", "security": "none", "grpcSettings": {"serviceName": "MyGun", "multiMode": true, "authority": "example.com"}}},
+            {"tag": "trojan-grpc", "port": 8443, "protocol": "trojan",
+             "settings": {"clients": [{"password": "secret", "email": "bob"}]},
+             "streamSettings": {"network": "gun", "security": "none"}}
+          ]
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.inbounds.len(), 2);
+        assert_eq!(config.inbounds[0].protocol, InboundProtocol::Vless);
+        if let InboundTransport::Grpc(grpc) = &config.inbounds[0].transport {
+            assert_eq!(grpc.service_name, "MyGun");
+            assert!(grpc.multi_mode);
+            assert_eq!(grpc.authority.as_deref(), Some("example.com"));
+        } else {
+            panic!("expected grpc transport");
+        }
+        assert_eq!(config.inbounds[1].protocol, InboundProtocol::Trojan);
+        if let InboundTransport::Grpc(grpc) = &config.inbounds[1].transport {
+            assert_eq!(grpc.service_name, "");
+            assert!(!grpc.multi_mode);
+            assert_eq!(grpc.authority, None);
+        } else {
+            panic!("expected grpc transport");
         }
     }
 

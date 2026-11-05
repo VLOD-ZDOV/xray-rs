@@ -3,6 +3,7 @@
 mod api;
 mod config;
 mod fallback;
+mod grpc;
 mod httpupgrade;
 mod inbound_proxy;
 mod log;
@@ -88,7 +89,11 @@ fn main() -> ExitCode {
         .iter()
         .map(|i| {
             let is_xhttp = matches!(i.transport, InboundTransport::Xhttp(_));
-            i.tls.as_ref().map(|s| tls_acceptor(s, is_xhttp)).transpose()
+            let is_grpc = matches!(i.transport, InboundTransport::Grpc(_));
+            i.tls
+                .as_ref()
+                .map(|s| tls_acceptor(s, is_xhttp, is_grpc))
+                .transpose()
         })
         .collect();
     let tls = match tls {
@@ -127,9 +132,11 @@ enum InboundHandler {
     VlessTcp(Arc<vless::Context>),
     VlessWs(Arc<vless::Context>, ws::WsSettings),
     VlessHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
+    VlessGrpc(Arc<grpc::Handler>),
     TrojanTcp(Arc<vless::Context>),
     TrojanWs(Arc<vless::Context>, ws::WsSettings),
     TrojanHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
+    TrojanGrpc(Arc<grpc::Handler>),
     Socks(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth, bool),
     Http(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth),
     Shadowsocks(Arc<vless::Context>, Arc<Vec<config::ShadowsocksUser>>),
@@ -175,12 +182,24 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             (InboundProtocol::Vless, InboundTransport::HttpUpgrade(settings)) => {
                 InboundHandler::VlessHttpUpgrade(ctx.clone(), settings)
             }
+            (InboundProtocol::Vless, InboundTransport::Grpc(settings)) => {
+                InboundHandler::VlessGrpc(grpc::Handler::new(
+                    settings,
+                    grpc::GrpcProtocol::Vless(ctx.clone()),
+                ))
+            }
             (InboundProtocol::Trojan, InboundTransport::Tcp) => InboundHandler::TrojanTcp(ctx.clone()),
             (InboundProtocol::Trojan, InboundTransport::Websocket(settings)) => {
                 InboundHandler::TrojanWs(ctx.clone(), settings)
             }
             (InboundProtocol::Trojan, InboundTransport::HttpUpgrade(settings)) => {
                 InboundHandler::TrojanHttpUpgrade(ctx.clone(), settings)
+            }
+            (InboundProtocol::Trojan, InboundTransport::Grpc(settings)) => {
+                InboundHandler::TrojanGrpc(grpc::Handler::new(
+                    settings,
+                    grpc::GrpcProtocol::Trojan(ctx.clone()),
+                ))
             }
             (InboundProtocol::Socks, InboundTransport::Tcp) => {
                 InboundHandler::Socks(ctx.clone(), inbound.socks_auth, inbound.udp)
@@ -209,6 +228,12 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             (other, InboundTransport::HttpUpgrade(_)) => {
                 return Err(format!(
                     "inbound {}: {:?} over HTTPUpgrade is not supported",
+                    inbound.tag, other
+                ));
+            }
+            (other, InboundTransport::Grpc(_)) => {
+                return Err(format!(
+                    "inbound {}: {:?} over gRPC is not supported",
                     inbound.tag, other
                 ));
             }
@@ -390,6 +415,9 @@ where
                 log::info(format!("shadowsocks from {} rejected: {e}", log::mask(peer)));
             }
         }
+        InboundHandler::VlessGrpc(h) | InboundHandler::TrojanGrpc(h) => {
+            grpc::serve(stream, peer, h).await;
+        }
         InboundHandler::VlessXhttp(h) => {
             serve_http(stream, peer, h).await;
         }
@@ -422,7 +450,11 @@ where
 
 const MAX_HEADERS: usize = 1024;
 
-fn tls_acceptor(settings: &TlsSettings, is_xhttp: bool) -> Result<TlsAcceptor, String> {
+fn tls_acceptor(
+    settings: &TlsSettings,
+    is_xhttp: bool,
+    is_grpc: bool,
+) -> Result<TlsAcceptor, String> {
     let certs = CertificateDer::pem_slice_iter(&settings.cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("invalid certificate: {e}"))?;
@@ -446,6 +478,8 @@ fn tls_acceptor(settings: &TlsSettings, is_xhttp: bool) -> Result<TlsAcceptor, S
         .collect();
     config.alpn_protocols = if !alpn.is_empty() {
         alpn
+    } else if is_grpc {
+        vec![b"h2".to_vec()]
     } else if is_xhttp {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     } else {
