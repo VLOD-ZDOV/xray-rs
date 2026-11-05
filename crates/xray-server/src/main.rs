@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use config::{Config, Inbound, TlsSettings};
+use config::{Config, Inbound, InboundTransport, TlsSettings};
 
 // 3x-ui reads the second word of `-version` output as the core version.
 const COMPAT_VERSION: &str = "26.10.31";
@@ -80,7 +80,10 @@ fn main() -> ExitCode {
     let tls: Result<Vec<_>, String> = config
         .inbounds
         .iter()
-        .map(|i| i.tls.as_ref().map(tls_acceptor).transpose())
+        .map(|i| {
+            let is_xhttp = matches!(i.transport, InboundTransport::Xhttp(_));
+            i.tls.as_ref().map(|s| tls_acceptor(s, is_xhttp)).transpose()
+        })
         .collect();
     let tls = match tls {
         Ok(tls) => tls,
@@ -113,6 +116,12 @@ fn main() -> ExitCode {
     }
 }
 
+#[derive(Clone)]
+enum InboundHandler {
+    Tcp(Arc<vless::Context>),
+    Xhttp(Arc<xhttp::Handler>),
+}
+
 async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String> {
     log::info(format!("xray-server {} started", env!("CARGO_PKG_VERSION")));
     stats::init(config.stats);
@@ -132,7 +141,12 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             router: router.clone(),
         });
         inbounds.insert(inbound.tag, ctx.clone());
-        let handler = xhttp::Handler::new(inbound.xhttp, ctx);
+        let handler = match inbound.transport {
+            InboundTransport::Tcp => InboundHandler::Tcp(ctx),
+            InboundTransport::Xhttp(settings) => {
+                InboundHandler::Xhttp(xhttp::Handler::new(*settings, ctx))
+            }
+        };
         tokio::spawn(accept_loop(listener, acceptor, handler));
     }
     if let Some(addr) = config.api {
@@ -169,7 +183,7 @@ fn bracket(host: &str) -> String {
 async fn accept_loop(
     listener: TcpListener,
     tls: Option<TlsAcceptor>,
-    handler: Arc<xhttp::Handler>,
+    handler: InboundHandler,
 ) {
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -185,15 +199,32 @@ async fn accept_loop(
         tokio::spawn(async move {
             match tls {
                 Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(stream) => serve_http(stream, peer, handler).await,
+                    Ok(stream) => dispatch(stream, peer, handler).await,
                     Err(e) => log::debug(format!(
                         "tls handshake from {} failed: {e}",
                         log::mask(peer)
                     )),
                 },
-                None => serve_http(stream, peer, handler).await,
+                None => dispatch(stream, peer, handler).await,
             }
         });
+    }
+}
+
+async fn dispatch<I>(stream: I, peer: SocketAddr, handler: InboundHandler)
+where
+    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    match handler {
+        InboundHandler::Tcp(ctx) => {
+            let (r, w) = tokio::io::split(stream);
+            if let Err(e) = vless::serve(r, w, &ctx, peer).await {
+                log::info(format!("from {} rejected: {e}", log::mask(peer)));
+            }
+        }
+        InboundHandler::Xhttp(h) => {
+            serve_http(stream, peer, h).await;
+        }
     }
 }
 
@@ -223,7 +254,7 @@ where
 
 const MAX_HEADERS: usize = 1024;
 
-fn tls_acceptor(settings: &TlsSettings) -> Result<TlsAcceptor, String> {
+fn tls_acceptor(settings: &TlsSettings, is_xhttp: bool) -> Result<TlsAcceptor, String> {
     let certs = CertificateDer::pem_slice_iter(&settings.cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("invalid certificate: {e}"))?;
@@ -245,10 +276,12 @@ fn tls_acceptor(settings: &TlsSettings) -> Result<TlsAcceptor, String> {
         .filter(|p| *p != "h3")
         .map(|p| p.as_bytes().to_vec())
         .collect();
-    config.alpn_protocols = if alpn.is_empty() {
+    config.alpn_protocols = if !alpn.is_empty() {
+        alpn
+    } else if is_xhttp {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     } else {
-        alpn
+        Vec::new()
     };
     Ok(TlsAcceptor::from(Arc::new(config)))
 }

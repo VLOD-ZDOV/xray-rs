@@ -22,6 +22,12 @@ pub struct Config {
     pub router: Router,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundTransport {
+    Tcp,
+    Xhttp(Box<XhttpSettings>),
+}
+
 #[derive(Debug)]
 pub struct Inbound {
     pub tag: String,
@@ -29,7 +35,7 @@ pub struct Inbound {
     pub port: u16,
     pub users: Vec<User>,
     pub tls: Option<TlsSettings>,
-    pub xhttp: XhttpSettings,
+    pub transport: InboundTransport,
 }
 
 #[derive(Debug, Clone)]
@@ -52,7 +58,7 @@ pub struct TlsSettings {
     pub alpn: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XhttpSettings {
     pub path: String,
     pub host: String,
@@ -82,13 +88,13 @@ pub enum Placement {
 }
 
 /// Where a piece of XHTTP metadata travels and under which name.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Meta {
     pub placement: Placement,
     pub key: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaddingObfs {
     pub key: String,
     pub header: String,
@@ -164,9 +170,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let network = str_field(stream, "network");
     let security = str_field(stream, "security");
 
-    let supported_network = matches!(network, "xhttp" | "splithttp");
+    let is_tcp = network.is_empty() || network == "tcp";
+    let is_xhttp = matches!(network, "xhttp" | "splithttp");
     let supported_security = matches!(security, "" | "none" | "tls");
-    if protocol != "vless" || !supported_network || !supported_security {
+    if protocol != "vless" || (!is_tcp && !is_xhttp) || !supported_security {
         log::warn(format!(
             "skipping inbound {tag:?}: {protocol}/{}/{} is not supported yet",
             if network.is_empty() { "tcp" } else { network },
@@ -214,12 +221,16 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     } else {
         None
     };
-    let xhttp = parse_xhttp(
-        stream
-            .get("xhttpSettings")
-            .or_else(|| stream.get("splithttpSettings"))
-            .unwrap_or(&Value::Null),
-    )?;
+    let transport = if is_tcp {
+        InboundTransport::Tcp
+    } else {
+        InboundTransport::Xhttp(Box::new(parse_xhttp(
+            stream
+                .get("xhttpSettings")
+                .or_else(|| stream.get("splithttpSettings"))
+                .unwrap_or(&Value::Null),
+        )?))
+    };
 
     Ok(Some(Inbound {
         tag,
@@ -227,7 +238,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         port,
         users,
         tls,
-        xhttp,
+        transport,
     }))
 }
 
@@ -532,10 +543,30 @@ mod tests {
         assert_eq!(config.inbounds.len(), 1);
         let inbound = &config.inbounds[0];
         assert_eq!(inbound.port, 443);
-        assert_eq!(inbound.xhttp.path, "/xh/");
-        assert_eq!(inbound.xhttp.padding, (100, 1000));
+        let InboundTransport::Xhttp(xhttp) = &inbound.transport else {
+            panic!("expected Xhttp transport");
+        };
+        assert_eq!(xhttp.path, "/xh/");
+        assert_eq!(xhttp.padding, (100, 1000));
         assert_eq!(inbound.users[0].email, "user1");
         assert_eq!(inbound.tls.as_ref().unwrap().cert_pem, b"CERT");
+    }
+
+    #[test]
+    fn parses_vless_tcp_inbound() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "vless-tcp", "port": 443, "protocol": "vless",
+             "settings": {"clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "email": "alice"}]},
+             "streamSettings": {"network": "tcp", "security": "none"}}
+          ]
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.inbounds.len(), 1);
+        let inbound = &config.inbounds[0];
+        assert_eq!(inbound.transport, InboundTransport::Tcp);
+        assert_eq!(inbound.port, 443);
+        assert_eq!(inbound.users[0].email, "alice");
     }
 
     #[test]
