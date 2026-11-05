@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! VLESS encryption client pinned to Xray-core v26.7.28.
 //!
 //! Supports bounded 1-RTT and 0-RTT sessions, one-to-eight chained NFS public

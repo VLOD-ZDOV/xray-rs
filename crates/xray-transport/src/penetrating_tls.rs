@@ -124,16 +124,14 @@ where
             .tls_read_limiter
             .next_limit(output.remaining())
             .min(TLS_READ_CHUNK_LIMIT);
-        // Read straight into the caller's buffer through a limited view so a
-        // record-bounded read costs neither a scratch-buffer zeroing nor an
-        // extra copy.
-        let mut limited = output.take(limit);
+        // Read through a limited view of the caller's buffer so a record-bounded
+        // read costs no extra copy. Only the not-yet-initialized tail is zeroed,
+        // at most `limit` bytes once per read.
+        let unfilled = output.initialize_unfilled_to(limit);
+        let mut limited = ReadBuf::new(unfilled);
         match Pin::new(&mut this.stream).poll_read(cx, &mut limited) {
             Poll::Ready(Ok(())) => {
                 let filled_len = limited.filled().len();
-                // SAFETY: `limited` borrows the unfilled region of `output`,
-                // and the inner poll_read initialized `filled_len` bytes of it.
-                unsafe { output.assume_init(filled_len) };
                 output.advance(filled_len);
                 let filled_start = output.filled().len() - filled_len;
                 let filled = &output.filled()[filled_start..];

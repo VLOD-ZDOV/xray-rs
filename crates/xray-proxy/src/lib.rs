@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 mod aead;
 mod erase;
 mod record_buffer;

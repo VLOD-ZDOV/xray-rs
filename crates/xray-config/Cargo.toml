@@ -22,5 +22,8 @@ xray-utls = { path = "../xray-utls" }
 xray-vless-encryption = { path = "../xray-vless-encryption" }
 zeroize.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
 [dev-dependencies]
 base64.workspace = true

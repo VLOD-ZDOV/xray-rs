@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 pub const DEFAULT_UTLS_FINGERPRINT: &str = "chrome";
 
 /// Every `fingerprint` name Xray's config builder accepts.

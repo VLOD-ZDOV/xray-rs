@@ -358,21 +358,23 @@ impl GeodataLoader {
 #[cfg(unix)]
 fn open_file_beneath(root: &Path, requested: &Path) -> io::Result<File> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
+
+    use nix::{
+        fcntl::{OFlag, open, openat},
+        sys::stat::Mode,
+    };
 
     let root = CString::new(root.as_os_str().as_bytes())
         .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "geodata root contains NUL"))?;
-    let root_flags =
-        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_DIRECTORY;
-    // SAFETY: `root` is a live NUL-terminated path and the flags request a
-    // read-only directory descriptor. The returned fd is uniquely owned.
-    let root_fd = unsafe { libc::open(root.as_ptr(), root_flags) };
-    if root_fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `open` returned a fresh owned fd and this is its sole owner.
-    let mut current_dir = unsafe { File::from_raw_fd(root_fd) };
+    let root_flags = OFlag::O_RDONLY
+        | OFlag::O_CLOEXEC
+        | OFlag::O_NOFOLLOW
+        | OFlag::O_NONBLOCK
+        | OFlag::O_DIRECTORY;
+    let mut current_dir = File::from(
+        open(root.as_c_str(), root_flags, Mode::empty()).map_err(io::Error::from)?,
+    );
     let mut components = requested.components().peekable();
     while let Some(Component::Normal(component)) = components.next() {
         let component = CString::new(component.as_bytes()).map_err(|_| {
@@ -382,19 +384,15 @@ fn open_file_beneath(root: &Path, requested: &Path) -> io::Result<File> {
             )
         })?;
         let is_last = components.peek().is_none();
-        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        let mut flags =
+            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
         if !is_last {
-            flags |= libc::O_DIRECTORY;
+            flags |= OFlag::O_DIRECTORY;
         }
-        // SAFETY: `current_dir` owns a live directory fd, `component` is a
-        // NUL-terminated single path component, and `flags` request no
-        // writable access. A successful fd is transferred to `File` below.
-        let fd = unsafe { libc::openat(current_dir.as_raw_fd(), component.as_ptr(), flags) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `openat` returned a fresh owned fd and this is its sole owner.
-        let opened = unsafe { File::from_raw_fd(fd) };
+        let opened = File::from(
+            openat(&current_dir, component.as_c_str(), flags, Mode::empty())
+                .map_err(io::Error::from)?,
+        );
         if is_last {
             return Ok(opened);
         }
@@ -1259,14 +1257,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn geodata_loader_rejects_fifo_without_blocking() {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
+        use nix::{sys::stat::Mode, unistd::mkfifo};
 
         let root = unique_temp_dir("fifo");
         let fifo = root.join("geo.dat");
-        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
-        // SAFETY: `fifo_path` is a live NUL-terminated filesystem path.
-        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        mkfifo(&fifo, Mode::from_bits_truncate(0o600)).unwrap();
         let loader = GeodataLoader::from_dirs(vec![root.clone()]);
 
         let started = Instant::now();

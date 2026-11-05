@@ -150,24 +150,6 @@ impl Records {
     }
 }
 
-// Public body padding only; keys, IVs and authentication retain OS randomness.
-// Apple's system CSPRNG amortizes kernel entropy requests without a buffer per
-// connection. Keep the measured ChaCha padding cache and non-Apple path intact.
-#[cfg(target_vendor = "apple")]
-fn aes_padding(output: &mut [u8]) -> io::Result<()> {
-    unsafe extern "C" {
-        fn arc4random_buf(buffer: *mut std::ffi::c_void, length: usize);
-    }
-    if !output.is_empty() {
-        // SAFETY: the slice supplies a valid, exclusively borrowed writable
-        // buffer for exactly length bytes. The system function cannot fail;
-        // skip empty slices for compatibility with older Apple OS versions.
-        unsafe { arc4random_buf(output.as_mut_ptr().cast(), output.len()) };
-    }
-    Ok(())
-}
-
-#[cfg(not(target_vendor = "apple"))]
 fn aes_padding(output: &mut [u8]) -> io::Result<()> {
     random(output)
 }

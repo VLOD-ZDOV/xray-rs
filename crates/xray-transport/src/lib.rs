@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use async_trait::async_trait;
 use std::net::{SocketAddr, SocketAddrV4, UdpSocket as StdUdpSocket};
 use std::pin::Pin;
