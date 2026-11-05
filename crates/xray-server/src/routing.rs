@@ -276,7 +276,8 @@ impl Router {
     fn decision(&self, tag: &str) -> Decision {
         // No outbounds at all behaves like a lone freedom outbound.
         let action = if self.outbounds.is_empty() { Action::Direct } else { self.outbounds.get(tag).cloned().unwrap_or(Action::Block) };
-        Decision { tag: if tag.is_empty() { "direct".into() } else { tag.to_owned() }, action }
+        // The tag stays as is, even empty: finalRules and stats are keyed by it.
+        Decision { tag: tag.to_owned(), action }
     }
 }
 
