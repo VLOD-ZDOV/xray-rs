@@ -22,14 +22,14 @@ use crate::routing::{Action, BlockAction, Decision, Router};
 use crate::stats::{self, Traffic};
 use crate::vless::{host_label, Host, RouteRequest, Sniffing, CONN_IDLE};
 
-const STATUS_NEW: u8 = 1;
-const STATUS_KEEP: u8 = 2;
-const STATUS_END: u8 = 3;
-const STATUS_KEEP_ALIVE: u8 = 4;
-const OPTION_DATA: u8 = 1;
-const OPTION_ERROR: u8 = 2;
-const NETWORK_TCP: u8 = 1;
-const NETWORK_UDP: u8 = 2;
+pub(crate) const STATUS_NEW: u8 = 1;
+pub(crate) const STATUS_KEEP: u8 = 2;
+pub(crate) const STATUS_END: u8 = 3;
+pub(crate) const STATUS_KEEP_ALIVE: u8 = 4;
+pub(crate) const OPTION_DATA: u8 = 1;
+pub(crate) const OPTION_ERROR: u8 = 2;
+pub(crate) const NETWORK_TCP: u8 = 1;
+pub(crate) const NETWORK_UDP: u8 = 2;
 const MAX_META: usize = 512;
 const MAX_SESSIONS: usize = 1024;
 // Xray splits stream data into 8 KiB frames.

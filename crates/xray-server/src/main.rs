@@ -532,25 +532,27 @@ async fn dispatch<I>(
 ) where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    match handler {
-        InboundHandler::VlessTcp(ctx) => {
+    let f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = match handler {
+        InboundHandler::VlessTcp(ctx) => Box::pin(async move {
             let (r, w) = tokio::io::split(stream);
             if let Err(e) = vless::serve(r, w, &ctx, peer).await {
                 log::info(format!("vless from {} rejected: {e}", log::mask(peer)));
             }
-        }
-        InboundHandler::VlessWs(ctx, ws_settings) => match ws::accept(stream, &ws_settings).await {
-            Ok(ws_stream) => {
-                let (uplink, downlink) = tokio::io::split(ws_stream);
-                if let Err(e) = vless::serve(uplink, downlink, &ctx, peer).await {
-                    log::info(format!("vless-ws from {} rejected: {e}", log::mask(peer)));
+        }),
+        InboundHandler::VlessWs(ctx, ws_settings) => Box::pin(async move {
+            match ws::accept(stream, &ws_settings).await {
+                Ok(ws_stream) => {
+                    let (uplink, downlink) = tokio::io::split(ws_stream);
+                    if let Err(e) = vless::serve(uplink, downlink, &ctx, peer).await {
+                        log::info(format!("vless-ws from {} rejected: {e}", log::mask(peer)));
+                    }
+                }
+                Err(e) => {
+                    log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
                 }
             }
-            Err(e) => {
-                log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
-            }
-        },
-        InboundHandler::VlessHttpUpgrade(ctx, hu_settings) => {
+        }),
+        InboundHandler::VlessHttpUpgrade(ctx, hu_settings) => Box::pin(async move {
             match httpupgrade::accept(stream, &hu_settings).await {
                 Ok(prefixed_stream) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
@@ -568,14 +570,14 @@ async fn dispatch<I>(
                     ));
                 }
             }
-        }
-        InboundHandler::TrojanTcp(ctx) => {
+        }),
+        InboundHandler::TrojanTcp(ctx) => Box::pin(async move {
             let (r, w) = tokio::io::split(stream);
             if let Err(e) = trojan::serve(r, w, &ctx, peer).await {
                 log::info(format!("trojan from {} rejected: {e}", log::mask(peer)));
             }
-        }
-        InboundHandler::TrojanWs(ctx, ws_settings) => {
+        }),
+        InboundHandler::TrojanWs(ctx, ws_settings) => Box::pin(async move {
             match ws::accept(stream, &ws_settings).await {
                 Ok(ws_stream) => {
                     let (uplink, downlink) = tokio::io::split(ws_stream);
@@ -587,8 +589,8 @@ async fn dispatch<I>(
                     log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
                 }
             }
-        }
-        InboundHandler::TrojanHttpUpgrade(ctx, hu_settings) => {
+        }),
+        InboundHandler::TrojanHttpUpgrade(ctx, hu_settings) => Box::pin(async move {
             match httpupgrade::accept(stream, &hu_settings).await {
                 Ok(prefixed_stream) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
@@ -606,25 +608,27 @@ async fn dispatch<I>(
                     ));
                 }
             }
-        }
-        InboundHandler::VmessTcp(ctx) => {
+        }),
+        InboundHandler::VmessTcp(ctx) => Box::pin(async move {
             let (r, w) = tokio::io::split(stream);
             if let Err(e) = vmess::serve(r, w, &ctx, peer).await {
                 log::info(format!("vmess from {} rejected: {e}", log::mask(peer)));
             }
-        }
-        InboundHandler::VmessWs(ctx, ws_settings) => match ws::accept(stream, &ws_settings).await {
-            Ok(ws_stream) => {
-                let (uplink, downlink) = tokio::io::split(ws_stream);
-                if let Err(e) = vmess::serve(uplink, downlink, &ctx, peer).await {
-                    log::info(format!("vmess-ws from {} rejected: {e}", log::mask(peer)));
+        }),
+        InboundHandler::VmessWs(ctx, ws_settings) => Box::pin(async move {
+            match ws::accept(stream, &ws_settings).await {
+                Ok(ws_stream) => {
+                    let (uplink, downlink) = tokio::io::split(ws_stream);
+                    if let Err(e) = vmess::serve(uplink, downlink, &ctx, peer).await {
+                        log::info(format!("vmess-ws from {} rejected: {e}", log::mask(peer)));
+                    }
+                }
+                Err(e) => {
+                    log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
                 }
             }
-            Err(e) => {
-                log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
-            }
-        },
-        InboundHandler::VmessHttpUpgrade(ctx, hu_settings) => {
+        }),
+        InboundHandler::VmessHttpUpgrade(ctx, hu_settings) => Box::pin(async move {
             match httpupgrade::accept(stream, &hu_settings).await {
                 Ok(prefixed_stream) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
@@ -642,38 +646,39 @@ async fn dispatch<I>(
                     ));
                 }
             }
-        }
-        InboundHandler::Socks(ctx, auth, udp) => {
+        }),
+        InboundHandler::Socks(ctx, auth, udp) => Box::pin(async move {
             if let Err(e) = inbound_proxy::serve_socks(stream, &auth, udp, &ctx, peer, local).await
             {
                 log::info(format!("socks from {} rejected: {e}", log::mask(peer)));
             }
-        }
-        InboundHandler::Http(ctx, auth) => {
+        }),
+        InboundHandler::Http(ctx, auth) => Box::pin(async move {
             if let Err(e) = inbound_proxy::serve_http(stream, &auth, &ctx, peer).await {
                 log::info(format!("http from {} rejected: {e}", log::mask(peer)));
             }
-        }
-        InboundHandler::Shadowsocks(ctx) => {
+        }),
+        InboundHandler::Shadowsocks(ctx) => Box::pin(async move {
             if let Err(e) = shadowsocks::serve_tcp(stream, &ctx, peer).await {
                 log::info(format!(
                     "shadowsocks from {} rejected: {e}",
                     log::mask(peer)
                 ));
             }
-        }
-        InboundHandler::Dokodemo(ctx, settings) => {
+        }),
+        InboundHandler::Dokodemo(ctx, settings) => Box::pin(async move {
             if let Err(e) = dokodemo::serve_tcp(stream, &settings, &ctx, peer).await {
                 log::info(format!("dokodemo from {} rejected: {e}", log::mask(peer)));
             }
-        }
-        InboundHandler::VlessGrpc(h) | InboundHandler::TrojanGrpc(h) => {
+        }),
+        InboundHandler::VlessGrpc(h) | InboundHandler::TrojanGrpc(h) => Box::pin(async move {
             grpc::serve(stream, peer, h).await;
-        }
-        InboundHandler::VlessXhttp(h) => {
+        }),
+        InboundHandler::VlessXhttp(h) => Box::pin(async move {
             serve_http(stream, peer, h).await;
-        }
-    }
+        }),
+    };
+    f.await;
 }
 
 async fn serve_http<I>(io: I, peer: SocketAddr, handler: Arc<xhttp::Handler>)

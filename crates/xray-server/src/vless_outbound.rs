@@ -105,6 +105,7 @@ pub struct VlessOutbound {
     pub server: (Host, u16),
     pub user_id: Uuid,
     pub flow: Option<String>,
+    pub packet_encoding: Option<String>,
     pub dialer: TransportDialer,
     pub connector: ConnectorConfig,
     pub transport: TransportLayer,
@@ -118,6 +119,7 @@ impl fmt::Debug for VlessOutbound {
             .field("server", &self.server)
             .field("user_id", &"<redacted>")
             .field("flow", &self.flow)
+            .field("packet_encoding", &self.packet_encoding)
             .field("connector", &self.connector)
             .field("transport", &self.transport)
             .finish()
@@ -332,15 +334,29 @@ impl VlessOutbound {
 
         let dialer = TransportDialer::system().map_err(|e| err(&format!("dialer error: {e}")))?;
 
+        let packet_encoding = settings
+            .get("packetEncoding")
+            .or_else(|| outbound.get("packetEncoding"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+
         Ok(Self {
             tag: tag.to_owned(),
             server: (host, port),
             user_id,
             flow,
+            packet_encoding,
             dialer,
             connector,
             transport,
         })
+    }
+
+    pub fn is_xudp(&self) -> bool {
+        self.packet_encoding
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("xudp"))
+            .unwrap_or(true)
     }
 
     async fn open_raw_stream(
@@ -501,11 +517,83 @@ impl VlessUdpLink {
     }
 }
 
+struct XudpSessions {
+    by_addr: HashMap<SocketAddr, u16>,
+    by_id: HashMap<u16, SocketAddr>,
+    next_id: u16,
+}
+
+struct XudpConn {
+    writer: Mutex<tokio::io::WriteHalf<VlessResponseStream<VisionTransportStream>>>,
+    sessions: Arc<Mutex<XudpSessions>>,
+    task: JoinHandle<()>,
+}
+
+impl XudpConn {
+    fn abort(&self) {
+        self.task.abort();
+    }
+
+    async fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
+        let wire = {
+            let mut s = self.sessions.lock().await;
+            if let Some(&session_id) = s.by_addr.get(&addr) {
+                let frame = xray_proxy::mux::Frame {
+                    session_id,
+                    status: xray_proxy::mux::Status::Keep,
+                    error: false,
+                    target: None,
+                    global_id: None,
+                    payload: Some(data),
+                };
+                xray_proxy::mux::encode(&frame)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+            } else {
+                let session_id = s.next_id;
+                s.next_id = s.next_id.wrapping_add(1);
+                if s.next_id == 0 {
+                    s.next_id = 1;
+                }
+                s.by_addr.insert(addr, session_id);
+                s.by_id.insert(session_id, addr);
+                let global_id: [u8; 8] = rand::random();
+                let target = Target::new(
+                    TargetAddr::Ip(addr.ip()),
+                    addr.port(),
+                    xray_routing::Network::Udp,
+                );
+                let frame = xray_proxy::mux::Frame {
+                    session_id,
+                    status: xray_proxy::mux::Status::New,
+                    error: false,
+                    target: Some(target),
+                    global_id: Some(global_id),
+                    payload: Some(data),
+                };
+                xray_proxy::mux::encode(&frame)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+            }
+        };
+
+        let mut w = self.writer.lock().await;
+        if let Err(e) = w.write_all(&wire).await {
+            self.abort();
+            return Err(e);
+        }
+        if let Err(e) = w.flush().await {
+            self.abort();
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
 type VlessFlow = (Arc<VlessUdpLink>, JoinHandle<()>);
 
 pub struct VlessConeUdp {
     vless: Arc<VlessOutbound>,
-    sessions: Mutex<HashMap<SocketAddr, VlessFlow>>,
+    xudp_conn: Mutex<Option<Arc<XudpConn>>>,
+    per_conn_sessions: Mutex<HashMap<SocketAddr, VlessFlow>>,
     tx: mpsc::Sender<(SocketAddr, Bytes)>,
     rx: Mutex<mpsc::Receiver<(SocketAddr, Bytes)>>,
 }
@@ -515,7 +603,8 @@ impl VlessConeUdp {
         let (tx, rx) = mpsc::channel(256);
         Self {
             vless,
-            sessions: Mutex::new(HashMap::new()),
+            xudp_conn: Mutex::new(None),
+            per_conn_sessions: Mutex::new(HashMap::new()),
             tx,
             rx: Mutex::new(rx),
         }
@@ -525,37 +614,138 @@ impl VlessConeUdp {
         self.vless.udp_target(host, port).await
     }
 
-    pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
-        let mut sessions = self.sessions.lock().await;
-        if sessions
-            .get(&addr)
-            .is_none_or(|(_, task)| task.is_finished())
-        {
-            let link = Arc::new(
-                self.vless
-                    .open_udp(&Host::Ip(addr.ip()), addr.port())
-                    .await?,
-            );
-            let (reader, tx) = (link.clone(), self.tx.clone());
-            let task = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65535];
-                while let Ok(n) = reader.recv(&mut buf).await {
-                    if n == 0 {
-                        break;
+    async fn open_xudp_conn(&self) -> io::Result<Arc<XudpConn>> {
+        let stream = self
+            .vless
+            .open_raw_stream(&Host::Domain("v1.mux.cool".into()), 0, VlessCommand::Mux)
+            .await?;
+        let (mut reader, writer) = tokio::io::split(stream);
+        let sessions = Arc::new(Mutex::new(XudpSessions {
+            by_addr: HashMap::new(),
+            by_id: HashMap::new(),
+            next_id: 1,
+        }));
+        let (tx, sessions_clone) = (self.tx.clone(), Arc::clone(&sessions));
+        let task = tokio::spawn(async move {
+            while let Ok(frame) = crate::mux::read_frame(&mut reader).await {
+                if frame.status == crate::mux::STATUS_END {
+                    let mut s = sessions_clone.lock().await;
+                    if let Some(addr) = s.by_id.remove(&frame.id) {
+                        s.by_addr.remove(&addr);
                     }
-                    let packet = Bytes::copy_from_slice(&buf[..n]);
-                    if tx.send((addr, packet)).await.is_err() {
-                        break;
+                    continue;
+                }
+                let from_opt = match frame.target {
+                    Some((_, Host::Ip(ip), port)) => Some(SocketAddr::new(ip, port)),
+                    _ => {
+                        let s = sessions_clone.lock().await;
+                        s.by_id.get(&frame.id).copied()
+                    }
+                };
+                if let Some(from_addr) = from_opt {
+                    if let Some(data) = frame.data {
+                        if tx.send((from_addr, Bytes::from(data))).await.is_err() {
+                            break;
+                        }
                     }
                 }
-            });
-            if let Some((_, old)) = sessions.insert(addr, (link, task)) {
-                old.abort();
+            }
+        });
+        Ok(Arc::new(XudpConn {
+            writer: Mutex::new(writer),
+            sessions,
+            task,
+        }))
+    }
+
+    async fn get_or_open_xudp_conn(&self) -> io::Result<Arc<XudpConn>> {
+        let existing = {
+            let guard = self.xudp_conn.lock().await;
+            if let Some(ref conn) = *guard {
+                if !conn.task.is_finished() {
+                    Some(Arc::clone(conn))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(conn) = existing {
+            return Ok(conn);
+        }
+
+        let new_conn = self.open_xudp_conn().await?;
+
+        let mut guard = self.xudp_conn.lock().await;
+        if let Some(ref conn) = *guard {
+            if !conn.task.is_finished() {
+                new_conn.abort();
+                return Ok(Arc::clone(conn));
             }
         }
-        let link = sessions[&addr].0.clone();
-        drop(sessions);
+        *guard = Some(Arc::clone(&new_conn));
+        Ok(new_conn)
+    }
+
+    async fn send_to_per_conn(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
+        let mut link_opt = None;
+        {
+            let sessions = self.per_conn_sessions.lock().await;
+            if let Some((link, task)) = sessions.get(&addr) {
+                if !task.is_finished() {
+                    link_opt = Some(link.clone());
+                }
+            }
+        }
+        let link = match link_opt {
+            Some(link) => link,
+            None => {
+                let new_link = Arc::new(
+                    self.vless
+                        .open_udp(&Host::Ip(addr.ip()), addr.port())
+                        .await?,
+                );
+                let (reader, tx) = (new_link.clone(), self.tx.clone());
+                let task = tokio::spawn(async move {
+                    let mut buf = vec![0u8; 65535];
+                    while let Ok(n) = reader.recv(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let packet = Bytes::copy_from_slice(&buf[..n]);
+                        if tx.send((addr, packet)).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                let mut sessions = self.per_conn_sessions.lock().await;
+                if let Some((existing_link, existing_task)) = sessions.get(&addr) {
+                    if !existing_task.is_finished() {
+                        task.abort();
+                        existing_link.clone()
+                    } else {
+                        if let Some((_, old)) = sessions.insert(addr, (new_link.clone(), task)) {
+                            old.abort();
+                        }
+                        new_link
+                    }
+                } else {
+                    sessions.insert(addr, (new_link.clone(), task));
+                    new_link
+                }
+            }
+        };
         link.send(data).await
+    }
+
+    pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
+        if self.vless.is_xudp() {
+            let conn = self.get_or_open_xudp_conn().await?;
+            conn.send_to(data, addr).await
+        } else {
+            self.send_to_per_conn(data, addr).await
+        }
     }
 
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
@@ -572,7 +762,10 @@ impl VlessConeUdp {
     }
 
     pub fn abort_all(&mut self) {
-        for (_, task) in self.sessions.get_mut().values() {
+        if let Some(conn) = self.xudp_conn.get_mut() {
+            conn.abort();
+        }
+        for (_, task) in self.per_conn_sessions.get_mut().values() {
             task.abort();
         }
     }
@@ -953,6 +1146,97 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = link.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"dns-query-packet");
+
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn vless_cone_xudp_multiplexing_roundtrip() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap();
+
+        let user_id = Uuid::new_v4();
+        let server_task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = [0u8; 1 + 16 + 1 + 1];
+            socket.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[0], 0);
+            assert_eq!(&head[1..17], user_id.as_bytes());
+            assert_eq!(head[17], 0);
+            assert_eq!(head[18], 3); // command Mux (3)
+
+            // VLESS response header: version 0, addons length 0
+            socket.write_all(&[0, 0]).await.unwrap();
+
+            // Read Mux frame 1
+            let frame1 = crate::mux::read_frame(&mut socket).await.unwrap();
+            assert_eq!(frame1.status, crate::mux::STATUS_NEW);
+            assert_eq!(frame1.id, 1);
+            let target1 = frame1.target.unwrap();
+            assert_eq!(target1.1, Host::Ip("8.8.8.8".parse().unwrap()));
+            assert_eq!(target1.2, 53);
+            assert_eq!(frame1.data.as_deref(), Some(&b"ping-8888"[..]));
+
+            // Send reply for frame 1
+            let resp_frame1 = crate::mux::encode_frame(
+                1,
+                crate::mux::STATUS_KEEP,
+                crate::mux::OPTION_DATA,
+                Some("8.8.8.8:53".parse().unwrap()),
+                Some(b"reply-8888"),
+            );
+            socket.write_all(&resp_frame1).await.unwrap();
+
+            // Read Mux frame 2 (to a different destination) over the same connection!
+            let frame2 = crate::mux::read_frame(&mut socket).await.unwrap();
+            assert_eq!(frame2.status, crate::mux::STATUS_NEW);
+            assert_eq!(frame2.id, 2);
+            let target2 = frame2.target.unwrap();
+            assert_eq!(target2.1, Host::Ip("1.1.1.1".parse().unwrap()));
+            assert_eq!(target2.2, 53);
+            assert_eq!(frame2.data.as_deref(), Some(&b"ping-1111"[..]));
+
+            // Send reply for frame 2
+            let resp_frame2 = crate::mux::encode_frame(
+                2,
+                crate::mux::STATUS_KEEP,
+                crate::mux::OPTION_DATA,
+                Some("1.1.1.1:53".parse().unwrap()),
+                Some(b"reply-1111"),
+            );
+            socket.write_all(&resp_frame2).await.unwrap();
+        });
+
+        let config = json!({
+            "settings": {
+                "address": server_addr.ip().to_string(),
+                "port": server_addr.port(),
+                "id": user_id.to_string(),
+                "packetEncoding": "xudp"
+            },
+            "streamSettings": {
+                "network": "tcp",
+                "security": "none"
+            }
+        });
+
+        let outbound = Arc::new(VlessOutbound::parse("vless-xudp-test", &config).unwrap());
+        let cone = outbound.open_cone_udp();
+
+        let dest1: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let dest2: SocketAddr = "1.1.1.1:53".parse().unwrap();
+
+        cone.send_to(b"ping-8888", dest1).await.unwrap();
+        let mut buf1 = [0u8; 64];
+        let (n1, from1) = cone.recv_from(&mut buf1).await.unwrap();
+        assert_eq!(&buf1[..n1], b"reply-8888");
+        assert_eq!(from1, dest1);
+
+        cone.send_to(b"ping-1111", dest2).await.unwrap();
+        let mut buf2 = [0u8; 64];
+        let (n2, from2) = cone.recv_from(&mut buf2).await.unwrap();
+        assert_eq!(&buf2[..n2], b"reply-1111");
+        assert_eq!(from2, dest2);
 
         server_task.await.unwrap();
     }
