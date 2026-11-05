@@ -39,6 +39,15 @@ pub enum InboundProtocol {
     Socks,
     Http,
     Shadowsocks,
+    Dokodemo,
+}
+
+#[derive(Clone, Debug)]
+pub struct DokodemoSettings {
+    pub address: Option<crate::vless::Host>,
+    pub port: Option<u16>,
+    #[allow(dead_code)]
+    pub follow_redirect: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +88,7 @@ pub struct Inbound {
     pub socks_auth: xray_proxy::inbound::SocksInboundAuth,
     pub udp: bool,
     pub sniffing: crate::vless::Sniffing,
+    pub dokodemo: Option<DokodemoSettings>,
     pub tls: Option<TlsSettings>,
     pub transport: InboundTransport,
 }
@@ -217,6 +227,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         "socks" => InboundProtocol::Socks,
         "http" => InboundProtocol::Http,
         "shadowsocks" => InboundProtocol::Shadowsocks,
+        "dokodemo-door" | "dokodemo" => InboundProtocol::Dokodemo,
         other => {
             log::warn(format!(
                 "skipping inbound {tag:?}: protocol {other:?} is not supported yet"
@@ -434,6 +445,30 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         }
     }
 
+    let dokodemo = if protocol == InboundProtocol::Dokodemo {
+        let addr_str = str_field(settings, "address");
+        let address = if !addr_str.is_empty() {
+            Some(match addr_str.parse::<std::net::IpAddr>() {
+                Ok(ip) => crate::vless::Host::Ip(ip),
+                Err(_) => crate::vless::Host::Domain(addr_str.to_owned()),
+            })
+        } else {
+            None
+        };
+        let port = parse_port(settings.get("port"));
+        let follow_redirect = settings
+            .get("followRedirect")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        Some(DokodemoSettings {
+            address,
+            port,
+            follow_redirect,
+        })
+    } else {
+        None
+    };
+
     Ok(Some(Inbound {
         tag,
         listen,
@@ -445,6 +480,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         socks_auth,
         udp,
         sniffing,
+        dokodemo,
         tls,
         transport,
     }))
@@ -1167,5 +1203,25 @@ mod tests {
         assert_eq!(inbounds.len(), 1);
         assert_eq!(inbounds[0].shadowsocks_users.len(), 1);
         assert_eq!(inbounds[0].shadowsocks_users[0].email, "a");
+    }
+
+    #[test]
+    fn parses_dokodemo_inbound() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "doko-tcp-udp", "port": 15353, "protocol": "dokodemo-door",
+             "settings": {"address": "1.1.1.1", "port": 53, "network": "tcp,udp"}}
+          ]
+        }"#;
+        let inbounds = parse(raw).unwrap().inbounds;
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0].protocol, InboundProtocol::Dokodemo);
+        assert!(inbounds[0].udp);
+        let doko = inbounds[0].dokodemo.as_ref().unwrap();
+        assert_eq!(
+            doko.address,
+            Some(crate::vless::Host::Ip("1.1.1.1".parse().unwrap()))
+        );
+        assert_eq!(doko.port, Some(53));
     }
 }

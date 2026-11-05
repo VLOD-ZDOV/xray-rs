@@ -2,6 +2,7 @@
 
 mod api;
 mod config;
+mod dokodemo;
 mod fallback;
 mod grpc;
 mod httpupgrade;
@@ -145,6 +146,7 @@ enum InboundHandler {
     ),
     Http(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth),
     Shadowsocks(Arc<vless::Context>, Arc<Vec<config::ShadowsocksUser>>),
+    Dokodemo(Arc<vless::Context>, Arc<config::DokodemoSettings>),
     VlessXhttp(Arc<xhttp::Handler>),
 }
 
@@ -170,6 +172,8 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
         });
         inbounds.insert(inbound.tag.clone(), ctx.clone());
         let is_ss_udp = inbound.protocol == InboundProtocol::Shadowsocks && inbound.udp;
+        let is_dokodemo_udp = inbound.protocol == InboundProtocol::Dokodemo && inbound.udp;
+        let dokodemo_settings = inbound.dokodemo.clone();
         let ss_users = if is_ss_udp {
             Arc::new(inbound.shadowsocks_users.clone())
         } else {
@@ -219,6 +223,14 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             (InboundProtocol::Shadowsocks, InboundTransport::Tcp) => {
                 InboundHandler::Shadowsocks(ctx.clone(), Arc::new(inbound.shadowsocks_users))
             }
+            (InboundProtocol::Dokodemo, InboundTransport::Tcp) => {
+                let settings = inbound.dokodemo.clone().unwrap_or(config::DokodemoSettings {
+                    address: None,
+                    port: None,
+                    follow_redirect: false,
+                });
+                InboundHandler::Dokodemo(ctx.clone(), Arc::new(settings))
+            }
             (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
                 InboundHandler::VlessXhttp(xhttp::Handler::new(*settings, ctx.clone()))
             }
@@ -261,6 +273,22 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
                 ctx.clone(),
             );
             tokio::spawn(udp_handler.run());
+        }
+        if is_dokodemo_udp {
+            if let Some(settings) = dokodemo_settings {
+                let udp_socket = bind_udp_addr(&inbound.listen, inbound.port).await?;
+                log::info(format!(
+                    "listening udp {} on {}",
+                    inbound.tag,
+                    udp_socket.local_addr().map_err(|e| e.to_string())?
+                ));
+                let udp_handler = dokodemo::DokodemoUdpHandler::new(
+                    Arc::new(udp_socket),
+                    Arc::new(settings),
+                    ctx.clone(),
+                );
+                tokio::spawn(udp_handler.run());
+            }
         }
     }
     if let Some(addr) = config.api {
@@ -437,6 +465,11 @@ async fn dispatch<I>(
                     "shadowsocks from {} rejected: {e}",
                     log::mask(peer)
                 ));
+            }
+        }
+        InboundHandler::Dokodemo(ctx, settings) => {
+            if let Err(e) = dokodemo::serve_tcp(stream, &settings, &ctx, peer).await {
+                log::info(format!("dokodemo from {} rejected: {e}", log::mask(peer)));
             }
         }
         InboundHandler::VlessGrpc(h) | InboundHandler::TrojanGrpc(h) => {
