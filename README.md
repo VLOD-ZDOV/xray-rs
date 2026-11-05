@@ -71,7 +71,19 @@ The binary is `target/release/xray-server`. It runs on glibc 2.34 or newer
 
 `scripts/install-3x-ui.sh` tests the current panel config with the new core,
 keeps the original core as `xray-linux-amd64.orig` and rolls back if the core
-does not come up:
+does not come up. Install or update from the latest release:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VLOD-ZDOV/xray-rs/main/scripts/install-3x-ui.sh | sudo bash
+```
+
+Back to the original Xray core:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/VLOD-ZDOV/xray-rs/main/scripts/install-3x-ui.sh | sudo bash -s -- --rollback
+```
+
+From a checkout:
 
 ```bash
 sudo ./scripts/install-3x-ui.sh                      # latest release
