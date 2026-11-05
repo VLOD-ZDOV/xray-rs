@@ -5,9 +5,6 @@ Those files are not covered by the project's own source-code license. If you
 redistribute an application containing them, retain these notices and comply
 with their respective licenses.
 
-The pinned versions and checksums below are also enforced by
-`scripts/fetch-geodata.sh`.
-
 ## uTLS-derived ClientHello profile data
 
 - Project:
