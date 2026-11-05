@@ -25,6 +25,7 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundTransport {
     Tcp,
+    Websocket(crate::ws::WsSettings),
     Xhttp(Box<XhttpSettings>),
 }
 
@@ -194,9 +195,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let security = str_field(stream, "security");
 
     let is_tcp = network.is_empty() || network == "tcp";
+    let is_ws = matches!(network, "ws" | "websocket");
     let is_xhttp = matches!(network, "xhttp" | "splithttp");
     let supported_security = matches!(security, "" | "none" | "tls");
-    if (!is_tcp && !is_xhttp) || !supported_security {
+    if (!is_tcp && !is_ws && !is_xhttp) || !supported_security {
         log::warn(format!(
             "skipping inbound {tag:?}: {:?}/{}/{} is not supported yet",
             protocol,
@@ -271,6 +273,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     };
     let transport = if is_tcp {
         InboundTransport::Tcp
+    } else if is_ws {
+        InboundTransport::Websocket(parse_ws(
+            stream.get("wsSettings").unwrap_or(&Value::Null),
+        )?)
     } else {
         InboundTransport::Xhttp(Box::new(parse_xhttp(
             stream
@@ -505,6 +511,22 @@ fn parse_xhttp(x: &Value) -> Result<XhttpSettings, String> {
     })
 }
 
+fn parse_ws(settings: &Value) -> Result<crate::ws::WsSettings, String> {
+    let mut path = str_field(settings, "path").to_owned();
+    if path.is_empty() {
+        path = "/".to_owned();
+    } else if !path.starts_with('/') {
+        path = format!("/{path}");
+    }
+    let host = str_field(settings, "host");
+    let host = if host.is_empty() {
+        None
+    } else {
+        Some(host.to_owned())
+    };
+    Ok(crate::ws::WsSettings { path, host })
+}
+
 fn placement_of(value: &str) -> Placement {
     match value {
         "query" => Placement::Query,
@@ -676,6 +698,36 @@ mod tests {
         assert!(config.inbounds[0].udp);
         assert_eq!(config.inbounds[1].protocol, InboundProtocol::Http);
         assert_eq!(config.inbounds[1].port, 8080);
+    }
+
+    #[test]
+    fn parses_websocket_inbounds() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "vless-ws", "port": 80, "protocol": "vless",
+             "settings": {"clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "email": "alice"}]},
+             "streamSettings": {"network": "ws", "security": "none", "wsSettings": {"path": "/chat", "host": "example.com"}}},
+            {"tag": "trojan-ws", "port": 443, "protocol": "trojan",
+             "settings": {"clients": [{"password": "secret", "email": "bob"}]},
+             "streamSettings": {"network": "websocket", "security": "none", "wsSettings": {"path": "trojan-ws"}}}
+          ]
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.inbounds.len(), 2);
+        assert_eq!(config.inbounds[0].protocol, InboundProtocol::Vless);
+        if let InboundTransport::Websocket(ws) = &config.inbounds[0].transport {
+            assert_eq!(ws.path, "/chat");
+            assert_eq!(ws.host.as_deref(), Some("example.com"));
+        } else {
+            panic!("expected websocket transport");
+        }
+        assert_eq!(config.inbounds[1].protocol, InboundProtocol::Trojan);
+        if let InboundTransport::Websocket(ws) = &config.inbounds[1].transport {
+            assert_eq!(ws.path, "/trojan-ws");
+            assert_eq!(ws.host, None);
+        } else {
+            panic!("expected websocket transport");
+        }
     }
 
     #[test]
