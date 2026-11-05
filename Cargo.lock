@@ -3193,6 +3193,7 @@ dependencies = [
 name = "xray-server"
 version = "0.9.0"
 dependencies = [
+ "base64 0.23.1",
  "bytes",
  "futures-util",
  "http",

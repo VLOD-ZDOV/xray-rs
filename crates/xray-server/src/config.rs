@@ -55,9 +55,41 @@ pub struct XhttpSettings {
     pub host: String,
     pub mode: String,
     pub padding: (usize, usize),
+    /// `xPaddingObfsMode`; `None` keeps the legacy Referer/query `x_padding`.
+    pub padding_obfs: Option<PaddingObfs>,
+    pub session: Meta,
+    pub seq: Meta,
+    pub uplink_data: Meta,
+    pub stream_up_secs: (u64, u64),
     pub no_sse_header: bool,
     pub max_each_post: usize,
     pub max_buffered_posts: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    Path,
+    Query,
+    Header,
+    Cookie,
+    QueryInHeader,
+    Body,
+    Auto,
+}
+
+/// Where a piece of XHTTP metadata travels and under which name.
+#[derive(Debug, Clone)]
+pub struct Meta {
+    pub placement: Placement,
+    pub key: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaddingObfs {
+    pub key: String,
+    pub header: String,
+    pub placement: Placement,
+    pub tokenish: bool,
 }
 
 pub fn load(path: &str) -> Result<Config, String> {
@@ -170,24 +202,91 @@ fn inline_or_file(cert: &Value, inline_key: &str, file_key: &str) -> Result<Vec<
 }
 
 fn parse_xhttp(x: &Value) -> Result<XhttpSettings, String> {
+    // Like Xray, `extra` replaces everything except host, path and mode.
+    let merged;
+    let x = match x.get("extra").filter(|e| e.is_object()) {
+        Some(extra) => {
+            let mut extra = extra.clone();
+            for key in ["host", "path", "mode"] {
+                extra[key] = x.get(key).cloned().unwrap_or(Value::Null);
+            }
+            merged = extra;
+            &merged
+        }
+        None => x,
+    };
     let mut path = str_field(x, "path").split('?').next().unwrap_or_default().to_owned();
     if !path.starts_with('/') {
         path.insert(0, '/');
-    }
-    if !path.ends_with('/') {
-        path.push('/');
     }
     let mode = match str_field(x, "mode") {
         "" => "auto",
         m @ ("auto" | "packet-up" | "stream-up" | "stream-one") => m,
         other => return Err(format!("unknown xhttp mode {other:?}")),
     };
-    for key in ["xPaddingObfsMode"] {
-        if x.get(key).and_then(Value::as_bool).unwrap_or(false) {
-            return Err(format!("xhttpSettings.{key} is not supported yet"));
-        }
+    let padding = match parse_range(x.get("xPaddingBytes")) {
+        Some((from, to)) if from == 0 && to == 0 => (100, 1000),
+        Some((from, to)) if from == 0 || to == 0 => return Err("xPaddingBytes cannot be disabled".into()),
+        Some(range) => range,
+        None => (100, 1000),
+    };
+    let text = |key: &str, default: &str| match str_field(x, key) {
+        "" => default.to_owned(),
+        value => value.to_owned(),
+    };
+    let placement = |key: &str, default: &str, allowed: &[&str]| {
+        let value = text(key, default);
+        allowed
+            .contains(&value.as_str())
+            .then(|| placement_of(&value))
+            .ok_or_else(|| format!("xhttpSettings.{key}: unsupported placement {value:?}"))
+    };
+    let padding_obfs = if x.get("xPaddingObfsMode").and_then(Value::as_bool).unwrap_or(false) {
+        let tokenish = match text("xPaddingMethod", "repeat-x").as_str() {
+            "repeat-x" => false,
+            "tokenish" => true,
+            other => return Err(format!("xhttpSettings.xPaddingMethod: unsupported method {other:?}")),
+        };
+        Some(PaddingObfs {
+            key: text("xPaddingKey", "x_padding"),
+            header: header_name(text("xPaddingHeader", "X-Padding"))?,
+            placement: placement("xPaddingPlacement", "queryInHeader", &["cookie", "header", "query", "queryInHeader"])?,
+            tokenish,
+        })
+    } else {
+        None
+    };
+    let meta = |placement_key: &str, key_key: &str, names: (&str, &str)| -> Result<Meta, String> {
+        let placement = placement(placement_key, "path", &["path", "cookie", "header", "query"])?;
+        let key = match (placement, str_field(x, key_key)) {
+            (Placement::Path, _) => String::new(),
+            (Placement::Header, "") => names.0.to_owned(),
+            (_, "") => names.1.to_owned(),
+            (_, key) => key.to_owned(),
+        };
+        let key = if placement == Placement::Header { header_name(key)? } else { key };
+        Ok(Meta { placement, key })
+    };
+    let session = meta("sessionIDPlacement", "sessionIDKey", ("X-Session", "x_session"))?;
+    let seq = meta("seqPlacement", "seqKey", ("X-Seq", "x_seq"))?;
+    // Xray adds the trailing slash only when a path segment carries metadata.
+    if (session.placement == Placement::Path || seq.placement == Placement::Path) && !path.ends_with('/') {
+        path.push('/');
     }
-    let padding = parse_range(x.get("xPaddingBytes")).filter(|r| r.1 > 0).unwrap_or((100, 1000));
+    let data_placement = placement("uplinkDataPlacement", "auto", &["auto", "body", "cookie", "header"])?;
+    if matches!(data_placement, Placement::Cookie | Placement::Header) && mode != "packet-up" {
+        return Err("xhttpSettings.uplinkDataPlacement can be cookie or header only in packet-up mode".into());
+    }
+    let data_key = match (data_placement, str_field(x, "uplinkDataKey")) {
+        (Placement::Cookie, "") => "x_data".to_owned(),
+        (_, "") => "X-Data".to_owned(),
+        (_, key) => key.to_owned(),
+    };
+    let data_key = if data_placement == Placement::Cookie { data_key } else { header_name(data_key)? };
+    let stream_up_secs = parse_range(x.get("scStreamUpServerSecs")).filter(|r| r.1 > 0).map_or((20, 80), |(a, b)| (a as u64, b as u64));
+    if x.get("h2Params").is_some_and(|v| !v.is_null()) {
+        log::warn("xhttpSettings.h2Params is ignored");
+    }
     let max_each_post = parse_range(x.get("scMaxEachPostBytes")).filter(|r| r.1 > 0).map_or(1_000_000, |r| r.1);
     let max_buffered_posts = x.get("scMaxBufferedPosts").and_then(Value::as_u64).filter(|n| *n > 0).unwrap_or(30) as usize;
     Ok(XhttpSettings {
@@ -195,10 +294,31 @@ fn parse_xhttp(x: &Value) -> Result<XhttpSettings, String> {
         host: str_field(x, "host").to_owned(),
         mode: mode.to_owned(),
         padding,
+        padding_obfs,
+        session,
+        seq,
+        uplink_data: Meta { placement: data_placement, key: data_key },
+        stream_up_secs,
         no_sse_header: x.get("noSSEHeader").and_then(Value::as_bool).unwrap_or(false),
         max_each_post,
         max_buffered_posts,
     })
+}
+
+fn placement_of(value: &str) -> Placement {
+    match value {
+        "query" => Placement::Query,
+        "header" => Placement::Header,
+        "cookie" => Placement::Cookie,
+        "queryInHeader" => Placement::QueryInHeader,
+        "body" => Placement::Body,
+        "auto" => Placement::Auto,
+        _ => Placement::Path,
+    }
+}
+
+fn header_name(name: String) -> Result<String, String> {
+    http::HeaderName::from_bytes(name.as_bytes()).map(|_| name.clone()).map_err(|_| format!("xhttpSettings: invalid header name {name:?}"))
 }
 
 /// Xray accepts ranges as `123`, `"100-1000"` or `{"from":..,"to":..}`.

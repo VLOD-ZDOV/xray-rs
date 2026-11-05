@@ -5,6 +5,7 @@ mod config;
 mod log;
 mod mux;
 mod outbound;
+mod padding;
 mod routing;
 mod socks;
 mod stats;
@@ -180,10 +181,14 @@ where
         .initial_stream_window_size(4 * 1024 * 1024)
         .initial_connection_window_size(16 * 1024 * 1024)
         .max_concurrent_streams(1024);
+    // XHTTP header uplink splits data over many headers; Go limits only their total size.
+    builder.http1().max_headers(MAX_HEADERS);
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
         log::debug(format!("http connection from {} ended: {e}", log::mask(peer)));
     }
 }
+
+const MAX_HEADERS: usize = 1024;
 
 fn tls_acceptor(settings: &TlsSettings) -> Result<TlsAcceptor, String> {
     let certs = CertificateDer::pem_slice_iter(&settings.cert_pem)

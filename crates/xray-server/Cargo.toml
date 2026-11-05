@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 bytes.workspace = true
 futures-util.workspace = true
+base64.workspace = true
 http.workspace = true
 http-body-util = "0.1"
 prost.workspace = true
