@@ -400,7 +400,12 @@ impl RouteRequest<'_> {
     pub(crate) async fn allow(&self, router: &Router, first_payload: &[u8]) -> Option<Decision> {
         let sniffed_domain = self.sniffing.domain(first_payload);
         let (domain, ip) = if let Some(ref d) = sniffed_domain {
-            (Some(d.as_str()), None)
+            // With routeOnly the original IP is still dialed, so IP rules must see it.
+            let ip = match self.host {
+                Host::Ip(ip) if self.sniffing.route_only => Some(*ip),
+                _ => None,
+            };
+            (Some(d.as_str()), ip)
         } else {
             match self.host {
                 Host::Domain(name) => (Some(name.as_str()), None),
@@ -709,5 +714,34 @@ mod tests {
         assert!(is_private("10.1.2.3".parse().unwrap()));
         assert!(is_private("::ffff:192.168.1.1".parse().unwrap()));
         assert!(!is_private("1.1.1.1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn route_only_sniffing_keeps_ip_rules() {
+        let config = serde_json::json!({
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "blocked", "protocol": "blackhole"}],
+            "routing": {"rules": [{"type": "field", "outboundTag": "blocked", "ip": ["10.0.0.0/8"]}]}
+        });
+        let router = Router::build(&config, &[]).unwrap();
+        let host = Host::Ip("10.0.0.1".parse().unwrap());
+        let payload = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let route = |route_only| RouteRequest {
+            ctx_tag: "in",
+            inbound_port: 443,
+            email: "u",
+            peer: "203.0.113.5:40000".parse().unwrap(),
+            network: Network::Tcp,
+            host: &host,
+            port: 80,
+            sniffing: Sniffing {
+                http: true,
+                tls: false,
+                route_only,
+            },
+        };
+        // routeOnly still dials 10.0.0.1; without it the sniffed domain is dialed instead.
+        assert!(route(true).allow(&router, payload).await.is_none());
+        let decision = route(false).allow(&router, payload).await.unwrap();
+        assert_eq!(decision.tag, "direct");
     }
 }
