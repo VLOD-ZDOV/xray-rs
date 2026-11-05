@@ -21,8 +21,8 @@ pub struct Config {
     pub stats: stats::Policy,
     pub inbounds: Vec<Inbound>,
     pub router: Router,
-    #[allow(dead_code)]
     pub dns: Option<xray_config::DnsConfig>,
+    pub policy: Option<xray_config::PolicyConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,16 +240,26 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         mask_address: str_field(section, "maskAddress").to_owned(),
         dns_log,
     };
-    let dns = if root.get("dns").is_some() {
+    let (dns, policy) = if root.get("dns").is_some() || root.get("policy").is_some() {
         let parsed = xray_config::parse_xray_json_with_geodata_dirs(raw, &asset_dirs())
             .map_err(|e| {
                 let messages: Vec<String> =
                     e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
-                format!("dns: {}", messages.join("; "))
+                format!("dns/policy: {}", messages.join("; "))
             })?;
-        Some(parsed.config.dns)
+        let dns = if root.get("dns").is_some() {
+            Some(parsed.config.dns)
+        } else {
+            None
+        };
+        let policy = if root.get("policy").is_some() {
+            Some(parsed.config.policy)
+        } else {
+            None
+        };
+        (dns, policy)
     } else {
-        None
+        (None, None)
     };
     Ok(Config {
         log,
@@ -258,6 +268,7 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         inbounds,
         router,
         dns,
+        policy,
     })
 }
 

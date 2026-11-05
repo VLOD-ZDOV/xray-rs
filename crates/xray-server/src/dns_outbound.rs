@@ -122,8 +122,9 @@ impl DnsOutbound {
             return Ok(resp);
         }
 
-        let ips: Vec<IpAddr> = match tokio::net::lookup_host(format!("{qname}:0")).await {
+        let ips: Vec<IpAddr> = match crate::dns::resolve_all(&qname, 0).await {
             Ok(addrs) => addrs
+                .into_iter()
                 .map(|a| a.ip())
                 .filter(|ip| match qtype {
                     1 => ip.is_ipv4(),

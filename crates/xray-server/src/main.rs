@@ -2,6 +2,7 @@
 
 mod api;
 mod config;
+mod dns;
 mod dns_outbound;
 mod dokodemo;
 mod fallback;
@@ -15,6 +16,7 @@ mod mux;
 mod outbound;
 mod outbound_transport;
 mod padding;
+mod policy;
 mod proxy_proto;
 mod reality;
 mod routing;
@@ -189,6 +191,8 @@ async fn run(
 ) -> Result<(), String> {
     log::info(format!("xray-rs {} started", env!("CARGO_PKG_VERSION")));
     stats::init(config.stats);
+    dns::init(config.dns);
+    policy::init(config.policy.as_ref());
     let router = Arc::new(config.router);
     let inbound_manager = Arc::new(api::InboundManager::new(router.clone()));
     for (inbound, acceptor) in config.inbounds.into_iter().zip(tls) {

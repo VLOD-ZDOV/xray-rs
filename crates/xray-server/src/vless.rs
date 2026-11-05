@@ -29,8 +29,6 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // Xray policy level 0 defaults.
 pub(crate) const CONN_IDLE: Duration = Duration::from_secs(300);
-const UPLINK_ONLY: Duration = Duration::from_secs(2);
-const DOWNLINK_ONLY: Duration = Duration::from_secs(5);
 // How long to wait for the first payload when a rule needs to sniff it.
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
 const MAX_HEADER: usize = 1 + 16 + 1 + 255 + 1 + 2 + 1 + 1 + 255;
@@ -582,9 +580,7 @@ pub(crate) async fn resolve_all(host: &Host, port: u16) -> io::Result<Vec<Socket
         Host::Ip(ip) => vec![SocketAddr::new(*ip, port)],
         Host::Domain(name) => {
             crate::log::dns(format!("resolving {name}:{port}"));
-            let list: Vec<SocketAddr> = tokio::net::lookup_host((name.as_str(), port))
-                .await?
-                .collect();
+            let list: Vec<SocketAddr> = crate::dns::resolve_all(name, port).await?;
             crate::log::dns(format!("resolved {name}:{port} -> {list:?}"));
             list
         }
@@ -663,19 +659,20 @@ pub(crate) async fn relay(
     down: impl std::future::Future<Output = io::Result<()>>,
     activity: &Activity,
 ) -> io::Result<()> {
+    let policy = crate::policy::get();
     tokio::pin!(up, down);
     tokio::select! {
         result = &mut up => {
             result?;
             activity.touch();
-            tokio::select! { _ = &mut down => {}, _ = idle_for(activity, DOWNLINK_ONLY) => {} }
+            tokio::select! { _ = &mut down => {}, _ = idle_for(activity, policy.downlink_only) => {} }
         }
         result = &mut down => {
             result?;
             activity.touch();
-            tokio::select! { _ = &mut up => {}, _ = idle_for(activity, UPLINK_ONLY) => {} }
+            tokio::select! { _ = &mut up => {}, _ = idle_for(activity, policy.uplink_only) => {} }
         }
-        _ = idle_for(activity, CONN_IDLE) => {}
+        _ = idle_for(activity, policy.conn_idle) => {}
     }
     Ok(())
 }
@@ -700,7 +697,8 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; 32 * 1024];
+    let buf_size = crate::policy::get().buffer_size;
+    let mut buf = vec![0u8; buf_size];
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
