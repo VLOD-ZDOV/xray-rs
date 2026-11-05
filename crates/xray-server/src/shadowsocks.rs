@@ -297,7 +297,9 @@ impl ShadowsocksUdpHandler {
             while let Some(packet) = rx.recv().await {
                 activity.touch();
                 let Ok((_idx, target, payload, cid, pid)) =
-                    xray_proxy::shadowsocks2022::ServerUdpSession::decode_request(&methods, &packet)
+                    xray_proxy::shadowsocks2022::ServerUdpSession::decode_request(
+                        &methods, &packet,
+                    )
                 else {
                     continue;
                 };
@@ -345,7 +347,11 @@ impl ShadowsocksUdpHandler {
                     from.port(),
                     xray_routing::Network::Udp,
                 );
-                if let Ok(wire) = session_down.lock().await.encode_response(&target, &buf[..n]) {
+                if let Ok(wire) = session_down
+                    .lock()
+                    .await
+                    .encode_response(&target, &buf[..n])
+                {
                     let _ = self.socket.send_to(&wire, init.peer).await;
                     traffic.down(n);
                 }

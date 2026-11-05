@@ -450,9 +450,7 @@ where
                 let activity = Activity::new();
                 relay(
                     copy(&mut client_r, &mut target_w, &activity, |n| traffic.up(n)),
-                    copy(&mut target_r, &mut client_w, &activity, |n| {
-                        traffic.down(n)
-                    }),
+                    copy(&mut target_r, &mut client_w, &activity, |n| traffic.down(n)),
                     &activity,
                 )
                 .await
@@ -467,9 +465,7 @@ where
                 let activity = Activity::new();
                 relay(
                     copy(&mut uplink, &mut target_w, &activity, |n| traffic.up(n)),
-                    copy(&mut target_r, &mut downlink, &activity, |n| {
-                        traffic.down(n)
-                    }),
+                    copy(&mut target_r, &mut downlink, &activity, |n| traffic.down(n)),
                     &activity,
                 )
                 .await

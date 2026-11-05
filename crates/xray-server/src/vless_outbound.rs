@@ -18,8 +18,8 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use uuid::Uuid;
 use xray_proxy::vless::{
-    encode_request_header, encode_udp_packet, read_udp_packet, VlessCommand, VlessRequest,
-    VlessResponseStream, VisionStream, VisionStreamIo, DEFAULT_VISION_SEED,
+    encode_request_header, encode_udp_packet, read_udp_packet, VisionStream, VisionStreamIo,
+    VlessCommand, VlessRequest, VlessResponseStream, DEFAULT_VISION_SEED,
 };
 use xray_routing::{Target, TargetAddr};
 use xray_transport::stream::{
@@ -190,11 +190,14 @@ impl VlessOutbound {
         let connector = match security {
             "" | "none" => ConnectorConfig::Tcp,
             "tls" => parse_tls(stream.get("tlsSettings").unwrap_or(&Value::Null), &host)?,
-            "reality" => parse_reality(
-                stream.get("realitySettings").unwrap_or(&Value::Null),
-                &host,
-            )?,
-            other => return Err(err(&format!("unsupported streamSettings.security {other:?}"))),
+            "reality" => {
+                parse_reality(stream.get("realitySettings").unwrap_or(&Value::Null), &host)?
+            }
+            other => {
+                return Err(err(&format!(
+                    "unsupported streamSettings.security {other:?}"
+                )))
+            }
         };
 
         let host_fallback = match &connector {
@@ -320,7 +323,11 @@ impl VlessOutbound {
                     initial_windows_size,
                 }))
             }
-            other => return Err(err(&format!("unsupported streamSettings.network {other:?}"))),
+            other => {
+                return Err(err(&format!(
+                    "unsupported streamSettings.network {other:?}"
+                )))
+            }
         };
 
         let dialer = TransportDialer::system().map_err(|e| err(&format!("dialer error: {e}")))?;
@@ -416,7 +423,9 @@ impl VlessOutbound {
         carrier.write_all(&header).await?;
         carrier.flush().await?;
 
-        Ok(VlessResponseStream::new(VisionTransportStream::new(carrier)))
+        Ok(VlessResponseStream::new(VisionTransportStream::new(
+            carrier,
+        )))
     }
 
     pub async fn connect(
@@ -518,8 +527,15 @@ impl VlessConeUdp {
 
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
         let mut sessions = self.sessions.lock().await;
-        if sessions.get(&addr).is_none_or(|(_, task)| task.is_finished()) {
-            let link = Arc::new(self.vless.open_udp(&Host::Ip(addr.ip()), addr.port()).await?);
+        if sessions
+            .get(&addr)
+            .is_none_or(|(_, task)| task.is_finished())
+        {
+            let link = Arc::new(
+                self.vless
+                    .open_udp(&Host::Ip(addr.ip()), addr.port())
+                    .await?,
+            );
             let (reader, tx) = (link.clone(), self.tx.clone());
             let task = tokio::spawn(async move {
                 let mut buf = vec![0u8; 65535];
@@ -801,7 +817,10 @@ mod tests {
         assert!(matches!(out.transport, TransportLayer::WebSocket(_)));
         if let ConnectorConfig::Reality(r) = &out.connector {
             assert_eq!(r.server_name, "reality.example.com");
-            assert_eq!(r.short_id, vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+            assert_eq!(
+                r.short_id,
+                vec![0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+            );
             assert_eq!(r.spider_x, "/api");
         } else {
             panic!("expected reality connector");

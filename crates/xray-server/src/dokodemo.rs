@@ -90,11 +90,7 @@ pub struct DokodemoUdpHandler {
 }
 
 impl DokodemoUdpHandler {
-    pub fn new(
-        socket: Arc<UdpSocket>,
-        settings: Arc<DokodemoSettings>,
-        ctx: Arc<Context>,
-    ) -> Self {
+    pub fn new(socket: Arc<UdpSocket>, settings: Arc<DokodemoSettings>, ctx: Arc<Context>) -> Self {
         Self {
             socket,
             settings,

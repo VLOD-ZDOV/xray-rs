@@ -2,25 +2,31 @@
 
 mod api;
 mod config;
+mod dns_outbound;
 mod dokodemo;
 mod fallback;
 mod grpc;
 mod http_obfs;
+mod http_outbound;
 mod httpupgrade;
 mod inbound_proxy;
 mod log;
 mod mux;
 mod outbound;
+mod outbound_transport;
 mod padding;
 mod proxy_proto;
 mod routing;
 mod shadowsocks;
+mod shadowsocks_outbound;
 mod socks;
 mod stats;
 mod trojan;
+mod trojan_outbound;
 mod vless;
 mod vless_outbound;
 mod vmess;
+mod vmess_outbound;
 mod wg;
 mod ws;
 mod xhttp;
@@ -237,11 +243,14 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
                 InboundHandler::Shadowsocks(ctx.clone())
             }
             (InboundProtocol::Dokodemo, InboundTransport::Tcp) => {
-                let settings = inbound.dokodemo.clone().unwrap_or(config::DokodemoSettings {
-                    address: None,
-                    port: None,
-                    follow_redirect: false,
-                });
+                let settings = inbound
+                    .dokodemo
+                    .clone()
+                    .unwrap_or(config::DokodemoSettings {
+                        address: None,
+                        port: None,
+                        follow_redirect: false,
+                    });
                 InboundHandler::Dokodemo(ctx.clone(), Arc::new(settings))
             }
             (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
@@ -502,19 +511,17 @@ async fn dispatch<I>(
                 log::info(format!("vmess from {} rejected: {e}", log::mask(peer)));
             }
         }
-        InboundHandler::VmessWs(ctx, ws_settings) => {
-            match ws::accept(stream, &ws_settings).await {
-                Ok(ws_stream) => {
-                    let (uplink, downlink) = tokio::io::split(ws_stream);
-                    if let Err(e) = vmess::serve(uplink, downlink, &ctx, peer).await {
-                        log::info(format!("vmess-ws from {} rejected: {e}", log::mask(peer)));
-                    }
-                }
-                Err(e) => {
-                    log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
+        InboundHandler::VmessWs(ctx, ws_settings) => match ws::accept(stream, &ws_settings).await {
+            Ok(ws_stream) => {
+                let (uplink, downlink) = tokio::io::split(ws_stream);
+                if let Err(e) = vmess::serve(uplink, downlink, &ctx, peer).await {
+                    log::info(format!("vmess-ws from {} rejected: {e}", log::mask(peer)));
                 }
             }
-        }
+            Err(e) => {
+                log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
+            }
+        },
         InboundHandler::VmessHttpUpgrade(ctx, hu_settings) => {
             match httpupgrade::accept(stream, &hu_settings).await {
                 Ok(prefixed_stream) => {

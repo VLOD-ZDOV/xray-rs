@@ -1429,4 +1429,95 @@ mod tests {
             vec!["example.com", "api.example.com", "*.internal.net"]
         );
     }
+
+    #[test]
+    fn parses_all_outbound_protocols_in_config() {
+        let raw = r#"{
+          "outbounds": [
+            {
+              "tag": "vmess-out",
+              "protocol": "vmess",
+              "settings": {
+                "vnext": [{
+                  "address": "127.0.0.1",
+                  "port": 10086,
+                  "users": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "security": "auto"}]
+                }]
+              }
+            },
+            {
+              "tag": "trojan-out",
+              "protocol": "trojan",
+              "settings": {
+                "servers": [{"address": "127.0.0.1", "port": 10087, "password": "password"}]
+              }
+            },
+            {
+              "tag": "ss-2017-out",
+              "protocol": "shadowsocks",
+              "settings": {
+                "servers": [{"address": "127.0.0.1", "port": 10088, "method": "aes-128-gcm", "password": "password"}]
+              }
+            },
+            {
+              "tag": "ss-2022-out",
+              "protocol": "shadowsocks",
+              "settings": {
+                "servers": [{"address": "127.0.0.1", "port": 10089, "method": "2022-blake3-aes-128-gcm", "password": "AAAAAAAAAAAAAAAAAAAAAA=="}]
+              }
+            },
+            {
+              "tag": "http-out",
+              "protocol": "http",
+              "settings": {
+                "servers": [{"address": "127.0.0.1", "port": 8080, "users": [{"user": "alice", "pass": "secret"}]}],
+                "headers": {"User-Agent": "Test/1.0"}
+              }
+            },
+            {
+              "tag": "dns-out",
+              "protocol": "dns",
+              "settings": {
+                "rewriteAddress": "1.1.1.1",
+                "rewritePort": 53
+              }
+            },
+            {
+              "tag": "loop-out",
+              "protocol": "loopback",
+              "settings": {
+                "inboundTag": "api"
+              }
+            },
+            {
+              "tag": "direct",
+              "protocol": "freedom",
+              "settings": {
+                "redirect": "127.0.0.1:8080",
+                "fragment": {
+                  "packets": "tlshello",
+                  "length": "100-200",
+                  "interval": "10-20"
+                }
+              }
+            }
+          ],
+          "routing": {
+            "balancers": [
+              {
+                "tag": "b1",
+                "selector": ["ss-"],
+                "strategy": "roundRobin"
+              }
+            ],
+            "rules": [
+              {"type": "field", "port": 80, "balancerTag": "b1"},
+              {"type": "field", "port": 53, "outboundTag": "dns-out"},
+              {"type": "field", "inboundTag": ["loop"], "outboundTag": "http-out"}
+            ]
+          }
+        }"#;
+        let cfg = parse(raw).unwrap();
+        assert_eq!(cfg.inbounds.len(), 0);
+    }
 }
