@@ -57,8 +57,6 @@ to run noise.
 
 ## Not supported yet
 
-- UDP through `vmess`, `trojan` and `shadowsocks` outbounds is blocked; TCP
-  works.
 - No replay protection for VMess and Shadowsocks 2022 TCP yet.
 - Skipped with a warning: VLESS encryption (`decryption` other than `none`),
   WireGuard and Hysteria2 inbounds, XHTTP over HTTP/3, mKCP, fallbacks selected

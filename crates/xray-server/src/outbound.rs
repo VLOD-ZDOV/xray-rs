@@ -16,9 +16,12 @@ use xray_wireguard::UdpSession;
 
 use crate::dns_outbound::DnsUdpSession;
 use crate::routing::{Action, Decision, FreedomSettings, FreedomStrategy, Query, Router};
+use crate::shadowsocks_outbound::{ShadowsocksConeUdp, ShadowsocksUdpLink};
 use crate::socks::SocksUdp;
+use crate::trojan_outbound::{TrojanConeUdp, TrojanUdpLink};
 use crate::vless::{resolve, resolve_all, Host, CONNECT_TIMEOUT};
 use crate::vless_outbound::{VlessConeUdp, VlessUdpLink};
+use crate::vmess_outbound::{VmessConeUdp, VmessUdpLink};
 use crate::wg::{to_io, WgOutbound};
 
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -188,6 +191,9 @@ pub enum UdpLink {
     Wireguard(UdpSession),
     Socks(SocksUdp, SocketAddr),
     Vless(VlessUdpLink),
+    Vmess(VmessUdpLink),
+    Trojan(TrojanUdpLink),
+    Shadowsocks(ShadowsocksUdpLink),
     Dns(Arc<DnsUdpSession>),
 }
 
@@ -225,6 +231,9 @@ impl UdpLink {
                 resolve(host, port).await?,
             )),
             Action::Vless(vless) => Ok(Self::Vless(vless.open_udp(host, port).await?)),
+            Action::Vmess(vmess) => Ok(Self::Vmess(vmess.open_udp(host, port).await?)),
+            Action::Trojan(trojan) => Ok(Self::Trojan(trojan.open_udp(host, port).await?)),
+            Action::Shadowsocks(ss) => Ok(Self::Shadowsocks(ss.open_udp(host, port).await?)),
             Action::Dns(dns) => Ok(Self::Dns(Arc::new(DnsUdpSession::new(dns.clone())))),
             Action::Loopback(inbound_tag) => {
                 let query = Query {
@@ -260,6 +269,9 @@ impl UdpLink {
             Self::Wireguard(session) => session.send(data).await.map_err(to_io),
             Self::Socks(udp, target) => udp.send_to(data, *target).await,
             Self::Vless(vless) => vless.send(data).await,
+            Self::Vmess(vmess) => vmess.send(data).await,
+            Self::Trojan(trojan) => trojan.send(data).await,
+            Self::Shadowsocks(ss) => ss.send(data).await,
             Self::Dns(session) => session.send(data).await,
         }
     }
@@ -280,6 +292,9 @@ impl UdpLink {
                 }
             },
             Self::Vless(vless) => vless.recv(buf).await,
+            Self::Vmess(vmess) => vmess.recv(buf).await,
+            Self::Trojan(trojan) => trojan.recv(buf).await,
+            Self::Shadowsocks(ss) => ss.recv(buf).await,
             Self::Dns(session) => session.recv(buf).await,
         }
     }
@@ -305,6 +320,9 @@ pub enum ConeUdp {
     },
     Socks(SocksUdp),
     Vless(VlessConeUdp),
+    Vmess(VmessConeUdp),
+    Trojan(TrojanConeUdp),
+    Shadowsocks(ShadowsocksConeUdp),
     Dns(Arc<DnsUdpSession>),
 }
 
@@ -336,6 +354,9 @@ impl ConeUdp {
             }
             Action::Socks(socks) => Ok(Self::Socks(socks.associate().await?)),
             Action::Vless(vless) => Ok(Self::Vless(vless.open_cone_udp())),
+            Action::Vmess(vmess) => Ok(Self::Vmess(vmess.open_cone_udp())),
+            Action::Trojan(trojan) => Ok(Self::Trojan(trojan.open_cone_udp())),
+            Action::Shadowsocks(ss) => Ok(Self::Shadowsocks(ss.open_cone_udp().await?)),
             Action::Dns(dns) => Ok(Self::Dns(Arc::new(DnsUdpSession::new(dns.clone())))),
             Action::Loopback(inbound_tag) => {
                 let query = Query {
@@ -381,6 +402,9 @@ impl ConeUdp {
             Self::Wireguard { wg, .. } => wg.udp_target(host, port).await,
             Self::Socks(_) => resolve(host, port).await,
             Self::Vless(vless) => vless.udp_target(host, port).await,
+            Self::Vmess(vmess) => vmess.udp_target(host, port).await,
+            Self::Trojan(trojan) => trojan.udp_target(host, port).await,
+            Self::Shadowsocks(ss) => ss.udp_target(host, port).await,
             Self::Dns(_) => resolve(host, port).await,
         }
     }
@@ -425,6 +449,9 @@ impl ConeUdp {
             }
             Self::Socks(udp) => udp.send_to(data, addr).await,
             Self::Vless(vless) => vless.send_to(data, addr).await,
+            Self::Vmess(vmess) => vmess.send_to(data, addr).await,
+            Self::Trojan(trojan) => trojan.send_to(data, addr).await,
+            Self::Shadowsocks(ss) => ss.send_to(data, addr).await,
             Self::Dns(session) => session.send(data).await,
         }
     }
@@ -456,6 +483,9 @@ impl ConeUdp {
             }
             Self::Socks(udp) => udp.recv_from(buf).await,
             Self::Vless(vless) => vless.recv_from(buf).await,
+            Self::Vmess(vmess) => vmess.recv_from(buf).await,
+            Self::Trojan(trojan) => trojan.recv_from(buf).await,
+            Self::Shadowsocks(ss) => ss.recv_from(buf).await,
             Self::Dns(session) => {
                 let n = session.recv(buf).await?;
                 Ok((n, "127.0.0.1:53".parse().unwrap()))
@@ -474,6 +504,12 @@ impl Drop for ConeUdp {
             }
             Self::Vless(vless) => {
                 vless.abort_all();
+            }
+            Self::Vmess(vmess) => {
+                vmess.abort_all();
+            }
+            Self::Trojan(trojan) => {
+                trojan.abort_all();
             }
             _ => {}
         }
