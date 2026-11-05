@@ -17,6 +17,13 @@ use crate::routing::{self, Action, BlockAction, Decision, Query, Router};
 use crate::stats::{self, Traffic};
 use crate::{log, mux};
 use xray_config::Network;
+use xray_proxy::vless::{VisionStream, VisionStreamIo, DEFAULT_VISION_SEED};
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct Addons {
+    #[prost(string, tag = "1")]
+    pub flow: String,
+}
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -48,6 +55,7 @@ pub struct Request {
     pub command: Command,
     pub host: Host,
     pub port: u16,
+    pub flow: Option<String>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -68,8 +76,16 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
         .iter()
         .position(|u| u.id == id)
         .ok_or(ParseError::Invalid("unknown user"))?;
-    let addons = r.u8()? as usize;
-    r.take(addons)?;
+    let addons_len = r.u8()? as usize;
+    let addons_bytes = r.take(addons_len)?;
+    let flow = if addons_len > 0 {
+        <Addons as prost::Message>::decode(addons_bytes)
+            .ok()
+            .map(|a| a.flow)
+            .filter(|f| !f.is_empty())
+    } else {
+        None
+    };
     let command = match r.u8()? {
         1 => Command::Tcp,
         2 => Command::Udp,
@@ -83,6 +99,7 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
                     command: Command::Mux,
                     host,
                     port: 0,
+                    flow,
                 },
                 r.pos,
             ));
@@ -115,6 +132,7 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
             command,
             host,
             port,
+            flow,
         },
         r.pos,
     ))
@@ -348,20 +366,68 @@ where
 
     match request.command {
         Command::Tcp => {
-            let stream =
-                outbound::connect(&ctx.router, &decision, &request.host, request.port).await?;
-            let (mut target_r, mut target_w) = tokio::io::split(stream);
-            target_w.write_all(&early).await?;
-            traffic.up(early.len());
-            downlink.write_all(&[request.version, 0]).await?;
-            downlink.flush().await?;
-            let activity = Activity::new();
-            relay(
-                copy(&mut uplink, &mut target_w, &activity, |n| traffic.up(n)),
-                copy(&mut target_r, &mut downlink, &activity, |n| traffic.down(n)),
-                &activity,
-            )
-            .await
+            let is_vision = matches!(
+                request.flow.as_deref(),
+                Some("xtls-rprx-vision" | "xtls-rprx-vision-udp443")
+            );
+            if is_vision {
+                let resp_addons = prost::Message::encode_to_vec(&Addons {
+                    flow: "xtls-rprx-vision".to_owned(),
+                });
+                let mut resp_header = vec![request.version, resp_addons.len() as u8];
+                resp_header.extend_from_slice(&resp_addons);
+                downlink.write_all(&resp_header).await?;
+                downlink.flush().await?;
+
+                let client_reader = PrefixedReader {
+                    early,
+                    pos: 0,
+                    inner: &mut uplink,
+                };
+                let client_stream = CombinedStream {
+                    r: client_reader,
+                    w: &mut downlink,
+                };
+                let vision_client = VisionStream::new(
+                    DirectIoWrapper {
+                        inner: client_stream,
+                    },
+                    user.id,
+                    DEFAULT_VISION_SEED,
+                );
+                let (mut client_r, mut client_w) = tokio::io::split(vision_client);
+
+                let stream =
+                    outbound::connect(&ctx.router, &decision, &request.host, request.port).await?;
+                let (mut target_r, mut target_w) = tokio::io::split(stream);
+
+                let activity = Activity::new();
+                relay(
+                    copy(&mut client_r, &mut target_w, &activity, |n| traffic.up(n)),
+                    copy(&mut target_r, &mut client_w, &activity, |n| {
+                        traffic.down(n)
+                    }),
+                    &activity,
+                )
+                .await
+            } else {
+                let stream =
+                    outbound::connect(&ctx.router, &decision, &request.host, request.port).await?;
+                let (mut target_r, mut target_w) = tokio::io::split(stream);
+                target_w.write_all(&early).await?;
+                traffic.up(early.len());
+                downlink.write_all(&[request.version, 0]).await?;
+                downlink.flush().await?;
+                let activity = Activity::new();
+                relay(
+                    copy(&mut uplink, &mut target_w, &activity, |n| traffic.up(n)),
+                    copy(&mut target_r, &mut downlink, &activity, |n| {
+                        traffic.down(n)
+                    }),
+                    &activity,
+                )
+                .await
+            }
         }
         Command::Mux => unreachable!("handled above"),
         Command::Udp => {
@@ -619,6 +685,89 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<'_, R> {
             return Poll::Ready(Ok(()));
         }
         Pin::new(&mut *this.inner).poll_read(cx, buf)
+    }
+}
+
+pub(crate) struct CombinedStream<R, W> {
+    pub(crate) r: R,
+    pub(crate) w: W,
+}
+
+impl<R: AsyncRead + Unpin, W: Unpin> AsyncRead for CombinedStream<R, W> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().r).poll_read(cx, buf)
+    }
+}
+
+impl<R: Unpin, W: AsyncWrite + Unpin> AsyncWrite for CombinedStream<R, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().w).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().w).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().w).poll_shutdown(cx)
+    }
+}
+
+pub(crate) struct DirectIoWrapper<T> {
+    pub(crate) inner: T,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for DirectIoWrapper<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, buf)
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for DirectIoWrapper<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl<T: AsyncRead + AsyncWrite + Unpin> VisionStreamIo for DirectIoWrapper<T> {
+    fn poll_read_direct(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(cx, output)
+    }
+
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, input)
     }
 }
 
