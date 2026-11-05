@@ -9,6 +9,7 @@ mod padding;
 mod routing;
 mod socks;
 mod stats;
+mod trojan;
 mod vless;
 mod wg;
 mod xhttp;
@@ -28,7 +29,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-use config::{Config, Inbound, InboundTransport, TlsSettings};
+use config::{Config, Inbound, InboundProtocol, InboundTransport, TlsSettings};
 
 // 3x-ui reads the second word of `-version` output as the core version.
 const COMPAT_VERSION: &str = "26.10.31";
@@ -118,8 +119,9 @@ fn main() -> ExitCode {
 
 #[derive(Clone)]
 enum InboundHandler {
-    Tcp(Arc<vless::Context>),
-    Xhttp(Arc<xhttp::Handler>),
+    VlessTcp(Arc<vless::Context>),
+    TrojanTcp(Arc<vless::Context>),
+    VlessXhttp(Arc<xhttp::Handler>),
 }
 
 async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String> {
@@ -140,11 +142,18 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             users: RwLock::new(inbound.users),
             router: router.clone(),
         });
-        inbounds.insert(inbound.tag, ctx.clone());
-        let handler = match inbound.transport {
-            InboundTransport::Tcp => InboundHandler::Tcp(ctx),
-            InboundTransport::Xhttp(settings) => {
-                InboundHandler::Xhttp(xhttp::Handler::new(*settings, ctx))
+        inbounds.insert(inbound.tag.clone(), ctx.clone());
+        let handler = match (inbound.protocol, inbound.transport) {
+            (InboundProtocol::Vless, InboundTransport::Tcp) => InboundHandler::VlessTcp(ctx),
+            (InboundProtocol::Trojan, InboundTransport::Tcp) => InboundHandler::TrojanTcp(ctx),
+            (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
+                InboundHandler::VlessXhttp(xhttp::Handler::new(*settings, ctx))
+            }
+            (InboundProtocol::Trojan, InboundTransport::Xhttp(_)) => {
+                return Err(format!(
+                    "inbound {}: Trojan over XHTTP is not supported",
+                    inbound.tag
+                ));
             }
         };
         tokio::spawn(accept_loop(listener, acceptor, handler));
@@ -216,13 +225,19 @@ where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     match handler {
-        InboundHandler::Tcp(ctx) => {
+        InboundHandler::VlessTcp(ctx) => {
             let (r, w) = tokio::io::split(stream);
             if let Err(e) = vless::serve(r, w, &ctx, peer).await {
-                log::info(format!("from {} rejected: {e}", log::mask(peer)));
+                log::info(format!("vless from {} rejected: {e}", log::mask(peer)));
             }
         }
-        InboundHandler::Xhttp(h) => {
+        InboundHandler::TrojanTcp(ctx) => {
+            let (r, w) = tokio::io::split(stream);
+            if let Err(e) = trojan::serve(r, w, &ctx, peer).await {
+                log::info(format!("trojan from {} rejected: {e}", log::mask(peer)));
+            }
+        }
+        InboundHandler::VlessXhttp(h) => {
             serve_http(stream, peer, h).await;
         }
     }

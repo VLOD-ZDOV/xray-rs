@@ -27,6 +27,7 @@ const HANDLER: &str = "/xray.app.proxyman.command.HandlerService/";
 const ADD_USER: &str = "xray.app.proxyman.command.AddUserOperation";
 const REMOVE_USER: &str = "xray.app.proxyman.command.RemoveUserOperation";
 const VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
+const TROJAN_ACCOUNT: &str = "xray.proxy.trojan.Account";
 const MAX_REQUEST: usize = 1 << 20;
 
 // grpc-status codes.
@@ -179,6 +180,12 @@ pub struct VlessAccount {
     pub flow: String,
     #[prost(string, tag = "3")]
     pub encryption: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TrojanAccount {
+    #[prost(string, tag = "1")]
+    pub password: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -419,20 +426,30 @@ fn missing_handler(tag: &str) -> Response<Body> {
 
 fn inbound_user(user: ProtocolUser) -> Result<InboundUser, String> {
     let account = user.account.unwrap_or_default();
-    if account.r#type != VLESS_ACCOUNT {
-        return Err(format!(
-            "account type {:?} is not supported, only VLESS",
-            account.r#type
-        ));
+    match account.r#type.as_str() {
+        VLESS_ACCOUNT => {
+            let account = VlessAccount::decode(account.value).map_err(|e| e.to_string())?;
+            if !account.encryption.is_empty() && account.encryption != "none" {
+                return Err("VLESS encryption is not supported".into());
+            }
+            Ok(InboundUser {
+                id: user_id(&account.id),
+                hash: crate::trojan::trojan_password_hash(&account.id),
+                email: user.email,
+            })
+        }
+        TROJAN_ACCOUNT => {
+            let account = TrojanAccount::decode(account.value).map_err(|e| e.to_string())?;
+            Ok(InboundUser {
+                id: user_id(&account.password),
+                hash: crate::trojan::trojan_password_hash(&account.password),
+                email: user.email,
+            })
+        }
+        other => Err(format!(
+            "account type {other:?} is not supported, only VLESS and Trojan"
+        )),
     }
-    let account = VlessAccount::decode(account.value).map_err(|e| e.to_string())?;
-    if !account.encryption.is_empty() && account.encryption != "none" {
-        return Err("VLESS encryption is not supported".into());
-    }
-    Ok(InboundUser {
-        id: user_id(&account.id),
-        email: user.email,
-    })
 }
 
 fn protocol_user(user: InboundUser) -> ProtocolUser {

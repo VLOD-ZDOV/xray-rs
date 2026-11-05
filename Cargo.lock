@@ -3206,11 +3206,13 @@ dependencies = [
  "regex",
  "rustls",
  "serde_json",
+ "sha2",
  "tokio",
  "tokio-rustls",
  "uuid",
  "xray-config",
  "xray-proxy",
+ "xray-routing",
  "xray-wireguard",
 ]
 

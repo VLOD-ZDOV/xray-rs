@@ -25,11 +25,13 @@ rand.workspace = true
 regex.workspace = true
 rustls = { workspace = true }
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tokio-rustls.workspace = true
 uuid = { workspace = true, features = ["v5"] }
 xray-config = { path = "../xray-config" }
 xray-proxy = { path = "../xray-proxy" }
+xray-routing = { path = "../xray-routing" }
 xray-wireguard = { path = "../xray-wireguard" }
 
 [build-dependencies]

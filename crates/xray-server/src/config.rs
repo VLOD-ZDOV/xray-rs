@@ -28,19 +28,27 @@ pub enum InboundTransport {
     Xhttp(Box<XhttpSettings>),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundProtocol {
+    Vless,
+    Trojan,
+}
+
 #[derive(Debug)]
 pub struct Inbound {
     pub tag: String,
     pub listen: String,
     pub port: u16,
+    pub protocol: InboundProtocol,
     pub users: Vec<User>,
     pub tls: Option<TlsSettings>,
     pub transport: InboundTransport,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
     pub id: [u8; 16],
+    pub hash: [u8; 56],
     pub email: String,
 }
 
@@ -165,7 +173,16 @@ pub fn parse(raw: &str) -> Result<Config, String> {
 }
 
 fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
-    let protocol = str_field(item, "protocol");
+    let protocol = match str_field(item, "protocol") {
+        "vless" => InboundProtocol::Vless,
+        "trojan" => InboundProtocol::Trojan,
+        other => {
+            log::warn(format!(
+                "skipping inbound {tag:?}: protocol {other:?} is not supported yet"
+            ));
+            return Ok(None);
+        }
+    };
     let stream = item.get("streamSettings").unwrap_or(&Value::Null);
     let network = str_field(stream, "network");
     let security = str_field(stream, "security");
@@ -173,9 +190,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let is_tcp = network.is_empty() || network == "tcp";
     let is_xhttp = matches!(network, "xhttp" | "splithttp");
     let supported_security = matches!(security, "" | "none" | "tls");
-    if protocol != "vless" || (!is_tcp && !is_xhttp) || !supported_security {
+    if (!is_tcp && !is_xhttp) || !supported_security {
         log::warn(format!(
-            "skipping inbound {tag:?}: {protocol}/{}/{} is not supported yet",
+            "skipping inbound {tag:?}: {:?}/{}/{} is not supported yet",
+            protocol,
             if network.is_empty() { "tcp" } else { network },
             if security.is_empty() {
                 "none"
@@ -196,20 +214,28 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     };
 
     let settings = item.get("settings").unwrap_or(&Value::Null);
-    let decryption = str_field(settings, "decryption");
-    if !decryption.is_empty() && decryption != "none" {
-        return Err("VLESS encryption (decryption != none) is not supported".into());
+    if protocol == InboundProtocol::Vless {
+        let decryption = str_field(settings, "decryption");
+        if !decryption.is_empty() && decryption != "none" {
+            return Err("VLESS encryption (decryption != none) is not supported".into());
+        }
     }
     let mut users = Vec::new();
     for client in array(settings, "clients") {
         let flow = str_field(client, "flow");
         if !flow.is_empty() {
-            log::warn(format!(
-                "inbound {tag:?}: flow {flow:?} is ignored for xhttp"
-            ));
+            log::warn(format!("inbound {tag:?}: flow {flow:?} is ignored"));
         }
+        let id_str = str_field(client, "id");
+        let pass_str = str_field(client, "password");
+        let key = if !pass_str.is_empty() {
+            pass_str
+        } else {
+            id_str
+        };
         users.push(User {
-            id: user_id(str_field(client, "id")),
+            id: user_id(key),
+            hash: crate::trojan::trojan_password_hash(key),
             email: str_field(client, "email").to_owned(),
         });
     }
@@ -236,6 +262,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         tag,
         listen,
         port,
+        protocol,
         users,
         tls,
         transport,
@@ -564,9 +591,31 @@ mod tests {
         let config = parse(raw).unwrap();
         assert_eq!(config.inbounds.len(), 1);
         let inbound = &config.inbounds[0];
+        assert_eq!(inbound.protocol, InboundProtocol::Vless);
         assert_eq!(inbound.transport, InboundTransport::Tcp);
         assert_eq!(inbound.port, 443);
         assert_eq!(inbound.users[0].email, "alice");
+    }
+
+    #[test]
+    fn parses_trojan_inbound() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "trojan-in", "port": 443, "protocol": "trojan",
+             "settings": {"clients": [{"password": "secret", "email": "bob@example.com"}]},
+             "streamSettings": {"network": "tcp", "security": "none"}}
+          ]
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.inbounds.len(), 1);
+        let inbound = &config.inbounds[0];
+        assert_eq!(inbound.protocol, InboundProtocol::Trojan);
+        assert_eq!(inbound.transport, InboundTransport::Tcp);
+        assert_eq!(inbound.users[0].email, "bob@example.com");
+        assert_eq!(
+            inbound.users[0].hash,
+            crate::trojan::trojan_password_hash("secret")
+        );
     }
 
     #[test]

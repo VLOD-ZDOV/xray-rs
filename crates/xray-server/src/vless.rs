@@ -441,20 +441,20 @@ pub fn is_private(ip: IpAddr) -> bool {
     }
 }
 
-struct Activity {
+pub(crate) struct Activity {
     start: Instant,
     last: AtomicU64,
 }
 
 impl Activity {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             start: Instant::now(),
             last: AtomicU64::new(0),
         }
     }
 
-    fn touch(&self) {
+    pub(crate) fn touch(&self) {
         self.last
             .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
@@ -469,7 +469,7 @@ impl Activity {
 /// Runs both directions until `CONN_IDLE` passes without traffic. Once one side
 /// finishes, the other keeps going only while it stays active (Xray's
 /// uplinkOnly/downlinkOnly semantics).
-async fn relay(
+pub(crate) async fn relay(
     up: impl std::future::Future<Output = io::Result<()>>,
     down: impl std::future::Future<Output = io::Result<()>>,
     activity: &Activity,
@@ -501,7 +501,7 @@ async fn idle_for(activity: &Activity, limit: Duration) {
     }
 }
 
-async fn copy<R, W>(
+pub(crate) async fn copy<R, W>(
     reader: &mut R,
     writer: &mut W,
     activity: &Activity,
@@ -525,10 +525,10 @@ where
     }
 }
 
-struct PrefixedReader<'a, R> {
-    early: Vec<u8>,
-    pos: usize,
-    inner: &'a mut R,
+pub(crate) struct PrefixedReader<'a, R> {
+    pub(crate) early: Vec<u8>,
+    pub(crate) pos: usize,
+    pub(crate) inner: &'a mut R,
 }
 
 /// Replays bytes read past the VLESS header before reading the stream.
@@ -596,6 +596,7 @@ mod tests {
     fn users() -> Vec<User> {
         vec![User {
             id: [7; 16],
+            hash: [0; 56],
             email: "u".into(),
         }]
     }
