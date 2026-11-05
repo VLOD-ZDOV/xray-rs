@@ -32,6 +32,8 @@ pub enum InboundTransport {
 pub enum InboundProtocol {
     Vless,
     Trojan,
+    Socks,
+    Http,
 }
 
 #[derive(Debug)]
@@ -41,6 +43,8 @@ pub struct Inbound {
     pub port: u16,
     pub protocol: InboundProtocol,
     pub users: Vec<User>,
+    pub socks_auth: xray_proxy::inbound::SocksInboundAuth,
+    pub udp: bool,
     pub tls: Option<TlsSettings>,
     pub transport: InboundTransport,
 }
@@ -176,6 +180,8 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let protocol = match str_field(item, "protocol") {
         "vless" => InboundProtocol::Vless,
         "trojan" => InboundProtocol::Trojan,
+        "socks" => InboundProtocol::Socks,
+        "http" => InboundProtocol::Http,
         other => {
             log::warn(format!(
                 "skipping inbound {tag:?}: protocol {other:?} is not supported yet"
@@ -240,6 +246,22 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         });
     }
 
+    let mut socks_accounts = Vec::new();
+    for account in array(settings, "accounts") {
+        let u = str_field(account, "user");
+        let p = str_field(account, "pass");
+        if let Some(acc) = xray_proxy::inbound::SocksAccount::new(u.as_bytes(), p.as_bytes()) {
+            socks_accounts.push(acc);
+        }
+    }
+    let auth_str = str_field(settings, "auth");
+    let socks_auth = if auth_str == "password" || !socks_accounts.is_empty() {
+        xray_proxy::inbound::SocksInboundAuth::Password(socks_accounts)
+    } else {
+        xray_proxy::inbound::SocksInboundAuth::NoAuth
+    };
+    let udp = settings.get("udp").and_then(Value::as_bool).unwrap_or(false);
+
     let tls = if security == "tls" {
         Some(parse_tls(
             stream.get("tlsSettings").unwrap_or(&Value::Null),
@@ -264,6 +286,8 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         port,
         protocol,
         users,
+        socks_auth,
+        udp,
         tls,
         transport,
     }))
@@ -633,6 +657,25 @@ mod tests {
             HeaderName::from_static("server"),
             HeaderValue::from_static("nginx/1.24.0")
         )));
+    }
+
+    #[test]
+    fn parses_socks_and_http_inbounds() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "socks-in", "port": 1080, "protocol": "socks",
+             "settings": {"auth": "password", "accounts": [{"user": "alice", "pass": "secret"}], "udp": true}},
+            {"tag": "http-in", "port": 8080, "protocol": "http",
+             "settings": {"accounts": [{"user": "bob", "pass": "secret2"}]}}
+          ]
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.inbounds.len(), 2);
+        assert_eq!(config.inbounds[0].protocol, InboundProtocol::Socks);
+        assert_eq!(config.inbounds[0].port, 1080);
+        assert!(config.inbounds[0].udp);
+        assert_eq!(config.inbounds[1].protocol, InboundProtocol::Http);
+        assert_eq!(config.inbounds[1].port, 8080);
     }
 
     #[test]

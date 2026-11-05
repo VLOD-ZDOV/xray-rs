@@ -2,6 +2,7 @@
 
 mod api;
 mod config;
+mod inbound_proxy;
 mod log;
 mod mux;
 mod outbound;
@@ -121,6 +122,8 @@ fn main() -> ExitCode {
 enum InboundHandler {
     VlessTcp(Arc<vless::Context>),
     TrojanTcp(Arc<vless::Context>),
+    Socks(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth, bool),
+    Http(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth),
     VlessXhttp(Arc<xhttp::Handler>),
 }
 
@@ -146,13 +149,19 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
         let handler = match (inbound.protocol, inbound.transport) {
             (InboundProtocol::Vless, InboundTransport::Tcp) => InboundHandler::VlessTcp(ctx),
             (InboundProtocol::Trojan, InboundTransport::Tcp) => InboundHandler::TrojanTcp(ctx),
+            (InboundProtocol::Socks, InboundTransport::Tcp) => {
+                InboundHandler::Socks(ctx, inbound.socks_auth, inbound.udp)
+            }
+            (InboundProtocol::Http, InboundTransport::Tcp) => {
+                InboundHandler::Http(ctx, inbound.socks_auth)
+            }
             (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
                 InboundHandler::VlessXhttp(xhttp::Handler::new(*settings, ctx))
             }
-            (InboundProtocol::Trojan, InboundTransport::Xhttp(_)) => {
+            (other, InboundTransport::Xhttp(_)) => {
                 return Err(format!(
-                    "inbound {}: Trojan over XHTTP is not supported",
-                    inbound.tag
+                    "inbound {}: {:?} over XHTTP is not supported",
+                    inbound.tag, other
                 ));
             }
         };
@@ -235,6 +244,16 @@ where
             let (r, w) = tokio::io::split(stream);
             if let Err(e) = trojan::serve(r, w, &ctx, peer).await {
                 log::info(format!("trojan from {} rejected: {e}", log::mask(peer)));
+            }
+        }
+        InboundHandler::Socks(ctx, auth, udp) => {
+            if let Err(e) = inbound_proxy::serve_socks(stream, &auth, udp, &ctx, peer).await {
+                log::info(format!("socks from {} rejected: {e}", log::mask(peer)));
+            }
+        }
+        InboundHandler::Http(ctx, auth) => {
+            if let Err(e) = inbound_proxy::serve_http(stream, &auth, &ctx, peer).await {
+                log::info(format!("http from {} rejected: {e}", log::mask(peer)));
             }
         }
         InboundHandler::VlessXhttp(h) => {
