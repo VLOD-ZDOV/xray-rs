@@ -1,5 +1,0 @@
-{
-  "expected": "full traffic pass",
-  "source": "same candidate and native library",
-  "control": "routing domainStrategy only"
-}

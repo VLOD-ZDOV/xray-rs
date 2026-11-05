@@ -1,8 +1,0 @@
-{
-  "result": "collector-clock-mismatch",
-  "failedAssertion": "no device HTTP error at host epoch filter",
-  "originalDeviceSocketErrorEpoch": 1792368137.257,
-  "originalHostBackendOpenEpoch": 1792368138.305006,
-  "explanation": "Phone wall clock lagged host. A device SocketException and server EOF existed; the collector incorrectly filtered phone log epochs against host epochs. Original log and collector retained. Per-case five-sample clock calibration plus bounded log polling added; no product code or 3-second bound changed.",
-  "time": 1792368219.127198
-}

@@ -1,5 +1,0 @@
-{
-  "expected": "domain traffic rejection",
-  "source": "same candidate and native library",
-  "control": "routing domainStrategy only"
-}

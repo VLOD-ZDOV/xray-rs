@@ -1,8 +1,0 @@
-1792257037.166 debug Debug startupProbe preflight start
-1792257042.223 debug Debug startupProbe preflight success
-1792257044.853 debug Debug startupProbe preflight start
-1792257049.971 error Debug startupProbe preflight fail error=<redacted>
-1792257051.762 debug Debug startupProbe preflight start
-1792257056.764 error Debug startupProbe preflight fail error=<redacted>
-1792257058.504 debug Debug startupProbe preflight start
-1792257060.563 error Debug startupProbe preflight fail error=<redacted>

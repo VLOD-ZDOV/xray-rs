@@ -1,4 +1,0 @@
-Fixture ready: <campaign>/android-cancellation/fixture-local-control/v07-probe.json
-{"backend": "hold-open", "id": 6001, "time": 1792368138.305006}
-{"backend": "udp", "requestBytes": 67, "time": 1792368138.4444869, "queryTag": "f5cfbb9939992cc4", "responseBytes": 83}
-{"backend": "hold-close", "id": 6001, "reason": "eof", "time": 1792368139.4124842}

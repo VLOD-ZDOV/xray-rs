@@ -1,4 +1,0 @@
-1792256984.645 debug Debug startupProbe start url=http://<redacted-host>:18669 timeoutMs=10000 outbound=default
-1792256989.688 debug Debug startupProbe success url=http://<redacted-host>:18669
-1792256992.206 debug Debug startupProbe start url=http://<redacted-host>:18669 timeoutMs=10000 outbound=default
-1792256997.543 error Debug startupProbe fail url=http://<redacted-host>:18669 error=<redacted>

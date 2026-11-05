@@ -1,5 +1,0 @@
-{
-  "expected": "FakeDNS assertion and full traffic pass",
-  "freshDNSName": true,
-  "nativeChanged": false
-}

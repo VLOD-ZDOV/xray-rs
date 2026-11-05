@@ -1,9 +1,0 @@
-{
-  "result": "inadequate-control",
-  "originalNegativeRun": "ios-ip-asis-negative-result.json",
-  "observed": "traffic passed unexpectedly",
-  "reason": "fixture lacked FakeDNS; OS resolved domain to a literal IP before routing, so AsIs matched IP rules",
-  "runtimeDefectConfirmed": false,
-  "supersedingCollection": "ios-fakedns-* with fresh names and explicit FakeDNS assertions",
-  "preserveOriginalResults": true
-}
