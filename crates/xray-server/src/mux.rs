@@ -159,6 +159,7 @@ pub struct Info {
     pub port: u16,
     pub email: String,
     pub router: Arc<Router>,
+    pub sniffing: bool,
 }
 
 struct Packet {
@@ -211,6 +212,7 @@ where
                         network: if udp { Network::Udp } else { Network::Tcp },
                         host: &host,
                         port,
+                        sniffing: info.sniffing,
                     };
                     let Some(decision) = route
                         .allow(&info.router, frame.data.as_deref().unwrap_or_default())

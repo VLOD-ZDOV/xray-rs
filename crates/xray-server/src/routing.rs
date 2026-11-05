@@ -465,6 +465,75 @@ pub fn sniff(data: &[u8], network: Network) -> Option<&'static str> {
     }
 }
 
+/// Extracts the SNI (Server Name Indication) domain from a TLS ClientHello packet.
+pub fn sniff_tls_sni(data: &[u8]) -> Option<String> {
+    if data.len() < 44 || data[0] != 0x16 || data.get(5) != Some(&0x01) {
+        return None;
+    }
+    let session_id_len = *data.get(43)? as usize;
+    let mut pos = 44 + session_id_len;
+    if pos + 2 > data.len() {
+        return None;
+    }
+    let cipher_suites_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2 + cipher_suites_len;
+    if pos + 1 > data.len() {
+        return None;
+    }
+    let compression_methods_len = *data.get(pos)? as usize;
+    pos += 1 + compression_methods_len;
+    if pos + 2 > data.len() {
+        return None;
+    }
+    let ext_total_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    let end = (pos + ext_total_len).min(data.len());
+    while pos + 4 <= end {
+        let ext_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let ext_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+        if ext_type == 0 {
+            if pos + 2 > end {
+                return None;
+            }
+            let list_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+            let mut list_pos = pos + 2;
+            let list_end = (list_pos + list_len).min(end);
+            while list_pos + 3 <= list_end {
+                let name_type = data[list_pos];
+                let name_len =
+                    u16::from_be_bytes([data[list_pos + 1], data[list_pos + 2]]) as usize;
+                list_pos += 3;
+                if name_type == 0 && list_pos + name_len <= list_end {
+                    let name_bytes = &data[list_pos..list_pos + name_len];
+                    return std::str::from_utf8(name_bytes)
+                        .ok()
+                        .map(|s| s.to_ascii_lowercase());
+                }
+                list_pos += name_len;
+            }
+        }
+        pos += ext_len;
+    }
+    None
+}
+
+/// Extracts the Host header domain from an HTTP request.
+pub fn sniff_http_host(data: &[u8]) -> Option<String> {
+    let header_str = std::str::from_utf8(data).ok()?;
+    for line in header_str.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("host") {
+                let host = v.trim().split(':').next()?.trim();
+                if !host.is_empty() {
+                    return Some(host.to_ascii_lowercase());
+                }
+            }
+        }
+    }
+    None
+}
+
 fn take_port_ranges(
     rule: &mut serde_json::Map<String, Value>,
     key: &str,
@@ -777,5 +846,42 @@ mod tests {
             ),
             Some("bittorrent")
         );
+    }
+
+    #[test]
+    fn sniffs_domain_from_http_and_tls() {
+        let http = b"GET /path HTTP/1.1\r\nHost: example.com:8080\r\nUser-Agent: curl\r\n\r\n";
+        assert_eq!(sniff_http_host(http), Some("example.com".to_owned()));
+
+        // Synthetic minimal TLS 1.2 ClientHello with SNI "test.domain.org"
+        let sni_name = b"test.domain.org";
+        let mut sni_ext = Vec::new();
+        sni_ext.extend_from_slice(&0u16.to_be_bytes()); // Ext type = 0 (SNI)
+        let list_len = 3 + sni_name.len() as u16;
+        sni_ext.extend_from_slice(&(list_len + 2).to_be_bytes()); // Ext len
+        sni_ext.extend_from_slice(&list_len.to_be_bytes()); // Server Name List len
+        sni_ext.push(0); // Name type = host_name
+        sni_ext.extend_from_slice(&(sni_name.len() as u16).to_be_bytes()); // Name len
+        sni_ext.extend_from_slice(sni_name);
+
+        let mut hello = Vec::new();
+        hello.extend_from_slice(&[0x16, 0x03, 0x01, 0x00, 0x00]); // TLS Record header
+        hello.push(0x01); // ClientHello
+        hello.extend_from_slice(&[0x00, 0x00, 0x00]); // Handshake len (dummy)
+        hello.extend_from_slice(&[0x03, 0x03]); // Client version
+        hello.extend_from_slice(&[0u8; 32]); // Random
+        hello.push(0x00); // Session ID len = 0
+        hello.extend_from_slice(&2u16.to_be_bytes()); // Cipher suites len = 2
+        hello.extend_from_slice(&[0x13, 0x01]); // TLS_AES_128_GCM_SHA256
+        hello.push(0x01); // Compression methods len = 1
+        hello.push(0x00); // null compression
+        hello.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes()); // Ext total len
+        hello.extend_from_slice(&sni_ext);
+
+        let rec_len = (hello.len() - 5) as u16;
+        hello[3..5].copy_from_slice(&rec_len.to_be_bytes());
+        hello[6..9].copy_from_slice(&(rec_len as u32 - 4).to_be_bytes()[1..4]);
+
+        assert_eq!(sniff_tls_sni(&hello), Some("test.domain.org".to_owned()));
     }
 }

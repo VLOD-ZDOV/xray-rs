@@ -2,6 +2,7 @@
 
 mod api;
 mod config;
+mod httpupgrade;
 mod inbound_proxy;
 mod log;
 mod mux;
@@ -123,8 +124,10 @@ fn main() -> ExitCode {
 enum InboundHandler {
     VlessTcp(Arc<vless::Context>),
     VlessWs(Arc<vless::Context>, ws::WsSettings),
+    VlessHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
     TrojanTcp(Arc<vless::Context>),
     TrojanWs(Arc<vless::Context>, ws::WsSettings),
+    TrojanHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
     Socks(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth, bool),
     Http(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth),
     VlessXhttp(Arc<xhttp::Handler>),
@@ -147,6 +150,7 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             port: inbound.port,
             users: RwLock::new(inbound.users),
             router: router.clone(),
+            sniffing: inbound.sniffing,
         });
         inbounds.insert(inbound.tag.clone(), ctx.clone());
         let handler = match (inbound.protocol, inbound.transport) {
@@ -154,9 +158,15 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             (InboundProtocol::Vless, InboundTransport::Websocket(settings)) => {
                 InboundHandler::VlessWs(ctx, settings)
             }
+            (InboundProtocol::Vless, InboundTransport::HttpUpgrade(settings)) => {
+                InboundHandler::VlessHttpUpgrade(ctx, settings)
+            }
             (InboundProtocol::Trojan, InboundTransport::Tcp) => InboundHandler::TrojanTcp(ctx),
             (InboundProtocol::Trojan, InboundTransport::Websocket(settings)) => {
                 InboundHandler::TrojanWs(ctx, settings)
+            }
+            (InboundProtocol::Trojan, InboundTransport::HttpUpgrade(settings)) => {
+                InboundHandler::TrojanHttpUpgrade(ctx, settings)
             }
             (InboundProtocol::Socks, InboundTransport::Tcp) => {
                 InboundHandler::Socks(ctx, inbound.socks_auth, inbound.udp)
@@ -176,6 +186,12 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             (other, InboundTransport::Websocket(_)) => {
                 return Err(format!(
                     "inbound {}: {:?} over WebSocket is not supported",
+                    inbound.tag, other
+                ));
+            }
+            (other, InboundTransport::HttpUpgrade(_)) => {
+                return Err(format!(
+                    "inbound {}: {:?} over HTTPUpgrade is not supported",
                     inbound.tag, other
                 ));
             }
@@ -268,6 +284,19 @@ where
                 }
             }
         }
+        InboundHandler::VlessHttpUpgrade(ctx, hu_settings) => {
+            match httpupgrade::accept(stream, &hu_settings).await {
+                Ok(prefixed_stream) => {
+                    let (uplink, downlink) = tokio::io::split(prefixed_stream);
+                    if let Err(e) = vless::serve(uplink, downlink, &ctx, peer).await {
+                        log::info(format!("vless-httpupgrade from {} rejected: {e}", log::mask(peer)));
+                    }
+                }
+                Err(e) => {
+                    log::info(format!("httpupgrade handshake from {} failed: {e}", log::mask(peer)));
+                }
+            }
+        }
         InboundHandler::TrojanTcp(ctx) => {
             let (r, w) = tokio::io::split(stream);
             if let Err(e) = trojan::serve(r, w, &ctx, peer).await {
@@ -284,6 +313,19 @@ where
                 }
                 Err(e) => {
                     log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
+                }
+            }
+        }
+        InboundHandler::TrojanHttpUpgrade(ctx, hu_settings) => {
+            match httpupgrade::accept(stream, &hu_settings).await {
+                Ok(prefixed_stream) => {
+                    let (uplink, downlink) = tokio::io::split(prefixed_stream);
+                    if let Err(e) = trojan::serve(uplink, downlink, &ctx, peer).await {
+                        log::info(format!("trojan-httpupgrade from {} rejected: {e}", log::mask(peer)));
+                    }
+                }
+                Err(e) => {
+                    log::info(format!("httpupgrade handshake from {} failed: {e}", log::mask(peer)));
                 }
             }
         }

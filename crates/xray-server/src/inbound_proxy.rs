@@ -60,6 +60,7 @@ where
                 network: Network::Tcp,
                 host: &host,
                 port,
+                sniffing: ctx.sniffing,
             };
             let Some(decision) = route.allow(&ctx.router, &[]).await else {
                 let _ = write_socks5_failure(&mut stream).await;
@@ -231,6 +232,7 @@ where
         network: Network::Tcp,
         host: &host,
         port,
+        sniffing: ctx.sniffing,
     };
 
     let Some(decision) = route.allow(&ctx.router, &[]).await else {

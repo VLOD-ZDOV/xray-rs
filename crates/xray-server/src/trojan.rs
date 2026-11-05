@@ -14,7 +14,7 @@ use xray_routing::{Target, TargetAddr};
 
 use crate::config::User;
 use crate::outbound::{self, ConeUdp};
-use crate::routing::{Action, BlockAction};
+use crate::routing::{self, Action, BlockAction};
 use crate::stats;
 use crate::vless::{
     copy, relay, Activity, Context, Host, RouteRequest, CONN_IDLE,
@@ -159,7 +159,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut buf = Vec::with_capacity(512);
-    let (request, header_len, user) = timeout(HANDSHAKE_TIMEOUT, async {
+    let (mut request, header_len, user) = timeout(HANDSHAKE_TIMEOUT, async {
         let mut chunk = [0u8; 512];
         loop {
             let parsed = {
@@ -200,7 +200,7 @@ where
         Command::Udp => Network::Udp,
     };
 
-    if network == Network::Tcp && early.is_empty() && ctx.router.needs_sniff() {
+    if network == Network::Tcp && early.is_empty() && (ctx.router.needs_sniff() || ctx.sniffing) {
         let mut chunk = vec![0u8; 4096];
         if let Ok(Ok(n)) = timeout(SNIFF_TIMEOUT, uplink.read(&mut chunk)).await {
             early.extend_from_slice(&chunk[..n]);
@@ -221,11 +221,20 @@ where
         network,
         host: &request.host,
         port: request.port,
+        sniffing: ctx.sniffing,
     };
 
     let Some(decision) = route.allow(&ctx.router, payload).await else {
         return Ok(());
     };
+
+    if ctx.sniffing {
+        if let Some(sniffed) =
+            routing::sniff_tls_sni(payload).or_else(|| routing::sniff_http_host(payload))
+        {
+            request.host = Host::Domain(sniffed);
+        }
+    }
 
     if let Action::Block(BlockAction::Http403) = decision.action {
         if request.command == Command::Tcp {

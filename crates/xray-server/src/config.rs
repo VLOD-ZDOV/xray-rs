@@ -26,6 +26,7 @@ pub struct Config {
 pub enum InboundTransport {
     Tcp,
     Websocket(crate::ws::WsSettings),
+    HttpUpgrade(crate::httpupgrade::HttpUpgradeSettings),
     Xhttp(Box<XhttpSettings>),
 }
 
@@ -46,6 +47,7 @@ pub struct Inbound {
     pub users: Vec<User>,
     pub socks_auth: xray_proxy::inbound::SocksInboundAuth,
     pub udp: bool,
+    pub sniffing: bool,
     pub tls: Option<TlsSettings>,
     pub transport: InboundTransport,
 }
@@ -196,9 +198,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
 
     let is_tcp = network.is_empty() || network == "tcp";
     let is_ws = matches!(network, "ws" | "websocket");
+    let is_httpupgrade = network == "httpupgrade";
     let is_xhttp = matches!(network, "xhttp" | "splithttp");
     let supported_security = matches!(security, "" | "none" | "tls");
-    if (!is_tcp && !is_ws && !is_xhttp) || !supported_security {
+    if (!is_tcp && !is_ws && !is_httpupgrade && !is_xhttp) || !supported_security {
         log::warn(format!(
             "skipping inbound {tag:?}: {:?}/{}/{} is not supported yet",
             protocol,
@@ -277,6 +280,12 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         InboundTransport::Websocket(parse_ws(
             stream.get("wsSettings").unwrap_or(&Value::Null),
         )?)
+    } else if is_httpupgrade {
+        InboundTransport::HttpUpgrade(parse_httpupgrade(
+            stream
+                .get("httpupgradeSettings")
+                .unwrap_or(&Value::Null),
+        )?)
     } else {
         InboundTransport::Xhttp(Box::new(parse_xhttp(
             stream
@@ -286,6 +295,12 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         )?))
     };
 
+    let sniffing = item
+        .get("sniffing")
+        .and_then(|s| s.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     Ok(Some(Inbound {
         tag,
         listen,
@@ -294,6 +309,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         users,
         socks_auth,
         udp,
+        sniffing,
         tls,
         transport,
     }))
@@ -527,6 +543,24 @@ fn parse_ws(settings: &Value) -> Result<crate::ws::WsSettings, String> {
     Ok(crate::ws::WsSettings { path, host })
 }
 
+fn parse_httpupgrade(
+    settings: &Value,
+) -> Result<crate::httpupgrade::HttpUpgradeSettings, String> {
+    let mut path = str_field(settings, "path").to_owned();
+    if path.is_empty() {
+        path = "/".to_owned();
+    } else if !path.starts_with('/') {
+        path = format!("/{path}");
+    }
+    let host = str_field(settings, "host");
+    let host = if host.is_empty() {
+        None
+    } else {
+        Some(host.to_owned())
+    };
+    Ok(crate::httpupgrade::HttpUpgradeSettings { path, host })
+}
+
 fn placement_of(value: &str) -> Placement {
     match value {
         "query" => Placement::Query,
@@ -727,6 +761,29 @@ mod tests {
             assert_eq!(ws.host, None);
         } else {
             panic!("expected websocket transport");
+        }
+    }
+
+    #[test]
+    fn parses_httpupgrade_and_sniffing_inbound() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "vless-hu", "port": 80, "protocol": "vless",
+             "sniffing": {"enabled": true, "destOverride": ["http", "tls"]},
+             "settings": {"clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "email": "alice"}]},
+             "streamSettings": {"network": "httpupgrade", "security": "none", "httpupgradeSettings": {"path": "/hu", "host": "upgrade.example.com"}}}
+          ]
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.inbounds.len(), 1);
+        let inbound = &config.inbounds[0];
+        assert_eq!(inbound.protocol, InboundProtocol::Vless);
+        assert!(inbound.sniffing);
+        if let InboundTransport::HttpUpgrade(hu) = &inbound.transport {
+            assert_eq!(hu.path, "/hu");
+            assert_eq!(hu.host.as_deref(), Some("upgrade.example.com"));
+        } else {
+            panic!("expected httpupgrade transport");
         }
     }
 

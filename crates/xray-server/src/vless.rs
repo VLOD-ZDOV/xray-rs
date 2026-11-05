@@ -145,6 +145,7 @@ pub struct Context {
     pub port: u16,
     pub users: RwLock<Vec<User>>,
     pub router: Arc<Router>,
+    pub sniffing: bool,
 }
 
 impl Context {
@@ -195,7 +196,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut buf = Vec::with_capacity(512);
-    let (request, header_len, user) = timeout(HANDSHAKE_TIMEOUT, async {
+    let (mut request, header_len, user) = timeout(HANDSHAKE_TIMEOUT, async {
         let mut chunk = [0u8; 512];
         loop {
             // The user is copied out so a concurrent removal cannot shift the index.
@@ -240,6 +241,7 @@ where
             port: ctx.port,
             email: user.email.clone(),
             router: ctx.router.clone(),
+            sniffing: ctx.sniffing,
         };
         let mut reader = PrefixedReader {
             early,
@@ -253,7 +255,7 @@ where
     } else {
         Network::Udp
     };
-    if network == Network::Tcp && early.is_empty() && ctx.router.needs_sniff() {
+    if network == Network::Tcp && early.is_empty() && (ctx.router.needs_sniff() || ctx.sniffing) {
         let mut chunk = vec![0u8; 4096];
         if let Ok(Ok(n)) = timeout(SNIFF_TIMEOUT, uplink.read(&mut chunk)).await {
             early.extend_from_slice(&chunk[..n]);
@@ -273,10 +275,16 @@ where
         network,
         host: &request.host,
         port: request.port,
+        sniffing: ctx.sniffing,
     };
     let Some(decision) = route.allow(&ctx.router, payload).await else {
         return Ok(());
     };
+    if ctx.sniffing {
+        if let Some(sniffed) = routing::sniff_tls_sni(payload).or_else(|| routing::sniff_http_host(payload)) {
+            request.host = Host::Domain(sniffed);
+        }
+    }
     if let Action::Block(BlockAction::Http403) = decision.action {
         if request.command == Command::Tcp {
             downlink.write_all(&[request.version, 0]).await?;
@@ -335,14 +343,24 @@ pub(crate) struct RouteRequest<'a> {
     pub network: Network,
     pub host: &'a Host,
     pub port: u16,
+    pub sniffing: bool,
 }
 
 impl RouteRequest<'_> {
     /// Routes the request and writes the access log line. None means blocked.
     pub(crate) async fn allow(&self, router: &Router, first_payload: &[u8]) -> Option<Decision> {
-        let (domain, ip) = match self.host {
-            Host::Domain(name) => (Some(name.as_str()), None),
-            Host::Ip(ip) => (None, Some(*ip)),
+        let sniffed_domain = if self.sniffing {
+            routing::sniff_tls_sni(first_payload).or_else(|| routing::sniff_http_host(first_payload))
+        } else {
+            None
+        };
+        let (domain, ip) = if let Some(ref d) = sniffed_domain {
+            (Some(d.as_str()), None)
+        } else {
+            match self.host {
+                Host::Domain(name) => (Some(name.as_str()), None),
+                Host::Ip(ip) => (None, Some(*ip)),
+            }
         };
         let protocol = if router.needs_sniff() {
             routing::sniff(first_payload, self.network)
@@ -366,7 +384,12 @@ impl RouteRequest<'_> {
         } else {
             "udp"
         };
-        let to = format!("{network}:{}:{}", host_label(self.host), self.port);
+        let label = if let Some(ref d) = sniffed_domain {
+            d.clone()
+        } else {
+            host_label(self.host)
+        };
+        let to = format!("{network}:{}:{}", label, self.port);
         let accepted = !matches!(decision.action, Action::Block(_));
         log::access(
             self.peer,
