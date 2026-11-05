@@ -16,6 +16,7 @@ mod outbound;
 mod outbound_transport;
 mod padding;
 mod proxy_proto;
+mod reality;
 mod routing;
 mod shadowsocks;
 mod shadowsocks_outbound;
@@ -94,7 +95,7 @@ fn main() -> ExitCode {
         log::error(e);
         return ExitCode::FAILURE;
     }
-    // Build TLS up front so `-test` rejects bad certificates like Xray does.
+    // Build TLS and REALITY up front so `-test` rejects bad certificates/keys like Xray does.
     let tls: Result<Vec<_>, String> = config
         .inbounds
         .iter()
@@ -109,6 +110,25 @@ fn main() -> ExitCode {
         .collect();
     let tls = match tls {
         Ok(tls) => tls,
+        Err(e) => {
+            log::error(e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let realities: Result<Vec<_>, String> = config
+        .inbounds
+        .iter()
+        .map(|i| {
+            let is_xhttp = matches!(i.transport, InboundTransport::Xhttp(_));
+            let is_grpc = matches!(i.transport, InboundTransport::Grpc(_));
+            i.reality
+                .as_ref()
+                .map(|r| reality::RealityServer::new(r.clone(), i.port, is_grpc, is_xhttp).map(Arc::new))
+                .transpose()
+        })
+        .collect();
+    let realities = match realities {
+        Ok(r) => r,
         Err(e) => {
             log::error(e);
             return ExitCode::FAILURE;
@@ -129,7 +149,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(config, tls)) {
+    match runtime.block_on(run(config, tls, realities)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             log::error(e);
@@ -162,12 +182,20 @@ enum InboundHandler {
     VlessXhttp(Arc<xhttp::Handler>),
 }
 
-async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String> {
+async fn run(
+    config: Config,
+    tls: Vec<Option<TlsAcceptor>>,
+    realities: Vec<Option<Arc<reality::RealityServer>>>,
+) -> Result<(), String> {
     log::info(format!("xray-rs {} started", env!("CARGO_PKG_VERSION")));
     stats::init(config.stats);
     let router = Arc::new(config.router);
     let mut inbounds = HashMap::new();
-    for (inbound, acceptor) in config.inbounds.into_iter().zip(tls) {
+    for (inbound, (acceptor, reality)) in config
+        .inbounds
+        .into_iter()
+        .zip(tls.into_iter().zip(realities))
+    {
         let listener = bind(&inbound).await?;
         log::info(format!(
             "listening {} on {}",
@@ -286,6 +314,7 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             listener,
             inbound.accept_proxy_protocol,
             acceptor,
+            reality,
             handler,
             http_obfs,
         ));
@@ -369,6 +398,7 @@ async fn accept_loop(
     listener: TcpListener,
     accept_proxy_protocol: proxy_proto::ProxyProtocolAccept,
     tls: Option<TlsAcceptor>,
+    reality: Option<Arc<reality::RealityServer>>,
     handler: InboundHandler,
     http_obfs: Option<Arc<http_obfs::HttpObfsSettings>>,
 ) {
@@ -383,7 +413,7 @@ async fn accept_loop(
         };
         let _ = stream.set_nodelay(true);
         let local = stream.local_addr().ok();
-        let (tls, handler, http_obfs) = (tls.clone(), handler.clone(), http_obfs.clone());
+        let (tls, reality, handler, http_obfs) = (tls.clone(), reality.clone(), handler.clone(), http_obfs.clone());
         tokio::spawn(async move {
             let leftover = if accept_proxy_protocol.is_enabled() {
                 match proxy_proto::read_proxy_header(&mut stream, accept_proxy_protocol, peer).await {
@@ -401,22 +431,30 @@ async fn accept_loop(
             };
 
             let stream = httpupgrade::PrefixedStream::new(stream, leftover);
-            match (tls, http_obfs) {
-                (Some(acceptor), _) => match acceptor.accept(stream).await {
-                    Ok(stream) => dispatch(stream, peer, local, handler).await,
-                    Err(e) => log::debug(format!(
-                        "tls handshake from {} failed: {e}",
-                        log::mask(peer)
-                    )),
-                },
-                (None, Some(obfs)) => match http_obfs::accept(stream, &obfs).await {
-                    Ok(stream) => dispatch(stream, peer, local, handler).await,
-                    Err(e) => log::debug(format!(
-                        "http obfs from {} failed: {e}",
-                        log::mask(peer)
-                    )),
-                },
-                (None, None) => dispatch(stream, peer, local, handler).await,
+            if let Some(reality) = reality {
+                match reality.handle(stream, peer).await {
+                    Ok(Some(tls_stream)) => dispatch(tls_stream, peer, local, handler).await,
+                    Ok(None) => {}
+                    Err(e) => log::debug(format!("reality handling from {} failed: {e}", log::mask(peer))),
+                }
+            } else {
+                match (tls, http_obfs) {
+                    (Some(acceptor), _) => match acceptor.accept(stream).await {
+                        Ok(stream) => dispatch(stream, peer, local, handler).await,
+                        Err(e) => log::debug(format!(
+                            "tls handshake from {} failed: {e}",
+                            log::mask(peer)
+                        )),
+                    },
+                    (None, Some(obfs)) => match http_obfs::accept(stream, &obfs).await {
+                        Ok(stream) => dispatch(stream, peer, local, handler).await,
+                        Err(e) => log::debug(format!(
+                            "http obfs from {} failed: {e}",
+                            log::mask(peer)
+                        )),
+                    },
+                    (None, None) => dispatch(stream, peer, local, handler).await,
+                }
             }
         });
     }
@@ -638,7 +676,7 @@ fn extract_cert_names(cert_der: &[u8]) -> Vec<String> {
     names
 }
 
-fn match_sni(pattern: &str, sni: &str) -> bool {
+pub(crate) fn match_sni(pattern: &str, sni: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     let sni = sni.to_ascii_lowercase();
     if pattern == sni {

@@ -67,11 +67,11 @@ where
     .await
 }
 
-trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
 #[cfg(target_os = "linux")]
-async fn connect_unix(path: &str) -> io::Result<UnixStream> {
+pub(crate) async fn connect_unix(path: &str) -> io::Result<UnixStream> {
     use std::os::linux::net::SocketAddrExt;
     use std::os::unix::net::{SocketAddr as UnixAddr, UnixStream as StdUnixStream};
 
@@ -91,11 +91,11 @@ async fn connect_unix(path: &str) -> io::Result<UnixStream> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-async fn connect_unix(path: &str) -> io::Result<UnixStream> {
+pub(crate) async fn connect_unix(path: &str) -> io::Result<UnixStream> {
     UnixStream::connect(path).await
 }
 
-async fn write_proxy_header<W: AsyncWrite + Unpin>(
+pub(crate) async fn write_proxy_header<W: AsyncWrite + Unpin>(
     writer: &mut W,
     xver: u8,
     peer: SocketAddr,

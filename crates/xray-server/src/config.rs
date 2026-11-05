@@ -70,7 +70,7 @@ pub struct Fallback {
     pub xver: u8,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FallbackDest {
     Tcp(crate::vless::Host, u16),
     /// A socket path; `@name` is abstract and `@@name` abstract padded like Xray.
@@ -94,6 +94,7 @@ pub struct Inbound {
     pub dokodemo: Option<DokodemoSettings>,
     pub http_obfs: Option<crate::http_obfs::HttpObfsSettings>,
     pub tls: Option<TlsSettings>,
+    pub reality: Option<RealityInboundSettings>,
     pub transport: InboundTransport,
     pub accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept,
 }
@@ -119,6 +120,20 @@ pub struct TlsSettings {
     pub alpn: Vec<String>,
     pub reject_unknown_sni: bool,
     pub server_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealityInboundSettings {
+    pub dest: FallbackDest,
+    pub server_names: Vec<String>,
+    pub private_key: [u8; 32],
+    pub short_ids: Vec<[u8; 8]>,
+    pub min_client_ver: Option<[u8; 3]>,
+    pub max_client_ver: Option<[u8; 3]>,
+    pub max_time_diff: u64,
+    pub xver: u8,
+    pub show: bool,
+    pub alpn: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,7 +269,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let is_httpupgrade = network == "httpupgrade";
     let is_grpc = matches!(network, "grpc" | "gun");
     let is_xhttp = matches!(network, "xhttp" | "splithttp");
-    let supported_security = matches!(security, "" | "none" | "tls");
+    let supported_security = matches!(security, "" | "none" | "tls" | "reality");
     if (!is_tcp && !is_ws && !is_httpupgrade && !is_grpc && !is_xhttp) || !supported_security {
         log::warn(format!(
             "skipping inbound {tag:?}: {:?}/{}/{} is not supported yet",
@@ -426,6 +441,15 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     } else {
         None
     };
+    let reality = if security == "reality" {
+        let Some(settings) = stream.get("realitySettings") else {
+            log::warn(format!("skipping inbound {tag:?}: missing realitySettings"));
+            return Ok(None);
+        };
+        Some(parse_reality(settings)?)
+    } else {
+        None
+    };
     let transport = if is_tcp {
         InboundTransport::Tcp
     } else if is_ws {
@@ -515,6 +539,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         dokodemo,
         http_obfs,
         tls,
+        reality,
         transport,
         accept_proxy_protocol,
     }))
@@ -660,35 +685,7 @@ fn parse_fallback(item: &Value) -> Result<Fallback, String> {
             return Err(format!("{key} is not supported"));
         }
     }
-    let localhost = |port| FallbackDest::Tcp(crate::vless::Host::Domain("localhost".into()), port);
-    let dest = match item.get("dest") {
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .and_then(|p| u16::try_from(p).ok())
-            .map(localhost)
-            .ok_or("invalid dest port")?,
-        Some(Value::String(s)) if s.starts_with('/') || s.starts_with('@') => {
-            if cfg!(unix) {
-                FallbackDest::Unix(s.clone())
-            } else {
-                return Err("unix sockets are not supported on this platform".into());
-            }
-        }
-        Some(Value::String(s)) => match s.parse::<u16>() {
-            Ok(port) => localhost(port),
-            Err(_) => {
-                let (host, port) = s.rsplit_once(':').ok_or("dest needs host:port")?;
-                let port = port.parse::<u16>().map_err(|_| "invalid dest port")?;
-                let host = host.trim_start_matches('[').trim_end_matches(']');
-                let host = match host.parse::<std::net::IpAddr>() {
-                    Ok(ip) => crate::vless::Host::Ip(ip),
-                    Err(_) => crate::vless::Host::Domain(host.to_owned()),
-                };
-                FallbackDest::Tcp(host, port)
-            }
-        },
-        _ => return Err("missing dest".into()),
-    };
+    let dest = parse_dest(item.get("dest"))?;
     let xver = match item.get("xver").and_then(Value::as_u64).unwrap_or(0) {
         x @ 0..=2 => x as u8,
         x => return Err(format!("xver {x} is not 0, 1 or 2")),
@@ -697,6 +694,183 @@ fn parse_fallback(item: &Value) -> Result<Fallback, String> {
         path: str_field(item, "path").to_owned(),
         dest,
         xver,
+    })
+}
+
+pub(crate) fn parse_dest(dest: Option<&Value>) -> Result<FallbackDest, String> {
+    let localhost = |port| FallbackDest::Tcp(crate::vless::Host::Domain("localhost".into()), port);
+    match dest {
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|p| u16::try_from(p).ok())
+            .map(localhost)
+            .ok_or_else(|| "invalid dest port".to_string()),
+        Some(Value::String(s)) if s.starts_with('/') || s.starts_with('@') => {
+            if cfg!(unix) {
+                Ok(FallbackDest::Unix(s.clone()))
+            } else {
+                Err("unix sockets are not supported on this platform".into())
+            }
+        }
+        Some(Value::String(s)) => match s.parse::<u16>() {
+            Ok(port) => Ok(localhost(port)),
+            Err(_) => {
+                let (host, port) = s.rsplit_once(':').ok_or("dest needs host:port")?;
+                let port = port.parse::<u16>().map_err(|_| "invalid dest port")?;
+                let host = host.trim_start_matches('[').trim_end_matches(']');
+                let host = match host.parse::<std::net::IpAddr>() {
+                    Ok(ip) => crate::vless::Host::Ip(ip),
+                    Err(_) => crate::vless::Host::Domain(host.to_owned()),
+                };
+                Ok(FallbackDest::Tcp(host, port))
+            }
+        },
+        _ => Err("missing dest".into()),
+    }
+}
+
+pub fn decode_base64_32(s: &str) -> Result<[u8; 32], String> {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD};
+    use base64::Engine;
+    let s = s.trim();
+    let bytes = URL_SAFE_NO_PAD
+        .decode(s)
+        .or_else(|_| URL_SAFE.decode(s))
+        .or_else(|_| STANDARD.decode(s))
+        .map_err(|e| format!("invalid base64: {e}"))?;
+    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| "key must be 32 bytes".to_string())
+}
+
+fn parse_short_id(s: &str) -> Result<[u8; 8], String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok([0u8; 8]);
+    }
+    if s.len() > 16 {
+        return Err(format!("shortId {s:?} cannot exceed 16 hex characters (8 bytes)"));
+    }
+    if !s.len().is_multiple_of(2) {
+        return Err(format!("shortId {s:?} has odd hex string length"));
+    }
+    let mut out = [0u8; 8];
+    for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+        let hex_chunk = match std::str::from_utf8(chunk) {
+            Ok(c) => c,
+            Err(e) => return Err(e.to_string()),
+        };
+        out[i] = u8::from_str_radix(hex_chunk, 16)
+            .map_err(|e| format!("invalid hex in shortId {s:?}: {e}"))?;
+    }
+    Ok(out)
+}
+
+fn parse_version_opt(v: &Value) -> Option<Result<[u8; 3], String>> {
+    match v {
+        Value::String(s) if !s.is_empty() => {
+            let parts: Vec<&str> = s.split('.').collect();
+            if parts.len() != 3 {
+                return Some(Err(format!("invalid version {s:?}, expected x.y.z")));
+            }
+            let a = match parts[0].parse::<u8>() {
+                Ok(n) => n,
+                Err(e) => return Some(Err(e.to_string())),
+            };
+            let b = match parts[1].parse::<u8>() {
+                Ok(n) => n,
+                Err(e) => return Some(Err(e.to_string())),
+            };
+            let c = match parts[2].parse::<u8>() {
+                Ok(n) => n,
+                Err(e) => return Some(Err(e.to_string())),
+            };
+            Some(Ok([a, b, c]))
+        }
+        Value::Array(arr) if arr.len() == 3 => {
+            let a = match arr[0].as_u64().and_then(|n| u8::try_from(n).ok()) {
+                Some(n) => n,
+                None => return Some(Err("invalid version array".into())),
+            };
+            let b = match arr[1].as_u64().and_then(|n| u8::try_from(n).ok()) {
+                Some(n) => n,
+                None => return Some(Err("invalid version array".into())),
+            };
+            let c = match arr[2].as_u64().and_then(|n| u8::try_from(n).ok()) {
+                Some(n) => n,
+                None => return Some(Err("invalid version array".into())),
+            };
+            Some(Ok([a, b, c]))
+        }
+        _ => None,
+    }
+}
+
+fn parse_reality(reality: &Value) -> Result<RealityInboundSettings, String> {
+    let dest = parse_dest(reality.get("dest"))?;
+
+    let mut server_names = Vec::new();
+    for name in array(reality, "serverNames") {
+        if let Some(s) = name.as_str() {
+            if !s.is_empty() {
+                server_names.push(s.to_ascii_lowercase());
+            }
+        }
+    }
+    if server_names.is_empty() {
+        if let Some(s) = reality.get("serverName").and_then(Value::as_str) {
+            if !s.is_empty() {
+                server_names.push(s.to_ascii_lowercase());
+            }
+        }
+    }
+    if server_names.is_empty() {
+        return Err("realitySettings: serverNames is empty".into());
+    }
+
+    let priv_str = str_field(reality, "privateKey");
+    if priv_str.is_empty() {
+        return Err("realitySettings: missing privateKey".into());
+    }
+    let private_key = decode_base64_32(priv_str)?;
+
+    let mut short_ids = Vec::new();
+    let short_id_arr = array(reality, "shortIds");
+    if !short_id_arr.is_empty() {
+        for sid in short_id_arr {
+            let s = sid.as_str().unwrap_or_default();
+            short_ids.push(parse_short_id(s)?);
+        }
+    } else if let Some(s) = reality.get("shortId").and_then(Value::as_str) {
+        short_ids.push(parse_short_id(s)?);
+    }
+
+    let min_client_ver = reality.get("minClientVer").and_then(parse_version_opt).transpose()?;
+    let max_client_ver = reality.get("maxClientVer").and_then(parse_version_opt).transpose()?;
+
+    let max_time_diff = reality.get("maxTimeDiff").and_then(Value::as_u64).unwrap_or(0);
+    let xver = match reality.get("xver").and_then(Value::as_u64).unwrap_or(0) {
+        x @ 0..=2 => x as u8,
+        x => return Err(format!("realitySettings: xver {x} is not 0, 1 or 2")),
+    };
+    let show = reality.get("show").and_then(Value::as_bool).unwrap_or(false);
+
+    let mut alpn = Vec::new();
+    for a in array(reality, "alpn") {
+        if let Some(s) = a.as_str() {
+            alpn.push(s.to_string());
+        }
+    }
+
+    Ok(RealityInboundSettings {
+        dest,
+        server_names,
+        private_key,
+        short_ids,
+        min_client_ver,
+        max_client_ver,
+        max_time_diff,
+        xver,
+        show,
+        alpn,
     })
 }
 
@@ -1519,5 +1693,70 @@ mod tests {
         }"#;
         let cfg = parse(raw).unwrap();
         assert_eq!(cfg.inbounds.len(), 0);
+    }
+
+    #[test]
+    fn parses_reality_inbound_settings() {
+        let raw = r#"{
+          "inbounds": [
+            {
+              "tag": "reality-in",
+              "port": 443,
+              "protocol": "vless",
+              "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                  "dest": "www.yahoo.com:443",
+                  "serverNames": ["www.yahoo.com", "yahoo.com"],
+                  "privateKey": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10",
+                  "shortIds": ["", "0123456789abcdef", "1234"],
+                  "minClientVer": "1.0.0",
+                  "maxClientVer": "26.10.21",
+                  "maxTimeDiff": 60000,
+                  "xver": 1,
+                  "show": true,
+                  "alpn": ["h2", "http/1.1"]
+                }
+              }
+            }
+          ]
+        }"#;
+        let inbounds = parse(raw).unwrap().inbounds;
+        assert_eq!(inbounds.len(), 1);
+        let reality = inbounds[0].reality.as_ref().unwrap();
+        assert_eq!(
+            reality.dest,
+            FallbackDest::Tcp(crate::vless::Host::Domain("www.yahoo.com".into()), 443)
+        );
+        assert_eq!(reality.server_names, vec!["www.yahoo.com", "yahoo.com"]);
+        assert_eq!(reality.short_ids.len(), 3);
+        assert_eq!(reality.short_ids[0], [0u8; 8]);
+        assert_eq!(
+            reality.short_ids[1],
+            [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]
+        );
+        assert_eq!(
+            reality.short_ids[2],
+            [0x12, 0x34, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(reality.min_client_ver, Some([1, 0, 0]));
+        assert_eq!(reality.max_client_ver, Some([26, 10, 21]));
+        assert_eq!(reality.max_time_diff, 60000);
+        assert_eq!(reality.xver, 1);
+        assert!(reality.show);
+        assert_eq!(reality.alpn, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn parses_short_id_validation() {
+        assert_eq!(parse_short_id("").unwrap(), [0u8; 8]);
+        assert_eq!(
+            parse_short_id("abcd").unwrap(),
+            [0xab, 0xcd, 0, 0, 0, 0, 0, 0]
+        );
+        assert!(parse_short_id("abc").is_err());
+        assert!(parse_short_id("0123456789abcdef01").is_err());
+        assert!(parse_short_id("zz").is_err());
     }
 }
