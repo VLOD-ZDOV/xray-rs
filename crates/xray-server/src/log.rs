@@ -41,7 +41,10 @@ pub fn init(settings: &Settings) -> Result<(), String> {
         other => return Err(format!("unknown log level {other:?}")),
     };
     let debug_override = std::env::var_os("XRAY_SERVER_DEBUG").is_some();
-    LEVEL.store(if debug_override { DEBUG } else { level }, Ordering::Relaxed);
+    LEVEL.store(
+        if debug_override { DEBUG } else { level },
+        Ordering::Relaxed,
+    );
     MASK.store(
         match settings.mask_address.as_str() {
             "quarter" => 1,
@@ -62,7 +65,11 @@ fn open_sink(target: &str) -> Result<Option<Sink>, String> {
         "none" => Ok(None),
         "" => Ok(Some(Mutex::new(Box::new(std::io::stdout())))),
         path => {
-            let file = OpenOptions::new().create(true).append(true).open(path).map_err(|e| format!("failed to open log {path}: {e}"))?;
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("failed to open log {path}: {e}"))?;
             Ok(Some(Mutex::new(Box::new(LineWriter::new(file)))))
         }
     }
@@ -98,14 +105,29 @@ fn write_error(level: u8, label: &str, message: impl Display) {
 
 /// One access log line in Xray's format:
 /// `from 1.2.3.4:5 accepted tcp:example.com:443 [in -> out] email: user`.
-pub fn access(from: SocketAddr, accepted: bool, to: impl Display, inbound: &str, outbound: &str, email: &str) {
-    let Some(Some(sink)) = ACCESS_SINK.get() else { return };
+pub fn access(
+    from: SocketAddr,
+    accepted: bool,
+    to: impl Display,
+    inbound: &str,
+    outbound: &str,
+    email: &str,
+) {
+    let Some(Some(sink)) = ACCESS_SINK.get() else {
+        return;
+    };
     let status = if accepted { "accepted" } else { "rejected" };
     let from = mask(from);
     if email.is_empty() {
-        write_line(sink, format_args!("from {from} {status} {to} [{inbound} -> {outbound}]"));
+        write_line(
+            sink,
+            format_args!("from {from} {status} {to} [{inbound} -> {outbound}]"),
+        );
     } else {
-        write_line(sink, format_args!("from {from} {status} {to} [{inbound} -> {outbound}] email: {email}"));
+        write_line(
+            sink,
+            format_args!("from {from} {status} {to} [{inbound} -> {outbound}] email: {email}"),
+        );
     }
 }
 
@@ -148,7 +170,9 @@ fn write_line(sink: &Sink, line: std::fmt::Arguments<'_>) {
 
 /// `YYYY/MM/DD HH:MM:SS.micros` in UTC.
 fn timestamp() -> String {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs();
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Civil date from days since 1970-01-01 (Howard Hinnant's algorithm).

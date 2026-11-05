@@ -100,9 +100,14 @@ impl Router {
                         let action = match str_field(raw, "action") {
                             "allow" => Action::Direct,
                             "block" => Action::Block,
-                            other => return Err(format!("outbound {tag:?} finalRules[{index}]: unknown action {other:?}")),
+                            other => {
+                                return Err(format!(
+                                "outbound {tag:?} finalRules[{index}]: unknown action {other:?}"
+                            ))
+                            }
                         };
-                        let mut rule = json!({"type": "field", "outboundTag": STUB_TAG, "network": "tcp,udp"});
+                        let mut rule =
+                            json!({"type": "field", "outboundTag": STUB_TAG, "network": "tcp,udp"});
                         for key in ["network", "port", "ip"] {
                             if let Some(value) = raw.get(key).filter(|v| !v.is_null()) {
                                 rule[key] = value.clone();
@@ -114,8 +119,14 @@ impl Router {
                     Action::Direct
                 }
                 "blackhole" => Action::Block,
-                "wireguard" => Action::Wireguard(Arc::new(WgOutbound::parse(&tag, outbound.get("settings").unwrap_or(&Value::Null))?)),
-                "socks" => Action::Socks(Arc::new(SocksOutbound::parse(&tag, outbound.get("settings").unwrap_or(&Value::Null))?)),
+                "wireguard" => Action::Wireguard(Arc::new(WgOutbound::parse(
+                    &tag,
+                    outbound.get("settings").unwrap_or(&Value::Null),
+                )?)),
+                "socks" => Action::Socks(Arc::new(SocksOutbound::parse(
+                    &tag,
+                    outbound.get("settings").unwrap_or(&Value::Null),
+                )?)),
                 other => {
                     log::warn(format!("outbound {tag:?} ({other}) is not supported yet; traffic routed to it will be blocked"));
                     Action::Block
@@ -140,12 +151,18 @@ impl Router {
                     outbounds.insert(tag.clone(), Action::Block);
                     tag
                 }
-                _ => return Err(format!("routing.rules[{index}] needs outboundTag or balancerTag")),
+                _ => {
+                    return Err(format!(
+                        "routing.rules[{index}] needs outboundTag or balancerTag"
+                    ))
+                }
             };
             let users = take_strings(&mut rule, "user")
                 .into_iter()
                 .map(|u| match u.strip_prefix("regexp:") {
-                    Some(pattern) => Regex::new(pattern).map(UserMatcher::Regex).map_err(|e| format!("routing.rules[{index}].user: {e}")),
+                    Some(pattern) => Regex::new(pattern)
+                        .map(UserMatcher::Regex)
+                        .map_err(|e| format!("routing.rules[{index}].user: {e}")),
                     None => Ok(UserMatcher::Exact(u)),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -155,9 +172,23 @@ impl Router {
             for key in IGNORED_FIELDS {
                 rule.remove(key);
             }
-            let known = ["type", "inboundTag", "network", "port", "domain", "domains", "ip", "localOS"];
-            if let Some(unknown) = rule.keys().find(|k| !known.contains(&k.as_str()) && !SERVER_FIELDS.contains(&k.as_str())) {
-                return Err(format!("routing.rules[{index}]: field {unknown:?} is not supported yet"));
+            let known = [
+                "type",
+                "inboundTag",
+                "network",
+                "port",
+                "domain",
+                "domains",
+                "ip",
+                "localOS",
+            ];
+            if let Some(unknown) = rule
+                .keys()
+                .find(|k| !known.contains(&k.as_str()) && !SERVER_FIELDS.contains(&k.as_str()))
+            {
+                return Err(format!(
+                    "routing.rules[{index}]: field {unknown:?} is not supported yet"
+                ));
             }
             // The parser rejects a rule without conditions; this one matches everything.
             if !rule.keys().any(|k| k != "type") {
@@ -186,10 +217,12 @@ impl Router {
             synth_routing["domainStrategy"] = strategy.clone();
         }
         let synth = json!({"outbounds": [{"tag": STUB_TAG, "protocol": "freedom"}], "routing": synth_routing});
-        let parsed = xray_config::parse_xray_json_with_geodata_dirs(&synth.to_string(), asset_dirs).map_err(|e| {
-            let messages: Vec<String> = e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
-            format!("routing: {}", messages.join("; "))
-        })?;
+        let parsed = xray_config::parse_xray_json_with_geodata_dirs(&synth.to_string(), asset_dirs)
+            .map_err(|e| {
+                let messages: Vec<String> =
+                    e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
+                format!("routing: {}", messages.join("; "))
+            })?;
         let parsed_rules = parsed.config.routing.rules;
         if parsed_rules.len() != expected_rules {
             return Err("routing: parser returned an unexpected number of rules".into());
@@ -197,7 +230,10 @@ impl Router {
 
         let mut final_rules: HashMap<String, Vec<(Action, RoutingRule)>> = HashMap::new();
         for (tag, action, index) in pending_final {
-            final_rules.entry(tag).or_default().push((action, parsed_rules[index].clone()));
+            final_rules
+                .entry(tag)
+                .or_default()
+                .push((action, parsed_rules[index].clone()));
         }
 
         let mut rules = Vec::with_capacity(pending.len());
@@ -205,7 +241,9 @@ impl Router {
         for (tag, main, helper, users, protocols) in pending {
             if !outbounds.contains_key(&tag) {
                 // 3x-ui routes its API inbound to the "api" tag, which is not an outbound.
-                log::debug(format!("routing: outbound {tag:?} is not defined; matching traffic will be blocked"));
+                log::debug(format!(
+                    "routing: outbound {tag:?} is not defined; matching traffic will be blocked"
+                ));
                 outbounds.insert(tag.clone(), Action::Block);
             }
             sniff |= !protocols.is_empty();
@@ -233,11 +271,25 @@ impl Router {
     /// Xray does for VLESS inbounds.
     pub fn final_action(&self, outbound: &str, network: Network, addr: SocketAddr) -> Action {
         let ip = addr.ip();
-        let rules = self.final_rules.get(outbound).map_or(&[][..], Vec::as_slice);
+        let rules = self
+            .final_rules
+            .get(outbound)
+            .map_or(&[][..], Vec::as_slice);
         rules
             .iter()
-            .find(|(_, rule)| rule.matches_network(Some(network)) && rule.matches_port(Some(addr.port())) && rule.matches_ip(Some(&ip)))
-            .map_or(if is_private(ip) { Action::Block } else { Action::Direct }, |(action, _)| action.clone())
+            .find(|(_, rule)| {
+                rule.matches_network(Some(network))
+                    && rule.matches_port(Some(addr.port()))
+                    && rule.matches_ip(Some(&ip))
+            })
+            .map_or(
+                if is_private(ip) {
+                    Action::Block
+                } else {
+                    Action::Direct
+                },
+                |(action, _)| action.clone(),
+            )
     }
 
     /// Whether any rule needs the first payload to detect the protocol.
@@ -266,27 +318,49 @@ impl Router {
 
     async fn resolve(&self, query: &Query<'_>) -> Option<IpAddr> {
         let domain = query.domain?;
-        tokio::net::lookup_host((domain, query.port)).await.ok()?.next().map(|a| a.ip())
+        tokio::net::lookup_host((domain, query.port))
+            .await
+            .ok()?
+            .next()
+            .map(|a| a.ip())
     }
 
     fn first_match(&self, query: &Query<'_>, ip: Option<IpAddr>) -> Option<&str> {
-        self.rules.iter().find(|rule| rule.matches(query, ip)).map(|rule| rule.tag.as_str())
+        self.rules
+            .iter()
+            .find(|rule| rule.matches(query, ip))
+            .map(|rule| rule.tag.as_str())
     }
 
     fn decision(&self, tag: &str) -> Decision {
         // No outbounds at all behaves like a lone freedom outbound.
-        let action = if self.outbounds.is_empty() { Action::Direct } else { self.outbounds.get(tag).cloned().unwrap_or(Action::Block) };
+        let action = if self.outbounds.is_empty() {
+            Action::Direct
+        } else {
+            self.outbounds.get(tag).cloned().unwrap_or(Action::Block)
+        };
         // The tag stays as is, even empty: finalRules and stats are keyed by it.
-        Decision { tag: tag.to_owned(), action }
+        Decision {
+            tag: tag.to_owned(),
+            action,
+        }
     }
 }
 
 impl Rule {
     fn matches(&self, q: &Query<'_>, ip: Option<IpAddr>) -> bool {
-        self.matcher.matches_target(Some(q.inbound), q.domain, ip.as_ref(), Some(q.network), Some(q.port))
-            && self.source.as_ref().is_none_or(|s| s.matches_ip(Some(&q.source.ip())) && s.matches_port(Some(q.source.port())))
-            && (self.users.is_empty() || self.users.iter().any(|u| u.matches(q.user)))
-            && (self.protocols.is_empty() || q.protocol.is_some_and(|p| self.protocols.iter().any(|x| x == p)))
+        self.matcher.matches_target(
+            Some(q.inbound),
+            q.domain,
+            ip.as_ref(),
+            Some(q.network),
+            Some(q.port),
+        ) && self.source.as_ref().is_none_or(|s| {
+            s.matches_ip(Some(&q.source.ip())) && s.matches_port(Some(q.source.port()))
+        }) && (self.users.is_empty() || self.users.iter().any(|u| u.matches(q.user)))
+            && (self.protocols.is_empty()
+                || q.protocol
+                    .is_some_and(|p| self.protocols.iter().any(|x| x == p)))
     }
 }
 
@@ -308,9 +382,12 @@ pub fn sniff(data: &[u8], network: Network) -> Option<&'static str> {
                 Some("bittorrent")
             } else if data.len() > 5 && data[0] == 0x16 && data[1] == 0x03 && data[5] == 0x01 {
                 Some("tls")
-            } else if ["GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "CONNECT ", "PATCH ", "TRACE "]
-                .iter()
-                .any(|m| data.starts_with(m.as_bytes()))
+            } else if [
+                "GET ", "POST ", "HEAD ", "PUT ", "DELETE ", "OPTIONS ", "CONNECT ", "PATCH ",
+                "TRACE ",
+            ]
+            .iter()
+            .any(|m| data.starts_with(m.as_bytes()))
             {
                 Some("http")
             } else {
@@ -318,7 +395,8 @@ pub fn sniff(data: &[u8], network: Network) -> Option<&'static str> {
             }
         }
         Network::Udp => {
-            let is_utp = data.len() >= 20 && data[0] & 0x0f == 1 && data[0] >> 4 <= 4 && data[1] <= 2;
+            let is_utp =
+                data.len() >= 20 && data[0] & 0x0f == 1 && data[0] >> 4 <= 4 && data[1] <= 2;
             let is_dht = data.starts_with(b"d1:") && data.windows(5).any(|w| w == b"1:y1:");
             if is_utp || is_dht {
                 Some("bittorrent")
@@ -334,14 +412,25 @@ pub fn sniff(data: &[u8], network: Network) -> Option<&'static str> {
 /// Xray accepts these fields as an array or a comma-separated string.
 fn take_strings(rule: &mut serde_json::Map<String, Value>, key: &str) -> Vec<String> {
     match rule.remove(key) {
-        Some(Value::String(s)) => s.split(',').map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()).collect(),
-        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
         _ => Vec::new(),
     }
 }
 
 fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
-    value.get(key).and_then(Value::as_array).map_or(&[], Vec::as_slice)
+    value
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
 }
 
 fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -380,8 +469,17 @@ mod tests {
             ]}
         }));
         assert!(r.needs_sniff());
-        assert_eq!(r.route(&query(None, Some("10.1.1.1"), 80)).await.action, Action::Block);
-        assert_eq!(r.route(&query(Some("example.com"), None, 443)).await, Decision { tag: "direct".into(), action: Action::Direct });
+        assert_eq!(
+            r.route(&query(None, Some("10.1.1.1"), 80)).await.action,
+            Action::Block
+        );
+        assert_eq!(
+            r.route(&query(Some("example.com"), None, 443)).await,
+            Decision {
+                tag: "direct".into(),
+                action: Action::Direct
+            }
+        );
         let mut bt = query(None, Some("1.1.1.1"), 6881);
         bt.protocol = Some("bittorrent");
         assert_eq!(r.route(&bt).await.tag, "blocked");
@@ -398,8 +496,17 @@ mod tests {
             ]}
         }));
         let blocked = r.route(&query(Some("chat.openai.com"), None, 443)).await;
-        assert_eq!(blocked, Decision { tag: "warp".into(), action: Action::Block });
-        assert_eq!(r.route(&query(Some("example.com"), None, 443)).await.action, Action::Direct);
+        assert_eq!(
+            blocked,
+            Decision {
+                tag: "warp".into(),
+                action: Action::Block
+            }
+        );
+        assert_eq!(
+            r.route(&query(Some("example.com"), None, 443)).await.action,
+            Action::Direct
+        );
         let mut bob = query(Some("example.com"), None, 443);
         bob.user = "bobby";
         assert_eq!(r.route(&bob).await.tag, "warp");
@@ -419,11 +526,26 @@ mod tests {
             ]}}, {"tag": "plain", "protocol": "freedom"}]
         }));
         let at = |s: &str| s.parse::<SocketAddr>().unwrap();
-        assert_eq!(r.final_action("direct", Network::Tcp, at("127.0.0.1:8080")), Action::Direct);
-        assert_eq!(r.final_action("direct", Network::Tcp, at("127.0.0.1:22")), Action::Block);
-        assert_eq!(r.final_action("direct", Network::Udp, at("1.1.1.1:53")), Action::Block);
-        assert_eq!(r.final_action("plain", Network::Tcp, at("1.1.1.1:53")), Action::Direct);
-        assert_eq!(r.final_action("plain", Network::Tcp, at("192.168.1.1:80")), Action::Block);
+        assert_eq!(
+            r.final_action("direct", Network::Tcp, at("127.0.0.1:8080")),
+            Action::Direct
+        );
+        assert_eq!(
+            r.final_action("direct", Network::Tcp, at("127.0.0.1:22")),
+            Action::Block
+        );
+        assert_eq!(
+            r.final_action("direct", Network::Udp, at("1.1.1.1:53")),
+            Action::Block
+        );
+        assert_eq!(
+            r.final_action("plain", Network::Tcp, at("1.1.1.1:53")),
+            Action::Direct
+        );
+        assert_eq!(
+            r.final_action("plain", Network::Tcp, at("192.168.1.1:80")),
+            Action::Block
+        );
     }
 
     #[test]
@@ -437,8 +559,17 @@ mod tests {
         let mut bt = vec![19u8];
         bt.extend_from_slice(b"BitTorrent protocol");
         assert_eq!(sniff(&bt, Network::Tcp), Some("bittorrent"));
-        assert_eq!(sniff(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01], Network::Tcp), Some("tls"));
+        assert_eq!(
+            sniff(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01], Network::Tcp),
+            Some("tls")
+        );
         assert_eq!(sniff(b"GET / HTTP/1.1\r\n", Network::Tcp), Some("http"));
-        assert_eq!(sniff(b"d1:ad2:id20:aaaaaaaaaaaaaaaaaaaae1:q4:ping1:t2:aa1:y1:qe", Network::Udp), Some("bittorrent"));
+        assert_eq!(
+            sniff(
+                b"d1:ad2:id20:aaaaaaaaaaaaaaaaaaaae1:q4:ping1:t2:aa1:y1:qe",
+                Network::Udp
+            ),
+            Some("bittorrent")
+        );
     }
 }

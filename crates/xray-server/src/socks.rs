@@ -29,20 +29,50 @@ impl SocksOutbound {
     /// `{address, port, user, pass}` form.
     pub fn parse(tag: &str, settings: &Value) -> Result<Self, String> {
         let err = |m: &str| format!("outbound {tag:?} (socks): {m}");
-        let server = settings.get("servers").and_then(Value::as_array).and_then(|s| s.first()).unwrap_or(settings);
-        let address = server.get("address").and_then(Value::as_str).filter(|a| !a.is_empty()).ok_or_else(|| err("missing address"))?;
-        let port = server.get("port").and_then(Value::as_u64).and_then(|p| u16::try_from(p).ok()).filter(|p| *p != 0).ok_or_else(|| err("invalid port"))?;
-        let user = server.get("users").and_then(Value::as_array).and_then(|u| u.first()).unwrap_or(server);
-        let field = |key| user.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
+        let server = settings
+            .get("servers")
+            .and_then(Value::as_array)
+            .and_then(|s| s.first())
+            .unwrap_or(settings);
+        let address = server
+            .get("address")
+            .and_then(Value::as_str)
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| err("missing address"))?;
+        let port = server
+            .get("port")
+            .and_then(Value::as_u64)
+            .and_then(|p| u16::try_from(p).ok())
+            .filter(|p| *p != 0)
+            .ok_or_else(|| err("invalid port"))?;
+        let user = server
+            .get("users")
+            .and_then(Value::as_array)
+            .and_then(|u| u.first())
+            .unwrap_or(server);
+        let field = |key| {
+            user.get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
         let (name, pass) = (field("user"), field("pass"));
         if name.len() > 255 || pass.len() > 255 {
             return Err(err("user and pass must be at most 255 bytes"));
         }
-        let host = match address.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+        let host = match address
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<IpAddr>()
+        {
             Ok(ip) => Host::Ip(ip),
             Err(_) => Host::Domain(address.to_owned()),
         };
-        Ok(Self { tag: tag.to_owned(), server: (host, port), auth: (!name.is_empty()).then_some((name, pass)) })
+        Ok(Self {
+            tag: tag.to_owned(),
+            server: (host, port),
+            auth: (!name.is_empty()).then_some((name, pass)),
+        })
     }
 
     pub async fn connect(&self, host: &Host, port: u16) -> io::Result<TcpStream> {
@@ -59,16 +89,32 @@ impl SocksOutbound {
         if relay.ip().is_unspecified() {
             relay.set_ip(control.peer_addr()?.ip());
         }
-        let bind: SocketAddr = if relay.is_ipv4() { (Ipv4Addr::UNSPECIFIED, 0).into() } else { (Ipv6Addr::UNSPECIFIED, 0).into() };
+        let bind: SocketAddr = if relay.is_ipv4() {
+            (Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (Ipv6Addr::UNSPECIFIED, 0).into()
+        };
         let socket = UdpSocket::bind(bind).await?;
         socket.connect(relay).await?;
-        Ok(SocksUdp { _control: control, socket })
+        Ok(SocksUdp {
+            _control: control,
+            socket,
+        })
     }
 
-    async fn handshake(&self, command: u8, host: &Host, port: u16) -> io::Result<(TcpStream, SocketAddr)> {
+    async fn handshake(
+        &self,
+        command: u8,
+        host: &Host,
+        port: u16,
+    ) -> io::Result<(TcpStream, SocketAddr)> {
         let work = async {
             let mut stream = self.dial().await?;
-            let method = if self.auth.is_some() { USER_PASS } else { NO_AUTH };
+            let method = if self.auth.is_some() {
+                USER_PASS
+            } else {
+                NO_AUTH
+            };
             stream.write_all(&[VERSION, 1, method]).await?;
             let mut reply = [0u8; 2];
             stream.read_exact(&mut reply).await?;
@@ -97,7 +143,9 @@ impl SocksOutbound {
             let bound = read_address(&mut stream).await?;
             Ok((stream, bound))
         };
-        timeout(CONNECT_TIMEOUT, work).await.map_err(|_| self.error("handshake timed out".into()))?
+        timeout(CONNECT_TIMEOUT, work)
+            .await
+            .map_err(|_| self.error("handshake timed out".into()))?
     }
 
     async fn dial(&self) -> io::Result<TcpStream> {
@@ -137,7 +185,9 @@ impl SocksUdp {
         loop {
             let n = self.socket.recv(buf).await?;
             // Fragmented datagrams (non-zero FRAG) are dropped, as RFC 1928 allows.
-            let Some((from, offset)) = parse_udp_header(&buf[..n]) else { continue };
+            let Some((from, offset)) = parse_udp_header(&buf[..n]) else {
+                continue;
+            };
             buf.copy_within(offset..n, 0);
             return Ok((n - offset, from));
         }
@@ -155,7 +205,9 @@ fn put_address(out: &mut Vec<u8>, host: &Host, port: u16) -> io::Result<()> {
             out.extend_from_slice(&ip.octets());
         }
         Host::Domain(name) => {
-            let len = u8::try_from(name.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "domain longer than 255 bytes"))?;
+            let len = u8::try_from(name.len()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "domain longer than 255 bytes")
+            })?;
             out.extend_from_slice(&[3, len]);
             out.extend_from_slice(name.as_bytes());
         }
@@ -183,7 +235,12 @@ async fn read_address(stream: &mut TcpStream) -> io::Result<SocketAddr> {
             stream.read_exact(&mut name).await?;
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
         }
-        other => return Err(io::Error::new(io::ErrorKind::InvalidData, format!("socks reply has address type {other}"))),
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("socks reply has address type {other}"),
+            ))
+        }
     };
     Ok(SocketAddr::new(ip, stream.read_u16().await?))
 }
@@ -193,8 +250,14 @@ fn parse_udp_header(packet: &[u8]) -> Option<(SocketAddr, usize)> {
         return None;
     }
     let (ip, end) = match packet[3] {
-        1 => (IpAddr::from(<[u8; 4]>::try_from(packet.get(4..8)?).ok()?), 8),
-        4 => (IpAddr::from(<[u8; 16]>::try_from(packet.get(4..20)?).ok()?), 20),
+        1 => (
+            IpAddr::from(<[u8; 4]>::try_from(packet.get(4..8)?).ok()?),
+            8,
+        ),
+        4 => (
+            IpAddr::from(<[u8; 16]>::try_from(packet.get(4..20)?).ok()?),
+            20,
+        ),
         _ => return None,
     };
     let port = u16::from_be_bytes(packet.get(end..end + 2)?.try_into().ok()?);
@@ -227,7 +290,8 @@ mod tests {
         let s = SocksOutbound::parse("t", &nested).unwrap();
         assert_eq!(s.server.1, 10109);
         assert_eq!(s.auth, Some(("a".into(), "b".into())));
-        let flat = SocksOutbound::parse("t", &json!({"address": "proxy.example", "port": 1080})).unwrap();
+        let flat =
+            SocksOutbound::parse("t", &json!({"address": "proxy.example", "port": 1080})).unwrap();
         assert!(matches!(flat.server.0, Host::Domain(_)));
         assert!(flat.auth.is_none());
         assert!(SocksOutbound::parse("t", &json!({"servers": [{"address": "x"}]})).is_err());

@@ -206,20 +206,29 @@ pub struct Empty {}
 
 type Inbounds = Arc<HashMap<String, Arc<Context>>>;
 
-pub async fn serve(addr: SocketAddr, inbounds: HashMap<String, Arc<Context>>) -> Result<(), String> {
+pub async fn serve(
+    addr: SocketAddr,
+    inbounds: HashMap<String, Arc<Context>>,
+) -> Result<(), String> {
     let inbounds: Inbounds = Arc::new(inbounds);
-    let listener = TcpListener::bind(addr).await.map_err(|e| format!("failed to listen on api {addr}: {e}"))?;
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("failed to listen on api {addr}: {e}"))?;
     log::info(format!("api listening on {addr}"));
     tokio::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else { continue };
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
             let inbounds = inbounds.clone();
             tokio::spawn(async move {
                 let service = service_fn(|req| {
                     let inbounds = inbounds.clone();
                     async move { Ok::<_, Infallible>(handle(req, &inbounds).await) }
                 });
-                let _ = auto::Builder::new(TokioExecutor::new()).serve_connection(TokioIo::new(stream), service).await;
+                let _ = auto::Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
             });
         }
     });
@@ -233,7 +242,10 @@ async fn handle(req: Request<Incoming>, inbounds: &Inbounds) -> Response<Body> {
         (_, Some(method)) => (true, method),
         _ => return status(UNIMPLEMENTED, "unknown service"),
     };
-    let body = match http_body_util::Limited::new(req.into_body(), MAX_REQUEST).collect().await {
+    let body = match http_body_util::Limited::new(req.into_body(), MAX_REQUEST)
+        .collect()
+        .await
+    {
         Ok(body) => body.to_bytes(),
         Err(_) => return status(INVALID_ARGUMENT, "request too large"),
     };
@@ -246,48 +258,95 @@ async fn handle(req: Request<Incoming>, inbounds: &Inbounds) -> Response<Body> {
     let stats = stats::get();
     match method {
         "QueryStats" => {
-            let Ok(r) = QueryStatsRequest::decode(message) else { return status(INVALID_ARGUMENT, "bad request") };
-            let stat = stats.query(&r.pattern, r.reset).into_iter().map(|(name, value)| Stat { name, value }).collect();
+            let Ok(r) = QueryStatsRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            let stat = stats
+                .query(&r.pattern, r.reset)
+                .into_iter()
+                .map(|(name, value)| Stat { name, value })
+                .collect();
             reply(&QueryStatsResponse { stat })
         }
         "GetStats" => {
-            let Ok(r) = GetStatsRequest::decode(message) else { return status(INVALID_ARGUMENT, "bad request") };
+            let Ok(r) = GetStatsRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
             match stats.get_counter(&r.name, r.reset) {
-                Some(value) => reply(&GetStatsResponse { stat: Some(Stat { name: r.name, value }) }),
+                Some(value) => reply(&GetStatsResponse {
+                    stat: Some(Stat {
+                        name: r.name,
+                        value,
+                    }),
+                }),
                 None => status(NOT_FOUND, &format!("{} not found.", r.name)),
             }
         }
-        "GetSysStats" => reply(&SysStatsResponse { num_goroutine: 0, uptime: stats.uptime_secs() }),
+        "GetSysStats" => reply(&SysStatsResponse {
+            num_goroutine: 0,
+            uptime: stats.uptime_secs(),
+        }),
         "GetUsersStats" => {
-            let Ok(r) = GetUsersStatsRequest::decode(message) else { return status(INVALID_ARGUMENT, "bad request") };
+            let Ok(r) = GetUsersStatsRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
             let users = stats
                 .online_users()
                 .into_iter()
                 .map(|(email, ips)| {
                     let traffic = r.include_traffic.then(|| TrafficUserStat {
-                        uplink: stats.get_counter(&format!("user>>>{email}>>>traffic>>>uplink"), r.reset).unwrap_or(0),
-                        downlink: stats.get_counter(&format!("user>>>{email}>>>traffic>>>downlink"), r.reset).unwrap_or(0),
+                        uplink: stats
+                            .get_counter(&format!("user>>>{email}>>>traffic>>>uplink"), r.reset)
+                            .unwrap_or(0),
+                        downlink: stats
+                            .get_counter(&format!("user>>>{email}>>>traffic>>>downlink"), r.reset)
+                            .unwrap_or(0),
                     });
-                    UserStat { email, ips: ips.into_iter().map(|(ip, last_seen)| OnlineIpEntry { ip, last_seen }).collect(), traffic }
+                    UserStat {
+                        email,
+                        ips: ips
+                            .into_iter()
+                            .map(|(ip, last_seen)| OnlineIpEntry { ip, last_seen })
+                            .collect(),
+                        traffic,
+                    }
                 })
                 .collect();
             reply(&GetUsersStatsResponse { users })
         }
         "GetStatsOnline" | "GetStatsOnlineIpList" => {
-            let Ok(r) = GetStatsRequest::decode(message) else { return status(INVALID_ARGUMENT, "bad request") };
+            let Ok(r) = GetStatsRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
             // Xray names these "user>>>EMAIL>>>online".
-            let email = r.name.strip_prefix("user>>>").and_then(|n| n.strip_suffix(">>>online")).unwrap_or(&r.name);
+            let email = r
+                .name
+                .strip_prefix("user>>>")
+                .and_then(|n| n.strip_suffix(">>>online"))
+                .unwrap_or(&r.name);
             let Some((_, ips)) = stats.online_users().into_iter().find(|(e, _)| e == email) else {
                 return status(NOT_FOUND, &format!("{} not found.", r.name));
             };
             if method == "GetStatsOnline" {
-                reply(&GetStatsResponse { stat: Some(Stat { name: r.name, value: ips.len() as i64 }) })
+                reply(&GetStatsResponse {
+                    stat: Some(Stat {
+                        name: r.name,
+                        value: ips.len() as i64,
+                    }),
+                })
             } else {
-                reply(&GetStatsOnlineIpListResponse { name: r.name, ips: ips.into_iter().collect() })
+                reply(&GetStatsOnlineIpListResponse {
+                    name: r.name,
+                    ips: ips.into_iter().collect(),
+                })
             }
         }
         "GetAllOnlineUsers" => {
-            let users = stats.online_users().into_iter().map(|(email, _)| format!("user>>>{email}>>>online")).collect();
+            let users = stats
+                .online_users()
+                .into_iter()
+                .map(|(email, _)| format!("user>>>{email}>>>online"))
+                .collect();
             reply(&GetAllOnlineUsersResponse { users })
         }
         _ => status(UNIMPLEMENTED, "unknown method"),
@@ -297,31 +356,51 @@ async fn handle(req: Request<Incoming>, inbounds: &Inbounds) -> Response<Body> {
 fn handle_handler(method: &str, message: Bytes, inbounds: &Inbounds) -> Response<Body> {
     match method {
         "AlterInbound" => {
-            let Ok(r) = AlterInboundRequest::decode(message) else { return status(INVALID_ARGUMENT, "bad request") };
-            let Some(ctx) = inbounds.get(&r.tag) else { return missing_handler(&r.tag) };
+            let Ok(r) = AlterInboundRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            let Some(ctx) = inbounds.get(&r.tag) else {
+                return missing_handler(&r.tag);
+            };
             let operation = r.operation.unwrap_or_default();
             let result = match operation.r#type.as_str() {
                 ADD_USER => AddUserOperation::decode(operation.value)
                     .map_err(|e| e.to_string())
                     .and_then(|op| inbound_user(op.user.unwrap_or_default()))
                     .and_then(|user| ctx.add_user(user)),
-                REMOVE_USER => RemoveUserOperation::decode(operation.value).map_err(|e| e.to_string()).and_then(|op| ctx.remove_user(&op.email)),
+                REMOVE_USER => RemoveUserOperation::decode(operation.value)
+                    .map_err(|e| e.to_string())
+                    .and_then(|op| ctx.remove_user(&op.email)),
                 other => Err(format!("unknown operation {other:?}")),
             };
             match result {
                 Ok(()) => {
-                    log::info(format!("api: {} on inbound {:?}", operation.r#type.rsplit('.').next().unwrap_or_default(), r.tag));
+                    log::info(format!(
+                        "api: {} on inbound {:?}",
+                        operation.r#type.rsplit('.').next().unwrap_or_default(),
+                        r.tag
+                    ));
                     reply(&Empty {})
                 }
                 Err(e) => status(UNKNOWN, &e),
             }
         }
         "GetInboundUsers" | "GetInboundUsersCount" => {
-            let Ok(r) = GetInboundUserRequest::decode(message) else { return status(INVALID_ARGUMENT, "bad request") };
-            let Some(ctx) = inbounds.get(&r.tag) else { return missing_handler(&r.tag) };
-            let users: Vec<_> = ctx.users().into_iter().filter(|u| r.email.is_empty() || u.email.eq_ignore_ascii_case(&r.email)).collect();
+            let Ok(r) = GetInboundUserRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            let Some(ctx) = inbounds.get(&r.tag) else {
+                return missing_handler(&r.tag);
+            };
+            let users: Vec<_> = ctx
+                .users()
+                .into_iter()
+                .filter(|u| r.email.is_empty() || u.email.eq_ignore_ascii_case(&r.email))
+                .collect();
             if method == "GetInboundUsersCount" {
-                return reply(&GetInboundUsersCountResponse { count: users.len() as i64 });
+                return reply(&GetInboundUsersCountResponse {
+                    count: users.len() as i64,
+                });
             }
             let users = users.into_iter().map(protocol_user).collect();
             reply(&GetInboundUserResponse { users })
@@ -332,27 +411,43 @@ fn handle_handler(method: &str, message: Bytes, inbounds: &Inbounds) -> Response
 
 // 3x-ui treats "not found" as an already absent handler.
 fn missing_handler(tag: &str) -> Response<Body> {
-    status(UNKNOWN, &format!("failed to get handler: {tag} > handler not found: {tag}"))
+    status(
+        UNKNOWN,
+        &format!("failed to get handler: {tag} > handler not found: {tag}"),
+    )
 }
 
 fn inbound_user(user: ProtocolUser) -> Result<InboundUser, String> {
     let account = user.account.unwrap_or_default();
     if account.r#type != VLESS_ACCOUNT {
-        return Err(format!("account type {:?} is not supported, only VLESS", account.r#type));
+        return Err(format!(
+            "account type {:?} is not supported, only VLESS",
+            account.r#type
+        ));
     }
     let account = VlessAccount::decode(account.value).map_err(|e| e.to_string())?;
     if !account.encryption.is_empty() && account.encryption != "none" {
         return Err("VLESS encryption is not supported".into());
     }
-    Ok(InboundUser { id: user_id(&account.id), email: user.email })
+    Ok(InboundUser {
+        id: user_id(&account.id),
+        email: user.email,
+    })
 }
 
 fn protocol_user(user: InboundUser) -> ProtocolUser {
-    let account = VlessAccount { id: uuid::Uuid::from_bytes(user.id).to_string(), encryption: "none".into(), ..Default::default() };
+    let account = VlessAccount {
+        id: uuid::Uuid::from_bytes(user.id).to_string(),
+        encryption: "none".into(),
+        ..Default::default()
+    };
     ProtocolUser {
         level: 0,
         email: user.email,
-        account: Some(TypedMessage { r#type: VLESS_ACCOUNT.into(), value: account.encode_to_vec().into() }),
+        account: Some(TypedMessage {
+            r#type: VLESS_ACCOUNT.into(),
+            value: account.encode_to_vec().into(),
+        }),
     }
 }
 
@@ -370,17 +465,27 @@ fn reply(message: &impl Message) -> Response<Body> {
     let mut data = BytesMut::with_capacity(5 + message.encoded_len());
     data.put_u8(0);
     data.put_u32(message.encoded_len() as u32);
-    message.encode(&mut data).unwrap_or_else(|_| unreachable!("buffer reserved"));
+    message
+        .encode(&mut data)
+        .unwrap_or_else(|_| unreachable!("buffer reserved"));
     let mut trailers = HeaderMap::new();
     trailers.insert("grpc-status", HeaderValue::from_static("0"));
-    let frames = [Ok(Frame::data(data.freeze())), Ok(Frame::trailers(trailers))];
+    let frames = [
+        Ok(Frame::data(data.freeze())),
+        Ok(Frame::trailers(trailers)),
+    ];
     let body = StreamBody::new(futures_util::stream::iter(frames));
     grpc_response(BodyExt::boxed(body), None)
 }
 
 /// A trailers-only error response.
 fn status(code: u8, message: &str) -> Response<Body> {
-    grpc_response(Full::new(Bytes::new()).map_err(|never| match never {}).boxed(), Some((code, message)))
+    grpc_response(
+        Full::new(Bytes::new())
+            .map_err(|never| match never {})
+            .boxed(),
+        Some((code, message)),
+    )
 }
 
 fn grpc_response(body: Body, error: Option<(u8, &str)>) -> Response<Body> {
@@ -389,7 +494,9 @@ fn grpc_response(body: Body, error: Option<(u8, &str)>) -> Response<Body> {
     headers.insert("content-type", HeaderValue::from_static("application/grpc"));
     if let Some((code, message)) = error {
         headers.insert("grpc-status", HeaderValue::from(u16::from(code)));
-        if let Ok(value) = HeaderValue::from_str(&message.replace(|c: char| !c.is_ascii_graphic() && c != ' ', "?")) {
+        if let Ok(value) = HeaderValue::from_str(
+            &message.replace(|c: char| !c.is_ascii_graphic() && c != ' ', "?"),
+        ) {
             headers.insert("grpc-message", value);
         }
     }
@@ -402,7 +509,10 @@ mod tests {
 
     #[test]
     fn frames_round_trip() {
-        let message = QueryStatsRequest { pattern: "user>>>".into(), reset: true };
+        let message = QueryStatsRequest {
+            pattern: "user>>>".into(),
+            reset: true,
+        };
         let mut framed = BytesMut::new();
         framed.put_u8(0);
         framed.put_u32(message.encoded_len() as u32);

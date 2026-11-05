@@ -21,7 +21,9 @@ pub fn generate(tokenish: bool, length: usize) -> String {
     }
     let mut rng = rand::thread_rng();
     let initial = (length * 5).div_ceil(4).max(1);
-    let mut padding: String = (0..initial).map(|_| BASE62[rng.gen_range(0..BASE62.len())] as char).collect();
+    let mut padding: String = (0..initial)
+        .map(|_| BASE62[rng.gen_range(0..BASE62.len())] as char)
+        .collect();
     // 'X' and 'Z' have 8-bit codes; alternating them avoids long runs.
     let mut adjust = 'X';
     for _ in 0..MAX_ADJUSTMENTS {
@@ -54,7 +56,11 @@ pub fn is_valid(value: &str, range: (usize, usize), tokenish: bool) -> bool {
 }
 
 fn huffman_len(value: &str) -> usize {
-    value.bytes().map(|b| usize::from(HPACK_HUFFMAN_CODE_LENGTHS[usize::from(b)])).sum::<usize>().div_ceil(8)
+    value
+        .bytes()
+        .map(|b| usize::from(HPACK_HUFFMAN_CODE_LENGTHS[usize::from(b)]))
+        .sum::<usize>()
+        .div_ceil(8)
 }
 
 // RFC 7541 Appendix B code lengths in bits.
@@ -80,7 +86,11 @@ mod tests {
         for length in [1, 100, 500, 1000] {
             let value = generate(true, length);
             assert!(value.bytes().all(|b| BASE62.contains(&b)));
-            assert!(is_valid(&value, (length, length), true), "{length}: {}", huffman_len(&value));
+            assert!(
+                is_valid(&value, (length, length), true),
+                "{length}: {}",
+                huffman_len(&value)
+            );
         }
         assert_eq!(generate(false, 3), "XXX");
         assert!(!is_valid("", (0, 10), false));

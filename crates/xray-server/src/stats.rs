@@ -29,7 +29,11 @@ impl Policy {
         if root.get("stats").is_none() {
             return Self::default();
         }
-        let flag = |v: Option<&Value>, key: &str| v.and_then(|v| v.get(key)).and_then(Value::as_bool).unwrap_or(false);
+        let flag = |v: Option<&Value>, key: &str| {
+            v.and_then(|v| v.get(key))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        };
         let level = root.pointer("/policy/levels/0");
         let system = root.pointer("/policy/system");
         Self {
@@ -66,7 +70,12 @@ pub fn get() -> &'static Stats {
 
 impl Stats {
     fn new(policy: Policy) -> Self {
-        Self { policy, counters: Mutex::new(HashMap::new()), online: Mutex::new(HashMap::new()), started: Instant::now() }
+        Self {
+            policy,
+            counters: Mutex::new(HashMap::new()),
+            online: Mutex::new(HashMap::new()),
+            started: Instant::now(),
+        }
     }
 
     pub fn uptime_secs(&self) -> u32 {
@@ -84,20 +93,48 @@ impl Stats {
         let mut add = |enabled: bool, name: String, up: bool| {
             if enabled {
                 let counter = self.counter(name);
-                if up { traffic.up.push(counter) } else { traffic.down.push(counter) }
+                if up {
+                    traffic.up.push(counter)
+                } else {
+                    traffic.down.push(counter)
+                }
             }
         };
         if !email.is_empty() {
-            add(p.user_uplink, format!("user>>>{email}>>>traffic>>>uplink"), true);
-            add(p.user_downlink, format!("user>>>{email}>>>traffic>>>downlink"), false);
+            add(
+                p.user_uplink,
+                format!("user>>>{email}>>>traffic>>>uplink"),
+                true,
+            );
+            add(
+                p.user_downlink,
+                format!("user>>>{email}>>>traffic>>>downlink"),
+                false,
+            );
         }
         if !inbound.is_empty() {
-            add(p.inbound_uplink, format!("inbound>>>{inbound}>>>traffic>>>uplink"), true);
-            add(p.inbound_downlink, format!("inbound>>>{inbound}>>>traffic>>>downlink"), false);
+            add(
+                p.inbound_uplink,
+                format!("inbound>>>{inbound}>>>traffic>>>uplink"),
+                true,
+            );
+            add(
+                p.inbound_downlink,
+                format!("inbound>>>{inbound}>>>traffic>>>downlink"),
+                false,
+            );
         }
         if !outbound.is_empty() {
-            add(p.outbound_uplink, format!("outbound>>>{outbound}>>>traffic>>>uplink"), true);
-            add(p.outbound_downlink, format!("outbound>>>{outbound}>>>traffic>>>downlink"), false);
+            add(
+                p.outbound_uplink,
+                format!("outbound>>>{outbound}>>>traffic>>>uplink"),
+                true,
+            );
+            add(
+                p.outbound_downlink,
+                format!("outbound>>>{outbound}>>>traffic>>>downlink"),
+                false,
+            );
         }
         traffic
     }
@@ -108,7 +145,16 @@ impl Stats {
         let mut out: Vec<(String, i64)> = counters
             .iter()
             .filter(|(name, _)| name.contains(pattern))
-            .map(|(name, c)| (name.clone(), if reset { c.swap(0, Ordering::Relaxed) } else { c.load(Ordering::Relaxed) }))
+            .map(|(name, c)| {
+                (
+                    name.clone(),
+                    if reset {
+                        c.swap(0, Ordering::Relaxed)
+                    } else {
+                        c.load(Ordering::Relaxed)
+                    },
+                )
+            })
             .collect();
         out.sort();
         out
@@ -117,7 +163,11 @@ impl Stats {
     pub fn get_counter(&self, name: &str, reset: bool) -> Option<i64> {
         let counters = lock(&self.counters);
         let c = counters.get(name)?;
-        Some(if reset { c.swap(0, Ordering::Relaxed) } else { c.load(Ordering::Relaxed) })
+        Some(if reset {
+            c.swap(0, Ordering::Relaxed)
+        } else {
+            c.load(Ordering::Relaxed)
+        })
     }
 
     /// Marks a live connection from `ip` for `email` until the guard drops.
@@ -130,10 +180,21 @@ impl Stats {
             ip => ip,
         };
         let mut online = lock(&self.online);
-        let entry = online.entry(email.to_owned()).or_default().entry(ip).or_insert(Online { connections: 0, last_seen: 0 });
+        let entry = online
+            .entry(email.to_owned())
+            .or_default()
+            .entry(ip)
+            .or_insert(Online {
+                connections: 0,
+                last_seen: 0,
+            });
         entry.connections += 1;
         entry.last_seen = unix_now();
-        Some(OnlineGuard { stats: self, email: email.to_owned(), ip })
+        Some(OnlineGuard {
+            stats: self,
+            email: email.to_owned(),
+            ip,
+        })
     }
 
     /// Users with live connections and, per IP, the last time one was opened.
@@ -142,7 +203,10 @@ impl Stats {
         let mut users: Vec<_> = online
             .iter()
             .map(|(email, ips)| {
-                let mut ips: Vec<_> = ips.iter().map(|(ip, o)| (ip.to_string(), o.last_seen)).collect();
+                let mut ips: Vec<_> = ips
+                    .iter()
+                    .map(|(ip, o)| (ip.to_string(), o.last_seen))
+                    .collect();
                 ips.sort();
                 (email.clone(), ips)
             })
@@ -196,7 +260,9 @@ impl Traffic {
 }
 
 fn unix_now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -222,22 +288,37 @@ mod tests {
         t.down(1000);
         let all = stats.query("", false);
         assert_eq!(all.len(), 4, "outbound counters are disabled by policy");
-        assert_eq!(stats.query("user>>>", true), vec![
-            ("user>>>alice>>>traffic>>>downlink".into(), 1000),
-            ("user>>>alice>>>traffic>>>uplink".into(), 100),
-        ]);
-        assert_eq!(stats.get_counter("user>>>alice>>>traffic>>>uplink", false), Some(0));
-        assert_eq!(stats.get_counter("inbound>>>in-1>>>traffic>>>downlink", false), Some(1000));
+        assert_eq!(
+            stats.query("user>>>", true),
+            vec![
+                ("user>>>alice>>>traffic>>>downlink".into(), 1000),
+                ("user>>>alice>>>traffic>>>uplink".into(), 100),
+            ]
+        );
+        assert_eq!(
+            stats.get_counter("user>>>alice>>>traffic>>>uplink", false),
+            Some(0)
+        );
+        assert_eq!(
+            stats.get_counter("inbound>>>in-1>>>traffic>>>downlink", false),
+            Some(1000)
+        );
     }
 
     #[test]
     fn no_stats_section_means_no_counters() {
-        assert_eq!(Policy::from_config(&json!({"policy": {"levels": {"0": {"statsUserUplink": true}}}})), Policy::default());
+        assert_eq!(
+            Policy::from_config(&json!({"policy": {"levels": {"0": {"statsUserUplink": true}}}})),
+            Policy::default()
+        );
     }
 
     #[test]
     fn tracks_online_ips() {
-        let stats = leaked(Policy { user_online: true, ..Policy::default() });
+        let stats = leaked(Policy {
+            user_online: true,
+            ..Policy::default()
+        });
         let a = stats.connect("bob", "1.2.3.4".parse().unwrap());
         let b = stats.connect("bob", "::ffff:1.2.3.4".parse().unwrap());
         assert_eq!(stats.online_users()[0].1.len(), 1);

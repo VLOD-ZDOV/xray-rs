@@ -64,7 +64,10 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
         return Err(ParseError::Invalid("unsupported version"));
     }
     let id = r.take(16)?;
-    let user = users.iter().position(|u| u.id == id).ok_or(ParseError::Invalid("unknown user"))?;
+    let user = users
+        .iter()
+        .position(|u| u.id == id)
+        .ok_or(ParseError::Invalid("unknown user"))?;
     let addons = r.u8()? as usize;
     r.take(addons)?;
     let command = match r.u8()? {
@@ -73,25 +76,48 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
         // Mux carries no address: targets travel inside Mux.Cool frames.
         3 => {
             let host = Host::Domain("v1.mux.cool".into());
-            return Ok((Request { version, user, command: Command::Mux, host, port: 0 }, r.pos));
+            return Ok((
+                Request {
+                    version,
+                    user,
+                    command: Command::Mux,
+                    host,
+                    port: 0,
+                },
+                r.pos,
+            ));
         }
         _ => return Err(ParseError::Invalid("unknown command")),
     };
     let port = u16::from_be_bytes(r.take(2)?.try_into().unwrap_or_default());
     let host = match r.u8()? {
-        1 => Host::Ip(IpAddr::from(<[u8; 4]>::try_from(r.take(4)?).unwrap_or_default())),
+        1 => Host::Ip(IpAddr::from(
+            <[u8; 4]>::try_from(r.take(4)?).unwrap_or_default(),
+        )),
         2 => {
             let len = r.u8()? as usize;
-            let name = std::str::from_utf8(r.take(len)?).map_err(|_| ParseError::Invalid("bad domain"))?;
+            let name =
+                std::str::from_utf8(r.take(len)?).map_err(|_| ParseError::Invalid("bad domain"))?;
             match name.parse::<IpAddr>() {
                 Ok(ip) => Host::Ip(ip),
                 Err(_) => Host::Domain(name.to_owned()),
             }
         }
-        3 => Host::Ip(IpAddr::from(<[u8; 16]>::try_from(r.take(16)?).unwrap_or_default())),
+        3 => Host::Ip(IpAddr::from(
+            <[u8; 16]>::try_from(r.take(16)?).unwrap_or_default(),
+        )),
         _ => return Err(ParseError::Invalid("unknown address type")),
     };
-    Ok((Request { version, user, command, host, port }, r.pos))
+    Ok((
+        Request {
+            version,
+            user,
+            command,
+            host,
+            port,
+        },
+        r.pos,
+    ))
 }
 
 struct Cursor<'a> {
@@ -105,7 +131,10 @@ impl<'a> Cursor<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], ParseError> {
-        let out = self.buf.get(self.pos..self.pos + n).ok_or(ParseError::Incomplete)?;
+        let out = self
+            .buf
+            .get(self.pos..self.pos + n)
+            .ok_or(ParseError::Incomplete)?;
         self.pos += n;
         Ok(out)
     }
@@ -121,7 +150,11 @@ impl Context {
     /// HandlerService AddUser; errors use Xray's wording, which 3x-ui matches on.
     pub fn add_user(&self, user: User) -> Result<(), String> {
         let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
-        if !user.email.is_empty() && users.iter().any(|u| u.email.eq_ignore_ascii_case(&user.email)) {
+        if !user.email.is_empty()
+            && users
+                .iter()
+                .any(|u| u.email.eq_ignore_ascii_case(&user.email))
+        {
             return Err(format!("User {} already exists.", user.email));
         }
         users.retain(|u| u.id != user.id);
@@ -143,11 +176,19 @@ impl Context {
     }
 
     pub fn users(&self) -> Vec<User> {
-        self.users.read().unwrap_or_else(PoisonError::into_inner).clone()
+        self.users
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
-pub async fn serve<R, W>(mut uplink: R, mut downlink: W, ctx: &Context, peer: SocketAddr) -> io::Result<()>
+pub async fn serve<R, W>(
+    mut uplink: R,
+    mut downlink: W,
+    ctx: &Context,
+    peer: SocketAddr,
+) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -166,9 +207,14 @@ where
             };
             match parsed {
                 Ok(parsed) => return Ok(parsed),
-                Err(ParseError::Invalid(reason)) => return Err(io::Error::new(io::ErrorKind::InvalidData, reason)),
+                Err(ParseError::Invalid(reason)) => {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+                }
                 Err(ParseError::Incomplete) if buf.len() > MAX_HEADER => {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "header too long"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "header too long",
+                    ));
                 }
                 Err(ParseError::Incomplete) => {}
             }
@@ -193,10 +239,18 @@ where
             email: user.email.clone(),
             router: ctx.router.clone(),
         };
-        let mut reader = PrefixedReader { early, pos: 0, inner: &mut uplink };
+        let mut reader = PrefixedReader {
+            early,
+            pos: 0,
+            inner: &mut uplink,
+        };
         return mux::serve(&mut reader, &mut downlink, &info).await;
     }
-    let network = if request.command == Command::Tcp { Network::Tcp } else { Network::Udp };
+    let network = if request.command == Command::Tcp {
+        Network::Tcp
+    } else {
+        Network::Udp
+    };
     if network == Network::Tcp && early.is_empty() && ctx.router.needs_sniff() {
         let mut chunk = vec![0u8; 4096];
         if let Ok(Ok(n)) = timeout(SNIFF_TIMEOUT, uplink.read(&mut chunk)).await {
@@ -204,8 +258,19 @@ where
         }
     }
     // UDP early data is length-prefixed packets.
-    let payload = if network == Network::Udp { early.get(2..).unwrap_or_default() } else { &early[..] };
-    let route = RouteRequest { ctx_tag: &ctx.tag, email: &user.email, peer, network, host: &request.host, port: request.port };
+    let payload = if network == Network::Udp {
+        early.get(2..).unwrap_or_default()
+    } else {
+        &early[..]
+    };
+    let route = RouteRequest {
+        ctx_tag: &ctx.tag,
+        email: &user.email,
+        peer,
+        network,
+        host: &request.host,
+        port: request.port,
+    };
     let Some(decision) = route.allow(&ctx.router, payload).await else {
         return Ok(());
     };
@@ -213,7 +278,8 @@ where
 
     match request.command {
         Command::Tcp => {
-            let stream = outbound::connect(&ctx.router, &decision, &request.host, request.port).await?;
+            let stream =
+                outbound::connect(&ctx.router, &decision, &request.host, request.port).await?;
             let (mut target_r, mut target_w) = tokio::io::split(stream);
             target_w.write_all(&early).await?;
             traffic.up(early.len());
@@ -233,8 +299,17 @@ where
             downlink.write_all(&[request.version, 0]).await?;
             downlink.flush().await?;
             let activity = Activity::new();
-            let reader = PrefixedReader { early, pos: 0, inner: &mut uplink };
-            relay(udp_up(reader, &link, &activity, &traffic), udp_down(&link, &mut downlink, &activity, &traffic), &activity).await
+            let reader = PrefixedReader {
+                early,
+                pos: 0,
+                inner: &mut uplink,
+            };
+            relay(
+                udp_up(reader, &link, &activity, &traffic),
+                udp_down(&link, &mut downlink, &activity, &traffic),
+                &activity,
+            )
+            .await
         }
     }
 }
@@ -255,7 +330,11 @@ impl RouteRequest<'_> {
             Host::Domain(name) => (Some(name.as_str()), None),
             Host::Ip(ip) => (None, Some(*ip)),
         };
-        let protocol = if router.needs_sniff() { routing::sniff(first_payload, self.network) } else { None };
+        let protocol = if router.needs_sniff() {
+            routing::sniff(first_payload, self.network)
+        } else {
+            None
+        };
         let query = Query {
             inbound: self.ctx_tag,
             user: self.email,
@@ -267,10 +346,21 @@ impl RouteRequest<'_> {
             protocol,
         };
         let decision = router.route(&query).await;
-        let network = if self.network == Network::Tcp { "tcp" } else { "udp" };
+        let network = if self.network == Network::Tcp {
+            "tcp"
+        } else {
+            "udp"
+        };
         let to = format!("{network}:{}:{}", host_label(self.host), self.port);
         let accepted = decision.action != Action::Block;
-        log::access(self.peer, accepted, to, self.ctx_tag, &decision.tag, self.email);
+        log::access(
+            self.peer,
+            accepted,
+            to,
+            self.ctx_tag,
+            &decision.tag,
+            self.email,
+        );
         accepted.then_some(decision)
     }
 }
@@ -287,10 +377,15 @@ pub(crate) fn host_label(host: &Host) -> String {
 pub(crate) async fn resolve_all(host: &Host, port: u16) -> io::Result<Vec<SocketAddr>> {
     let mut addrs = match host {
         Host::Ip(ip) => vec![SocketAddr::new(*ip, port)],
-        Host::Domain(name) => tokio::net::lookup_host((name.as_str(), port)).await?.collect(),
+        Host::Domain(name) => tokio::net::lookup_host((name.as_str(), port))
+            .await?
+            .collect(),
     };
     if addrs.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "no address for host"));
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no address for host",
+        ));
     }
     addrs.sort_by_key(SocketAddr::is_ipv6);
     Ok(addrs)
@@ -318,7 +413,11 @@ pub fn is_private(ip: IpAddr) -> bool {
                 return is_private(IpAddr::V4(v4));
             }
             let first = v6.segments()[0];
-            v6.is_loopback() || v6.is_unspecified() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80 || (first & 0xff00) == 0xff00
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+                || (first & 0xff00) == 0xff00
         }
     }
 }
@@ -330,15 +429,21 @@ struct Activity {
 
 impl Activity {
     fn new() -> Self {
-        Self { start: Instant::now(), last: AtomicU64::new(0) }
+        Self {
+            start: Instant::now(),
+            last: AtomicU64::new(0),
+        }
     }
 
     fn touch(&self) {
-        self.last.store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+        self.last
+            .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
 
     fn idle(&self) -> Duration {
-        self.start.elapsed().saturating_sub(Duration::from_millis(self.last.load(Ordering::Relaxed)))
+        self.start
+            .elapsed()
+            .saturating_sub(Duration::from_millis(self.last.load(Ordering::Relaxed)))
     }
 }
 
@@ -377,7 +482,12 @@ async fn idle_for(activity: &Activity, limit: Duration) {
     }
 }
 
-async fn copy<R, W>(reader: &mut R, writer: &mut W, activity: &Activity, count: impl Fn(usize)) -> io::Result<()>
+async fn copy<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    activity: &Activity,
+    count: impl Fn(usize),
+) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -404,7 +514,11 @@ struct PrefixedReader<'a, R> {
 
 /// Replays bytes read past the VLESS header before reading the stream.
 impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<'_, R> {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         let this = &mut *self;
         if this.pos < this.early.len() {
             let n = (this.early.len() - this.pos).min(buf.remaining());
@@ -416,7 +530,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for PrefixedReader<'_, R> {
     }
 }
 
-async fn udp_up<R: AsyncRead + Unpin>(mut reader: PrefixedReader<'_, R>, link: &UdpLink, activity: &Activity, traffic: &Traffic) -> io::Result<()> {
+async fn udp_up<R: AsyncRead + Unpin>(
+    mut reader: PrefixedReader<'_, R>,
+    link: &UdpLink,
+    activity: &Activity,
+    traffic: &Traffic,
+) -> io::Result<()> {
     let mut packet = vec![0u8; 65535];
     loop {
         let mut len = [0u8; 2];
@@ -434,7 +553,12 @@ async fn udp_up<R: AsyncRead + Unpin>(mut reader: PrefixedReader<'_, R>, link: &
     }
 }
 
-async fn udp_down<W: AsyncWrite + Unpin>(link: &UdpLink, writer: &mut W, activity: &Activity, traffic: &Traffic) -> io::Result<()> {
+async fn udp_down<W: AsyncWrite + Unpin>(
+    link: &UdpLink,
+    writer: &mut W,
+    activity: &Activity,
+    traffic: &Traffic,
+) -> io::Result<()> {
     let mut packet = vec![0u8; 2 + 65535];
     loop {
         let n = link.recv(&mut packet[2..]).await?;
@@ -451,7 +575,10 @@ mod tests {
     use super::*;
 
     fn users() -> Vec<User> {
-        vec![User { id: [7; 16], email: "u".into() }]
+        vec![User {
+            id: [7; 16],
+            email: "u".into(),
+        }]
     }
 
     fn header(addr: &[u8]) -> Vec<u8> {
@@ -476,10 +603,16 @@ mod tests {
     #[test]
     fn reports_incomplete_and_rejects_unknown_user() {
         let buf = header(&[1, 1, 2, 3]);
-        assert_eq!(parse_request(&buf[..buf.len() - 1], &users()), Err(ParseError::Incomplete));
+        assert_eq!(
+            parse_request(&buf[..buf.len() - 1], &users()),
+            Err(ParseError::Incomplete)
+        );
         let mut bad = buf.clone();
         bad[1] = 0;
-        assert_eq!(parse_request(&bad, &users()), Err(ParseError::Invalid("unknown user")));
+        assert_eq!(
+            parse_request(&bad, &users()),
+            Err(ParseError::Invalid("unknown user"))
+        );
     }
 
     #[test]

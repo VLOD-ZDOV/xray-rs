@@ -361,7 +361,7 @@ fn open_file_beneath(root: &Path, requested: &Path) -> io::Result<File> {
     use std::os::unix::ffi::OsStrExt;
 
     use nix::{
-        fcntl::{OFlag, open, openat},
+        fcntl::{open, openat, OFlag},
         sys::stat::Mode,
     };
 
@@ -372,9 +372,8 @@ fn open_file_beneath(root: &Path, requested: &Path) -> io::Result<File> {
         | OFlag::O_NOFOLLOW
         | OFlag::O_NONBLOCK
         | OFlag::O_DIRECTORY;
-    let mut current_dir = File::from(
-        open(root.as_c_str(), root_flags, Mode::empty()).map_err(io::Error::from)?,
-    );
+    let mut current_dir =
+        File::from(open(root.as_c_str(), root_flags, Mode::empty()).map_err(io::Error::from)?);
     let mut components = requested.components().peekable();
     while let Some(Component::Normal(component)) = components.next() {
         let component = CString::new(component.as_bytes()).map_err(|_| {
@@ -384,8 +383,7 @@ fn open_file_beneath(root: &Path, requested: &Path) -> io::Result<File> {
             )
         })?;
         let is_last = components.peek().is_none();
-        let mut flags =
-            OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
+        let mut flags = OFlag::O_RDONLY | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK;
         if !is_last {
             flags |= OFlag::O_DIRECTORY;
         }

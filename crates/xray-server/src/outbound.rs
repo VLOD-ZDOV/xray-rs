@@ -22,24 +22,44 @@ use crate::wg::{to_io, WgOutbound};
 pub trait Stream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Stream for T {}
 
-pub async fn connect(router: &Router, decision: &Decision, host: &Host, port: u16) -> io::Result<Box<dyn Stream>> {
+pub async fn connect(
+    router: &Router,
+    decision: &Decision,
+    host: &Host,
+    port: u16,
+) -> io::Result<Box<dyn Stream>> {
     match &decision.action {
-        Action::Direct => Ok(Box::new(connect_direct(router, &decision.tag, host, port).await?)),
+        Action::Direct => Ok(Box::new(
+            connect_direct(router, &decision.tag, host, port).await?,
+        )),
         Action::Wireguard(wg) => Ok(Box::new(wg.connect(host, port).await?)),
         Action::Socks(socks) => Ok(Box::new(socks.connect(host, port).await?)),
         Action::Block => Err(blocked(&decision.tag)),
     }
 }
 
-pub fn check_final(router: &Router, outbound: &str, network: Network, addr: SocketAddr) -> io::Result<()> {
+pub fn check_final(
+    router: &Router,
+    outbound: &str,
+    network: Network,
+    addr: SocketAddr,
+) -> io::Result<()> {
     match router.final_action(outbound, network, addr) {
-        Action::Block => Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{addr} blocked by finalRules of {outbound:?}"))),
+        Action::Block => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{addr} blocked by finalRules of {outbound:?}"),
+        )),
         _ => Ok(()),
     }
 }
 
 /// Tries each resolved address that passes the outbound's finalRules.
-async fn connect_direct(router: &Router, outbound: &str, host: &Host, port: u16) -> io::Result<TcpStream> {
+async fn connect_direct(
+    router: &Router,
+    outbound: &str,
+    host: &Host,
+    port: u16,
+) -> io::Result<TcpStream> {
     let mut last_error = None;
     for addr in resolve_all(host, port).await? {
         if let Err(e) = check_final(router, outbound, Network::Tcp, addr) {
@@ -52,7 +72,12 @@ async fn connect_direct(router: &Router, outbound: &str, host: &Host, port: u16)
                 return Ok(stream);
             }
             Ok(Err(e)) => last_error = Some(e),
-            Err(_) => last_error = Some(io::Error::new(io::ErrorKind::TimedOut, format!("connect to {addr} timed out"))),
+            Err(_) => {
+                last_error = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to {addr} timed out"),
+                ))
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| io::ErrorKind::NotFound.into()))
@@ -66,18 +91,32 @@ pub enum UdpLink {
 }
 
 impl UdpLink {
-    pub async fn open(router: &Router, decision: &Decision, host: &Host, port: u16) -> io::Result<Self> {
+    pub async fn open(
+        router: &Router,
+        decision: &Decision,
+        host: &Host,
+        port: u16,
+    ) -> io::Result<Self> {
         match &decision.action {
             Action::Direct => {
                 let target = resolve(host, port).await?;
                 check_final(router, &decision.tag, Network::Udp, target)?;
-                let bind: SocketAddr = if target.is_ipv4() { ([0, 0, 0, 0], 0).into() } else { ([0u16; 8], 0).into() };
+                let bind: SocketAddr = if target.is_ipv4() {
+                    ([0, 0, 0, 0], 0).into()
+                } else {
+                    ([0u16; 8], 0).into()
+                };
                 let socket = UdpSocket::bind(bind).await?;
                 socket.connect(target).await?;
                 Ok(Self::Direct(socket))
             }
-            Action::Wireguard(wg) => Ok(Self::Wireguard(wg.open_udp(wg.udp_target(host, port).await?).await?)),
-            Action::Socks(socks) => Ok(Self::Socks(socks.associate().await?, resolve(host, port).await?)),
+            Action::Wireguard(wg) => Ok(Self::Wireguard(
+                wg.open_udp(wg.udp_target(host, port).await?).await?,
+            )),
+            Action::Socks(socks) => Ok(Self::Socks(
+                socks.associate().await?,
+                resolve(host, port).await?,
+            )),
             Action::Block => Err(blocked(&decision.tag)),
         }
     }
@@ -138,11 +177,21 @@ impl ConeUdp {
                     Err(_) => UdpSocket::bind(("0.0.0.0", 0)).await?,
                 };
                 let dual_stack = socket.local_addr()?.is_ipv6();
-                Ok(Self::Direct { socket, dual_stack, router, outbound: decision.tag.clone() })
+                Ok(Self::Direct {
+                    socket,
+                    dual_stack,
+                    router,
+                    outbound: decision.tag.clone(),
+                })
             }
             Action::Wireguard(wg) => {
                 let (tx, rx) = mpsc::channel(256);
-                Ok(Self::Wireguard { wg: wg.clone(), sessions: Mutex::new(HashMap::new()), tx, rx: Mutex::new(rx) })
+                Ok(Self::Wireguard {
+                    wg: wg.clone(),
+                    sessions: Mutex::new(HashMap::new()),
+                    tx,
+                    rx: Mutex::new(rx),
+                })
             }
             Action::Socks(socks) => Ok(Self::Socks(socks.associate().await?)),
             Action::Block => Err(blocked(&decision.tag)),
@@ -152,7 +201,9 @@ impl ConeUdp {
     /// Resolves a destination for this outbound (domains via the system resolver).
     pub async fn target(&self, host: &Host, port: u16) -> io::Result<SocketAddr> {
         match self {
-            Self::Direct { router, outbound, .. } => {
+            Self::Direct {
+                router, outbound, ..
+            } => {
                 let addr = resolve(host, port).await?;
                 check_final(router, outbound, Network::Udp, addr)?;
                 Ok(addr)
@@ -164,16 +215,25 @@ impl ConeUdp {
 
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
         match self {
-            Self::Direct { socket, dual_stack, .. } => {
+            Self::Direct {
+                socket, dual_stack, ..
+            } => {
                 let addr = match addr {
-                    SocketAddr::V4(v4) if *dual_stack => SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port()),
+                    SocketAddr::V4(v4) if *dual_stack => {
+                        SocketAddr::new(IpAddr::V6(v4.ip().to_ipv6_mapped()), v4.port())
+                    }
                     other => other,
                 };
                 socket.send_to(data, addr).await.map(|_| ())
             }
-            Self::Wireguard { wg, sessions, tx, .. } => {
+            Self::Wireguard {
+                wg, sessions, tx, ..
+            } => {
                 let mut sessions = sessions.lock().await;
-                if sessions.get(&addr).is_none_or(|(_, task)| task.is_finished()) {
+                if sessions
+                    .get(&addr)
+                    .is_none_or(|(_, task)| task.is_finished())
+                {
                     let session = Arc::new(wg.open_udp(addr).await?);
                     let (reader, tx) = (session.clone(), tx.clone());
                     let task = tokio::spawn(async move {
@@ -201,13 +261,21 @@ impl ConeUdp {
             Self::Direct { socket, .. } => {
                 let (n, from) = socket.recv_from(buf).await?;
                 let from = match from {
-                    SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or(from, |v4| SocketAddr::new(IpAddr::V4(v4), v6.port())),
+                    SocketAddr::V6(v6) => v6
+                        .ip()
+                        .to_ipv4_mapped()
+                        .map_or(from, |v4| SocketAddr::new(IpAddr::V4(v4), v6.port())),
                     other => other,
                 };
                 Ok((n, from))
             }
             Self::Wireguard { rx, .. } => {
-                let (from, packet) = rx.lock().await.recv().await.ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                let (from, packet) = rx
+                    .lock()
+                    .await
+                    .recv()
+                    .await
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
                 let n = packet.len().min(buf.len());
                 buf[..n].copy_from_slice(&packet[..n]);
                 Ok((n, from))
@@ -228,5 +296,8 @@ impl Drop for ConeUdp {
 }
 
 fn blocked(tag: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, format!("blocked by outbound {tag:?}"))
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("blocked by outbound {tag:?}"),
+    )
 }

@@ -61,7 +61,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Fram
         if network != NETWORK_TCP && network != NETWORK_UDP {
             return Err(invalid("unknown mux network"));
         }
-        let (host, port, _) = parse_port_addr(&meta[5..]).ok_or_else(|| invalid("bad mux address"))?;
+        let (host, port, _) =
+            parse_port_addr(&meta[5..]).ok_or_else(|| invalid("bad mux address"))?;
         target = Some((network, host, port));
     }
 
@@ -73,27 +74,47 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Fram
     } else {
         None
     };
-    Ok(Frame { id, status, option, target, data })
+    Ok(Frame {
+        id,
+        status,
+        option,
+        target,
+        data,
+    })
 }
 
 fn parse_port_addr(buf: &[u8]) -> Option<(Host, u16, usize)> {
     let port = u16::from_be_bytes([*buf.first()?, *buf.get(1)?]);
     let (host, used) = match *buf.get(2)? {
-        1 => (Host::Ip(IpAddr::from(<[u8; 4]>::try_from(buf.get(3..7)?).ok()?)), 7),
+        1 => (
+            Host::Ip(IpAddr::from(<[u8; 4]>::try_from(buf.get(3..7)?).ok()?)),
+            7,
+        ),
         2 => {
             let len = *buf.get(3)? as usize;
             let name = std::str::from_utf8(buf.get(4..4 + len)?).ok()?;
-            let host = name.parse::<IpAddr>().map_or_else(|_| Host::Domain(name.to_owned()), Host::Ip);
+            let host = name
+                .parse::<IpAddr>()
+                .map_or_else(|_| Host::Domain(name.to_owned()), Host::Ip);
             (host, 4 + len)
         }
-        3 => (Host::Ip(IpAddr::from(<[u8; 16]>::try_from(buf.get(3..19)?).ok()?)), 19),
+        3 => (
+            Host::Ip(IpAddr::from(<[u8; 16]>::try_from(buf.get(3..19)?).ok()?)),
+            19,
+        ),
         _ => return None,
     };
     Some((host, port, used))
 }
 
 /// Encodes a server-to-client frame. `udp_from` marks a UDP packet's source.
-pub fn encode_frame(id: u16, status: u8, option: u8, udp_from: Option<SocketAddr>, data: Option<&[u8]>) -> Bytes {
+pub fn encode_frame(
+    id: u16,
+    status: u8,
+    option: u8,
+    udp_from: Option<SocketAddr>,
+    data: Option<&[u8]>,
+) -> Bytes {
     let mut meta = BytesMut::with_capacity(32);
     meta.put_u16(id);
     meta.put_u8(status);
@@ -123,7 +144,13 @@ pub fn encode_frame(id: u16, status: u8, option: u8, udp_from: Option<SocketAddr
 }
 
 fn end_frame(id: u16, error: bool) -> Bytes {
-    encode_frame(id, STATUS_END, if error { OPTION_ERROR } else { 0 }, None, None)
+    encode_frame(
+        id,
+        STATUS_END,
+        if error { OPTION_ERROR } else { 0 },
+        None,
+        None,
+    )
 }
 
 pub struct Info {
@@ -183,12 +210,19 @@ where
                         host: &host,
                         port,
                     };
-                    let Some(decision) = route.allow(&info.router, frame.data.as_deref().unwrap_or_default()).await else {
+                    let Some(decision) = route
+                        .allow(&info.router, frame.data.as_deref().unwrap_or_default())
+                        .await
+                    else {
                         let _ = out_tx.send(end_frame(frame.id, true)).await;
                         continue;
                     };
                     let traffic = stats::get().traffic(&info.tag, &info.email, &decision.tag);
-                    let dial = Dial { router: info.router.clone(), decision, traffic };
+                    let dial = Dial {
+                        router: info.router.clone(),
+                        decision,
+                        traffic,
+                    };
                     let (tx, rx) = mpsc::channel(64);
                     let out = out_tx.clone();
                     let id = frame.id;
@@ -197,9 +231,20 @@ where
                     } else {
                         tokio::spawn(tcp_session(id, (host, port), rx, out, dial))
                     };
-                    let session = Session { input: tx, udp, task };
+                    let session = Session {
+                        input: tx,
+                        udp,
+                        task,
+                    };
                     if let Some(data) = frame.data {
-                        forward(&session, Packet { data: data.into(), dest: None }).await;
+                        forward(
+                            &session,
+                            Packet {
+                                data: data.into(),
+                                dest: None,
+                            },
+                        )
+                        .await;
                     }
                     sessions.insert(frame.id, session);
                 }
@@ -208,7 +253,14 @@ where
                     match sessions.get(&frame.id) {
                         Some(session) => {
                             let dest = frame.target.map(|(_, host, port)| (host, port));
-                            forward(session, Packet { data: data.into(), dest }).await;
+                            forward(
+                                session,
+                                Packet {
+                                    data: data.into(),
+                                    dest,
+                                },
+                            )
+                            .await;
                         }
                         // Tell the client this session is gone.
                         None => {
@@ -253,7 +305,13 @@ struct Dial {
     traffic: Traffic,
 }
 
-async fn tcp_session(id: u16, target: (Host, u16), mut input: mpsc::Receiver<Packet>, out: mpsc::Sender<Bytes>, dial: Dial) {
+async fn tcp_session(
+    id: u16,
+    target: (Host, u16),
+    mut input: mpsc::Receiver<Packet>,
+    out: mpsc::Sender<Bytes>,
+    dial: Dial,
+) {
     let result: io::Result<()> = async {
         let stream = outbound::connect(&dial.router, &dial.decision, &target.0, target.1).await?;
         let (mut r, mut w) = tokio::io::split(stream);
@@ -275,7 +333,9 @@ async fn tcp_session(id: u16, target: (Host, u16), mut input: mpsc::Receiver<Pac
                 }
                 dial.traffic.down(n);
                 let frame = encode_frame(id, STATUS_KEEP, OPTION_DATA, None, Some(&buf[..n]));
-                out.send(frame).await.map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                out.send(frame)
+                    .await
+                    .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
             }
         };
         tokio::pin!(up);
@@ -293,13 +353,22 @@ async fn tcp_session(id: u16, target: (Host, u16), mut input: mpsc::Receiver<Pac
 
 /// Full-cone UDP: one socket per session, any destination, replies tagged
 /// with their source address.
-async fn udp_session(id: u16, target: (Host, u16), mut input: mpsc::Receiver<Packet>, out: mpsc::Sender<Bytes>, dial: Dial) {
+async fn udp_session(
+    id: u16,
+    target: (Host, u16),
+    mut input: mpsc::Receiver<Packet>,
+    out: mpsc::Sender<Bytes>,
+    dial: Dial,
+) {
     let result: io::Result<()> = async {
         let cone = ConeUdp::open(dial.router.clone(), &dial.decision).await?;
         let mut resolved: HashMap<(String, u16), SocketAddr> = HashMap::new();
         let up = async {
             while let Some(packet) = input.recv().await {
-                let (host, port) = packet.dest.as_ref().map_or((&target.0, target.1), |(h, p)| (h, *p));
+                let (host, port) = packet
+                    .dest
+                    .as_ref()
+                    .map_or((&target.0, target.1), |(h, p)| (h, *p));
                 let key = (host_label(host), port);
                 let addr = match resolved.get(&key) {
                     Some(addr) => *addr,
@@ -326,7 +395,9 @@ async fn udp_session(id: u16, target: (Host, u16), mut input: mpsc::Receiver<Pac
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
                 dial.traffic.down(n);
                 let frame = encode_frame(id, STATUS_KEEP, OPTION_DATA, Some(from), Some(&buf[..n]));
-                out.send(frame).await.map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+                out.send(frame)
+                    .await
+                    .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
             }
         };
         tokio::select! {
@@ -351,14 +422,30 @@ mod tests {
 
     #[tokio::test]
     async fn parses_xudp_new_frame_with_global_id() {
-        let mut meta = vec![0, 5, STATUS_NEW, OPTION_DATA, NETWORK_UDP, 0x01, 0xbb, 1, 8, 8, 8, 8];
+        let mut meta = vec![
+            0,
+            5,
+            STATUS_NEW,
+            OPTION_DATA,
+            NETWORK_UDP,
+            0x01,
+            0xbb,
+            1,
+            8,
+            8,
+            8,
+            8,
+        ];
         meta.extend_from_slice(&[9; 8]);
         let mut wire = (meta.len() as u16).to_be_bytes().to_vec();
         wire.extend_from_slice(&meta);
         wire.extend_from_slice(&[0, 3, b'a', b'b', b'c']);
         let frame = read_frame(&mut wire.as_slice()).await.unwrap();
         assert_eq!(frame.id, 5);
-        assert_eq!(frame.target, Some((NETWORK_UDP, Host::Ip("8.8.8.8".parse().unwrap()), 443)));
+        assert_eq!(
+            frame.target,
+            Some((NETWORK_UDP, Host::Ip("8.8.8.8".parse().unwrap()), 443))
+        );
         assert_eq!(frame.data.as_deref(), Some(&b"abc"[..]));
     }
 

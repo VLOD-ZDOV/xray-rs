@@ -47,10 +47,18 @@ enum Upload {
 
 impl Handler {
     pub fn new(settings: XhttpSettings, vless: Arc<vless::Context>) -> Arc<Self> {
-        Arc::new(Self { settings, vless, sessions: Mutex::new(HashMap::new()) })
+        Arc::new(Self {
+            settings,
+            vless,
+            sessions: Mutex::new(HashMap::new()),
+        })
     }
 
-    pub async fn handle(self: Arc<Self>, req: Request<Incoming>, peer: SocketAddr) -> Response<Body> {
+    pub async fn handle(
+        self: Arc<Self>,
+        req: Request<Incoming>,
+        peer: SocketAddr,
+    ) -> Response<Body> {
         let s = &self.settings;
         if !s.host.is_empty() && !host_matches(&req, &s.host) {
             log::debug(format!("xhttp: host mismatch from {}", log::mask(peer)));
@@ -58,22 +66,35 @@ impl Handler {
         }
         let path = req.uri().path().to_owned();
         let Some(rest) = path.strip_prefix(s.path.as_str()) else {
-            log::debug(format!("xhttp: path mismatch {path:?} from {}", log::mask(peer)));
+            log::debug(format!(
+                "xhttp: path mismatch {path:?} from {}",
+                log::mask(peer)
+            ));
             return status(StatusCode::NOT_FOUND);
         };
 
         let mut response = self.response_headers(&req);
 
         // A real CORS preflight carries Access-Control-Request-Method; a bare OPTIONS is an uplink.
-        if req.method() == Method::OPTIONS && req.headers().contains_key("Access-Control-Request-Method") {
+        if req.method() == Method::OPTIONS
+            && req.headers().contains_key("Access-Control-Request-Method")
+        {
             return finish(response, StatusCode::OK, empty());
         }
 
-        let referer = req.headers().get(REFERER).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        let referer = req
+            .headers()
+            .get(REFERER)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
         let pad = self.request_padding(&req, referer.as_deref());
         let tokenish = s.padding_obfs.as_ref().is_some_and(|o| o.tokenish);
         if !padding::is_valid(&pad, s.padding, tokenish) {
-            log::debug(format!("xhttp: invalid padding (length {}) from {}", pad.len(), log::mask(peer)));
+            log::debug(format!(
+                "xhttp: invalid padding (length {}) from {}",
+                pad.len(),
+                log::mask(peer)
+            ));
             return status(StatusCode::BAD_REQUEST);
         }
         let obfs_padding_accepted = s.padding_obfs.is_some();
@@ -95,9 +116,18 @@ impl Handler {
                 if !allowed("stream-up") {
                     return status(StatusCode::BAD_REQUEST);
                 }
-                let send_padding = (referer.is_some() || obfs_padding_accepted) && s.stream_up_secs.1 > 0;
-                let body = stream_up(req.into_body(), session, send_padding, s.padding, s.stream_up_secs);
-                response = response.header("X-Accel-Buffering", "no").header(CACHE_CONTROL, "no-store");
+                let send_padding =
+                    (referer.is_some() || obfs_padding_accepted) && s.stream_up_secs.1 > 0;
+                let body = stream_up(
+                    req.into_body(),
+                    session,
+                    send_padding,
+                    s.padding,
+                    s.stream_up_secs,
+                );
+                response = response
+                    .header("X-Accel-Buffering", "no")
+                    .header(CACHE_CONTROL, "no-store");
                 return finish(response, StatusCode::OK, body);
             }
             if !allowed("packet-up") {
@@ -108,7 +138,10 @@ impl Handler {
             };
             let data = &s.uplink_data;
             let mut payload = Vec::new();
-            for (placement, chunks) in [(Placement::Header, header_chunks(&req, &data.key)), (Placement::Cookie, cookie_chunks(&req, &data.key))] {
+            for (placement, chunks) in [
+                (Placement::Header, header_chunks(&req, &data.key)),
+                (Placement::Cookie, cookie_chunks(&req, &data.key)),
+            ] {
                 if data.placement == placement || data.placement == Placement::Auto {
                     match URL_SAFE_NO_PAD.decode(chunks) {
                         Ok(decoded) => payload.extend_from_slice(&decoded),
@@ -118,7 +151,10 @@ impl Handler {
             }
             let mut body_empty = true;
             if matches!(data.placement, Placement::Body | Placement::Auto) {
-                let body = match Limited::new(req.into_body(), s.max_each_post).collect().await {
+                let body = match Limited::new(req.into_body(), s.max_each_post)
+                    .collect()
+                    .await
+                {
                     Ok(collected) => collected.to_bytes(),
                     Err(_) => return status(StatusCode::PAYLOAD_TOO_LARGE),
                 };
@@ -133,7 +169,12 @@ impl Handler {
                 response = response.header(CACHE_CONTROL, "no-store");
             }
             let payload = Bytes::from(payload);
-            if session.uploads.send(Upload::Packet(seq, payload)).await.is_err() {
+            if session
+                .uploads
+                .send(Upload::Packet(seq, payload))
+                .await
+                .is_err()
+            {
                 return status(StatusCode::INTERNAL_SERVER_ERROR);
             }
             return finish(response, StatusCode::OK, empty());
@@ -178,7 +219,9 @@ impl Handler {
             }
         });
 
-        response = response.header("X-Accel-Buffering", "no").header(CACHE_CONTROL, "no-store");
+        response = response
+            .header("X-Accel-Buffering", "no")
+            .header(CACHE_CONTROL, "no-store");
         if !s.no_sse_header {
             response = response.header(CONTENT_TYPE, "text/event-stream");
         }
@@ -188,16 +231,31 @@ impl Handler {
     fn response_headers(&self, req: &Request<Incoming>) -> http::response::Builder {
         let s = &self.settings;
         let mut response = Response::builder().header("Access-Control-Allow-Origin", origin(req));
-        let cookie_used = [&s.session, &s.seq, &s.uplink_data].iter().any(|m| m.placement == Placement::Cookie)
-            || s.padding_obfs.as_ref().is_some_and(|o| o.placement == Placement::Cookie);
+        let cookie_used = [&s.session, &s.seq, &s.uplink_data]
+            .iter()
+            .any(|m| m.placement == Placement::Cookie)
+            || s.padding_obfs
+                .as_ref()
+                .is_some_and(|o| o.placement == Placement::Cookie);
         if cookie_used {
             response = response.header("Access-Control-Allow-Credentials", "true");
         }
         if req.method() == Method::OPTIONS {
-            let echo = |name: &str| req.headers().get(name).cloned().unwrap_or_else(|| HeaderValue::from_static("*"));
+            let echo = |name: &str| {
+                req.headers()
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| HeaderValue::from_static("*"))
+            };
             response = response
-                .header("Access-Control-Allow-Methods", echo("Access-Control-Request-Method"))
-                .header("Access-Control-Allow-Headers", echo("Access-Control-Request-Headers"));
+                .header(
+                    "Access-Control-Allow-Methods",
+                    echo("Access-Control-Request-Method"),
+                )
+                .header(
+                    "Access-Control-Allow-Headers",
+                    echo("Access-Control-Request-Headers"),
+                );
         }
         let length = padding::draw(s.padding);
         match &s.padding_obfs {
@@ -207,8 +265,12 @@ impl Handler {
                 match obfs.placement {
                     Placement::Header => response.header(obfs.header.as_str(), value),
                     // Xray formats an empty URL carrying only the query.
-                    Placement::QueryInHeader => response.header(obfs.header.as_str(), format!("?{}={value}", obfs.key)),
-                    Placement::Cookie => response.header(SET_COOKIE, format!("{}={value}; Path=/", obfs.key)),
+                    Placement::QueryInHeader => {
+                        response.header(obfs.header.as_str(), format!("?{}={value}", obfs.key))
+                    }
+                    Placement::Cookie => {
+                        response.header(SET_COOKIE, format!("{}={value}; Path=/", obfs.key))
+                    }
                     _ => response,
                 }
             }
@@ -220,18 +282,29 @@ impl Handler {
         let request_query = req.uri().query().unwrap_or_default();
         let Some(obfs) = &self.settings.padding_obfs else {
             let query = referer.map_or(request_query, |r| r.split_once('?').map_or("", |(_, q)| q));
-            return query_value(query, "x_padding").unwrap_or_default().to_owned();
+            return query_value(query, "x_padding")
+                .unwrap_or_default()
+                .to_owned();
         };
         if let Some(value) = cookie(req, &obfs.key).filter(|v| !v.is_empty()) {
             return value;
         }
-        if let Some(value) = req.headers().get(obfs.header.as_str()).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()) {
+        if let Some(value) = req
+            .headers()
+            .get(obfs.header.as_str())
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| !v.is_empty())
+        {
             if obfs.placement == Placement::Header {
                 return value.to_owned();
             }
-            return query_value(value.split_once('?').map_or("", |(_, q)| q), &obfs.key).unwrap_or_default().to_owned();
+            return query_value(value.split_once('?').map_or("", |(_, q)| q), &obfs.key)
+                .unwrap_or_default()
+                .to_owned();
         }
-        query_value(request_query, &obfs.key).unwrap_or_default().to_owned()
+        query_value(request_query, &obfs.key)
+            .unwrap_or_default()
+            .to_owned()
     }
 
     fn upsert(self: &Arc<Self>, id: &str) -> Arc<Session> {
@@ -242,7 +315,11 @@ impl Handler {
         let (writer, reader) = tokio::io::duplex(PIPE_SIZE);
         let (tx, rx) = mpsc::channel(self.settings.max_buffered_posts);
         tokio::spawn(upload_task(rx, writer, self.settings.max_buffered_posts));
-        let session = Arc::new(Session { uploads: tx, uplink: Mutex::new(Some(reader)), connected: AtomicBool::new(false) });
+        let session = Arc::new(Session {
+            uploads: tx,
+            uplink: Mutex::new(Some(reader)),
+            connected: AtomicBool::new(false),
+        });
         sessions.insert(id.to_owned(), session.clone());
 
         let this = self.clone();
@@ -258,14 +335,21 @@ impl Handler {
 
     fn remove(&self, id: &str, session: &Arc<Session>) {
         let mut sessions = lock(&self.sessions);
-        if sessions.get(id).is_some_and(|current| Arc::ptr_eq(current, session)) {
+        if sessions
+            .get(id)
+            .is_some_and(|current| Arc::ptr_eq(current, session))
+        {
             sessions.remove(id);
         }
     }
 }
 
 /// Writes uploads into the session pipe, reordering packet-up posts by seq.
-async fn upload_task(mut rx: mpsc::Receiver<Upload>, mut writer: DuplexStream, max_buffered: usize) {
+async fn upload_task(
+    mut rx: mpsc::Receiver<Upload>,
+    mut writer: DuplexStream,
+    max_buffered: usize,
+) {
     let mut next = 0u64;
     let mut pending = BTreeMap::new();
     while let Some(upload) = rx.recv().await {
@@ -297,10 +381,17 @@ async fn upload_task(mut rx: mpsc::Receiver<Upload>, mut writer: DuplexStream, m
 
 /// Forwards a stream-up body into the session and keeps the response open
 /// until the upload ends, with periodic padding for clients that expect it.
-fn stream_up(mut body: Incoming, session: Arc<Session>, send_padding: bool, range: (usize, usize), secs: (u64, u64)) -> Body {
+fn stream_up(
+    mut body: Incoming,
+    session: Arc<Session>,
+    send_padding: bool,
+    range: (usize, usize),
+    secs: (u64, u64),
+) -> Body {
     let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(4);
     tokio::spawn(async move {
-        let delay = || Duration::from_secs(padding::draw((secs.0 as usize, secs.1 as usize)) as u64);
+        let delay =
+            || Duration::from_secs(padding::draw((secs.0 as usize, secs.1 as usize)) as u64);
         let mut next_padding = delay();
         loop {
             tokio::select! {
@@ -326,7 +417,9 @@ fn stream_up(mut body: Incoming, session: Arc<Session>, send_padding: bool, rang
 }
 
 fn channel_body(rx: mpsc::Receiver<Result<Frame<Bytes>, io::Error>>) -> Body {
-    let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|item| (item, rx)) });
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    });
     BodyExt::boxed(StreamBody::new(stream))
 }
 
@@ -358,11 +451,22 @@ fn finish(builder: http::response::Builder, code: StatusCode, body: Body) -> Res
 }
 
 /// Session ID or seq; path placements consume the next path segment.
-fn meta<'a>(req: &Request<Incoming>, meta: &Meta, path: &mut impl Iterator<Item = &'a str>) -> String {
+fn meta<'a>(
+    req: &Request<Incoming>,
+    meta: &Meta,
+    path: &mut impl Iterator<Item = &'a str>,
+) -> String {
     match meta.placement {
         Placement::Path => path.next().unwrap_or_default().to_owned(),
-        Placement::Query => query_value(req.uri().query().unwrap_or_default(), &meta.key).unwrap_or_default().to_owned(),
-        Placement::Header => req.headers().get(meta.key.as_str()).and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned(),
+        Placement::Query => query_value(req.uri().query().unwrap_or_default(), &meta.key)
+            .unwrap_or_default()
+            .to_owned(),
+        Placement::Header => req
+            .headers()
+            .get(meta.key.as_str())
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned(),
         Placement::Cookie => cookie(req, &meta.key).unwrap_or_default(),
         _ => String::new(),
     }
@@ -383,17 +487,27 @@ fn cookie(req: &Request<Incoming>, name: &str) -> Option<String> {
 /// Uplink data split over `KEY-0`, `KEY-1`, ... headers.
 fn header_chunks(req: &Request<Incoming>, key: &str) -> String {
     (0..)
-        .map_while(|i| req.headers().get(format!("{key}-{i}")).and_then(|v| v.to_str().ok()).filter(|v| !v.is_empty()))
+        .map_while(|i| {
+            req.headers()
+                .get(format!("{key}-{i}"))
+                .and_then(|v| v.to_str().ok())
+                .filter(|v| !v.is_empty())
+        })
         .collect()
 }
 
 /// Uplink data split over `KEY_0`, `KEY_1`, ... cookies.
 fn cookie_chunks(req: &Request<Incoming>, key: &str) -> String {
-    (0..).map_while(|i| cookie(req, &format!("{key}_{i}"))).collect()
+    (0..)
+        .map_while(|i| cookie(req, &format!("{key}_{i}")))
+        .collect()
 }
 
 fn origin(req: &Request<Incoming>) -> HeaderValue {
-    req.headers().get("Origin").cloned().unwrap_or_else(|| HeaderValue::from_static("*"))
+    req.headers()
+        .get("Origin")
+        .cloned()
+        .unwrap_or_else(|| HeaderValue::from_static("*"))
 }
 
 fn host_matches(req: &Request<Incoming>, expected: &str) -> bool {
@@ -416,11 +530,15 @@ fn strip_port(host: &str) -> &str {
 
 fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
     let query = query.split('#').next().unwrap_or_default();
-    query.split('&').find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
+    query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

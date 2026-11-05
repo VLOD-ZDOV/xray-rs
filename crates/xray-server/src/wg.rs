@@ -24,7 +24,9 @@ const BUSY_WARN_INTERVAL_SECS: u64 = 60;
 
 impl std::fmt::Debug for WgOutbound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WgOutbound").field("tag", &self.tag).finish_non_exhaustive()
+        f.debug_struct("WgOutbound")
+            .field("tag", &self.tag)
+            .finish_non_exhaustive()
     }
 }
 
@@ -52,43 +54,77 @@ struct Peer {
 impl WgOutbound {
     pub fn parse(tag: &str, settings: &Value) -> Result<Self, String> {
         let err = |m: String| format!("outbound {tag:?} (wireguard): {m}");
-        let secret_key = KeyMaterial::parse(str_field(settings, "secretKey")).map_err(|_| err("invalid secretKey".into()))?;
+        let secret_key = KeyMaterial::parse(str_field(settings, "secretKey"))
+            .map_err(|_| err("invalid secretKey".into()))?;
         let mut addresses = Vec::new();
         for raw in strings(settings.get("address")) {
             let ip = raw.split('/').next().unwrap_or_default();
-            addresses.push(ip.parse::<IpAddr>().map_err(|_| err(format!("invalid address {raw:?}")))?);
+            addresses.push(
+                ip.parse::<IpAddr>()
+                    .map_err(|_| err(format!("invalid address {raw:?}")))?,
+            );
         }
         let mut peers = Vec::new();
-        for peer in settings.get("peers").and_then(Value::as_array).map_or(&[][..], Vec::as_slice) {
+        for peer in settings
+            .get("peers")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+        {
             let endpoint = str_field(peer, "endpoint");
-            let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| err(format!("invalid endpoint {endpoint:?}")))?;
-            let port = port.parse::<u16>().map_err(|_| err(format!("invalid endpoint {endpoint:?}")))?;
-            let host = host.trim_start_matches('[').trim_end_matches(']').to_owned();
+            let (host, port) = endpoint
+                .rsplit_once(':')
+                .ok_or_else(|| err(format!("invalid endpoint {endpoint:?}")))?;
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| err(format!("invalid endpoint {endpoint:?}")))?;
+            let host = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_owned();
             let mut allowed_ips = Vec::new();
             for raw in strings(peer.get("allowedIPs")) {
-                allowed_ips.push(raw.parse::<AllowedIp>().map_err(|_| err(format!("invalid allowedIPs entry {raw:?}")))?);
+                allowed_ips.push(
+                    raw.parse::<AllowedIp>()
+                        .map_err(|_| err(format!("invalid allowedIPs entry {raw:?}")))?,
+                );
             }
             if allowed_ips.is_empty() {
-                allowed_ips = vec!["0.0.0.0/0".parse().unwrap_or_else(|_| unreachable!()), "::/0".parse().unwrap_or_else(|_| unreachable!())];
+                allowed_ips = vec![
+                    "0.0.0.0/0".parse().unwrap_or_else(|_| unreachable!()),
+                    "::/0".parse().unwrap_or_else(|_| unreachable!()),
+                ];
             }
             let preshared_key = match str_field(peer, "preSharedKey") {
                 "" => None,
-                key => Some(KeyMaterial::parse(key).map_err(|_| err("invalid preSharedKey".into()))?),
+                key => {
+                    Some(KeyMaterial::parse(key).map_err(|_| err("invalid preSharedKey".into()))?)
+                }
             };
             peers.push(Peer {
-                public_key: KeyMaterial::parse(str_field(peer, "publicKey")).map_err(|_| err("invalid publicKey".into()))?,
+                public_key: KeyMaterial::parse(str_field(peer, "publicKey"))
+                    .map_err(|_| err("invalid publicKey".into()))?,
                 preshared_key,
                 endpoint: (host, port),
                 allowed_ips,
-                keepalive: peer.get("keepAlive").and_then(Value::as_u64).unwrap_or(0).min(u64::from(u16::MAX)) as u16,
+                keepalive: peer
+                    .get("keepAlive")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0)
+                    .min(u64::from(u16::MAX)) as u16,
             });
         }
-        let mut mtu = settings.get("mtu").and_then(Value::as_u64).map_or(DEFAULT_MTU, |m| m.min(u64::from(u16::MAX)) as u16);
+        let mut mtu = settings
+            .get("mtu")
+            .and_then(Value::as_u64)
+            .map_or(DEFAULT_MTU, |m| m.min(u64::from(u16::MAX)) as u16);
         if !(1280..=1420).contains(&mtu) {
-            log::warn(err(format!("mtu {mtu} is outside 1280..1420, using {DEFAULT_MTU}")));
+            log::warn(err(format!(
+                "mtu {mtu} is outside 1280..1420, using {DEFAULT_MTU}"
+            )));
             mtu = DEFAULT_MTU;
         }
-        let reserved = parse_reserved(settings.get("reserved")).ok_or_else(|| err("reserved must be 3 bytes".into()))?;
+        let reserved = parse_reserved(settings.get("reserved"))
+            .ok_or_else(|| err("reserved must be 3 bytes".into()))?;
         let strategy = str_field(settings, "domainStrategy").to_ascii_lowercase();
         let outbound = Self {
             tag: tag.to_owned(),
@@ -103,7 +139,13 @@ impl WgOutbound {
             last_busy_warn: AtomicU64::new(0),
         };
         // Validate everything except endpoint resolution, which waits for first use.
-        outbound.config(vec![SocketAddr::from(([192, 0, 2, 1], 1)); outbound.peers.len()]).validate().map_err(|e| err(e.to_string()))?;
+        outbound
+            .config(vec![
+                SocketAddr::from(([192, 0, 2, 1], 1));
+                outbound.peers.len()
+            ])
+            .validate()
+            .map_err(|e| err(e.to_string()))?;
         Ok(outbound)
     }
 
@@ -140,8 +182,14 @@ impl WgOutbound {
             };
             endpoints.push(resolve_all(&host, peer.endpoint.1).await?[0]);
         }
-        let options = Options { reserved: self.reserved, tcp_flows: TCP_FLOWS, pending_opens: PENDING_OPENS };
-        let client = Client::start_with_options(self.config(endpoints), None, options).await.map_err(to_io)?;
+        let options = Options {
+            reserved: self.reserved,
+            tcp_flows: TCP_FLOWS,
+            pending_opens: PENDING_OPENS,
+        };
+        let client = Client::start_with_options(self.config(endpoints), None, options)
+            .await
+            .map_err(to_io)?;
         log::info(format!("wireguard outbound {:?} started", self.tag));
         *slot = Some(client.clone());
         Ok(client)
@@ -150,12 +198,19 @@ impl WgOutbound {
     /// Resolved addresses usable through the tunnel, in preference order.
     async fn targets(&self, host: &Host, port: u16) -> io::Result<Vec<SocketAddr>> {
         let mut addrs = resolve_all(host, port).await?;
-        addrs.retain(|a| self.addresses.iter().any(|local| local.is_ipv4() == a.is_ipv4()));
+        addrs.retain(|a| {
+            self.addresses
+                .iter()
+                .any(|local| local.is_ipv4() == a.is_ipv4())
+        });
         if self.prefer_v6 {
             addrs.sort_by_key(SocketAddr::is_ipv4);
         }
         if addrs.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no address family usable through wireguard"));
+            return Err(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no address family usable through wireguard",
+            ));
         }
         Ok(addrs)
     }
@@ -180,7 +235,12 @@ impl WgOutbound {
     fn warn_busy(&self) {
         let now = self.started.elapsed().as_secs() + BUSY_WARN_INTERVAL_SECS;
         let last = self.last_busy_warn.load(Ordering::Relaxed);
-        if now >= last + BUSY_WARN_INTERVAL_SECS && self.last_busy_warn.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        if now >= last + BUSY_WARN_INTERVAL_SECS
+            && self
+                .last_busy_warn
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
             log::warn(format!("wireguard outbound {:?}: connection limit ({TCP_FLOWS}) reached, new connections are refused", self.tag));
         }
     }
@@ -207,20 +267,35 @@ fn parse_reserved(value: Option<&Value>) -> Option<[u8; 3]> {
         None | Some(Value::Null) => return Some([0; 3]),
         Some(Value::Array(items)) => items.iter().map(Value::as_u64).collect::<Option<_>>()?,
         Some(Value::String(s)) if s.is_empty() => return Some([0; 3]),
-        Some(Value::String(s)) => s.split(',').map(|p| p.trim().parse().ok()).collect::<Option<_>>()?,
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(|p| p.trim().parse().ok())
+            .collect::<Option<_>>()?,
         _ => return None,
     };
     match bytes.as_slice() {
         [] => Some([0; 3]),
-        [a, b, c] => Some([u8::try_from(*a).ok()?, u8::try_from(*b).ok()?, u8::try_from(*c).ok()?]),
+        [a, b, c] => Some([
+            u8::try_from(*a).ok()?,
+            u8::try_from(*b).ok()?,
+            u8::try_from(*c).ok()?,
+        ]),
         _ => None,
     }
 }
 
 fn strings(value: Option<&Value>) -> Vec<String> {
     match value {
-        Some(Value::String(s)) => s.split(',').map(|p| p.trim().to_owned()).filter(|p| !p.is_empty()).collect(),
-        Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(|p| p.trim().to_owned())
+            .filter(|p| !p.is_empty())
+            .collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -249,7 +324,10 @@ mod tests {
         let wg = WgOutbound::parse("warp", &settings).unwrap();
         assert_eq!(wg.reserved, [12, 34, 56]);
         assert!(wg.prefer_v6);
-        assert_eq!(wg.peers[0].endpoint, ("engage.cloudflareclient.com".to_owned(), 2408));
+        assert_eq!(
+            wg.peers[0].endpoint,
+            ("engage.cloudflareclient.com".to_owned(), 2408)
+        );
         assert_eq!(wg.addresses.len(), 2);
     }
 

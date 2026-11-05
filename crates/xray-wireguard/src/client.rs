@@ -155,7 +155,11 @@ impl Client {
         protector: Option<Arc<dyn SocketProtector>>,
         options: Options,
     ) -> Result<Self, Error> {
-        let Options { reserved, tcp_flows, pending_opens } = options;
+        let Options {
+            reserved,
+            tcp_flows,
+            pending_opens,
+        } = options;
         config.validate()?;
         let stop = Stop::new();
         // If creation is cancelled or fails, every injected I/O boundary is cancelled.
