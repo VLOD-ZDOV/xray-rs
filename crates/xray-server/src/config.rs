@@ -42,8 +42,14 @@ pub enum InboundProtocol {
 }
 
 #[derive(Clone, Debug)]
+pub enum ShadowsocksMethod {
+    Aead2017(Arc<xray_proxy::shadowsocks::aead2017::Method>),
+    Ss2022(Arc<xray_proxy::shadowsocks2022::Method>),
+}
+
+#[derive(Clone, Debug)]
 pub struct ShadowsocksUser {
-    pub method: Arc<xray_proxy::shadowsocks::aead2017::Method>,
+    pub method: ShadowsocksMethod,
     pub email: String,
 }
 
@@ -312,33 +318,78 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let mut shadowsocks_users = Vec::new();
     if protocol == InboundProtocol::Shadowsocks {
         let top_method = str_field(settings, "method");
-        // Like Xray, the top-level password is the single user only when there are no clients.
+        let top_password = str_field(settings, "password");
         let clients = array(settings, "clients");
-        let entries: Vec<&Value> = if clients.is_empty() {
-            vec![settings]
-        } else {
-            clients.iter().collect()
-        };
-        for entry in entries {
-            let method = match str_field(entry, "method") {
-                "" => top_method,
-                m => m,
-            };
-            let password = str_field(entry, "password");
-            let m = match xray_proxy::shadowsocks::aead2017::Method::new(method, password) {
-                Ok(m) => m,
-                Err(e) => {
-                    // 3x-ui defaults to 2022-blake3 methods, so skip rather than refuse to start.
-                    log::warn(format!(
-                        "skipping inbound {tag:?}: shadowsocks {method:?}: {e}"
-                    ));
-                    return Ok(None);
+        let is_ss2022 = top_method.starts_with("2022-blake3-");
+
+        if is_ss2022 {
+            if clients.is_empty() {
+                let m = match xray_proxy::shadowsocks2022::Method::new(top_method, top_password) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        log::warn(format!(
+                            "skipping inbound {tag:?}: shadowsocks 2022 {top_method:?}: {e}"
+                        ));
+                        return Ok(None);
+                    }
+                };
+                shadowsocks_users.push(ShadowsocksUser {
+                    method: ShadowsocksMethod::Ss2022(Arc::new(m)),
+                    email: str_field(settings, "email").to_owned(),
+                });
+            } else {
+                for entry in clients {
+                    let method = match str_field(entry, "method") {
+                        "" => top_method,
+                        m => m,
+                    };
+                    let password = str_field(entry, "password");
+                    let full_password = if top_password.is_empty() {
+                        password.to_string()
+                    } else {
+                        format!("{top_password}:{password}")
+                    };
+                    let m = match xray_proxy::shadowsocks2022::Method::new(method, &full_password) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            log::warn(format!(
+                                "skipping inbound {tag:?}: shadowsocks 2022 {method:?}: {e}"
+                            ));
+                            return Ok(None);
+                        }
+                    };
+                    shadowsocks_users.push(ShadowsocksUser {
+                        method: ShadowsocksMethod::Ss2022(Arc::new(m)),
+                        email: str_field(entry, "email").to_owned(),
+                    });
                 }
+            }
+        } else {
+            let entries: Vec<&Value> = if clients.is_empty() {
+                vec![settings]
+            } else {
+                clients.iter().collect()
             };
-            shadowsocks_users.push(ShadowsocksUser {
-                method: Arc::new(m),
-                email: str_field(entry, "email").to_owned(),
-            });
+            for entry in entries {
+                let method = match str_field(entry, "method") {
+                    "" => top_method,
+                    m => m,
+                };
+                let password = str_field(entry, "password");
+                let m = match xray_proxy::shadowsocks::aead2017::Method::new(method, password) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        log::warn(format!(
+                            "skipping inbound {tag:?}: shadowsocks {method:?}: {e}"
+                        ));
+                        return Ok(None);
+                    }
+                };
+                shadowsocks_users.push(ShadowsocksUser {
+                    method: ShadowsocksMethod::Aead2017(Arc::new(m)),
+                    email: str_field(entry, "email").to_owned(),
+                });
+            }
         }
     }
 
@@ -1104,7 +1155,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_shadowsocks_2022_inbound() {
+    fn parses_shadowsocks_2022_inbound() {
         let raw = r#"{
           "inbounds": [
             {"tag": "ss", "port": 8388, "protocol": "shadowsocks",
@@ -1112,6 +1163,9 @@ mod tests {
                           "clients": [{"password": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", "email": "a"}]}}
           ]
         }"#;
-        assert!(parse(raw).unwrap().inbounds.is_empty());
+        let inbounds = parse(raw).unwrap().inbounds;
+        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds[0].shadowsocks_users.len(), 1);
+        assert_eq!(inbounds[0].shadowsocks_users[0].email, "a");
     }
 }

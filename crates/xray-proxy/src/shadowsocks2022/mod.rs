@@ -4,8 +4,8 @@
 mod crypto;
 mod stream;
 mod udp;
-pub use stream::ClientStream;
-pub use udp::UdpSession;
+pub use stream::{ClientStream, ServerStream};
+pub use udp::{ServerUdpSession, UdpSession};
 
 use crate::shadowsocks::address::encode as encode_address;
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -97,8 +97,17 @@ impl Method {
     pub fn cipher(&self) -> Cipher {
         self.cipher
     }
-    fn psk(&self) -> &[u8] {
+    pub fn psk(&self) -> &[u8] {
         self.keys.last().expect("validated nonempty keys")
+    }
+    pub fn server_key(&self) -> &[u8] {
+        &self.keys[0]
+    }
+    pub fn is_multi_user(&self) -> bool {
+        self.keys.len() > 1
+    }
+    pub fn identity_hash(&self) -> [u8; 16] {
+        *crypto::identity_hash(self.psk())
     }
     pub fn validate_target(target: &Target) -> io::Result<()> {
         encode_address(target).map(|_| ())

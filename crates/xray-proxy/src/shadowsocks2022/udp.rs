@@ -217,6 +217,216 @@ impl UdpSession {
     }
 }
 
+/// A bounded server UDP session.
+pub struct ServerUdpSession {
+    method: Arc<Method>,
+    client_id: u64,
+    server_id: u64,
+    next: Option<u64>,
+    replay: Window,
+}
+
+impl ServerUdpSession {
+    pub fn new(method: Arc<Method>, client_id: u64) -> io::Result<Self> {
+        let mut id = [0; 8];
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut id)
+            .map_err(|_| invalid("Shadowsocks 2022 random source failed"))?;
+        Ok(Self {
+            method,
+            client_id,
+            server_id: u64::from_be_bytes(id),
+            next: Some(0),
+            replay: Window::new(),
+        })
+    }
+
+    pub fn client_id(&self) -> u64 {
+        self.client_id
+    }
+
+    pub fn decode_request(
+        methods: &[Arc<Method>],
+        wire: &[u8],
+    ) -> io::Result<(usize, Target, Vec<u8>, u64, u64)> {
+        Self::decode_request_at(methods, wire, now()?)
+    }
+
+    pub fn decode_request_at(
+        methods: &[Arc<Method>],
+        wire: &[u8],
+        timestamp: u64,
+    ) -> io::Result<(usize, Target, Vec<u8>, u64, u64)> {
+        if methods.is_empty() {
+            return Err(invalid("no Shadowsocks 2022 methods"));
+        }
+        let first = &methods[0];
+        let cipher = first.cipher;
+
+        let mut body;
+        let mut separate = [0; 16];
+        let (user_idx, _matched_method) = if cipher == Cipher::ChaCha20Poly1305 {
+            if wire.len() < 24 + 16 + 11 + TAG_LENGTH {
+                return Err(invalid("truncated Shadowsocks 2022 packet"));
+            }
+            body = Zeroizing::new(wire[24..].to_vec());
+            XChaChaKey::new(first.psk())
+                .open(wire[..24].try_into().unwrap(), &[], &mut body)
+                .map_err(|_| invalid("Shadowsocks 2022 authentication failed"))?;
+            if body.len() < 16 {
+                return Err(invalid("truncated Shadowsocks 2022 packet"));
+            }
+            separate.copy_from_slice(&body[..16]);
+            body.drain(..16);
+            (0, first.clone())
+        } else if first.is_multi_user() {
+            let id_count = first.keys.len() - 1;
+            let header_len = 16 + id_count * 16;
+            if wire.len() < header_len + 11 + TAG_LENGTH {
+                return Err(invalid("truncated Shadowsocks 2022 packet"));
+            }
+            separate.copy_from_slice(&wire[..16]);
+            crypto::block(first.server_key(), &mut separate, true);
+
+            let mut identity = [0u8; 16];
+            identity.copy_from_slice(&wire[16..32]);
+            crypto::block(first.server_key(), &mut identity, true);
+            for (b, s) in identity.iter_mut().zip(&separate) {
+                *b ^= s;
+            }
+
+            let (idx, matched) = if methods.len() > 1 {
+                let mut found = None;
+                for (idx, m) in methods.iter().enumerate() {
+                    let user_key = if m.keys.len() > 1 {
+                        &m.keys[1]
+                    } else {
+                        m.psk()
+                    };
+                    if *crypto::identity_hash(user_key) == identity {
+                        found = Some((idx, m.clone()));
+                        break;
+                    }
+                }
+                found.ok_or_else(|| invalid("Shadowsocks 2022 user identity mismatch"))?
+            } else {
+                if *crypto::identity_hash(&first.keys[1]) != identity {
+                    return Err(invalid("Shadowsocks 2022 user identity mismatch"));
+                }
+                (0, first.clone())
+            };
+
+            let mut offset = 32;
+            for w in matched.keys[1..].windows(2) {
+                let mut enc = [0u8; 16];
+                enc.copy_from_slice(&wire[offset..offset + 16]);
+                crypto::block(&w[0], &mut enc, true);
+                for (b, s) in enc.iter_mut().zip(&separate) {
+                    *b ^= s;
+                }
+                if *crypto::identity_hash(&w[1]) != enc {
+                    return Err(invalid("Shadowsocks 2022 chained identity mismatch"));
+                }
+                offset += 16;
+            }
+
+            body = Zeroizing::new(wire[offset..].to_vec());
+            let aead = Aead::session(&matched, &separate[..8]);
+            aead.open(separate[4..].try_into().unwrap(), &mut body)?;
+            (idx, matched)
+        } else {
+            if wire.len() < 16 + 11 + TAG_LENGTH {
+                return Err(invalid("truncated Shadowsocks 2022 packet"));
+            }
+            separate.copy_from_slice(&wire[..16]);
+            crypto::block(first.psk(), &mut separate, true);
+            body = Zeroizing::new(wire[16..].to_vec());
+            let aead = Aead::session(first, &separate[..8]);
+            aead.open(separate[4..].try_into().unwrap(), &mut body)?;
+            (0, first.clone())
+        };
+
+        let client_id = u64::from_be_bytes(separate[..8].try_into().unwrap());
+        let packet_id = u64::from_be_bytes(separate[8..].try_into().unwrap());
+
+        let mut cursor = Cursor(&body);
+        if cursor.u8()? != 0 {
+            return Err(invalid("invalid Shadowsocks 2022 packet type"));
+        }
+        check_time(cursor.u64()?, timestamp)?;
+        let padding = cursor.u16()? as usize;
+        cursor.take(padding)?;
+        let mut target = cursor.target()?;
+        target.network = Network::Udp;
+        let payload = cursor.0.to_vec();
+
+        Ok((user_idx, target, payload, client_id, packet_id))
+    }
+
+    pub fn check_replay(&mut self, packet_id: u64) -> bool {
+        if !self.replay.check(packet_id) {
+            return false;
+        }
+        self.replay.add(packet_id);
+        true
+    }
+
+    pub fn encode_response(&mut self, target: &Target, payload: &[u8]) -> io::Result<Vec<u8>> {
+        self.encode_response_at(target, payload, now()?)
+    }
+
+    pub fn encode_response_at(
+        &mut self,
+        target: &Target,
+        payload: &[u8],
+        timestamp: u64,
+    ) -> io::Result<Vec<u8>> {
+        let address = encode_address(target)?;
+        if target.network != Network::Udp
+            || 16 + 19 + address.len() + payload.len() + TAG_LENGTH > MAX_UDP_WIRE_LENGTH
+        {
+            return Err(invalid("invalid Shadowsocks 2022 response size or network"));
+        }
+        let packet_id = self
+            .next
+            .ok_or_else(|| invalid("Shadowsocks 2022 packet counter exhausted"))?;
+        self.next = packet_id.checked_add(1);
+
+        let mut separate = [0; 16];
+        separate[..8].copy_from_slice(&self.server_id.to_be_bytes());
+        separate[8..].copy_from_slice(&packet_id.to_be_bytes());
+
+        let mut body = Zeroizing::new(vec![1]); // response type 1
+        body.extend_from_slice(&timestamp.to_be_bytes());
+        body.extend_from_slice(&self.client_id.to_be_bytes());
+        body.extend_from_slice(&[0, 0]); // 0 padding
+        body.extend_from_slice(&address);
+        body.extend_from_slice(payload);
+
+        if self.method.cipher == Cipher::ChaCha20Poly1305 {
+            let mut nonce = [0; 24];
+            rand::rngs::OsRng
+                .try_fill_bytes(&mut nonce)
+                .map_err(|_| invalid("Shadowsocks 2022 random source failed"))?;
+            let mut plain = Zeroizing::new(separate.to_vec());
+            plain.extend_from_slice(&body);
+            XChaChaKey::new(self.method.psk())
+                .seal(&nonce, &[], &mut plain)
+                .map_err(|_| invalid("Shadowsocks 2022 encryption failed"))?;
+            let mut wire = nonce.to_vec();
+            wire.extend_from_slice(&plain);
+            Ok(wire)
+        } else {
+            let aead = Aead::session(&self.method, &self.server_id.to_be_bytes());
+            aead.seal(separate[4..].try_into().unwrap(), &mut body)?;
+            crypto::block(self.method.psk(), &mut separate, false);
+            let mut wire = separate.to_vec();
+            wire.extend_from_slice(&body);
+            Ok(wire)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{fixtures, unhex};
@@ -403,5 +613,45 @@ mod tests {
         session.next = Some(u64::MAX);
         session.encode(&target, b"last").unwrap();
         assert!(session.encode(&target, b"exhausted").is_err());
+    }
+    #[test]
+    fn ss2022_server_udp_and_client_udp_interop() {
+        for case in fixtures() {
+            let method = Arc::new(
+                Method::new(
+                    case["method"].as_str().unwrap(),
+                    case["password"].as_str().unwrap(),
+                )
+                .unwrap(),
+            );
+            let mut client = UdpSession::new(method.clone()).unwrap();
+            let target = Target::new(
+                TargetAddr::Ip("192.0.2.8".parse().unwrap()),
+                53,
+                Network::Udp,
+            );
+            let wire = client.encode(&target, b"dns query").unwrap();
+
+            let (_idx, req_target, req_payload, client_id, packet_id) =
+                ServerUdpSession::decode_request(std::slice::from_ref(&method), &wire).unwrap();
+            assert_eq!(req_target, target);
+            assert_eq!(&req_payload, b"dns query");
+
+            let mut server = ServerUdpSession::new(method.clone(), client_id).unwrap();
+            assert!(server.check_replay(packet_id));
+
+            let resp_target = Target::new(
+                TargetAddr::Ip("192.0.2.8".parse().unwrap()),
+                53,
+                Network::Udp,
+            );
+            let resp_wire = server
+                .encode_response(&resp_target, b"dns reply")
+                .unwrap();
+
+            let (decoded_target, decoded_payload) = client.decode(&resp_wire).unwrap();
+            assert_eq!(decoded_target, resp_target);
+            assert_eq!(&decoded_payload, b"dns reply");
+        }
     }
 }
