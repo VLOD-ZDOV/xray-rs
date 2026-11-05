@@ -125,7 +125,9 @@ fn main() -> ExitCode {
             let is_grpc = matches!(i.transport, InboundTransport::Grpc(_));
             i.reality
                 .as_ref()
-                .map(|r| reality::RealityServer::new(r.clone(), i.port, is_grpc, is_xhttp).map(Arc::new))
+                .map(|r| {
+                    reality::RealityServer::new(r.clone(), i.port, is_grpc, is_xhttp).map(Arc::new)
+                })
                 .transpose()
         })
         .collect();
@@ -192,7 +194,7 @@ async fn run(
     log::info(format!("xray-rs {} started", env!("CARGO_PKG_VERSION")));
     stats::init(config.stats);
     dns::init(config.dns);
-    policy::init(config.policy.as_ref());
+    policy::init(config.policy);
     let router = Arc::new(config.router);
     let inbound_manager = Arc::new(api::InboundManager::new(router.clone()));
     for (inbound, acceptor) in config.inbounds.into_iter().zip(tls) {
@@ -281,11 +283,14 @@ pub(crate) async fn start_inbound(
             InboundHandler::Shadowsocks(ctx.clone())
         }
         (InboundProtocol::Dokodemo, InboundTransport::Tcp) => {
-            let settings = inbound.dokodemo.clone().unwrap_or(config::DokodemoSettings {
-                address: None,
-                port: None,
-                follow_redirect: false,
-            });
+            let settings = inbound
+                .dokodemo
+                .clone()
+                .unwrap_or(config::DokodemoSettings {
+                    address: None,
+                    port: None,
+                    follow_redirect: false,
+                });
             InboundHandler::Dokodemo(ctx.clone(), Arc::new(settings))
         }
         (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
@@ -428,16 +433,25 @@ async fn accept_loop(
         };
         let _ = stream.set_nodelay(true);
         let local = stream.local_addr().ok();
-        let (tls, reality, handler, http_obfs) = (tls.clone(), reality.clone(), handler.clone(), http_obfs.clone());
+        let (tls, reality, handler, http_obfs) = (
+            tls.clone(),
+            reality.clone(),
+            handler.clone(),
+            http_obfs.clone(),
+        );
         tokio::spawn(async move {
             let leftover = if accept_proxy_protocol.is_enabled() {
-                match proxy_proto::read_proxy_header(&mut stream, accept_proxy_protocol, peer).await {
+                match proxy_proto::read_proxy_header(&mut stream, accept_proxy_protocol, peer).await
+                {
                     Ok((new_peer, leftover)) => {
                         peer = new_peer;
                         leftover
                     }
                     Err(e) => {
-                        log::info(format!("proxy protocol from {} rejected: {e}", log::mask(peer)));
+                        log::info(format!(
+                            "proxy protocol from {} rejected: {e}",
+                            log::mask(peer)
+                        ));
                         return;
                     }
                 }
@@ -450,7 +464,10 @@ async fn accept_loop(
                 match reality.handle(stream, peer).await {
                     Ok(Some(tls_stream)) => dispatch(tls_stream, peer, local, handler).await,
                     Ok(None) => {}
-                    Err(e) => log::debug(format!("reality handling from {} failed: {e}", log::mask(peer))),
+                    Err(e) => log::debug(format!(
+                        "reality handling from {} failed: {e}",
+                        log::mask(peer)
+                    )),
                 }
             } else {
                 match (tls, http_obfs) {
@@ -463,10 +480,9 @@ async fn accept_loop(
                     },
                     (None, Some(obfs)) => match http_obfs::accept(stream, &obfs).await {
                         Ok(stream) => dispatch(stream, peer, local, handler).await,
-                        Err(e) => log::debug(format!(
-                            "http obfs from {} failed: {e}",
-                            log::mask(peer)
-                        )),
+                        Err(e) => {
+                            log::debug(format!("http obfs from {} failed: {e}", log::mask(peer)))
+                        }
                     },
                     (None, None) => dispatch(stream, peer, local, handler).await,
                 }
@@ -776,12 +792,14 @@ fn tls_acceptor(
         reject_unknown_sni: settings.reject_unknown_sni,
     });
 
-    let versions: &[&'static rustls::SupportedProtocolVersion] =
-        match (settings.min_version.as_deref(), settings.max_version.as_deref()) {
-            (Some("1.3"), _) => &[&rustls::version::TLS13],
-            (_, Some("1.2")) => &[&rustls::version::TLS12],
-            _ => rustls::ALL_VERSIONS,
-        };
+    let versions: &[&'static rustls::SupportedProtocolVersion] = match (
+        settings.min_version.as_deref(),
+        settings.max_version.as_deref(),
+    ) {
+        (Some("1.3"), _) => &[&rustls::version::TLS13],
+        (_, Some("1.2")) => &[&rustls::version::TLS12],
+        _ => rustls::ALL_VERSIONS,
+    };
 
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(versions)

@@ -12,8 +12,8 @@ use xray_config::{
     DnsConfig, DnsQueryStrategy as ConfigQueryStrategy, DnsServerConfig, DnsServerEndpoint,
 };
 use xray_transport::{
-    ConfiguredDnsResolver, DnsQueryStrategy as TransportQueryStrategy, DnsResolver,
-    NameServer, NameServerPolicy, NameServerTransport, SystemDnsResolver,
+    ConfiguredDnsResolver, DnsQueryStrategy as TransportQueryStrategy, DnsResolver, NameServer,
+    NameServerPolicy, NameServerTransport, SystemDnsResolver,
 };
 
 static GLOBAL_RESOLVER: OnceLock<Arc<dyn DnsResolver>> = OnceLock::new();
@@ -47,11 +47,7 @@ pub fn init(config: Option<DnsConfig>) {
                 let mut policy = NameServerPolicy::new(server);
                 policy.transport = transport;
                 if let DnsServerConfig::Policy(p) = s {
-                    policy.tag = if p.tag.is_empty() {
-                        None
-                    } else {
-                        Some(p.tag)
-                    };
+                    policy.tag = if p.tag.is_empty() { None } else { Some(p.tag) };
                     policy.https_path = p.https_path;
                     policy.domains = p.domains;
                     policy.expected_ips = p.expected_ips;
@@ -72,17 +68,14 @@ pub fn init(config: Option<DnsConfig>) {
             ConfigQueryStrategy::UseIpv6 => TransportQueryStrategy::UseIpv6,
         };
 
-        let configured = ConfiguredDnsResolver::new(
-            dns.hosts,
-            Vec::new(),
-            Arc::new(SystemDnsResolver),
-        )
-        .with_name_server_policies(name_servers)
-        .with_query_strategy(query_strategy)
-        .with_name_server_fallback_policy(
-            dns.disable_fallback,
-            dns.disable_fallback_if_match,
-        );
+        let configured =
+            ConfiguredDnsResolver::new(dns.hosts, Vec::new(), Arc::new(SystemDnsResolver))
+                .with_name_server_policies(name_servers)
+                .with_query_strategy(query_strategy)
+                .with_name_server_fallback_policy(
+                    dns.disable_fallback,
+                    dns.disable_fallback_if_match,
+                );
 
         Arc::new(configured)
     } else {
@@ -134,11 +127,8 @@ mod tests {
             ..Default::default()
         };
 
-        let configured = ConfiguredDnsResolver::new(
-            dns_config.hosts,
-            Vec::new(),
-            Arc::new(SystemDnsResolver),
-        );
+        let configured =
+            ConfiguredDnsResolver::new(dns_config.hosts, Vec::new(), Arc::new(SystemDnsResolver));
 
         let lookup = configured.resolve_all("custom.local", 80).await.unwrap();
         assert_eq!(

@@ -326,8 +326,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerStream<S> {
             let mut enc_identity = [0u8; 16];
             inner.read_exact(&mut enc_identity).await?;
 
-            let subkey =
-                crypto::derive("shadowsocks 2022 identity subkey", first.server_key(), &salt);
+            let subkey = crypto::derive(
+                "shadowsocks 2022 identity subkey",
+                first.server_key(),
+                &salt,
+            );
             crypto::block(&subkey[..key_len], &mut enc_identity, true);
 
             let (matched_idx, current_method) = if methods.len() > 1 {
@@ -377,7 +380,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerStream<S> {
         check_time(cursor.u64()?, now()?)?;
         let variable_len = cursor.u16()? as usize;
         if variable_len > MAX_RECORD_LENGTH {
-            return Err(invalid("Shadowsocks 2022 request variable header too large"));
+            return Err(invalid(
+                "Shadowsocks 2022 request variable header too large",
+            ));
         }
 
         let mut var_buf = Zeroizing::new(vec![0u8; variable_len + TAG_LENGTH]);
@@ -828,14 +833,12 @@ mod tests {
             let target = Target::new(TargetAddr::Domain("example.test".into()), 443, Network::Tcp);
             let (client_io, server_io) = tokio::io::duplex(4096);
             let mut client = ClientStream::new(client_io, method.clone(), &target).unwrap();
-            let (server_fut, client_fut) = tokio::join!(
-                ServerStream::handshake(server_io, method.clone()),
-                async {
+            let (server_fut, client_fut) =
+                tokio::join!(ServerStream::handshake(server_io, method.clone()), async {
                     client.write_all(b"ping from client").await.unwrap();
                     client.flush().await.unwrap();
                     client
-                }
-            );
+                });
             let (mut server, decoded_target, early) = server_fut.unwrap();
             let mut client = client_fut;
             assert_eq!(decoded_target, target);

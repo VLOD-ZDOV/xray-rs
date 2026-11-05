@@ -23,15 +23,15 @@ use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteReques
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub async fn serve_tcp<S>(
-    stream: S,
-    ctx: &Context,
-    peer: SocketAddr,
-) -> io::Result<()>
+pub async fn serve_tcp<S>(stream: S, ctx: &Context, peer: SocketAddr) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let users = ctx.ss_users.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let users = ctx
+        .ss_users
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     if users.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -155,10 +155,7 @@ pub struct ShadowsocksUdpHandler {
 }
 
 impl ShadowsocksUdpHandler {
-    pub fn new(
-        socket: Arc<UdpSocket>,
-        ctx: Arc<Context>,
-    ) -> Self {
+    pub fn new(socket: Arc<UdpSocket>, ctx: Arc<Context>) -> Self {
         Self {
             socket,
             ctx,
@@ -168,8 +165,14 @@ impl ShadowsocksUdpHandler {
 
     pub async fn run(self) {
         let is_2022 = {
-            let users = self.ctx.ss_users.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            users.first().is_some_and(|u| matches!(u.method, ShadowsocksMethod::Ss2022(_)))
+            let users = self
+                .ctx
+                .ss_users
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            users
+                .first()
+                .is_some_and(|u| matches!(u.method, ShadowsocksMethod::Ss2022(_)))
         };
         if is_2022 {
             self.run_2022().await;
@@ -189,7 +192,12 @@ impl ShadowsocksUdpHandler {
                     continue;
                 }
             };
-            let users = self.ctx.ss_users.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let users = self
+                .ctx
+                .ss_users
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let methods: Vec<Arc<xray_proxy::shadowsocks2022::Method>> = users
                 .iter()
                 .filter_map(|u| match &u.method {
@@ -374,7 +382,12 @@ impl ShadowsocksUdpHandler {
                     continue;
                 }
             };
-            let users = self.ctx.ss_users.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            let users = self
+                .ctx
+                .ss_users
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
             let methods: Vec<Arc<xray_proxy::shadowsocks::aead2017::Method>> = users
                 .iter()
                 .filter_map(|u| match &u.method {

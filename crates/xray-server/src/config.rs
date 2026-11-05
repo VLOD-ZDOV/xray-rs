@@ -11,6 +11,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::log;
+use crate::policy;
 use crate::routing::Router;
 use crate::stats;
 
@@ -22,7 +23,7 @@ pub struct Config {
     pub inbounds: Vec<Inbound>,
     pub router: Router,
     pub dns: Option<xray_config::DnsConfig>,
-    pub policy: Option<xray_config::PolicyConfig>,
+    pub policy: policy::PolicySettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,7 +233,10 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     }
     let router = Router::build(&root, &asset_dirs())?;
     let section = root.get("log").unwrap_or(&Value::Null);
-    let dns_log = section.get("dnsLog").and_then(Value::as_bool).unwrap_or(false);
+    let dns_log = section
+        .get("dnsLog")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let log = log::Settings {
         level: str_field(section, "loglevel").to_owned(),
         access: str_field(section, "access").to_owned(),
@@ -240,27 +244,22 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         mask_address: str_field(section, "maskAddress").to_owned(),
         dns_log,
     };
-    let (dns, policy) = if root.get("dns").is_some() || root.get("policy").is_some() {
-        let parsed = xray_config::parse_xray_json_with_geodata_dirs(raw, &asset_dirs())
-            .map_err(|e| {
+    // The upstream parser is client-side and rejects server-only sections, so
+    // it only sees `dns`.
+    let dns = match root.get("dns") {
+        Some(section) => {
+            let only_dns = serde_json::json!({ "dns": section }).to_string();
+            let parsed = xray_config::parse_xray_json_with_geodata_dirs(&only_dns, &asset_dirs())
+                .map_err(|e| {
                 let messages: Vec<String> =
                     e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
-                format!("dns/policy: {}", messages.join("; "))
+                format!("dns: {}", messages.join("; "))
             })?;
-        let dns = if root.get("dns").is_some() {
             Some(parsed.config.dns)
-        } else {
-            None
-        };
-        let policy = if root.get("policy").is_some() {
-            Some(parsed.config.policy)
-        } else {
-            None
-        };
-        (dns, policy)
-    } else {
-        (None, None)
+        }
+        None => None,
     };
+    let policy = policy::PolicySettings::from_config(&root);
     Ok(Config {
         log,
         api,
@@ -542,14 +541,15 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         .unwrap_or(&Value::Null);
     let accept_proxy_protocol = parse_accept_proxy_protocol(sockopt.get("acceptProxyProtocol"));
 
-    let (shadowsocks_top_method, shadowsocks_top_password) = if protocol == InboundProtocol::Shadowsocks {
-        (
-            Some(str_field(settings, "method").to_owned()).filter(|s| !s.is_empty()),
-            Some(str_field(settings, "password").to_owned()).filter(|s| !s.is_empty()),
-        )
-    } else {
-        (None, None)
-    };
+    let (shadowsocks_top_method, shadowsocks_top_password) =
+        if protocol == InboundProtocol::Shadowsocks {
+            (
+                Some(str_field(settings, "method").to_owned()).filter(|s| !s.is_empty()),
+                Some(str_field(settings, "password").to_owned()).filter(|s| !s.is_empty()),
+            )
+        } else {
+            (None, None)
+        };
 
     Ok(Some(Inbound {
         tag,
@@ -714,7 +714,10 @@ fn parse_sniffing(item: &Value, tag: &str) -> crate::vless::Sniffing {
         }
     }
     let mut excluded = Vec::new();
-    for ex in array(item, "domainsExcluded").iter().filter_map(Value::as_str) {
+    for ex in array(item, "domainsExcluded")
+        .iter()
+        .filter_map(Value::as_str)
+    {
         excluded.push(ex.to_owned());
     }
     sniffing.domains_excluded = std::sync::Arc::new(excluded);
@@ -796,7 +799,9 @@ fn parse_short_id(s: &str) -> Result<[u8; 8], String> {
         return Ok([0u8; 8]);
     }
     if s.len() > 16 {
-        return Err(format!("shortId {s:?} cannot exceed 16 hex characters (8 bytes)"));
+        return Err(format!(
+            "shortId {s:?} cannot exceed 16 hex characters (8 bytes)"
+        ));
     }
     if !s.len().is_multiple_of(2) {
         return Err(format!("shortId {s:?} has odd hex string length"));
@@ -892,15 +897,27 @@ fn parse_reality(reality: &Value) -> Result<RealityInboundSettings, String> {
         short_ids.push(parse_short_id(s)?);
     }
 
-    let min_client_ver = reality.get("minClientVer").and_then(parse_version_opt).transpose()?;
-    let max_client_ver = reality.get("maxClientVer").and_then(parse_version_opt).transpose()?;
+    let min_client_ver = reality
+        .get("minClientVer")
+        .and_then(parse_version_opt)
+        .transpose()?;
+    let max_client_ver = reality
+        .get("maxClientVer")
+        .and_then(parse_version_opt)
+        .transpose()?;
 
-    let max_time_diff = reality.get("maxTimeDiff").and_then(Value::as_u64).unwrap_or(0);
+    let max_time_diff = reality
+        .get("maxTimeDiff")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let xver = match reality.get("xver").and_then(Value::as_u64).unwrap_or(0) {
         x @ 0..=2 => x as u8,
         x => return Err(format!("realitySettings: xver {x} is not 0, 1 or 2")),
     };
-    let show = reality.get("show").and_then(Value::as_bool).unwrap_or(false);
+    let show = reality
+        .get("show")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
 
     let mut alpn = Vec::new();
     for a in array(reality, "alpn") {
@@ -1834,8 +1851,13 @@ mod tests {
 
     #[test]
     fn parses_dns_config() {
+        // Panel configs carry server-only sections next to `dns`.
         let raw = r#"{
-          "inbounds": [],
+          "api": {"tag": "api", "services": ["HandlerService", "StatsService"]},
+          "stats": {},
+          "policy": {"levels": {"0": {"statsUserOnline": true, "connIdle": 120}}},
+          "inbounds": [{"tag": "api", "listen": "127.0.0.1", "port": 62789,
+                        "protocol": "tunnel", "settings": {"address": "127.0.0.1"}}],
           "dns": {
             "servers": ["8.8.8.8", "1.1.1.1"],
             "hosts": {
@@ -1849,5 +1871,6 @@ mod tests {
         assert_eq!(dns.servers.len(), 2);
         assert_eq!(dns.query_strategy, xray_config::DnsQueryStrategy::UseIpv4);
         assert!(!dns.hosts.is_empty());
+        assert_eq!(config.policy.conn_idle, std::time::Duration::from_secs(120));
     }
 }

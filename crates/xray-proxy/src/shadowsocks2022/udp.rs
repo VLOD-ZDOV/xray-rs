@@ -645,9 +645,7 @@ mod tests {
                 53,
                 Network::Udp,
             );
-            let resp_wire = server
-                .encode_response(&resp_target, b"dns reply")
-                .unwrap();
+            let resp_wire = server.encode_response(&resp_target, b"dns reply").unwrap();
 
             let (decoded_target, decoded_payload) = client.decode(&resp_wire).unwrap();
             assert_eq!(decoded_target, resp_target);

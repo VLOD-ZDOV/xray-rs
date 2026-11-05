@@ -1,8 +1,8 @@
 //! Runtime timeouts and buffer sizes configured by the `policy` section.
 
+use serde_json::Value;
 use std::sync::RwLock;
 use std::time::Duration;
-use xray_config::PolicyConfig;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicySettings {
@@ -33,73 +33,67 @@ static POLICY: RwLock<PolicySettings> = RwLock::new(PolicySettings {
     buffer_size: 32 * 1024,
 });
 
-pub fn init(config: Option<&PolicyConfig>) {
-    let mut current = PolicySettings::default();
-    if let Some(cfg) = config {
-        if let Some(level0) = cfg.levels.get(&0) {
-            if let Some(hs) = level0.handshake {
-                current.handshake = Duration::from_secs(hs as u64);
-            }
-            if let Some(idle) = level0.conn_idle {
-                current.conn_idle = Duration::from_secs(idle as u64);
-            }
-            if let Some(up) = level0.uplink_only {
-                current.uplink_only = Duration::from_secs(up as u64);
-            }
-            if let Some(down) = level0.downlink_only {
-                current.downlink_only = Duration::from_secs(down as u64);
-            }
-            if let Some(buf) = level0.buffer_size {
-                if buf > 0 {
-                    current.buffer_size = (buf as usize) * 1024;
-                }
+impl PolicySettings {
+    /// Level 0 of the `policy` section; other levels are not applied.
+    pub fn from_config(root: &Value) -> Self {
+        let mut current = Self::default();
+        let level = &root["policy"]["levels"]["0"];
+        let secs = |name: &str| {
+            level
+                .get(name)
+                .and_then(Value::as_u64)
+                .map(Duration::from_secs)
+        };
+        if let Some(v) = secs("handshake") {
+            current.handshake = v;
+        }
+        if let Some(v) = secs("connIdle") {
+            current.conn_idle = v;
+        }
+        if let Some(v) = secs("uplinkOnly") {
+            current.uplink_only = v;
+        }
+        if let Some(v) = secs("downlinkOnly") {
+            current.downlink_only = v;
+        }
+        if let Some(kib) = level.get("bufferSize").and_then(Value::as_u64) {
+            if kib > 0 {
+                current.buffer_size = kib as usize * 1024;
             }
         }
+        current
     }
+}
+
+pub fn init(settings: PolicySettings) {
     if let Ok(mut lock) = POLICY.write() {
-        *lock = current;
+        *lock = settings;
     }
 }
 
 pub fn get() -> PolicySettings {
-    POLICY
-        .read()
-        .map(|p| *p)
-        .unwrap_or_default()
+    POLICY.read().map(|p| *p).unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-    use xray_config::PolicyLevelConfig;
 
     #[test]
-    fn test_policy_init() {
-        let mut levels = BTreeMap::new();
-        levels.insert(
-            0,
-            PolicyLevelConfig {
-                handshake: Some(10),
-                conn_idle: Some(60),
-                uplink_only: Some(3),
-                downlink_only: Some(7),
-                buffer_size: Some(64),
-                ..Default::default()
-            },
-        );
-
-        let cfg = PolicyConfig {
-            levels,
-            ..Default::default()
-        };
-
-        init(Some(&cfg));
-        let settings = get();
+    fn reads_level_zero() {
+        let root = serde_json::json!({"policy": {"levels": {"0": {
+            "handshake": 10, "connIdle": 60, "uplinkOnly": 3, "downlinkOnly": 7,
+            "bufferSize": 64, "statsUserOnline": true
+        }}}});
+        let settings = PolicySettings::from_config(&root);
         assert_eq!(settings.handshake, Duration::from_secs(10));
         assert_eq!(settings.conn_idle, Duration::from_secs(60));
         assert_eq!(settings.uplink_only, Duration::from_secs(3));
         assert_eq!(settings.downlink_only, Duration::from_secs(7));
         assert_eq!(settings.buffer_size, 64 * 1024);
+        assert_eq!(
+            PolicySettings::from_config(&serde_json::json!({})),
+            PolicySettings::default()
+        );
     }
 }

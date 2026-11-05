@@ -102,7 +102,11 @@ pub async fn handshake<S: AsyncRead + Unpin>(
         &*user.command_key,
         &*user.command_key,
         &[b"VMess Header AEAD Key_Length", &auth_id, connection_nonce],
-        &[b"VMess Header AEAD Nonce_Length", &auth_id, connection_nonce],
+        &[
+            b"VMess Header AEAD Nonce_Length",
+            &auth_id,
+            connection_nonce,
+        ],
     );
     let mut length_buf = length_bytes.to_vec();
     aead_len.open(&nonce_len, &auth_id, &mut length_buf)?;

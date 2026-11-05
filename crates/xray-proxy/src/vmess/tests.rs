@@ -139,11 +139,7 @@ async fn vmess_server_and_client_stream_interop() {
                     no_termination_signal: false,
                 };
                 let account = Account::new(&id, cipher, options);
-                let target = Target::new(
-                    TargetAddr::Domain("example.com".to_string()),
-                    8443,
-                    net,
-                );
+                let target = Target::new(TargetAddr::Domain("example.com".to_string()), 8443, net);
 
                 let (client_io, mut server_io) = tokio::io::duplex(65536);
                 let mut client = ClientStream::new(client_io, &account, &target).unwrap();

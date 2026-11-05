@@ -139,8 +139,7 @@ pub async fn parse_http_inbound_request<R: AsyncRead + Unpin>(
         if let Some(colon) = line.iter().position(|&byte| byte == b':') {
             let name = &line[..colon];
             if name.eq_ignore_ascii_case(b"proxy-authorization") {
-                proxy_authorization =
-                    Some(Zeroizing::new(line[colon + 1..].trim_ascii().to_vec()));
+                proxy_authorization = Some(Zeroizing::new(line[colon + 1..].trim_ascii().to_vec()));
                 continue;
             }
             if name.eq_ignore_ascii_case(b"proxy-connection") {

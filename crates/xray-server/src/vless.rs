@@ -248,8 +248,14 @@ impl Context {
         if email.is_empty() {
             return Err("Email must not be empty.".into());
         }
-        let mut ss_users = self.ss_users.write().unwrap_or_else(PoisonError::into_inner);
-        if ss_users.iter().any(|u| u.email.eq_ignore_ascii_case(&email)) {
+        let mut ss_users = self
+            .ss_users
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if ss_users
+            .iter()
+            .any(|u| u.email.eq_ignore_ascii_case(&email))
+        {
             return Err(format!("User {email} already exists."));
         }
         ss_users.push(ss_user);
@@ -269,7 +275,10 @@ impl Context {
             return Err("Email must not be empty.".into());
         }
         let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
-        let mut ss_users = self.ss_users.write().unwrap_or_else(PoisonError::into_inner);
+        let mut ss_users = self
+            .ss_users
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let before_u = users.len();
         users.retain(|u| !u.email.eq_ignore_ascii_case(email));
         let before_ss = ss_users.len();
@@ -945,8 +954,14 @@ mod tests {
             sniffing,
         };
         // routeOnly still dials 10.0.0.1; without it the sniffed domain is dialed instead.
-        assert!(route(&sniff_route_only).allow(&router, payload).await.is_none());
-        let decision = route(&sniff_override).allow(&router, payload).await.unwrap();
+        assert!(route(&sniff_route_only)
+            .allow(&router, payload)
+            .await
+            .is_none());
+        let decision = route(&sniff_override)
+            .allow(&router, payload)
+            .await
+            .unwrap();
         assert_eq!(decision.tag, "direct");
     }
 
@@ -958,7 +973,10 @@ mod tests {
             quic: false,
             route_only: false,
             metadata_only: false,
-            domains_excluded: std::sync::Arc::new(vec!["example.com".to_owned(), "test.org".to_owned()]),
+            domains_excluded: std::sync::Arc::new(vec![
+                "example.com".to_owned(),
+                "test.org".to_owned(),
+            ]),
         };
         let http_excluded = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert_eq!(sniffing.domain(http_excluded), None);
@@ -967,7 +985,10 @@ mod tests {
         assert_eq!(sniffing.domain(sub_excluded), None);
 
         let http_allowed = b"GET / HTTP/1.1\r\nHost: allowed.com\r\n\r\n";
-        assert_eq!(sniffing.domain(http_allowed), Some("allowed.com".to_string()));
+        assert_eq!(
+            sniffing.domain(http_allowed),
+            Some("allowed.com".to_string())
+        );
 
         let metadata_sniffing = Sniffing {
             metadata_only: true,

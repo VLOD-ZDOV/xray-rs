@@ -569,12 +569,13 @@ impl Router {
                 "outbounds": [{"tag": STUB_TAG, "protocol": "freedom"}],
                 "routing": {"rules": synth_rules}
             });
-            let parsed = xray_config::parse_xray_json_with_geodata_dirs(&synth.to_string(), asset_dirs)
-                .map_err(|e| {
-                    let messages: Vec<String> =
-                        e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
-                    format!("routing finalRules: {}", messages.join("; "))
-                })?;
+            let parsed =
+                xray_config::parse_xray_json_with_geodata_dirs(&synth.to_string(), asset_dirs)
+                    .map_err(|e| {
+                        let messages: Vec<String> =
+                            e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
+                        format!("routing finalRules: {}", messages.join("; "))
+                    })?;
             for (tag, action, index) in pending_final {
                 final_rules
                     .entry(tag)
@@ -603,7 +604,10 @@ impl Router {
     }
 
     pub fn add_rule(&self, rule: Rule, should_append: bool) {
-        let mut rules = self.rules.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rules = self
+            .rules
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if should_append {
             rules.push(rule);
         } else {
@@ -612,15 +616,24 @@ impl Router {
     }
 
     pub fn remove_rule(&self, rule_tag: &str) -> usize {
-        let mut rules = self.rules.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rules = self
+            .rules
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = rules.len();
         rules.retain(|r| r.rule_tag != rule_tag);
         before - rules.len()
     }
 
     pub fn list_rules(&self) -> Vec<(String, String)> {
-        let rules = self.rules.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        rules.iter().map(|r| (r.tag.clone(), r.rule_tag.clone())).collect()
+        let rules = self
+            .rules
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        rules
+            .iter()
+            .map(|r| (r.tag.clone(), r.rule_tag.clone()))
+            .collect()
     }
 
     pub fn parse_rule(&self, raw: &Value) -> Result<Rule, String> {
@@ -628,12 +641,18 @@ impl Router {
     }
 
     pub fn add_outbound(&self, tag: String, action: Action) {
-        let mut outbounds = self.outbounds.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut outbounds = self
+            .outbounds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         outbounds.insert(tag, action);
     }
 
     pub fn remove_outbound(&self, tag: &str) -> bool {
-        let mut outbounds = self.outbounds.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut outbounds = self
+            .outbounds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         outbounds.remove(tag).is_some()
     }
 
@@ -642,8 +661,14 @@ impl Router {
     /// Xray does for VLESS inbounds.
     pub fn final_action(&self, outbound: &str, network: Network, addr: SocketAddr) -> Action {
         let ip = addr.ip();
-        let final_rules = self.final_rules.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let outbounds = self.outbounds.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let final_rules = self
+            .final_rules
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outbounds = self
+            .outbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         final_rules
             .get(outbound)
             .into_iter()
@@ -720,8 +745,12 @@ impl Router {
 
     async fn route_once(&self, query: &Query<'_>, resolved: Option<IpAddr>) -> Decision {
         let matched = {
-            let rules = self.rules.read().unwrap_or_else(std::sync::PoisonError::into_inner);
-            self.first_match(&rules, query, query.ip.or(resolved)).cloned()
+            let rules = self
+                .rules
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.first_match(&rules, query, query.ip.or(resolved))
+                .cloned()
         };
         if let Some(target) = matched {
             return self.resolve_target(&target).await;
@@ -733,7 +762,10 @@ impl Router {
             };
             if let Some(ip) = ip {
                 let matched = {
-                    let rules = self.rules.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let rules = self
+                        .rules
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     self.first_match(&rules, query, Some(ip)).cloned()
                 };
                 if let Some(target) = matched {
@@ -741,12 +773,24 @@ impl Router {
                 }
             }
         }
-        let default_tag = self.default_tag.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let outbounds = self.outbounds.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let default_tag = self
+            .default_tag
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let outbounds = self
+            .outbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.decision(&outbounds, &default_tag)
     }
 
-    fn first_match<'a>(&'a self, rules: &'a [Rule], query: &Query<'_>, ip: Option<IpAddr>) -> Option<&'a RuleTarget> {
+    fn first_match<'a>(
+        &'a self,
+        rules: &'a [Rule],
+        query: &Query<'_>,
+        ip: Option<IpAddr>,
+    ) -> Option<&'a RuleTarget> {
         rules
             .iter()
             .find(|rule| rule.matches(query, ip))
@@ -754,7 +798,10 @@ impl Router {
     }
 
     async fn resolve_target(&self, target: &RuleTarget) -> Decision {
-        let outbounds = self.outbounds.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let outbounds = self
+            .outbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         match target {
             RuleTarget::Outbound(tag) => self.decision(&outbounds, tag),
             RuleTarget::Balancer(balancer_tag) => {
@@ -965,9 +1012,8 @@ fn take_vless_routes(
                             }
                         }
                         Value::String(s) => {
-                            let single: u32 = s
-                                .parse()
-                                .map_err(|e| format!("{key} value {s:?}: {e}"))?;
+                            let single: u32 =
+                                s.parse().map_err(|e| format!("{key} value {s:?}: {e}"))?;
                             ranges.push((single, single));
                         }
                         _ => return Err(format!("{key} array item must be number or string")),
@@ -1000,16 +1046,20 @@ impl Rule {
                     .iter()
                     .any(|(from, to)| q.inbound_port >= *from && q.inbound_port <= *to))
             && (self.attrs.is_empty()
-                || self.attrs.iter().all(|(k, v)| {
-                    q.attributes.and_then(|a| a.get(k)) == Some(v)
-                }))
+                || self
+                    .attrs
+                    .iter()
+                    .all(|(k, v)| q.attributes.and_then(|a| a.get(k)) == Some(v)))
             && (self.vless_routes.is_empty()
                 || q.vless_route.is_some_and(|r| {
-                    self.vless_routes.iter().any(|(from, to)| r >= *from && r <= *to)
+                    self.vless_routes
+                        .iter()
+                        .any(|(from, to)| r >= *from && r <= *to)
                 }))
-            && self.local_ip.as_ref().is_none_or(|lip_rule| {
-                q.local_ip.is_some_and(|ip| lip_rule.matches_ip(Some(&ip)))
-            })
+            && self
+                .local_ip
+                .as_ref()
+                .is_none_or(|lip_rule| q.local_ip.is_some_and(|ip| lip_rule.matches_ip(Some(&ip))))
     }
 }
 

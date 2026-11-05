@@ -21,11 +21,15 @@ struct RealitySigningKey {
 }
 
 impl rustls::sign::SigningKey for RealitySigningKey {
-    fn choose_scheme(&self, offered: &[rustls::SignatureScheme]) -> Option<Box<dyn rustls::sign::Signer>> {
+    fn choose_scheme(
+        &self,
+        offered: &[rustls::SignatureScheme],
+    ) -> Option<Box<dyn rustls::sign::Signer>> {
         if let Some(signer) = self.inner.choose_scheme(offered) {
             return Some(signer);
         }
-        self.inner.choose_scheme(&[rustls::SignatureScheme::ED25519])
+        self.inner
+            .choose_scheme(&[rustls::SignatureScheme::ED25519])
     }
 
     fn algorithm(&self) -> rustls::SignatureAlgorithm {
@@ -73,7 +77,8 @@ impl RealityServer {
             .key_provider
             .load_private_key(private_key)
             .map_err(|e| format!("failed to load reality signing key: {e}"))?;
-        let signing_key: Arc<dyn rustls::sign::SigningKey> = Arc::new(RealitySigningKey { inner: signing_key });
+        let signing_key: Arc<dyn rustls::sign::SigningKey> =
+            Arc::new(RealitySigningKey { inner: signing_key });
 
         let alpn: Vec<Vec<u8>> = settings
             .alpn
@@ -257,12 +262,7 @@ impl RealityServer {
         Ok(Some(tls_stream))
     }
 
-    async fn fallback<S>(
-        &self,
-        client: S,
-        early: &[u8],
-        peer: SocketAddr,
-    ) -> io::Result<()>
+    async fn fallback<S>(&self, client: S, early: &[u8], peer: SocketAddr) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -280,13 +280,8 @@ impl RealityServer {
             FallbackDest::Unix(path) => Box::new(crate::fallback::connect_unix(path).await?),
         };
 
-        crate::fallback::write_proxy_header(
-            &mut dest,
-            self.settings.xver,
-            peer,
-            self.inbound_port,
-        )
-        .await?;
+        crate::fallback::write_proxy_header(&mut dest, self.settings.xver, peer, self.inbound_port)
+            .await?;
 
         if !early.is_empty() {
             dest.write_all(early).await?;
@@ -340,12 +335,20 @@ mod tests {
             let (mut socket, _) = dest_listener.accept().await.unwrap();
             let mut buf = [0u8; 64];
             let n = socket.read(&mut buf).await.unwrap();
-            assert!(std::str::from_utf8(&buf[..n]).unwrap().contains("GET /probe"));
-            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK").await.unwrap();
+            assert!(std::str::from_utf8(&buf[..n])
+                .unwrap()
+                .contains("GET /probe"));
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                .await
+                .unwrap();
         });
 
         let settings = RealityInboundSettings {
-            dest: FallbackDest::Tcp(crate::vless::Host::Ip("127.0.0.1".parse().unwrap()), dest_port),
+            dest: FallbackDest::Tcp(
+                crate::vless::Host::Ip("127.0.0.1".parse().unwrap()),
+                dest_port,
+            ),
             server_names: vec!["example.com".to_string()],
             private_key: [0x11; 32],
             short_ids: vec![[0u8; 8]],
@@ -363,7 +366,10 @@ mod tests {
 
         let client_task = tokio::spawn(async move {
             let mut client = TcpStream::connect(srv_addr).await.unwrap();
-            client.write_all(b"GET /probe HTTP/1.1\r\n\r\n").await.unwrap();
+            client
+                .write_all(b"GET /probe HTTP/1.1\r\n\r\n")
+                .await
+                .unwrap();
             let mut buf = Vec::new();
             client.read_to_end(&mut buf).await.unwrap();
             buf
@@ -374,6 +380,8 @@ mod tests {
         assert!(res.is_none()); // Was handled via fallback
 
         let resp_bytes = client_task.await.unwrap();
-        assert!(std::str::from_utf8(&resp_bytes).unwrap().contains("HTTP/1.1 200 OK"));
+        assert!(std::str::from_utf8(&resp_bytes)
+            .unwrap()
+            .contains("HTTP/1.1 200 OK"));
     }
 }

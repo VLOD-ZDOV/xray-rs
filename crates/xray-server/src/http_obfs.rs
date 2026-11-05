@@ -86,10 +86,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     }
 }
 
-pub async fn accept<S>(
-    mut stream: S,
-    settings: &HttpObfsSettings,
-) -> io::Result<PrefixedStream<S>>
+pub async fn accept<S>(mut stream: S, settings: &HttpObfsSettings) -> io::Result<PrefixedStream<S>>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {

@@ -590,22 +590,41 @@ impl InboundManager {
         tcp_abort: Option<tokio::task::AbortHandle>,
         udp_abort: Option<tokio::task::AbortHandle>,
     ) {
-        let mut map = self.inbounds.write().unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.insert(tag, InboundEntry { ctx, tcp_abort, udp_abort });
+        let mut map = self
+            .inbounds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.insert(
+            tag,
+            InboundEntry {
+                ctx,
+                tcp_abort,
+                udp_abort,
+            },
+        );
     }
 
     pub fn get_ctx(&self, tag: &str) -> Option<Arc<Context>> {
-        let map = self.inbounds.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .inbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(tag).map(|e| e.ctx.clone())
     }
 
     pub fn contains(&self, tag: &str) -> bool {
-        let map = self.inbounds.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .inbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.contains_key(tag)
     }
 
     pub fn remove(&self, tag: &str) -> bool {
-        let mut map = self.inbounds.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inbounds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(entry) = map.remove(tag) {
             if let Some(h) = entry.tcp_abort {
                 h.abort();
@@ -630,11 +649,21 @@ impl InboundManager {
         tcp_abort: Option<tokio::task::AbortHandle>,
         udp_abort: Option<tokio::task::AbortHandle>,
     ) -> Result<(), String> {
-        let mut map = self.inbounds.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .inbounds
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if map.contains_key(&tag) {
             return Err(format!("handler already exists: {tag}"));
         }
-        map.insert(tag, InboundEntry { ctx, tcp_abort, udp_abort });
+        map.insert(
+            tag,
+            InboundEntry {
+                ctx,
+                tcp_abort,
+                udp_abort,
+            },
+        );
         Ok(())
     }
 }
@@ -752,7 +781,10 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                                 if let Some(c) = ip.custom {
                                     if !c.ip.is_empty() {
                                         let ip_str = if c.ip.len() == 4 {
-                                            format!("{}.{}.{}.{}/{}", c.ip[0], c.ip[1], c.ip[2], c.ip[3], c.prefix)
+                                            format!(
+                                                "{}.{}.{}.{}/{}",
+                                                c.ip[0], c.ip[1], c.ip[2], c.ip[3], c.prefix
+                                            )
                                         } else {
                                             format!("{:?}/{}", c.ip, c.prefix)
                                         };
@@ -766,20 +798,28 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                                 rule_obj.insert("ip".into(), serde_json::json!(ips));
                             }
                             if !r.networks.is_empty() {
-                                let nets: Vec<&str> = r.networks.iter().filter_map(|n| match n {
-                                    2 => Some("tcp"),
-                                    3 => Some("udp"),
-                                    _ => None,
-                                }).collect();
+                                let nets: Vec<&str> = r
+                                    .networks
+                                    .iter()
+                                    .filter_map(|n| match n {
+                                        2 => Some("tcp"),
+                                        3 => Some("udp"),
+                                        _ => None,
+                                    })
+                                    .collect();
                                 if !nets.is_empty() {
-                                    rule_obj.insert("network".into(), serde_json::json!(nets.join(",")));
+                                    rule_obj.insert(
+                                        "network".into(),
+                                        serde_json::json!(nets.join(",")),
+                                    );
                                 }
                             }
                             if !r.user_email.is_empty() {
                                 rule_obj.insert("user".into(), serde_json::json!(r.user_email));
                             }
                             if !r.inbound_tag.is_empty() {
-                                rule_obj.insert("inboundTag".into(), serde_json::json!(r.inbound_tag));
+                                rule_obj
+                                    .insert("inboundTag".into(), serde_json::json!(r.inbound_tag));
                             }
                             if !r.protocol.is_empty() {
                                 rule_obj.insert("protocol".into(), serde_json::json!(r.protocol));
@@ -788,9 +828,20 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                                 rule_obj.insert("attrs".into(), serde_json::json!(r.attributes));
                             }
                             if let Some(pl) = r.port_list {
-                                let ports: Vec<String> = pl.range.iter().map(|p| if p.from == p.to { format!("{}", p.from) } else { format!("{}-{}", p.from, p.to) }).collect();
+                                let ports: Vec<String> = pl
+                                    .range
+                                    .iter()
+                                    .map(|p| {
+                                        if p.from == p.to {
+                                            format!("{}", p.from)
+                                        } else {
+                                            format!("{}-{}", p.from, p.to)
+                                        }
+                                    })
+                                    .collect();
                                 if !ports.is_empty() {
-                                    rule_obj.insert("port".into(), serde_json::json!(ports.join(",")));
+                                    rule_obj
+                                        .insert("port".into(), serde_json::json!(ports.join(",")));
                                 }
                             }
                             match router.parse_rule(&serde_json::Value::Object(rule_obj)) {
@@ -843,20 +894,44 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                     local_port: 0,
                     vless_route: 0,
                 });
-                let source_ip: IpAddr = rc.source_ips.first()
-                    .and_then(|b| if b.len() == 4 { Some(IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))) } else { None })
+                let source_ip: IpAddr = rc
+                    .source_ips
+                    .first()
+                    .and_then(|b| {
+                        if b.len() == 4 {
+                            Some(IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3])))
+                        } else {
+                            None
+                        }
+                    })
                     .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
                 let source = SocketAddr::new(source_ip, rc.source_port as u16);
                 let network = match rc.network {
                     3 => xray_config::Network::Udp,
                     _ => xray_config::Network::Tcp,
                 };
-                let target_ip: Option<IpAddr> = rc.target_ips.first()
-                    .and_then(|b| if b.len() == 4 { Some(IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))) } else { None });
-                let local_ip: Option<IpAddr> = rc.local_ips.first()
-                    .and_then(|b| if b.len() == 4 { Some(IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]))) } else { None });
-                let domain = if rc.target_domain.is_empty() { None } else { Some(rc.target_domain.as_str()) };
-                let protocol = if rc.protocol.is_empty() { None } else {
+                let target_ip: Option<IpAddr> = rc.target_ips.first().and_then(|b| {
+                    if b.len() == 4 {
+                        Some(IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3])))
+                    } else {
+                        None
+                    }
+                });
+                let local_ip: Option<IpAddr> = rc.local_ips.first().and_then(|b| {
+                    if b.len() == 4 {
+                        Some(IpAddr::V4(std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3])))
+                    } else {
+                        None
+                    }
+                });
+                let domain = if rc.target_domain.is_empty() {
+                    None
+                } else {
+                    Some(rc.target_domain.as_str())
+                };
+                let protocol = if rc.protocol.is_empty() {
+                    None
+                } else {
                     match rc.protocol.as_str() {
                         "http" => Some("http"),
                         "tls" => Some("tls"),
@@ -864,7 +939,11 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                         _ => None,
                     }
                 };
-                let vless_route = if rc.vless_route > 0 { Some(rc.vless_route) } else { None };
+                let vless_route = if rc.vless_route > 0 {
+                    Some(rc.vless_route)
+                } else {
+                    None
+                };
                 let query = crate::routing::Query {
                     inbound: &rc.inbound_tag,
                     inbound_port: rc.local_port as u16,
@@ -1054,67 +1133,94 @@ async fn handle_handler(
             if inbound_manager.contains(&tag) {
                 return status(UNKNOWN, &format!("handler already exists: {tag}"));
             }
-            let (port, listen, sniffing, transport) = if let Some(rec) = inbound_cfg.receiver_settings {
-                let rec = ReceiverConfig::decode(rec.value).unwrap_or(ReceiverConfig {
-                    port_list: None,
-                    listen: None,
-                    stream_settings: None,
-                    receive_original_destination: false,
-                    sniffing_settings: None,
-                });
-                let port = rec.port_list.and_then(|p| p.range.first().map(|r| r.from as u16)).unwrap_or(0);
-                let listen = if let Some(l) = rec.listen {
-                    if let Some(d) = l.domain {
-                        d
-                    } else if let Some(ip) = l.ip {
-                        if ip.len() == 4 {
-                            format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+            let (port, listen, sniffing, transport) =
+                if let Some(rec) = inbound_cfg.receiver_settings {
+                    let rec = ReceiverConfig::decode(rec.value).unwrap_or(ReceiverConfig {
+                        port_list: None,
+                        listen: None,
+                        stream_settings: None,
+                        receive_original_destination: false,
+                        sniffing_settings: None,
+                    });
+                    let port = rec
+                        .port_list
+                        .and_then(|p| p.range.first().map(|r| r.from as u16))
+                        .unwrap_or(0);
+                    let listen = if let Some(l) = rec.listen {
+                        if let Some(d) = l.domain {
+                            d
+                        } else if let Some(ip) = l.ip {
+                            if ip.len() == 4 {
+                                format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
+                            } else {
+                                "127.0.0.1".into()
+                            }
                         } else {
                             "127.0.0.1".into()
                         }
                     } else {
                         "127.0.0.1".into()
-                    }
+                    };
+                    let sniffing = if let Some(s) = rec.sniffing_settings {
+                        let http = s
+                            .destination_override
+                            .iter()
+                            .any(|d| d.eq_ignore_ascii_case("http"));
+                        let tls = s
+                            .destination_override
+                            .iter()
+                            .any(|d| d.eq_ignore_ascii_case("tls"));
+                        crate::vless::Sniffing {
+                            http: s.enabled && (http || s.destination_override.is_empty()),
+                            tls: s.enabled && (tls || s.destination_override.is_empty()),
+                            route_only: s.route_only,
+                            quic: false,
+                            domains_excluded: std::sync::Arc::new(Vec::new()),
+                            metadata_only: false,
+                        }
+                    } else {
+                        crate::vless::Sniffing::default()
+                    };
+                    let transport = match rec
+                        .stream_settings
+                        .as_ref()
+                        .map(|s| s.protocol_name.as_str())
+                    {
+                        Some("ws") => {
+                            crate::config::InboundTransport::Websocket(crate::ws::WsSettings {
+                                path: "/".into(),
+                                host: None,
+                            })
+                        }
+                        Some("grpc") => {
+                            crate::config::InboundTransport::Grpc(crate::grpc::GrpcSettings {
+                                service_name: String::new(),
+                                multi_mode: false,
+                                authority: None,
+                            })
+                        }
+                        Some("httpupgrade") => crate::config::InboundTransport::HttpUpgrade(
+                            crate::httpupgrade::HttpUpgradeSettings {
+                                path: "/".into(),
+                                host: None,
+                            },
+                        ),
+                        _ => crate::config::InboundTransport::Tcp,
+                    };
+                    (port, listen, sniffing, transport)
                 } else {
-                    "127.0.0.1".into()
+                    (
+                        0,
+                        "127.0.0.1".into(),
+                        crate::vless::Sniffing::default(),
+                        crate::config::InboundTransport::Tcp,
+                    )
                 };
-                let sniffing = if let Some(s) = rec.sniffing_settings {
-                    let http = s.destination_override.iter().any(|d| d.eq_ignore_ascii_case("http"));
-                    let tls = s.destination_override.iter().any(|d| d.eq_ignore_ascii_case("tls"));
-                    crate::vless::Sniffing {
-                        http: s.enabled && (http || s.destination_override.is_empty()),
-                        tls: s.enabled && (tls || s.destination_override.is_empty()),
-                        route_only: s.route_only,
-                        quic: false,
-                        domains_excluded: std::sync::Arc::new(Vec::new()),
-                        metadata_only: false,
-                    }
-                } else {
-                    crate::vless::Sniffing::default()
-                };
-                let transport = match rec.stream_settings.as_ref().map(|s| s.protocol_name.as_str()) {
-                    Some("ws") => crate::config::InboundTransport::Websocket(crate::ws::WsSettings {
-                        path: "/".into(),
-                        host: None,
-                    }),
-                    Some("grpc") => crate::config::InboundTransport::Grpc(crate::grpc::GrpcSettings {
-                        service_name: String::new(),
-                        multi_mode: false,
-                        authority: None,
-                    }),
-                    Some("httpupgrade") => crate::config::InboundTransport::HttpUpgrade(
-                        crate::httpupgrade::HttpUpgradeSettings {
-                            path: "/".into(),
-                            host: None,
-                        },
-                    ),
-                    _ => crate::config::InboundTransport::Tcp,
-                };
-                (port, listen, sniffing, transport)
-            } else {
-                (0, "127.0.0.1".into(), crate::vless::Sniffing::default(), crate::config::InboundTransport::Tcp)
-            };
-            let proxy_type = inbound_cfg.proxy_settings.as_ref().map(|p| p.r#type.as_str()).unwrap_or_default();
+            let proxy_type = inbound_cfg
+                .proxy_settings
+                .as_ref()
+                .map(|p| p.r#type.as_str())
+                .unwrap_or_default();
             let protocol = if proxy_type.contains("trojan") {
                 crate::config::InboundProtocol::Trojan
             } else if proxy_type.contains("vmess") {
@@ -1163,14 +1269,23 @@ async fn handle_handler(
                                     let m_name = match CipherType::try_from(acc.cipher_type) {
                                         Ok(CipherType::Aes128Gcm) => "aes-128-gcm",
                                         Ok(CipherType::Aes256Gcm) => "aes-256-gcm",
-                                        Ok(CipherType::Chacha20Poly1305) => "chacha20-ietf-poly1305",
-                                        Ok(CipherType::Xchacha20Poly1305) => "xchacha20-ietf-poly1305",
+                                        Ok(CipherType::Chacha20Poly1305) => {
+                                            "chacha20-ietf-poly1305"
+                                        }
+                                        Ok(CipherType::Xchacha20Poly1305) => {
+                                            "xchacha20-ietf-poly1305"
+                                        }
                                         _ => "aes-256-gcm",
                                     };
-                                    if let Ok(m) = xray_proxy::shadowsocks::aead2017::Method::new(m_name, &acc.password) {
+                                    if let Ok(m) = xray_proxy::shadowsocks::aead2017::Method::new(
+                                        m_name,
+                                        &acc.password,
+                                    ) {
                                         parsed_ss_users.push(crate::config::ShadowsocksUser {
                                             email,
-                                            method: crate::config::ShadowsocksMethod::Aead2017(Arc::new(m)),
+                                            method: crate::config::ShadowsocksMethod::Aead2017(
+                                                Arc::new(m),
+                                            ),
                                         });
                                         ss_method = Some(m_name.to_owned());
                                         ss_pass = Some(acc.password);
@@ -1227,7 +1342,11 @@ async fn handle_handler(
                 return status(INVALID_ARGUMENT, "missing outbound");
             };
             let tag = outbound.tag;
-            let proxy_type = outbound.proxy_settings.as_ref().map(|p| p.r#type.as_str()).unwrap_or_default();
+            let proxy_type = outbound
+                .proxy_settings
+                .as_ref()
+                .map(|p| p.r#type.as_str())
+                .unwrap_or_default();
             let action = if proxy_type.contains("freedom") {
                 crate::routing::Action::Direct(crate::routing::FreedomStrategy::AsIs.into())
             } else if proxy_type.contains("blackhole") {
@@ -1346,9 +1465,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 },
             )
         }
-        other => Err(format!(
-            "account type {other:?} is not supported"
-        )),
+        other => Err(format!("account type {other:?} is not supported")),
     }
 }
 
@@ -1453,10 +1570,16 @@ mod tests {
 
     #[test]
     fn alter_inbound_vmess_and_shadowsocks() {
-        let router = Arc::new(crate::routing::Router::build(&serde_json::json!({
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
-            "routing": {"rules": []}
-        }), &[]).unwrap());
+        let router = Arc::new(
+            crate::routing::Router::build(
+                &serde_json::json!({
+                    "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+                    "routing": {"rules": []}
+                }),
+                &[],
+            )
+            .unwrap(),
+        );
         let ctx = Context {
             tag: "test_in".into(),
             port: 1234,
@@ -1557,7 +1680,12 @@ mod tests {
         assert_eq!(resp.status(), 200);
 
         // 3. ListRule should now have 1 rule
-        let resp = handle_router("ListRule", ListRuleRequest {}.encode_to_vec().into(), &router).await;
+        let resp = handle_router(
+            "ListRule",
+            ListRuleRequest {}.encode_to_vec().into(),
+            &router,
+        )
+        .await;
         let collected = resp.into_body().collect().await.unwrap().to_bytes();
         let list_resp = ListRuleResponse::decode(unframe(collected).unwrap()).unwrap();
         assert_eq!(list_resp.rules.len(), 1);
@@ -1611,10 +1739,16 @@ mod tests {
 
     #[tokio::test]
     async fn handler_service_inbound_outbound_management() {
-        let router = Arc::new(crate::routing::Router::build(&serde_json::json!({
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}],
-            "routing": {"rules": []}
-        }), &[]).unwrap());
+        let router = Arc::new(
+            crate::routing::Router::build(
+                &serde_json::json!({
+                    "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+                    "routing": {"rules": []}
+                }),
+                &[],
+            )
+            .unwrap(),
+        );
         let inbound_manager = Arc::new(InboundManager::new(router.clone()));
 
         // Outbound: AddOutbound
@@ -1630,18 +1764,33 @@ mod tests {
                 comment: String::new(),
             }),
         };
-        let resp = handle_handler("AddOutbound", add_out_req.encode_to_vec().into(), &inbound_manager).await;
+        let resp = handle_handler(
+            "AddOutbound",
+            add_out_req.encode_to_vec().into(),
+            &inbound_manager,
+        )
+        .await;
         assert_eq!(resp.status(), 200);
 
         // Outbound: RemoveOutbound
         let rm_out_req = RemoveOutboundRequest {
             tag: "dyn_out".into(),
         };
-        let resp = handle_handler("RemoveOutbound", rm_out_req.encode_to_vec().into(), &inbound_manager).await;
+        let resp = handle_handler(
+            "RemoveOutbound",
+            rm_out_req.encode_to_vec().into(),
+            &inbound_manager,
+        )
+        .await;
         assert_eq!(resp.status(), 200);
 
         // Outbound: Remove non-existent outbound returns error
-        let resp = handle_handler("RemoveOutbound", rm_out_req.encode_to_vec().into(), &inbound_manager).await;
+        let resp = handle_handler(
+            "RemoveOutbound",
+            rm_out_req.encode_to_vec().into(),
+            &inbound_manager,
+        )
+        .await;
         assert_eq!(resp.headers().get("grpc-status").unwrap(), "2");
 
         // Inbound: AddInbound (bind port 0)
@@ -1670,24 +1819,44 @@ mod tests {
                 }),
             }),
         };
-        let resp = handle_handler("AddInbound", add_in_req.encode_to_vec().into(), &inbound_manager).await;
+        let resp = handle_handler(
+            "AddInbound",
+            add_in_req.encode_to_vec().into(),
+            &inbound_manager,
+        )
+        .await;
         assert_eq!(resp.status(), 200);
         assert!(inbound_manager.contains("dyn_in"));
 
         // Inbound: Add duplicate inbound returns error
-        let resp = handle_handler("AddInbound", add_in_req.encode_to_vec().into(), &inbound_manager).await;
+        let resp = handle_handler(
+            "AddInbound",
+            add_in_req.encode_to_vec().into(),
+            &inbound_manager,
+        )
+        .await;
         assert_eq!(resp.headers().get("grpc-status").unwrap(), "2");
 
         // Inbound: RemoveInbound
         let rm_in_req = RemoveInboundRequest {
             tag: "dyn_in".into(),
         };
-        let resp = handle_handler("RemoveInbound", rm_in_req.encode_to_vec().into(), &inbound_manager).await;
+        let resp = handle_handler(
+            "RemoveInbound",
+            rm_in_req.encode_to_vec().into(),
+            &inbound_manager,
+        )
+        .await;
         assert_eq!(resp.status(), 200);
         assert!(!inbound_manager.contains("dyn_in"));
 
         // Inbound: Remove non-existent inbound returns error
-        let resp = handle_handler("RemoveInbound", rm_in_req.encode_to_vec().into(), &inbound_manager).await;
+        let resp = handle_handler(
+            "RemoveInbound",
+            rm_in_req.encode_to_vec().into(),
+            &inbound_manager,
+        )
+        .await;
         assert_eq!(resp.headers().get("grpc-status").unwrap(), "2");
     }
 }

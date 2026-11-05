@@ -227,10 +227,9 @@ mod tests {
         let mut cursor = Cursor::new(input.to_vec());
         let fallback: SocketAddr = "127.0.0.1:80".parse().unwrap();
 
-        let (peer, leftover) =
-            read_proxy_header(&mut cursor, ProxyProtocolAccept::Any, fallback)
-                .await
-                .unwrap();
+        let (peer, leftover) = read_proxy_header(&mut cursor, ProxyProtocolAccept::Any, fallback)
+            .await
+            .unwrap();
         assert_eq!(peer, "198.51.100.1:54321".parse::<SocketAddr>().unwrap());
         assert_eq!(leftover, b"GET / HTTP/1.1\r\n");
     }
@@ -241,10 +240,9 @@ mod tests {
         let mut cursor = Cursor::new(input.to_vec());
         let fallback: SocketAddr = "127.0.0.1:80".parse().unwrap();
 
-        let (peer, leftover) =
-            read_proxy_header(&mut cursor, ProxyProtocolAccept::V1, fallback)
-                .await
-                .unwrap();
+        let (peer, leftover) = read_proxy_header(&mut cursor, ProxyProtocolAccept::V1, fallback)
+            .await
+            .unwrap();
         assert_eq!(peer, "[2001:db8::1]:54321".parse::<SocketAddr>().unwrap());
         assert!(leftover.is_empty());
     }
@@ -255,10 +253,9 @@ mod tests {
         let mut cursor = Cursor::new(input.to_vec());
         let fallback: SocketAddr = "127.0.0.1:80".parse().unwrap();
 
-        let (peer, leftover) =
-            read_proxy_header(&mut cursor, ProxyProtocolAccept::V1, fallback)
-                .await
-                .unwrap();
+        let (peer, leftover) = read_proxy_header(&mut cursor, ProxyProtocolAccept::V1, fallback)
+            .await
+            .unwrap();
         assert_eq!(peer, fallback);
         assert!(leftover.is_empty());
     }
@@ -280,10 +277,9 @@ mod tests {
         let mut cursor = Cursor::new(input);
         let fallback: SocketAddr = "127.0.0.1:80".parse().unwrap();
 
-        let (peer, leftover) =
-            read_proxy_header(&mut cursor, ProxyProtocolAccept::Any, fallback)
-                .await
-                .unwrap();
+        let (peer, leftover) = read_proxy_header(&mut cursor, ProxyProtocolAccept::Any, fallback)
+            .await
+            .unwrap();
         assert_eq!(peer, "198.51.100.2:43210".parse::<SocketAddr>().unwrap());
         assert_eq!(leftover, b"hello world");
     }
@@ -305,10 +301,9 @@ mod tests {
         let mut cursor = Cursor::new(input);
         let fallback: SocketAddr = "127.0.0.1:80".parse().unwrap();
 
-        let (peer, leftover) =
-            read_proxy_header(&mut cursor, ProxyProtocolAccept::V2, fallback)
-                .await
-                .unwrap();
+        let (peer, leftover) = read_proxy_header(&mut cursor, ProxyProtocolAccept::V2, fallback)
+            .await
+            .unwrap();
         assert_eq!(peer, "[2001:db8::10]:12345".parse::<SocketAddr>().unwrap());
         assert!(leftover.is_empty());
     }
@@ -324,10 +319,9 @@ mod tests {
         let mut cursor = Cursor::new(input);
         let fallback: SocketAddr = "127.0.0.1:80".parse().unwrap();
 
-        let (peer, leftover) =
-            read_proxy_header(&mut cursor, ProxyProtocolAccept::V2, fallback)
-                .await
-                .unwrap();
+        let (peer, leftover) = read_proxy_header(&mut cursor, ProxyProtocolAccept::V2, fallback)
+            .await
+            .unwrap();
         assert_eq!(peer, fallback);
         assert!(leftover.is_empty());
     }

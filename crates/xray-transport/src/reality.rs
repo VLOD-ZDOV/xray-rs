@@ -412,11 +412,9 @@ pub fn parse_reality_client_hello(raw: &[u8]) -> Result<RealityClientHello, Real
 
     while extensions_cursor.offset < extensions.len() {
         let extension_type = extensions_cursor.read_u16("missing extension type")?;
-        let extension_len =
-            usize::from(extensions_cursor.read_u16("missing extension length")?);
+        let extension_len = usize::from(extensions_cursor.read_u16("missing extension length")?);
         let extension_offset = extensions_cursor.absolute_offset();
-        let extension_data =
-            extensions_cursor.take(extension_len, "truncated extension data")?;
+        let extension_data = extensions_cursor.take(extension_len, "truncated extension data")?;
         if extension_type == TLS_EXTENSION_KEY_SHARE {
             if let Some(share) = parse_key_share_extension(extension_data, extension_offset)? {
                 key_share = Some(share);
