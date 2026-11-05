@@ -16,16 +16,18 @@ The server crate and every workspace crate it is built from (`xray-config`,
 
 | Area | Supported |
 |---|---|
-| Inbound protocols | VLESS, Trojan, Shadowsocks (AEAD: `aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`), SOCKS5, HTTP `CONNECT` |
-| Transports | XHTTP (packet-up, stream-up, stream-one, Xray 26 obfuscation settings, `responseHeaders`), raw TCP, WebSocket (with early data), HTTPUpgrade, gRPC (gun and multi mode); TLS or plain (behind nginx) |
+| Inbound protocols | VLESS (including XTLS Vision), VMess (AEAD), Trojan, Shadowsocks (AEAD and 2022, multi-user), SOCKS5, HTTP proxy, dokodemo-door |
+| Security | TLS (`minVersion`, `maxVersion`, `cipherSuites`, `rejectUnknownSni`), REALITY (see the note below), or plain behind nginx |
+| Transports | XHTTP (packet-up, stream-up, stream-one, Xray 26 obfuscation settings, `responseHeaders`), raw TCP (including `header: http`), WebSocket (with early data), HTTPUpgrade, gRPC (gun and multi mode); `acceptProxyProtocol` |
 | VLESS / Trojan | TCP, UDP, Mux.Cool and XUDP; `fallbacks` by `path` with PROXY protocol v1/v2 |
-| Sniffing | `destOverride` `http` and `tls`, `routeOnly` |
-| Outbound | `freedom` (`finalRules`, `domainStrategy`, private addresses blocked by default), `blackhole` (including the `http` response), `wireguard` (Cloudflare WARP, including `reserved`), `socks` (SOCKS5 with optional login, TCP and UDP) |
-| Routing | `domain`, `geosite`, `ip`, `geoip`, `port`, `network`, `inboundTag`, `user`, `source`, `sourcePort`, `localPort`, `protocol`; `domainStrategy` AsIs, IPIfNonMatch, IPOnDemand |
-| 3x-ui | `-c`, `run -test -c`, `-version`, gRPC `StatsService` (traffic, online users and IPs), `HandlerService` user operations for VLESS and Trojan (clients are added and removed without a restart), the `log` section (`loglevel`, `access`, `error`, `maskAddress`) |
+| Sniffing | `destOverride` `http`, `tls`, `quic`; `routeOnly`, `metadataOnly`, `domainsExcluded` |
+| Outbound | `freedom`, `blackhole`, `wireguard` (Cloudflare WARP), `socks`, `vless` (raw, WS, gRPC), `vmess`, `trojan`, `shadowsocks`, `http`, `dns`, `loopback`; balancers (`random`, `roundRobin`) |
+| Routing | `domain`, `geosite`, `ip`, `geoip`, `port`, `network`, `inboundTag`, `user`, `source`, `sourcePort`, `localPort`, `localIP`, `protocol`, `attrs`, `vlessRoute`, `balancerTag`; `domainStrategy` AsIs, IPIfNonMatch, IPOnDemand |
+| DNS and policy | built-in `dns` section (servers, `hosts`, `queryStrategy`); `policy` level 0 timeouts and `bufferSize` |
+| 3x-ui | `-c`, `run -test -c`, `-version`; gRPC `StatsService`, `HandlerService` (users for VLESS, VMess, Trojan and Shadowsocks, `AddInbound`, `RemoveInbound`, `AddOutbound`, `RemoveOutbound`), `RoutingService`, `LoggerService`; the `log` section (`loglevel`, `access`, `error`, `maskAddress`, `dnsLog`) |
 
-Tested against the official Xray-core 26.10.21 as client, WireGuard peer and
-`xray api` client.
+Tested against the official Xray-core 26.10.21 as client, outbound peer,
+WireGuard peer and `xray api` client.
 
 ## Resource use
 
@@ -55,18 +57,17 @@ to run noise.
 
 ## Not supported yet
 
-- Outbounds other than the four above (`vless`, `vmess`, ...) and balancers.
-  Traffic routed to them is blocked with a warning.
-- Changing routing rules, inbounds or outbounds in the panel still restarts
-  the core (no `RoutingService`, `AddInbound`, `AddOutbound`).
-- Skipped with a warning: REALITY, XTLS Vision (`flow` is ignored, so Vision
-  clients cannot connect), XHTTP over HTTP/3, Shadowsocks 2022, VMess,
-  WireGuard and dokodemo-door inbounds, raw TCP header obfuscation, fallbacks
-  selected by `name` or `alpn`, sniffing `quic` and `fakedns`.
-- The HTTP inbound only accepts `CONNECT`, not plain proxy requests.
-- DNS for WireGuard traffic goes through the system resolver, not the tunnel.
-- Routing fields `attrs`, `vlessRoute`, `localIP`, `process`, `webhook` stop
-  the core at startup with an error.
+- REALITY answers with its own TLS handshake instead of mirroring the `dest`
+  site the way XTLS/REALITY does. Clients connect, but an observer may tell the
+  server apart from the site. Keep the original core for REALITY for now.
+- UDP through `vmess`, `trojan` and `shadowsocks` outbounds is blocked; TCP
+  works.
+- No replay protection for VMess and Shadowsocks 2022 TCP yet.
+- Skipped with a warning: VLESS encryption (`decryption` other than `none`),
+  WireGuard and Hysteria2 inbounds, XHTTP over HTTP/3, mKCP, fallbacks selected
+  by `name` or `alpn`, fakedns.
+- `policy` levels other than 0, `reverse`, `metrics`, observatory and the
+  `leastPing` / `leastLoad` balancer strategies.
 
 ## Build
 
