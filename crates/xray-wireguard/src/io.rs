@@ -29,6 +29,7 @@ pub(crate) struct Factory {
     pub(crate) protection_failed: Arc<AtomicBool>,
     pub(crate) stop: Stop,
     pub(crate) carrier: watch::Sender<Option<Arc<Sockets>>>,
+    pub(crate) reserved: [u8; 3],
 }
 pub(crate) type Sockets = [Option<Arc<UdpSocket>>; 2];
 
@@ -40,6 +41,7 @@ pub(crate) struct Udp {
     receiving: Option<Arc<Sockets>>,
     previous: Option<(Arc<Sockets>, tokio::time::Instant)>,
     stop: Stop,
+    reserved: [u8; 3],
 }
 impl Factory {
     /// Publish a complete, protected socket set in one step. The engine and its
@@ -108,6 +110,7 @@ impl UdpTransportFactory for Factory {
             receiving: None,
             previous: None,
             stop: self.stop.clone(),
+            reserved: self.reserved,
         };
         Ok((udp.clone(), udp))
     }
@@ -120,7 +123,11 @@ impl UdpSend for Udp {
     fn max_number_of_packets_to_send(&self) -> usize {
         16
     }
-    async fn send_to(&self, packet: Packet, destination: SocketAddr) -> io::Result<()> {
+    async fn send_to(&self, mut packet: Packet, destination: SocketAddr) -> io::Result<()> {
+        // Bytes 1..4 of every WireGuard message are reserved and zero on the wire.
+        if self.reserved != [0; 3] && packet.len() >= 4 {
+            packet[1..4].copy_from_slice(&self.reserved);
+        }
         // The ready path must retain Tokio's cooperative scheduling budget.
         // Register a cancellation waiter only when sending actually blocks.
         tokio::task::consume_budget().await;
@@ -215,6 +222,9 @@ impl UdpRecv for Udp {
             }
         };
         packet.truncate(n);
+        if self.reserved != [0; 3] && packet.len() >= 4 {
+            packet[1..4].fill(0);
+        }
         Ok((packet, source))
     }
 }
@@ -362,8 +372,21 @@ mod udp_ready_send_tests {
             receiving: None,
             previous: None,
             stop: Stop::new(),
+            reserved: [0; 3],
         };
         (carrier, udp, local)
+    }
+    #[tokio::test]
+    async fn reserved_bytes_are_stamped_on_send() {
+        let (_carrier, mut udp, _local) = sender().await;
+        udp.reserved = [7, 8, 9];
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        udp.send_to(packet(&[4, 0, 0, 0, 42]), peer.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut bytes = [0u8; 8];
+        let (n, _) = peer.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..n], &[4, 7, 8, 9, 42]);
     }
     fn packet(data: &[u8]) -> Packet {
         Packet::from_bytes(bytes::BytesMut::from(data))

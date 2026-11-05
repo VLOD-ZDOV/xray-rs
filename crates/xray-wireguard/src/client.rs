@@ -122,11 +122,40 @@ impl fmt::Debug for Client {
             .finish_non_exhaustive()
     }
 }
+/// Device knobs beyond the WireGuard config. Defaults suit a single mobile
+/// user; a server relaying many clients needs more concurrent TCP flows.
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    /// Xray's `reserved` bytes stamped into every outgoing message header
+    /// (Cloudflare WARP uses them as a client id).
+    pub reserved: [u8; 3],
+    /// Concurrent TCP flows; further connects fail with `Error::Busy`.
+    pub tcp_flows: usize,
+    /// Opens queued for the stack before connects fail with `Error::Busy`.
+    pub pending_opens: usize,
+}
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            reserved: [0; 3],
+            tcp_flows: TCP_LIMIT,
+            pending_opens: COMMAND_QUEUE,
+        }
+    }
+}
 impl Client {
     pub async fn start(
         config: Config,
         protector: Option<Arc<dyn SocketProtector>>,
     ) -> Result<Self, Error> {
+        Self::start_with_options(config, protector, Options::default()).await
+    }
+    pub async fn start_with_options(
+        config: Config,
+        protector: Option<Arc<dyn SocketProtector>>,
+        options: Options,
+    ) -> Result<Self, Error> {
+        let Options { reserved, tcp_flows, pending_opens } = options;
         config.validate()?;
         let stop = Stop::new();
         // If creation is cancelled or fails, every injected I/O boundary is cancelled.
@@ -134,7 +163,7 @@ impl Client {
         let wake = Arc::new(Notify::new());
         let (to_engine, ip_rx) = mpsc::channel(IP_PACKET_QUEUE);
         let (ip_tx, from_engine) = mpsc::channel(IP_PACKET_QUEUE);
-        let (commands, requests) = mpsc::channel(COMMAND_QUEUE);
+        let (commands, requests) = mpsc::channel(pending_opens.max(1));
         let stack = stack::Stack::new(&config, to_engine, from_engine, requests, wake.clone());
         let protection_failed = Arc::new(AtomicBool::new(false));
         let peers = config.peers.iter().map(|settings| {
@@ -161,6 +190,7 @@ impl Client {
             stop: stop.clone(),
             protection_failed: protection_failed.clone(),
             carrier: watch::channel(None).0,
+            reserved,
         };
         let mut limits = gotatun::device::DeviceLimits::mobile();
         // Keep queue storage bounded while allowing larger batches to cross
@@ -237,7 +267,7 @@ impl Client {
             finished: done,
             wake,
             rebind,
-            tcp: Arc::new(Semaphore::new(TCP_LIMIT)),
+            tcp: Arc::new(Semaphore::new(tcp_flows)),
             udp: Arc::new(Semaphore::new(UDP_LIMIT)),
             next: AtomicU64::new(1),
         })))
