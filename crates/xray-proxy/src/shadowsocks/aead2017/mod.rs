@@ -5,7 +5,7 @@
 //! the `none` method are not accepted, as in the reference.
 mod stream;
 mod udp;
-pub use stream::ClientStream;
+pub use stream::{ClientStream, ServerStream};
 pub use udp::UdpSession;
 
 use aws_lc_rs::{

@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
     task::{ready, Context, Poll},
 };
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use xray_routing::{Network, Target};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -260,6 +260,276 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for ClientStream<S> {
     }
 }
 
+/// One bounded server stream with no background tasks.
+pub struct ServerStream<S> {
+    inner: S,
+    method: Arc<Method>,
+    reader: Records,
+    writer: Option<Records>,
+    pending: Zeroizing<Vec<u8>>,
+    pending_pos: usize,
+    body: crate::record_buffer::RecordBuffer,
+    plain_len: usize,
+    plain_pos: usize,
+    phase: ServerPhase,
+    failed: bool,
+    eof: bool,
+    write_closed: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ServerPhase {
+    Length,
+    Payload,
+    Plain,
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> ServerStream<S> {
+    pub async fn handshake(
+        inner: S,
+        method: Arc<Method>,
+    ) -> io::Result<(Self, Target, Vec<u8>)> {
+        let (stream, _, target, early) = Self::handshake_methods(inner, &[method]).await?;
+        Ok((stream, target, early))
+    }
+
+    pub async fn handshake_methods(
+        mut inner: S,
+        methods: &[Arc<Method>],
+    ) -> io::Result<(Self, usize, Target, Vec<u8>)> {
+        if methods.is_empty() {
+            return Err(invalid("no Shadowsocks methods provided"));
+        }
+        let key_len = methods[0].cipher.key_len();
+        let mut salt = vec![0u8; key_len];
+        inner.read_exact(&mut salt).await?;
+
+        let mut len_record = [0u8; 2 + TAG_LENGTH];
+        inner.read_exact(&mut len_record).await?;
+
+        let mut matched = None;
+        for (i, m) in methods.iter().enumerate() {
+            if m.cipher.key_len() != key_len {
+                continue;
+            }
+            let mut test_buf = len_record;
+            let mut reader = Records::new(m, &salt);
+            if reader.open(&mut test_buf).is_ok() {
+                let length = u16::from_be_bytes(test_buf[..2].try_into().unwrap()) as usize;
+                if length > 0 && length <= MAX_PAYLOAD_LENGTH {
+                    matched = Some((i, m.clone(), reader, length));
+                    break;
+                }
+            }
+        }
+
+        let (user_idx, method, mut reader, addr_len) = matched
+            .ok_or_else(|| invalid("Shadowsocks AEAD authentication failed"))?;
+
+        let mut addr_buf = Zeroizing::new(vec![0u8; addr_len + TAG_LENGTH]);
+        inner.read_exact(&mut addr_buf).await?;
+        let plain_len = reader.open(&mut addr_buf)?;
+
+        let (mut target, used) = address::decode(&addr_buf[..plain_len])?;
+        target.network = Network::Tcp;
+        let early = addr_buf[used..plain_len].to_vec();
+
+        let stream = Self {
+            inner,
+            method,
+            reader,
+            writer: None,
+            pending: Zeroizing::new(Vec::new()),
+            pending_pos: 0,
+            body: crate::record_buffer::RecordBuffer::new(2 + TAG_LENGTH, 2 + TAG_LENGTH),
+            plain_len: 0,
+            plain_pos: 0,
+            phase: ServerPhase::Length,
+            failed: false,
+            eof: false,
+            write_closed: false,
+        };
+        Ok((stream, user_idx, target, early))
+    }
+}
+
+impl<S> ServerStream<S> {
+    fn require_body(&mut self, length: usize, phase: ServerPhase) {
+        if !matches!(self.phase, ServerPhase::Plain) {
+            self.body.frame().zeroize();
+        }
+        self.body.advance(length);
+        self.plain_len = 0;
+        self.plain_pos = 0;
+        self.phase = phase;
+    }
+
+    fn process_body(&mut self) -> io::Result<()> {
+        match self.phase {
+            ServerPhase::Length => {
+                self.reader.open(self.body.frame())?;
+                let length =
+                    u16::from_be_bytes(self.body.frame()[..2].try_into().unwrap()) as usize;
+                if length == 0 {
+                    self.body.frame().zeroize();
+                    self.eof = true;
+                    return Ok(());
+                }
+                if length > MAX_PAYLOAD_LENGTH {
+                    return Err(invalid("Shadowsocks AEAD record exceeds 0x3FFF"));
+                }
+                self.require_body(length + TAG_LENGTH, ServerPhase::Payload);
+            }
+            ServerPhase::Payload => {
+                self.plain_len = self.reader.open(self.body.frame())?;
+                self.plain_pos = 0;
+                self.phase = ServerPhase::Plain;
+            }
+            ServerPhase::Plain => unreachable!(),
+        }
+        Ok(())
+    }
+}
+
+impl<S: AsyncWrite + Unpin> ServerStream<S> {
+    fn drain(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while self.pending_pos < self.pending.len() {
+            match ready!(Pin::new(&mut self.inner).poll_write(cx, &self.pending[self.pending_pos..]))
+            {
+                Ok(0) => {
+                    self.failed = true;
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+                Ok(n) => self.pending_pos += n,
+                Err(e) => {
+                    self.failed = true;
+                    return Poll::Ready(Err(e));
+                }
+            }
+        }
+        self.pending.clear();
+        self.pending_pos = 0;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for ServerStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.failed {
+            return Poll::Ready(Err(invalid("Shadowsocks AEAD stream failed")));
+        }
+        if out.remaining() == 0 || this.eof {
+            return Poll::Ready(Ok(()));
+        }
+        if let Poll::Ready(result) = this.drain(cx) {
+            result?;
+        }
+        for _ in 0..16 {
+            if matches!(this.phase, ServerPhase::Plain) {
+                if this.plain_pos < this.plain_len {
+                    let n = out.remaining().min(this.plain_len - this.plain_pos);
+                    out.put_slice(&this.body.frame()[this.plain_pos..this.plain_pos + n]);
+                    crate::erase::erase(&mut this.body.frame()[this.plain_pos..this.plain_pos + n]);
+                    this.plain_pos += n;
+                    return Poll::Ready(Ok(()));
+                }
+                this.require_body(2 + TAG_LENGTH, ServerPhase::Length);
+            }
+            match ready!(this.body.poll_frame(&mut this.inner, cx)) {
+                Ok(true) => {}
+                Ok(false) if matches!(this.phase, ServerPhase::Length) => {
+                    this.eof = true;
+                    return Poll::Ready(Ok(()));
+                }
+                result => {
+                    this.failed = true;
+                    return Poll::Ready(Err(result
+                        .err()
+                        .unwrap_or_else(|| io::ErrorKind::UnexpectedEof.into())));
+                }
+            }
+            if let Err(e) = this.process_body() {
+                this.failed = true;
+                return Poll::Ready(Err(e));
+            }
+            if this.eof {
+                return Poll::Ready(Ok(()));
+            }
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ServerStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        if this.failed || this.write_closed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        ready!(this.drain(cx))?;
+        if input.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        if this.writer.is_none() {
+            let mut salt = Zeroizing::new(vec![0; this.method.cipher.key_len()]);
+            if rand::rngs::OsRng.try_fill_bytes(&mut salt).is_err() {
+                this.failed = true;
+                return Poll::Ready(Err(invalid("Shadowsocks random source failed")));
+            }
+            let writer = Records::new(&this.method, &salt);
+            this.pending.extend_from_slice(&salt);
+            this.writer = Some(writer);
+        }
+        let n = input.len().min(MAX_WRITE_PAYLOAD);
+        this.pending.reserve_exact(2 + TAG_LENGTH + n + TAG_LENGTH);
+        let start = this.pending.len();
+        this.pending.extend_from_slice(&(n as u16).to_be_bytes());
+        let writer = this.writer.as_mut().unwrap();
+        let result = writer.seal_from(&mut this.pending, start).and_then(|_| {
+            let start = this.pending.len();
+            this.pending.extend_from_slice(&input[..n]);
+            writer.seal_from(&mut this.pending, start)
+        });
+        if let Err(e) = result {
+            this.pending.as_mut_slice().zeroize();
+            this.pending.clear();
+            this.failed = true;
+            return Poll::Ready(Err(e));
+        }
+        Poll::Ready(Ok(n))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if this.failed {
+            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+        }
+        ready!(this.drain(cx))?;
+        let result = ready!(Pin::new(&mut this.inner).poll_flush(cx));
+        if result.is_err() {
+            this.failed = true;
+        }
+        Poll::Ready(result)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        ready!(self.as_mut().poll_flush(cx))?;
+        let this = self.get_mut();
+        this.write_closed = true;
+        Pin::new(&mut this.inner).poll_shutdown(cx)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{fixtures, method, unhex};
@@ -410,5 +680,37 @@ mod tests {
         assert!(stream.pending.is_empty());
         let udp = Target::new(TargetAddr::Domain("example.test".into()), 443, Network::Udp);
         assert!(ClientStream::new(tokio::io::sink(), method(case), &udp).is_err());
+    }
+
+    #[tokio::test]
+    async fn server_stream_and_client_stream_interop() {
+        for case in fixtures() {
+            let m = method(&case);
+            let target = Target::new(TargetAddr::Domain("example.test".into()), 8080, Network::Tcp);
+            let (client_io, server_io) = tokio::io::duplex(65536);
+
+            let mut client = ClientStream::new(client_io, m.clone(), &target).unwrap();
+            let handle = tokio::spawn(async move {
+                ServerStream::handshake(server_io, m).await
+            });
+            client.flush().await.unwrap();
+            let (mut server, decoded_target, early) = handle.await.unwrap().unwrap();
+            assert_eq!(decoded_target, target);
+            assert!(early.is_empty());
+
+            client.write_all(b"hello from client").await.unwrap();
+            client.flush().await.unwrap();
+
+            let mut buf = [0u8; 17];
+            server.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"hello from client");
+
+            server.write_all(b"hello from server").await.unwrap();
+            server.flush().await.unwrap();
+
+            let mut resp = [0u8; 17];
+            client.read_exact(&mut resp).await.unwrap();
+            assert_eq!(&resp, b"hello from server");
+        }
     }
 }

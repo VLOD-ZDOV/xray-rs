@@ -4,6 +4,7 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use http::{HeaderName, HeaderValue};
 use serde_json::Value;
@@ -36,6 +37,13 @@ pub enum InboundProtocol {
     Trojan,
     Socks,
     Http,
+    Shadowsocks,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShadowsocksUser {
+    pub method: Arc<xray_proxy::shadowsocks::aead2017::Method>,
+    pub email: String,
 }
 
 #[derive(Debug)]
@@ -45,6 +53,7 @@ pub struct Inbound {
     pub port: u16,
     pub protocol: InboundProtocol,
     pub users: Vec<User>,
+    pub shadowsocks_users: Vec<ShadowsocksUser>,
     pub socks_auth: xray_proxy::inbound::SocksInboundAuth,
     pub udp: bool,
     pub sniffing: bool,
@@ -185,6 +194,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         "trojan" => InboundProtocol::Trojan,
         "socks" => InboundProtocol::Socks,
         "http" => InboundProtocol::Http,
+        "shadowsocks" => InboundProtocol::Shadowsocks,
         other => {
             log::warn(format!(
                 "skipping inbound {tag:?}: protocol {other:?} is not supported yet"
@@ -265,7 +275,40 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     } else {
         xray_proxy::inbound::SocksInboundAuth::NoAuth
     };
-    let udp = settings.get("udp").and_then(Value::as_bool).unwrap_or(false);
+    let net_str = str_field(settings, "network");
+    let udp = settings.get("udp").and_then(Value::as_bool).unwrap_or(false) || net_str.contains("udp");
+
+    let mut shadowsocks_users = Vec::new();
+    if protocol == InboundProtocol::Shadowsocks {
+        let top_method = str_field(settings, "method");
+        let top_password = str_field(settings, "password");
+        let top_email = str_field(settings, "email");
+        if !top_method.is_empty() && !top_password.is_empty() {
+            let m = xray_proxy::shadowsocks::aead2017::Method::new(top_method, top_password)
+                .map_err(|e| format!("inbound {tag:?}: {e}"))?;
+            shadowsocks_users.push(ShadowsocksUser {
+                method: Arc::new(m),
+                email: top_email.to_owned(),
+            });
+        }
+        for client in array(settings, "clients") {
+            let m_str = str_field(client, "method");
+            let method_name = if !m_str.is_empty() { m_str } else { top_method };
+            let pass = str_field(client, "password");
+            let email = str_field(client, "email");
+            if !method_name.is_empty() && !pass.is_empty() {
+                let m = xray_proxy::shadowsocks::aead2017::Method::new(method_name, pass)
+                    .map_err(|e| format!("inbound {tag:?}: {e}"))?;
+                shadowsocks_users.push(ShadowsocksUser {
+                    method: Arc::new(m),
+                    email: email.to_owned(),
+                });
+            }
+        }
+        if shadowsocks_users.is_empty() {
+            return Err(format!("inbound {tag:?}: shadowsocks requires method and password"));
+        }
+    }
 
     let tls = if security == "tls" {
         Some(parse_tls(
@@ -307,6 +350,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         port,
         protocol,
         users,
+        shadowsocks_users,
         socks_auth,
         udp,
         sniffing,
@@ -732,6 +776,50 @@ mod tests {
         assert!(config.inbounds[0].udp);
         assert_eq!(config.inbounds[1].protocol, InboundProtocol::Http);
         assert_eq!(config.inbounds[1].port, 8080);
+    }
+
+    #[test]
+    fn parses_shadowsocks_inbound() {
+        let raw = r#"{
+          "inbounds": [
+            {
+              "tag": "ss-in",
+              "port": 8388,
+              "protocol": "shadowsocks",
+              "settings": {
+                "method": "aes-128-gcm",
+                "password": "ss-secret-pass",
+                "network": "tcp,udp"
+              }
+            },
+            {
+              "tag": "ss-multi",
+              "port": 8389,
+              "protocol": "shadowsocks",
+              "settings": {
+                "method": "chacha20-poly1305",
+                "clients": [
+                  {"password": "pass1", "email": "user1@ss"},
+                  {"password": "pass2", "email": "user2@ss"}
+                ],
+                "udp": true
+              }
+            }
+          ]
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.inbounds.len(), 2);
+        assert_eq!(config.inbounds[0].protocol, InboundProtocol::Shadowsocks);
+        assert_eq!(config.inbounds[0].port, 8388);
+        assert!(config.inbounds[0].udp);
+        assert_eq!(config.inbounds[0].shadowsocks_users.len(), 1);
+
+        assert_eq!(config.inbounds[1].protocol, InboundProtocol::Shadowsocks);
+        assert_eq!(config.inbounds[1].port, 8389);
+        assert!(config.inbounds[1].udp);
+        assert_eq!(config.inbounds[1].shadowsocks_users.len(), 2);
+        assert_eq!(config.inbounds[1].shadowsocks_users[0].email, "user1@ss");
+        assert_eq!(config.inbounds[1].shadowsocks_users[1].email, "user2@ss");
     }
 
     #[test]

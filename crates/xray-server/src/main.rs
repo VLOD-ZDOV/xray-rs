@@ -9,6 +9,7 @@ mod mux;
 mod outbound;
 mod padding;
 mod routing;
+mod shadowsocks;
 mod socks;
 mod stats;
 mod trojan;
@@ -29,7 +30,7 @@ use hyper_util::server::conn::auto;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
 use config::{Config, Inbound, InboundProtocol, InboundTransport, TlsSettings};
@@ -130,6 +131,7 @@ enum InboundHandler {
     TrojanHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
     Socks(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth, bool),
     Http(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth),
+    Shadowsocks(Arc<vless::Context>, Arc<Vec<config::ShadowsocksUser>>),
     VlessXhttp(Arc<xhttp::Handler>),
 }
 
@@ -153,29 +155,42 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             sniffing: inbound.sniffing,
         });
         inbounds.insert(inbound.tag.clone(), ctx.clone());
+        let is_ss_udp = inbound.protocol == InboundProtocol::Shadowsocks && inbound.udp;
+        let ss_users = if is_ss_udp {
+            Arc::new(inbound.shadowsocks_users.clone())
+        } else {
+            Arc::new(Vec::new())
+        };
+        let ss_inbound_tag = inbound.tag.clone();
+        let ss_listen = inbound.listen.clone();
+        let ss_port = inbound.port;
+
         let handler = match (inbound.protocol, inbound.transport) {
-            (InboundProtocol::Vless, InboundTransport::Tcp) => InboundHandler::VlessTcp(ctx),
+            (InboundProtocol::Vless, InboundTransport::Tcp) => InboundHandler::VlessTcp(ctx.clone()),
             (InboundProtocol::Vless, InboundTransport::Websocket(settings)) => {
-                InboundHandler::VlessWs(ctx, settings)
+                InboundHandler::VlessWs(ctx.clone(), settings)
             }
             (InboundProtocol::Vless, InboundTransport::HttpUpgrade(settings)) => {
-                InboundHandler::VlessHttpUpgrade(ctx, settings)
+                InboundHandler::VlessHttpUpgrade(ctx.clone(), settings)
             }
-            (InboundProtocol::Trojan, InboundTransport::Tcp) => InboundHandler::TrojanTcp(ctx),
+            (InboundProtocol::Trojan, InboundTransport::Tcp) => InboundHandler::TrojanTcp(ctx.clone()),
             (InboundProtocol::Trojan, InboundTransport::Websocket(settings)) => {
-                InboundHandler::TrojanWs(ctx, settings)
+                InboundHandler::TrojanWs(ctx.clone(), settings)
             }
             (InboundProtocol::Trojan, InboundTransport::HttpUpgrade(settings)) => {
-                InboundHandler::TrojanHttpUpgrade(ctx, settings)
+                InboundHandler::TrojanHttpUpgrade(ctx.clone(), settings)
             }
             (InboundProtocol::Socks, InboundTransport::Tcp) => {
-                InboundHandler::Socks(ctx, inbound.socks_auth, inbound.udp)
+                InboundHandler::Socks(ctx.clone(), inbound.socks_auth, inbound.udp)
             }
             (InboundProtocol::Http, InboundTransport::Tcp) => {
-                InboundHandler::Http(ctx, inbound.socks_auth)
+                InboundHandler::Http(ctx.clone(), inbound.socks_auth)
+            }
+            (InboundProtocol::Shadowsocks, InboundTransport::Tcp) => {
+                InboundHandler::Shadowsocks(ctx.clone(), Arc::new(inbound.shadowsocks_users))
             }
             (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
-                InboundHandler::VlessXhttp(xhttp::Handler::new(*settings, ctx))
+                InboundHandler::VlessXhttp(xhttp::Handler::new(*settings, ctx.clone()))
             }
             (other, InboundTransport::Xhttp(_)) => {
                 return Err(format!(
@@ -197,6 +212,20 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             }
         };
         tokio::spawn(accept_loop(listener, acceptor, handler));
+        if is_ss_udp {
+            let udp_socket = bind_udp_addr(&ss_listen, ss_port).await?;
+            log::info(format!(
+                "listening udp {} on {}",
+                ss_inbound_tag,
+                udp_socket.local_addr().map_err(|e| e.to_string())?
+            ));
+            let udp_handler = shadowsocks::ShadowsocksUdpHandler::new(
+                Arc::new(udp_socket),
+                ss_users,
+                ctx.clone(),
+            );
+            tokio::spawn(udp_handler.run());
+        }
     }
     if let Some(addr) = config.api {
         api::serve(addr, inbounds).await?;
@@ -218,6 +247,21 @@ async fn bind(inbound: &Inbound) -> Result<TcpListener, String> {
         Err(_) => TcpListener::bind(("0.0.0.0", port))
             .await
             .map_err(|e| format!("failed to listen on port {port}: {e}")),
+    }
+}
+
+async fn bind_udp_addr(listen: &str, port: u16) -> Result<UdpSocket, String> {
+    if !listen.is_empty() {
+        let addr = format!("{}:{port}", bracket(listen));
+        return UdpSocket::bind(&addr)
+            .await
+            .map_err(|e| format!("failed to bind udp on {addr}: {e}"));
+    }
+    match UdpSocket::bind(("::", port)).await {
+        Ok(socket) => Ok(socket),
+        Err(_) => UdpSocket::bind(("0.0.0.0", port))
+            .await
+            .map_err(|e| format!("failed to bind udp on port {port}: {e}")),
     }
 }
 
@@ -337,6 +381,11 @@ where
         InboundHandler::Http(ctx, auth) => {
             if let Err(e) = inbound_proxy::serve_http(stream, &auth, &ctx, peer).await {
                 log::info(format!("http from {} rejected: {e}", log::mask(peer)));
+            }
+        }
+        InboundHandler::Shadowsocks(ctx, users) => {
+            if let Err(e) = shadowsocks::serve_tcp(stream, users, &ctx, peer).await {
+                log::info(format!("shadowsocks from {} rejected: {e}", log::mask(peer)));
             }
         }
         InboundHandler::VlessXhttp(h) => {

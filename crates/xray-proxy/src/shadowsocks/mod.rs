@@ -3,6 +3,7 @@
 //! AEAD methods. Both families share the SOCKS-style target address codec.
 pub(crate) mod address;
 pub mod aead2017;
+pub use aead2017::ServerStream;
 
 use crate::shadowsocks2022;
 use std::{
