@@ -43,8 +43,7 @@ Tested against the official Xray-core 26.10.31 as client, WireGuard peer and
 cargo build --release -p xray-server
 ```
 
-The binary is `target/release/xray-server`. A glibc build needs glibc 2.38 or
-newer (Ubuntu 24.04 works, Ubuntu 22.04 and Debian 12 do not).
+The binary is `target/release/xray-server`. Compatible with Ubuntu 22.04+, Debian 12+ and modern Linux distributions.
 
 ## Install into 3x-ui
 

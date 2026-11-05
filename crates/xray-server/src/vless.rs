@@ -13,7 +13,7 @@ use tokio::time::timeout;
 
 use crate::config::User;
 use crate::outbound::{self, UdpLink};
-use crate::routing::{self, Action, Decision, Query, Router};
+use crate::routing::{self, Action, BlockAction, Decision, Query, Router};
 use crate::stats::{self, Traffic};
 use crate::{log, mux};
 use xray_config::Network;
@@ -142,6 +142,7 @@ impl<'a> Cursor<'a> {
 
 pub struct Context {
     pub tag: String,
+    pub port: u16,
     pub users: RwLock<Vec<User>>,
     pub router: Arc<Router>,
 }
@@ -236,6 +237,7 @@ where
         let info = mux::Info {
             peer,
             tag: ctx.tag.clone(),
+            port: ctx.port,
             email: user.email.clone(),
             router: ctx.router.clone(),
         };
@@ -265,6 +267,7 @@ where
     };
     let route = RouteRequest {
         ctx_tag: &ctx.tag,
+        inbound_port: ctx.port,
         email: &user.email,
         peer,
         network,
@@ -274,6 +277,16 @@ where
     let Some(decision) = route.allow(&ctx.router, payload).await else {
         return Ok(());
     };
+    if let Action::Block(BlockAction::Http403) = decision.action {
+        if request.command == Command::Tcp {
+            downlink.write_all(&[request.version, 0]).await?;
+            downlink
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nCache-Control: max-age=600\r\nContent-Length: 0\r\n\r\n")
+                .await?;
+            downlink.flush().await?;
+        }
+        return Ok(());
+    }
     let traffic = stats::get().traffic(&ctx.tag, &user.email, &decision.tag);
 
     match request.command {
@@ -316,6 +329,7 @@ where
 
 pub(crate) struct RouteRequest<'a> {
     pub ctx_tag: &'a str,
+    pub inbound_port: u16,
     pub email: &'a str,
     pub peer: SocketAddr,
     pub network: Network,
@@ -337,6 +351,7 @@ impl RouteRequest<'_> {
         };
         let query = Query {
             inbound: self.ctx_tag,
+            inbound_port: self.inbound_port,
             user: self.email,
             source: self.peer,
             network: self.network,
@@ -352,7 +367,7 @@ impl RouteRequest<'_> {
             "udp"
         };
         let to = format!("{network}:{}:{}", host_label(self.host), self.port);
-        let accepted = decision.action != Action::Block;
+        let accepted = !matches!(decision.action, Action::Block(_));
         log::access(
             self.peer,
             accepted,
@@ -361,7 +376,11 @@ impl RouteRequest<'_> {
             &decision.tag,
             self.email,
         );
-        accepted.then_some(decision)
+        match decision.action {
+            Action::Block(BlockAction::Http403) => Some(decision),
+            Action::Block(_) => None,
+            _ => Some(decision),
+        }
     }
 }
 

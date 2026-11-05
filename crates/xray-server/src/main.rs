@@ -127,6 +127,7 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
         ));
         let ctx = Arc::new(vless::Context {
             tag: inbound.tag.clone(),
+            port: inbound.port,
             users: RwLock::new(inbound.users),
             router: router.clone(),
         });

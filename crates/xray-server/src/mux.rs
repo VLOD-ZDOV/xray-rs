@@ -18,7 +18,7 @@ use xray_config::Network;
 
 use crate::log;
 use crate::outbound::{self, ConeUdp};
-use crate::routing::{Decision, Router};
+use crate::routing::{Action, BlockAction, Decision, Router};
 use crate::stats::{self, Traffic};
 use crate::vless::{host_label, Host, RouteRequest, CONN_IDLE};
 
@@ -156,6 +156,7 @@ fn end_frame(id: u16, error: bool) -> Bytes {
 pub struct Info {
     pub peer: SocketAddr,
     pub tag: String,
+    pub port: u16,
     pub email: String,
     pub router: Arc<Router>,
 }
@@ -204,6 +205,7 @@ where
                     let udp = network == NETWORK_UDP;
                     let route = RouteRequest {
                         ctx_tag: &info.tag,
+                        inbound_port: info.port,
                         email: &info.email,
                         peer: info.peer,
                         network: if udp { Network::Udp } else { Network::Tcp },
@@ -217,6 +219,22 @@ where
                         let _ = out_tx.send(end_frame(frame.id, true)).await;
                         continue;
                     };
+                    if let Action::Block(BlockAction::Http403) = decision.action {
+                        if !udp {
+                            let resp = b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nCache-Control: max-age=600\r\nContent-Length: 0\r\n\r\n";
+                            let _ = out_tx
+                                .send(encode_frame(
+                                    frame.id,
+                                    STATUS_KEEP,
+                                    OPTION_DATA,
+                                    None,
+                                    Some(resp),
+                                ))
+                                .await;
+                        }
+                        let _ = out_tx.send(end_frame(frame.id, false)).await;
+                        continue;
+                    }
                     let traffic = stats::get().traffic(&info.tag, &info.email, &decision.tag);
                     let dial = Dial {
                         router: info.router.clone(),

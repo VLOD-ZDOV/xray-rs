@@ -34,7 +34,7 @@ pub async fn connect(
         )),
         Action::Wireguard(wg) => Ok(Box::new(wg.connect(host, port).await?)),
         Action::Socks(socks) => Ok(Box::new(socks.connect(host, port).await?)),
-        Action::Block => Err(blocked(&decision.tag)),
+        Action::Block(_) => Err(blocked(&decision.tag)),
     }
 }
 
@@ -45,7 +45,7 @@ pub fn check_final(
     addr: SocketAddr,
 ) -> io::Result<()> {
     match router.final_action(outbound, network, addr) {
-        Action::Block => Err(io::Error::new(
+        Action::Block(_) => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{addr} blocked by finalRules of {outbound:?}"),
         )),
@@ -142,7 +142,7 @@ impl UdpLink {
                 socks.associate().await?,
                 resolve(host, port).await?,
             )),
-            Action::Block => Err(blocked(&decision.tag)),
+            Action::Block(_) => Err(blocked(&decision.tag)),
         }
     }
 
@@ -221,7 +221,7 @@ impl ConeUdp {
                 })
             }
             Action::Socks(socks) => Ok(Self::Socks(socks.associate().await?)),
-            Action::Block => Err(blocked(&decision.tag)),
+            Action::Block(_) => Err(blocked(&decision.tag)),
         }
     }
 

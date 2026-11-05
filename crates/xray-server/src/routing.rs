@@ -21,7 +21,7 @@ use crate::vless::is_private;
 use crate::wg::WgOutbound;
 
 const STUB_TAG: &str = "rule";
-const SERVER_FIELDS: [&str; 4] = ["user", "source", "sourcePort", "protocol"];
+const SERVER_FIELDS: [&str; 5] = ["user", "source", "sourcePort", "protocol", "localPort"];
 const IGNORED_FIELDS: [&str; 1] = ["ruleTag"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,10 +33,17 @@ pub enum FreedomStrategy {
     UseIPv6,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockAction {
+    #[default]
+    Drop,
+    Http403,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Direct(FreedomStrategy),
-    Block,
+    Block(BlockAction),
     Wireguard(Arc<WgOutbound>),
     Socks(Arc<SocksOutbound>),
 }
@@ -45,6 +52,7 @@ impl PartialEq for Action {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Direct(a), Self::Direct(b)) => a == b,
+            (Self::Block(a), Self::Block(b)) => a == b,
             (Self::Wireguard(a), Self::Wireguard(b)) => Arc::ptr_eq(a, b),
             (Self::Socks(a), Self::Socks(b)) => Arc::ptr_eq(a, b),
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
@@ -62,6 +70,7 @@ pub struct Decision {
 
 pub struct Query<'a> {
     pub inbound: &'a str,
+    pub inbound_port: u16,
     pub user: &'a str,
     pub source: SocketAddr,
     pub network: Network,
@@ -87,6 +96,7 @@ struct Rule {
     source: Option<RoutingRule>,
     users: Vec<UserMatcher>,
     protocols: Vec<String>,
+    local_ports: Vec<(u16, u16)>,
 }
 
 enum UserMatcher {
@@ -120,7 +130,7 @@ impl Router {
                     for (index, raw) in array(settings, "finalRules").iter().enumerate() {
                         let action = match str_field(raw, "action") {
                             "allow" => Action::Direct(domain_strategy),
-                            "block" => Action::Block,
+                            "block" => Action::Block(BlockAction::Drop),
                             other => {
                                 return Err(format!(
                                 "outbound {tag:?} finalRules[{index}]: unknown action {other:?}"
@@ -139,7 +149,19 @@ impl Router {
                     }
                     Action::Direct(domain_strategy)
                 }
-                "blackhole" => Action::Block,
+                "blackhole" => {
+                    let settings = outbound.get("settings").unwrap_or(&Value::Null);
+                    let resp = settings.get("response").unwrap_or(&Value::Null);
+                    let block_action = match str_field(resp, "type") {
+                        "" | "none" => BlockAction::Drop,
+                        "http" => BlockAction::Http403,
+                        other => {
+                            log::warn(format!("outbound {tag:?}: unsupported blackhole response type {other:?}"));
+                            BlockAction::Drop
+                        }
+                    };
+                    Action::Block(block_action)
+                }
                 "wireguard" => Action::Wireguard(Arc::new(WgOutbound::parse(
                     &tag,
                     outbound.get("settings").unwrap_or(&Value::Null),
@@ -150,7 +172,7 @@ impl Router {
                 )?)),
                 other => {
                     log::warn(format!("outbound {tag:?} ({other}) is not supported yet; traffic routed to it will be blocked"));
-                    Action::Block
+                    Action::Block(BlockAction::Drop)
                 }
             };
             default_tag.get_or_insert_with(|| tag.clone());
@@ -169,7 +191,7 @@ impl Router {
                 (_, Some(Value::String(tag))) => {
                     log::warn(format!("balancer {tag:?} is not supported yet; traffic routed to it will be blocked"));
                     let tag = format!("balancer:{tag}");
-                    outbounds.insert(tag.clone(), Action::Block);
+                    outbounds.insert(tag.clone(), Action::Block(BlockAction::Drop));
                     tag
                 }
                 _ => {
@@ -188,6 +210,7 @@ impl Router {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let protocols = take_strings(&mut rule, "protocol");
+            let local_ports = take_port_ranges(&mut rule, "localPort")?;
             let source = rule.remove("source").or_else(|| rule.remove("sourceIP"));
             let source_port = rule.remove("sourcePort");
             for key in IGNORED_FIELDS {
@@ -229,7 +252,7 @@ impl Router {
                 synth_rules.push(helper);
                 synth_rules.len() - 1
             });
-            pending.push((tag, main, helper, users, protocols));
+            pending.push((tag, main, helper, users, protocols, local_ports));
         }
 
         let expected_rules = synth_rules.len();
@@ -259,13 +282,13 @@ impl Router {
 
         let mut rules = Vec::with_capacity(pending.len());
         let mut sniff = false;
-        for (tag, main, helper, users, protocols) in pending {
+        for (tag, main, helper, users, protocols, local_ports) in pending {
             if !outbounds.contains_key(&tag) {
                 // 3x-ui routes its API inbound to the "api" tag, which is not an outbound.
                 log::debug(format!(
                     "routing: outbound {tag:?} is not defined; matching traffic will be blocked"
                 ));
-                outbounds.insert(tag.clone(), Action::Block);
+                outbounds.insert(tag.clone(), Action::Block(BlockAction::Drop));
             }
             sniff |= !protocols.is_empty();
             rules.push(Rule {
@@ -274,6 +297,7 @@ impl Router {
                 source: helper.map(|i| parsed_rules[i].clone()),
                 users,
                 protocols,
+                local_ports,
             });
         }
 
@@ -305,7 +329,7 @@ impl Router {
             })
             .map_or(
                 if is_private(ip) {
-                    Action::Block
+                    Action::Block(BlockAction::Drop)
                 } else {
                     self.outbounds
                         .get(outbound)
@@ -361,7 +385,10 @@ impl Router {
         let action = if self.outbounds.is_empty() {
             Action::Direct(FreedomStrategy::AsIs)
         } else {
-            self.outbounds.get(tag).cloned().unwrap_or(Action::Block)
+            self.outbounds
+                .get(tag)
+                .cloned()
+                .unwrap_or(Action::Block(BlockAction::Drop))
         };
         // The tag stays as is, even empty: finalRules and stats are keyed by it.
         Decision {
@@ -385,6 +412,11 @@ impl Rule {
             && (self.protocols.is_empty()
                 || q.protocol
                     .is_some_and(|p| self.protocols.iter().any(|x| x == p)))
+            && (self.local_ports.is_empty()
+                || self
+                    .local_ports
+                    .iter()
+                    .any(|(from, to)| q.inbound_port >= *from && q.inbound_port <= *to))
     }
 }
 
@@ -433,6 +465,80 @@ pub fn sniff(data: &[u8], network: Network) -> Option<&'static str> {
     }
 }
 
+fn take_port_ranges(
+    rule: &mut serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Vec<(u16, u16)>, String> {
+    let mut ranges = Vec::new();
+    match rule.remove(key) {
+        Some(Value::Number(n)) => {
+            let p = n
+                .as_u64()
+                .and_then(|v| u16::try_from(v).ok())
+                .ok_or_else(|| format!("{key}: invalid port number {n}"))?;
+            ranges.push((p, p));
+        }
+        Some(Value::String(s)) => {
+            for part in s.split(',') {
+                let part = part.trim();
+                if !part.is_empty() {
+                    ranges.push(parse_port_range(part).map_err(|e| format!("{key}: {e}"))?);
+                }
+            }
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item {
+                    Value::Number(n) => {
+                        let p = n
+                            .as_u64()
+                            .and_then(|v| u16::try_from(v).ok())
+                            .ok_or_else(|| format!("{key}: invalid port number {n}"))?;
+                        ranges.push((p, p));
+                    }
+                    Value::String(s) => {
+                        for part in s.split(',') {
+                            let part = part.trim();
+                            if !part.is_empty() {
+                                ranges.push(
+                                    parse_port_range(part).map_err(|e| format!("{key}: {e}"))?,
+                                );
+                            }
+                        }
+                    }
+                    other => return Err(format!("{key}: unexpected item {other:?}")),
+                }
+            }
+        }
+        Some(other) => return Err(format!("{key}: unexpected value {other:?}")),
+        None => {}
+    }
+    Ok(ranges)
+}
+
+fn parse_port_range(part: &str) -> Result<(u16, u16), String> {
+    let part = part.trim();
+    if let Some((start, end)) = part.split_once('-') {
+        let s = start
+            .trim()
+            .parse::<u16>()
+            .map_err(|e| format!("invalid port {start}: {e}"))?;
+        let e = end
+            .trim()
+            .parse::<u16>()
+            .map_err(|e| format!("invalid port {end}: {e}"))?;
+        if s > e {
+            return Err(format!("port range start {s} exceeds end {e}"));
+        }
+        Ok((s, e))
+    } else {
+        let p = part
+            .parse::<u16>()
+            .map_err(|e| format!("invalid port {part}: {e}"))?;
+        Ok((p, p))
+    }
+}
+
 /// Xray accepts these fields as an array or a comma-separated string.
 fn take_strings(rule: &mut serde_json::Map<String, Value>, key: &str) -> Vec<String> {
     match rule.remove(key) {
@@ -468,6 +574,7 @@ mod tests {
     fn query<'a>(domain: Option<&'a str>, ip: Option<&str>, port: u16) -> Query<'a> {
         Query {
             inbound: "in",
+            inbound_port: 443,
             user: "alice",
             source: "203.0.113.5:40000".parse().unwrap(),
             network: Network::Tcp,
@@ -495,7 +602,7 @@ mod tests {
         assert!(r.needs_sniff());
         assert_eq!(
             r.route(&query(None, Some("10.1.1.1"), 80)).await.action,
-            Action::Block
+            Action::Block(BlockAction::Drop)
         );
         assert_eq!(
             r.route(&query(Some("example.com"), None, 443)).await,
@@ -524,7 +631,7 @@ mod tests {
             blocked,
             Decision {
                 tag: "warp".into(),
-                action: Action::Block
+                action: Action::Block(BlockAction::Drop)
             }
         );
         assert_eq!(
@@ -556,11 +663,11 @@ mod tests {
         );
         assert_eq!(
             r.final_action("direct", Network::Tcp, at("127.0.0.1:22")),
-            Action::Block
+            Action::Block(BlockAction::Drop)
         );
         assert_eq!(
             r.final_action("direct", Network::Udp, at("1.1.1.1:53")),
-            Action::Block
+            Action::Block(BlockAction::Drop)
         );
         assert_eq!(
             r.final_action("plain", Network::Tcp, at("1.1.1.1:53")),
@@ -568,7 +675,59 @@ mod tests {
         );
         assert_eq!(
             r.final_action("plain", Network::Tcp, at("192.168.1.1:80")),
-            Action::Block
+            Action::Block(BlockAction::Drop)
+        );
+    }
+
+    #[tokio::test]
+    async fn blackhole_http_and_local_port_matching() {
+        let r = router(json!({
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "forbidden", "protocol": "blackhole", "settings": {"response": {"type": "http"}}},
+                {"tag": "blocked", "protocol": "blackhole"}
+            ],
+            "routing": {"rules": [
+                {"type": "field", "outboundTag": "forbidden", "localPort": "8443,9000-9100"},
+                {"type": "field", "outboundTag": "blocked", "localPort": 1234}
+            ]}
+        }));
+
+        let mut q = query(Some("example.com"), None, 80);
+        q.inbound_port = 8443;
+        assert_eq!(
+            r.route(&q).await,
+            Decision {
+                tag: "forbidden".into(),
+                action: Action::Block(BlockAction::Http403)
+            }
+        );
+
+        q.inbound_port = 9050;
+        assert_eq!(
+            r.route(&q).await,
+            Decision {
+                tag: "forbidden".into(),
+                action: Action::Block(BlockAction::Http403)
+            }
+        );
+
+        q.inbound_port = 1234;
+        assert_eq!(
+            r.route(&q).await,
+            Decision {
+                tag: "blocked".into(),
+                action: Action::Block(BlockAction::Drop)
+            }
+        );
+
+        q.inbound_port = 443;
+        assert_eq!(
+            r.route(&q).await,
+            Decision {
+                tag: "direct".into(),
+                action: Action::Direct(FreedomStrategy::AsIs)
+            }
         );
     }
 
