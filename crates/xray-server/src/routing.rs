@@ -24,9 +24,18 @@ const STUB_TAG: &str = "rule";
 const SERVER_FIELDS: [&str; 4] = ["user", "source", "sourcePort", "protocol"];
 const IGNORED_FIELDS: [&str; 1] = ["ruleTag"];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FreedomStrategy {
+    #[default]
+    AsIs,
+    UseIP,
+    UseIPv4,
+    UseIPv6,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
-    Direct,
+    Direct(FreedomStrategy),
     Block,
     Wireguard(Arc<WgOutbound>),
     Socks(Arc<SocksOutbound>),
@@ -35,6 +44,7 @@ pub enum Action {
 impl PartialEq for Action {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
+            (Self::Direct(a), Self::Direct(b)) => a == b,
             (Self::Wireguard(a), Self::Wireguard(b)) => Arc::ptr_eq(a, b),
             (Self::Socks(a), Self::Socks(b)) => Arc::ptr_eq(a, b),
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
@@ -96,9 +106,20 @@ impl Router {
             let action = match protocol {
                 "freedom" => {
                     let settings = outbound.get("settings").unwrap_or(&Value::Null);
+                    let domain_strategy = match str_field(settings, "domainStrategy") {
+                        "" | "AsIs" => FreedomStrategy::AsIs,
+                        "UseIP" => FreedomStrategy::UseIP,
+                        "UseIPv4" | "UseIP4" => FreedomStrategy::UseIPv4,
+                        "UseIPv6" | "UseIP6" => FreedomStrategy::UseIPv6,
+                        other => {
+                            return Err(format!(
+                                "outbound {tag:?}: unknown domainStrategy {other:?}"
+                            ))
+                        }
+                    };
                     for (index, raw) in array(settings, "finalRules").iter().enumerate() {
                         let action = match str_field(raw, "action") {
-                            "allow" => Action::Direct,
+                            "allow" => Action::Direct(domain_strategy),
                             "block" => Action::Block,
                             other => {
                                 return Err(format!(
@@ -116,7 +137,7 @@ impl Router {
                         pending_final.push((tag.clone(), action, synth_rules.len()));
                         synth_rules.push(rule);
                     }
-                    Action::Direct
+                    Action::Direct(domain_strategy)
                 }
                 "blackhole" => Action::Block,
                 "wireguard" => Action::Wireguard(Arc::new(WgOutbound::parse(
@@ -286,7 +307,10 @@ impl Router {
                 if is_private(ip) {
                     Action::Block
                 } else {
-                    Action::Direct
+                    self.outbounds
+                        .get(outbound)
+                        .cloned()
+                        .unwrap_or(Action::Direct(FreedomStrategy::AsIs))
                 },
                 |(action, _)| action.clone(),
             )
@@ -335,7 +359,7 @@ impl Router {
     fn decision(&self, tag: &str) -> Decision {
         // No outbounds at all behaves like a lone freedom outbound.
         let action = if self.outbounds.is_empty() {
-            Action::Direct
+            Action::Direct(FreedomStrategy::AsIs)
         } else {
             self.outbounds.get(tag).cloned().unwrap_or(Action::Block)
         };
@@ -477,7 +501,7 @@ mod tests {
             r.route(&query(Some("example.com"), None, 443)).await,
             Decision {
                 tag: "direct".into(),
-                action: Action::Direct
+                action: Action::Direct(FreedomStrategy::AsIs)
             }
         );
         let mut bt = query(None, Some("1.1.1.1"), 6881);
@@ -505,7 +529,7 @@ mod tests {
         );
         assert_eq!(
             r.route(&query(Some("example.com"), None, 443)).await.action,
-            Action::Direct
+            Action::Direct(FreedomStrategy::AsIs)
         );
         let mut bob = query(Some("example.com"), None, 443);
         bob.user = "bobby";
@@ -528,7 +552,7 @@ mod tests {
         let at = |s: &str| s.parse::<SocketAddr>().unwrap();
         assert_eq!(
             r.final_action("direct", Network::Tcp, at("127.0.0.1:8080")),
-            Action::Direct
+            Action::Direct(FreedomStrategy::AsIs)
         );
         assert_eq!(
             r.final_action("direct", Network::Tcp, at("127.0.0.1:22")),
@@ -540,12 +564,35 @@ mod tests {
         );
         assert_eq!(
             r.final_action("plain", Network::Tcp, at("1.1.1.1:53")),
-            Action::Direct
+            Action::Direct(FreedomStrategy::AsIs)
         );
         assert_eq!(
             r.final_action("plain", Network::Tcp, at("192.168.1.1:80")),
             Action::Block
         );
+    }
+
+    #[tokio::test]
+    async fn freedom_domain_strategy_parsing() {
+        let r = router(json!({
+            "outbounds": [
+                {"tag": "v4only", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv4"}},
+                {"tag": "v6only", "protocol": "freedom", "settings": {"domainStrategy": "UseIPv6"}},
+                {"tag": "default", "protocol": "freedom"}
+            ]
+        }));
+        assert_eq!(
+            r.route(&query(Some("example.com"), None, 80)).await,
+            Decision {
+                tag: "v4only".into(),
+                action: Action::Direct(FreedomStrategy::UseIPv4)
+            }
+        );
+        assert!(Router::build(
+            &json!({"outbounds": [{"tag": "bad", "protocol": "freedom", "settings": {"domainStrategy": "invalid"}}]}),
+            &[]
+        )
+        .is_err());
     }
 
     #[test]

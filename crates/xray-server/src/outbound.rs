@@ -14,7 +14,7 @@ use tokio::time::timeout;
 use xray_config::Network;
 use xray_wireguard::UdpSession;
 
-use crate::routing::{Action, Decision, Router};
+use crate::routing::{Action, Decision, FreedomStrategy, Router};
 use crate::socks::SocksUdp;
 use crate::vless::{resolve, resolve_all, Host, CONNECT_TIMEOUT};
 use crate::wg::{to_io, WgOutbound};
@@ -29,8 +29,8 @@ pub async fn connect(
     port: u16,
 ) -> io::Result<Box<dyn Stream>> {
     match &decision.action {
-        Action::Direct => Ok(Box::new(
-            connect_direct(router, &decision.tag, host, port).await?,
+        Action::Direct(strategy) => Ok(Box::new(
+            connect_direct(router, &decision.tag, *strategy, host, port).await?,
         )),
         Action::Wireguard(wg) => Ok(Box::new(wg.connect(host, port).await?)),
         Action::Socks(socks) => Ok(Box::new(socks.connect(host, port).await?)),
@@ -53,15 +53,38 @@ pub fn check_final(
     }
 }
 
-/// Tries each resolved address that passes the outbound's finalRules.
+/// Applies freedom's domainStrategy filtering to candidate addresses.
+pub fn apply_strategy(addrs: &mut Vec<SocketAddr>, strategy: FreedomStrategy) -> io::Result<()> {
+    match strategy {
+        FreedomStrategy::AsIs | FreedomStrategy::UseIP => {}
+        FreedomStrategy::UseIPv4 => {
+            addrs.retain(SocketAddr::is_ipv4);
+        }
+        FreedomStrategy::UseIPv6 => {
+            addrs.retain(SocketAddr::is_ipv6);
+        }
+    }
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no addresses matched freedom domainStrategy {strategy:?}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Tries each resolved address that passes the outbound's finalRules and matches domainStrategy.
 async fn connect_direct(
     router: &Router,
     outbound: &str,
+    strategy: FreedomStrategy,
     host: &Host,
     port: u16,
 ) -> io::Result<TcpStream> {
     let mut last_error = None;
-    for addr in resolve_all(host, port).await? {
+    let mut addrs = resolve_all(host, port).await?;
+    apply_strategy(&mut addrs, strategy)?;
+    for addr in addrs {
         if let Err(e) = check_final(router, outbound, Network::Tcp, addr) {
             last_error = Some(e);
             continue;
@@ -98,8 +121,10 @@ impl UdpLink {
         port: u16,
     ) -> io::Result<Self> {
         match &decision.action {
-            Action::Direct => {
-                let target = resolve(host, port).await?;
+            Action::Direct(strategy) => {
+                let mut addrs = resolve_all(host, port).await?;
+                apply_strategy(&mut addrs, *strategy)?;
+                let target = addrs[0];
                 check_final(router, &decision.tag, Network::Udp, target)?;
                 let bind: SocketAddr = if target.is_ipv4() {
                     ([0, 0, 0, 0], 0).into()
@@ -158,6 +183,7 @@ pub enum ConeUdp {
         dual_stack: bool,
         router: Arc<Router>,
         outbound: String,
+        strategy: FreedomStrategy,
     },
     Wireguard {
         wg: Arc<WgOutbound>,
@@ -171,7 +197,7 @@ pub enum ConeUdp {
 impl ConeUdp {
     pub async fn open(router: Arc<Router>, decision: &Decision) -> io::Result<Self> {
         match &decision.action {
-            Action::Direct => {
+            Action::Direct(strategy) => {
                 let socket = match UdpSocket::bind(("::", 0)).await {
                     Ok(socket) => socket,
                     Err(_) => UdpSocket::bind(("0.0.0.0", 0)).await?,
@@ -182,6 +208,7 @@ impl ConeUdp {
                     dual_stack,
                     router,
                     outbound: decision.tag.clone(),
+                    strategy: *strategy,
                 })
             }
             Action::Wireguard(wg) => {
@@ -202,9 +229,14 @@ impl ConeUdp {
     pub async fn target(&self, host: &Host, port: u16) -> io::Result<SocketAddr> {
         match self {
             Self::Direct {
-                router, outbound, ..
+                router,
+                outbound,
+                strategy,
+                ..
             } => {
-                let addr = resolve(host, port).await?;
+                let mut addrs = resolve_all(host, port).await?;
+                apply_strategy(&mut addrs, *strategy)?;
+                let addr = addrs[0];
                 check_final(router, outbound, Network::Udp, addr)?;
                 Ok(addr)
             }
@@ -300,4 +332,30 @@ fn blocked(tag: &str) -> io::Error {
         io::ErrorKind::PermissionDenied,
         format!("blocked by outbound {tag:?}"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn freedom_domain_strategy_filtering() {
+        let v4: SocketAddr = "1.2.3.4:80".parse().unwrap();
+        let v6: SocketAddr = "[2001:db8::1]:80".parse().unwrap();
+
+        let mut addrs = vec![v4, v6];
+        apply_strategy(&mut addrs, FreedomStrategy::AsIs).unwrap();
+        assert_eq!(addrs, vec![v4, v6]);
+
+        let mut addrs = vec![v4, v6];
+        apply_strategy(&mut addrs, FreedomStrategy::UseIPv4).unwrap();
+        assert_eq!(addrs, vec![v4]);
+
+        let mut addrs = vec![v4, v6];
+        apply_strategy(&mut addrs, FreedomStrategy::UseIPv6).unwrap();
+        assert_eq!(addrs, vec![v6]);
+
+        let mut addrs = vec![v4];
+        assert!(apply_strategy(&mut addrs, FreedomStrategy::UseIPv6).is_err());
+    }
 }
