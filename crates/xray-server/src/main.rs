@@ -12,6 +12,7 @@ mod log;
 mod mux;
 mod outbound;
 mod padding;
+mod proxy_proto;
 mod routing;
 mod shadowsocks;
 mod socks;
@@ -274,7 +275,13 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             }
         };
         let http_obfs = inbound.http_obfs.map(Arc::new);
-        tokio::spawn(accept_loop(listener, acceptor, handler, http_obfs));
+        tokio::spawn(accept_loop(
+            listener,
+            inbound.accept_proxy_protocol,
+            acceptor,
+            handler,
+            http_obfs,
+        ));
         if is_ss_udp {
             let udp_socket = bind_udp_addr(&ss_listen, ss_port).await?;
             log::info(format!(
@@ -354,12 +361,13 @@ fn bracket(host: &str) -> String {
 
 async fn accept_loop(
     listener: TcpListener,
+    accept_proxy_protocol: proxy_proto::ProxyProtocolAccept,
     tls: Option<TlsAcceptor>,
     handler: InboundHandler,
     http_obfs: Option<Arc<http_obfs::HttpObfsSettings>>,
 ) {
     loop {
-        let (stream, peer) = match listener.accept().await {
+        let (mut stream, mut peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(e) => {
                 log::warn(format!("accept failed: {e}"));
@@ -371,6 +379,22 @@ async fn accept_loop(
         let local = stream.local_addr().ok();
         let (tls, handler, http_obfs) = (tls.clone(), handler.clone(), http_obfs.clone());
         tokio::spawn(async move {
+            let leftover = if accept_proxy_protocol.is_enabled() {
+                match proxy_proto::read_proxy_header(&mut stream, accept_proxy_protocol, peer).await {
+                    Ok((new_peer, leftover)) => {
+                        peer = new_peer;
+                        leftover
+                    }
+                    Err(e) => {
+                        log::info(format!("proxy protocol from {} rejected: {e}", log::mask(peer)));
+                        return;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+
+            let stream = httpupgrade::PrefixedStream::new(stream, leftover);
             match (tls, http_obfs) {
                 (Some(acceptor), _) => match acceptor.accept(stream).await {
                     Ok(stream) => dispatch(stream, peer, local, handler).await,

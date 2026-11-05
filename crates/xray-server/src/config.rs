@@ -93,6 +93,7 @@ pub struct Inbound {
     pub http_obfs: Option<crate::http_obfs::HttpObfsSettings>,
     pub tls: Option<TlsSettings>,
     pub transport: InboundTransport,
+    pub accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,6 +478,12 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         None
     };
 
+    let sockopt = stream
+        .get("sockopt")
+        .or_else(|| item.get("sockopt"))
+        .unwrap_or(&Value::Null);
+    let accept_proxy_protocol = parse_accept_proxy_protocol(sockopt.get("acceptProxyProtocol"));
+
     Ok(Some(Inbound {
         tag,
         listen,
@@ -492,6 +499,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         http_obfs,
         tls,
         transport,
+        accept_proxy_protocol,
     }))
 }
 
@@ -531,6 +539,18 @@ fn parse_http_obfs(header: &Value) -> crate::http_obfs::HttpObfsSettings {
     resp.push_str("\r\n");
     crate::http_obfs::HttpObfsSettings {
         response: resp.into_bytes(),
+    }
+}
+
+fn parse_accept_proxy_protocol(val: Option<&Value>) -> crate::proxy_proto::ProxyProtocolAccept {
+    match val {
+        Some(Value::Bool(true)) => crate::proxy_proto::ProxyProtocolAccept::Any,
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(1) => crate::proxy_proto::ProxyProtocolAccept::V1,
+            Some(2) => crate::proxy_proto::ProxyProtocolAccept::V2,
+            _ => crate::proxy_proto::ProxyProtocolAccept::None,
+        },
+        _ => crate::proxy_proto::ProxyProtocolAccept::None,
     }
 }
 
@@ -1319,5 +1339,38 @@ mod tests {
         assert!(std::str::from_utf8(&obfs.response)
             .unwrap()
             .starts_with("HTTP/1.1 200 OK"));
+    }
+
+    #[test]
+    fn parses_accept_proxy_protocol() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "in-v1", "port": 10001, "protocol": "vless",
+             "streamSettings": {"sockopt": {"acceptProxyProtocol": 1}}},
+            {"tag": "in-v2", "port": 10002, "protocol": "vless",
+             "streamSettings": {"sockopt": {"acceptProxyProtocol": 2}}},
+            {"tag": "in-bool", "port": 10003, "protocol": "vless",
+             "streamSettings": {"sockopt": {"acceptProxyProtocol": true}}},
+            {"tag": "in-none", "port": 10004, "protocol": "vless"}
+          ]
+        }"#;
+        let inbounds = parse(raw).unwrap().inbounds;
+        assert_eq!(inbounds.len(), 4);
+        assert_eq!(
+            inbounds[0].accept_proxy_protocol,
+            crate::proxy_proto::ProxyProtocolAccept::V1
+        );
+        assert_eq!(
+            inbounds[1].accept_proxy_protocol,
+            crate::proxy_proto::ProxyProtocolAccept::V2
+        );
+        assert_eq!(
+            inbounds[2].accept_proxy_protocol,
+            crate::proxy_proto::ProxyProtocolAccept::Any
+        );
+        assert_eq!(
+            inbounds[3].accept_proxy_protocol,
+            crate::proxy_proto::ProxyProtocolAccept::None
+        );
     }
 }
