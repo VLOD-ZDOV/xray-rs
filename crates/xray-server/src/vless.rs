@@ -146,6 +146,7 @@ pub struct Context {
     pub users: RwLock<Vec<User>>,
     pub router: Arc<Router>,
     pub sniffing: bool,
+    pub fallbacks: Vec<crate::config::Fallback>,
 }
 
 impl Context {
@@ -196,7 +197,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut buf = Vec::with_capacity(512);
-    let (mut request, header_len, user) = timeout(HANDSHAKE_TIMEOUT, async {
+    let handshake_res = timeout(HANDSHAKE_TIMEOUT, async {
         let mut chunk = [0u8; 512];
         loop {
             // The user is copied out so a concurrent removal cannot shift the index.
@@ -210,7 +211,7 @@ where
             match parsed {
                 Ok(parsed) => return Ok(parsed),
                 Err(ParseError::Invalid(reason)) => {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, reason))
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, reason));
                 }
                 Err(ParseError::Incomplete) if buf.len() > MAX_HEADER => {
                     return Err(io::Error::new(
@@ -227,8 +228,17 @@ where
             buf.extend_from_slice(&chunk[..n]);
         }
     })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timeout"))??;
+    .await;
+
+    let (mut request, header_len, user) = match handshake_res {
+        Ok(Ok(parsed)) => parsed,
+        Err(_) | Ok(Err(_)) => {
+            if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, &buf) {
+                return crate::fallback::serve(uplink, downlink, fb, buf, peer, ctx.port).await;
+            }
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "vless handshake failed"));
+        }
+    };
     let mut early = buf.split_off(header_len);
 
     let _online = stats::get().connect(&user.email, peer.ip());

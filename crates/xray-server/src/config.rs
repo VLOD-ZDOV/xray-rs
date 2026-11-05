@@ -46,6 +46,22 @@ pub struct ShadowsocksUser {
     pub email: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct Fallback {
+    #[allow(dead_code)]
+    pub alpn: String,
+    pub path: String,
+    pub dest: FallbackDest,
+    pub xver: u8,
+}
+
+#[derive(Clone, Debug)]
+pub enum FallbackDest {
+    Tcp(crate::vless::Host, u16),
+    #[cfg(unix)]
+    Unix(String),
+}
+
 #[derive(Debug)]
 pub struct Inbound {
     pub tag: String,
@@ -54,6 +70,7 @@ pub struct Inbound {
     pub protocol: InboundProtocol,
     pub users: Vec<User>,
     pub shadowsocks_users: Vec<ShadowsocksUser>,
+    pub fallbacks: Vec<Fallback>,
     pub socks_auth: xray_proxy::inbound::SocksInboundAuth,
     pub udp: bool,
     pub sniffing: bool,
@@ -344,6 +361,13 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
+    let mut fallbacks = Vec::new();
+    for fb in array(settings, "fallbacks") {
+        if let Some(f) = parse_fallback(fb) {
+            fallbacks.push(f);
+        }
+    }
+
     Ok(Some(Inbound {
         tag,
         listen,
@@ -351,6 +375,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         protocol,
         users,
         shadowsocks_users,
+        fallbacks,
         socks_auth,
         udp,
         sniffing,
@@ -390,6 +415,58 @@ fn inline_or_file(cert: &Value, inline_key: &str, file_key: &str) -> Result<Vec<
         return Err(format!("certificate needs {inline_key} or {file_key}"));
     }
     fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))
+}
+
+fn parse_fallback(item: &Value) -> Option<Fallback> {
+    let dest_val = item.get("dest")?;
+    let dest = if let Some(p) = dest_val.as_u64() {
+        FallbackDest::Tcp(
+            crate::vless::Host::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            u16::try_from(p).ok()?,
+        )
+    } else if let Some(s) = dest_val.as_str() {
+        if s.starts_with('/') || s.starts_with('@') {
+            #[cfg(unix)]
+            {
+                FallbackDest::Unix(s.to_owned())
+            }
+            #[cfg(not(unix))]
+            {
+                return None;
+            }
+        } else if let Ok(p) = s.parse::<u16>() {
+            FallbackDest::Tcp(
+                crate::vless::Host::Ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+                p,
+            )
+        } else if let Some((h_str, p_str)) = s.rsplit_once(':') {
+            let port = p_str.parse::<u16>().ok()?;
+            let host = match h_str
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<std::net::IpAddr>()
+            {
+                Ok(ip) => crate::vless::Host::Ip(ip),
+                Err(_) => crate::vless::Host::Domain(h_str.to_owned()),
+            };
+            FallbackDest::Tcp(host, port)
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+
+    let alpn = str_field(item, "alpn").to_owned();
+    let path = str_field(item, "path").to_owned();
+    let xver = item.get("xver").and_then(Value::as_u64).unwrap_or(0) as u8;
+
+    Some(Fallback {
+        alpn,
+        path,
+        dest,
+        xver,
+    })
 }
 
 fn parse_xhttp(x: &Value) -> Result<XhttpSettings, String> {
@@ -820,6 +897,37 @@ mod tests {
         assert_eq!(config.inbounds[1].shadowsocks_users.len(), 2);
         assert_eq!(config.inbounds[1].shadowsocks_users[0].email, "user1@ss");
         assert_eq!(config.inbounds[1].shadowsocks_users[1].email, "user2@ss");
+    }
+
+    #[test]
+    fn parses_fallbacks_inbound() {
+        let raw = r#"{
+          "inbounds": [
+            {
+              "tag": "vless-fallbacks",
+              "port": 443,
+              "protocol": "vless",
+              "settings": {
+                "clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+                "decryption": "none",
+                "fallbacks": [
+                  {"path": "/ray", "dest": "127.0.0.1:8001", "xver": 1},
+                  {"dest": "80"}
+                ]
+              }
+            }
+          ]
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.inbounds.len(), 1);
+        let inb = &config.inbounds[0];
+        assert_eq!(inb.fallbacks.len(), 2);
+        assert_eq!(inb.fallbacks[0].path, "/ray");
+        assert_eq!(inb.fallbacks[0].xver, 1);
+        assert!(matches!(inb.fallbacks[0].dest, FallbackDest::Tcp(_, 8001)));
+        assert_eq!(inb.fallbacks[1].path, "");
+        assert_eq!(inb.fallbacks[1].xver, 0);
+        assert!(matches!(inb.fallbacks[1].dest, FallbackDest::Tcp(_, 80)));
     }
 
     #[test]

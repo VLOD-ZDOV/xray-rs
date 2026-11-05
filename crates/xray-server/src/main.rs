@@ -2,6 +2,7 @@
 
 mod api;
 mod config;
+mod fallback;
 mod httpupgrade;
 mod inbound_proxy;
 mod log;
@@ -153,6 +154,7 @@ async fn run(config: Config, tls: Vec<Option<TlsAcceptor>>) -> Result<(), String
             users: RwLock::new(inbound.users),
             router: router.clone(),
             sniffing: inbound.sniffing,
+            fallbacks: inbound.fallbacks,
         });
         inbounds.insert(inbound.tag.clone(), ctx.clone());
         let is_ss_udp = inbound.protocol == InboundProtocol::Shadowsocks && inbound.udp;

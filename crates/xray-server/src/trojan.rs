@@ -159,7 +159,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let mut buf = Vec::with_capacity(512);
-    let (mut request, header_len, user) = timeout(HANDSHAKE_TIMEOUT, async {
+    let handshake_res = timeout(HANDSHAKE_TIMEOUT, async {
         let mut chunk = [0u8; 512];
         loop {
             let parsed = {
@@ -189,8 +189,17 @@ where
             buf.extend_from_slice(&chunk[..n]);
         }
     })
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "trojan handshake timeout"))??;
+    .await;
+
+    let (mut request, header_len, user) = match handshake_res {
+        Ok(Ok(parsed)) => parsed,
+        Err(_) | Ok(Err(_)) => {
+            if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, &buf) {
+                return crate::fallback::serve(uplink, downlink, fb, buf, peer, ctx.port).await;
+            }
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "trojan handshake failed"));
+        }
+    };
 
     let mut early = buf.split_off(header_len);
     let _online = stats::get().connect(&user.email, peer.ip());
