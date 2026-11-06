@@ -16,15 +16,15 @@ The server crate and every workspace crate it is built from (`xray-config`,
 
 | Area | Supported |
 |---|---|
-| Inbound protocols | VLESS (including XTLS Vision), VMess (AEAD), Trojan, Shadowsocks (AEAD and 2022, multi-user), SOCKS5, HTTP proxy, dokodemo-door |
-| Security | TLS (`minVersion`, `maxVersion`, `cipherSuites`, `rejectUnknownSni`), REALITY (dest mirroring and padding), or plain behind nginx |
-| Transports | XHTTP (packet-up, stream-up, stream-one, Xray 26 obfuscation settings, `responseHeaders`), raw TCP (including `header: http`), WebSocket (with early data), HTTPUpgrade, gRPC (gun and multi mode); `acceptProxyProtocol` |
-| VLESS / Trojan | TCP, UDP, Mux.Cool and XUDP; `fallbacks` by `path` with PROXY protocol v1/v2 |
-| Sniffing | `destOverride` `http`, `tls`, `quic`; `routeOnly`, `metadataOnly`, `domainsExcluded` |
-| Outbound | `freedom`, `blackhole`, `wireguard` (Cloudflare WARP), `socks`, `vless` (raw, WS, gRPC), `vmess`, `trojan`, `shadowsocks`, `http`, `dns`, `loopback`; balancers (`random`, `roundRobin`) |
+| Inbound protocols | VLESS (including XTLS Vision and VLESS encryption), VMess (AEAD), Trojan, Shadowsocks (AEAD and 2022, multi-user), Hysteria2, SOCKS 5/4a and HTTP proxy (`mixed`, with keep-alive), dokodemo-door / `tunnel` (including `followRedirect`) |
+| Security | TLS (`minVersion`, `maxVersion`, `cipherSuites`, `rejectUnknownSni`), REALITY (dest mirroring and padding, `mldsa65Seed`), or plain behind nginx |
+| Transports | XHTTP over HTTP/1.1 and HTTP/2 (packet-up, stream-up, stream-one, Xray 26 obfuscation settings, `responseHeaders`), raw TCP (including `header: http`), WebSocket (with early data), HTTPUpgrade, gRPC (gun and multi mode); `acceptProxyProtocol`; `sockopt` (`mark`, `interface`, `tcpFastOpen`, keepalive, `tcpCongestion`, `tcpUserTimeout`, `tcpMaxSeg`, `v6only`, `tcpMptcp`, `tproxy`) |
+| VLESS / Trojan | TCP, UDP, Mux.Cool and XUDP; `fallbacks` by `name`, `alpn` and `path` with PROXY protocol v1/v2 |
+| Sniffing | `destOverride` `http`, `tls`, `quic`, `fakedns`; `routeOnly`, `metadataOnly`, `domainsExcluded` |
+| Outbound | `freedom` / `direct` (every `domainStrategy`, `fragment`, `noises`, `redirect`), `blackhole` / `block`, `wireguard` (Cloudflare WARP), `socks`, `vless` (raw, WS, gRPC, TLS, REALITY, Vision), `vmess`, `trojan`, `shadowsocks`, `http`, `dns`, `loopback`; `sendThrough`, `proxySettings`, `mux`; balancers (`random`, `roundRobin`, `leastPing`, `leastLoad`) with `observatory` and `burstObservatory` |
 | Routing | `domain`, `geosite`, `ip`, `geoip`, `port`, `network`, `inboundTag`, `user`, `source`, `sourcePort`, `localPort`, `localIP`, `protocol`, `attrs`, `vlessRoute`, `balancerTag`; `domainStrategy` AsIs, IPIfNonMatch, IPOnDemand |
-| DNS and policy | built-in `dns` section (servers, `hosts`, `queryStrategy`); `policy` levels (timeouts, `bufferSize`, per-user stats and online tracking) |
-| 3x-ui | `-c`, `run -test -c`, `-version`; gRPC `StatsService`, `HandlerService` (users for VLESS, VMess, Trojan and Shadowsocks, `AddInbound`, `RemoveInbound`, `AddOutbound`, `RemoveOutbound`), `RoutingService`, `LoggerService`; the `log` section (`loglevel`, `access`, `error`, `maskAddress`, `dnsLog`) |
+| DNS and policy | built-in `dns` section (servers, `hosts`, `queryStrategy`), `fakedns`; `policy` levels (timeouts, `bufferSize`, per-user stats and online tracking) |
+| 3x-ui | `-c`, `run -test -c`, `-version`; gRPC `StatsService`, `HandlerService` (users for VLESS, VMess, Trojan and Shadowsocks, `AddInbound`, `RemoveInbound`, `AddOutbound`, `RemoveOutbound`), `RoutingService`, `LoggerService`, `ObservatoryService`; the `log` section (`loglevel`, `access`, `error`, `maskAddress`, `dnsLog`); `metrics` (`/debug/vars`); `version` |
 
 Tested against the official Xray-core 26.10.31 as client, outbound peer,
 WireGuard peer and `xray api` client.
@@ -57,9 +57,14 @@ to run noise.
 
 ## Not supported yet
 
-- Skipped with a warning: WireGuard inbound, XHTTP over HTTP/3, mKCP, fallbacks selected
-  by `name` or `alpn`.
-- `reverse`, `metrics`.
+- Skipped with a warning: XHTTP over HTTP/3, mKCP, the `hysteria`, `masque`
+  and `xdrive` transports, WireGuard and MASQUE inbounds, Hysteria and
+  MASQUE outbounds.
+- `reverse` (both the `reverse` section and VLESS users' `reverse`), `env`,
+  `geodata`, `transport`: skipped with a warning.
+- `sockopt` on outbounds other than `freedom`; `tcpWindowClamp` and
+  `customSockopt`.
+- `metrics` serves `/debug/vars` without Go's `memstats`, and no `pprof`.
 
 ## Build
 
