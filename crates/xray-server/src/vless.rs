@@ -298,12 +298,7 @@ impl Context {
     }
 }
 
-pub async fn serve<R, W>(
-    uplink: R,
-    downlink: W,
-    ctx: &Context,
-    peer: SocketAddr,
-) -> io::Result<()>
+pub async fn serve<R, W>(uplink: R, downlink: W, ctx: &Context, peer: SocketAddr) -> io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -321,11 +316,7 @@ where
     .await
 }
 
-pub async fn serve_stream<S>(
-    mut stream: S,
-    ctx: &Context,
-    peer: SocketAddr,
-) -> io::Result<()>
+pub async fn serve_stream<S>(mut stream: S, ctx: &Context, peer: SocketAddr) -> io::Result<()>
 where
     S: VisionStreamIo + Send + 'static,
 {
@@ -463,11 +454,7 @@ where
                 stream.flush().await?;
 
                 let client_stream = PrefixedStreamIo::new(stream, early);
-                let vision_client = VisionStream::new(
-                    client_stream,
-                    user.id,
-                    DEFAULT_VISION_SEED,
-                );
+                let vision_client = VisionStream::new(client_stream, user.id, DEFAULT_VISION_SEED);
                 let (mut client_r, mut client_w) = tokio::io::split(vision_client);
 
                 let target =

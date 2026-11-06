@@ -1,17 +1,21 @@
 //! REALITY Inbound implementation matching Xray-core / xtls/reality semantics.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, RwLock};
 use std::task::{ready, Context, Poll};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use aws_lc_rs::signature::KeyPair;
 use chacha20poly1305::ChaCha20Poly1305;
 use hmac::Mac;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
 use sha2::{Digest, Sha256, Sha384};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -251,6 +255,268 @@ struct DestHandshake {
     handshake_lens: [usize; 7],
 }
 
+pub static GLOBAL_POST_HANDSHAKE_RECORDS_LENS: LazyLock<
+    RwLock<HashMap<String, Option<Vec<usize>>>>,
+> = LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn compute_nonce(iv: &[u8; 12], seq: u64) -> [u8; 12] {
+    let mut nonce = *iv;
+    let seq_bytes = seq.to_be_bytes();
+    for i in 0..8 {
+        nonce[4 + i] ^= seq_bytes[i];
+    }
+    nonce
+}
+
+#[derive(Debug)]
+struct NoCertVerifier {
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl ServerCertVerifier for NoCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+struct PostHandshakeRecordDetectStream<S> {
+    inner: S,
+    ccs_sent: bool,
+}
+
+impl<S> PostHandshakeRecordDetectStream<S> {
+    fn new(inner: S) -> Self {
+        Self {
+            inner,
+            ccs_sent: false,
+        }
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PostHandshakeRecordDetectStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if buf.len() >= 3 && buf[..3] == [20, 3, 3] {
+            self.ccs_sent = true;
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PostHandshakeRecordDetectStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        if !self.ccs_sent {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        } else {
+            Poll::Ready(Ok(()))
+        }
+    }
+}
+
+async fn connect_dest_stream(dest: &FallbackDest) -> io::Result<Box<dyn Stream>> {
+    let s: Box<dyn Stream> = match dest {
+        FallbackDest::Tcp(host, port) => {
+            let stream = match host {
+                crate::vless::Host::Ip(ip) => TcpStream::connect((*ip, *port)).await?,
+                crate::vless::Host::Domain(name) => {
+                    TcpStream::connect((name.as_str(), *port)).await?
+                }
+            };
+            let _ = stream.set_nodelay(true);
+            Box::new(stream)
+        }
+        FallbackDest::Unix(path) => Box::new(crate::fallback::connect_unix(path).await?),
+    };
+    Ok(s)
+}
+
+async fn probe_dest_post_handshake_lens(
+    dest: &FallbackDest,
+    xver: u8,
+    sni: &str,
+    alpn: u8,
+) -> io::Result<Vec<usize>> {
+    let mut stream = connect_dest_stream(dest).await?;
+
+    if xver > 0 {
+        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        crate::fallback::write_proxy_header(&mut stream, xver, peer, 443).await?;
+    }
+
+    let alpn_list: Vec<Vec<u8>> = match alpn {
+        2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+        1 => vec![b"http/1.1".to_vec()],
+        _ => vec![],
+    };
+
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+    let mut client_config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoCertVerifier { provider }))
+        .with_no_client_auth();
+    client_config.alpn_protocols = alpn_list;
+
+    let server_name = ServerName::try_from(sni.to_string())
+        .or_else(|_| ServerName::try_from("localhost".to_string()))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+    let detect_stream = PostHandshakeRecordDetectStream::new(stream);
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+    let tls_stream = tokio::time::timeout(
+        Duration::from_secs(3),
+        connector.connect(server_name, detect_stream),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "handshake timed out"))?
+    .map_err(|e| io::Error::new(io::ErrorKind::ConnectionReset, e.to_string()))?;
+
+    let (mut detect_stream, _) = tls_stream.into_inner();
+
+    let mut raw_buf = Vec::new();
+    let mut tmp = [0u8; 4096];
+    let timeout = Duration::from_secs(2);
+    let start = tokio::time::Instant::now();
+
+    while start.elapsed() < timeout {
+        let remaining = timeout.saturating_sub(start.elapsed());
+        match tokio::time::timeout(remaining, detect_stream.inner.read(&mut tmp)).await {
+            Ok(Ok(n)) if n > 0 => {
+                raw_buf.extend_from_slice(&tmp[..n]);
+                let mut offset = 0;
+                let mut complete = false;
+                while offset + 5 <= raw_buf.len() && raw_buf[offset..offset + 3] == [23, 3, 3] {
+                    let rlen =
+                        u16::from_be_bytes([raw_buf[offset + 3], raw_buf[offset + 4]]) as usize;
+                    if offset + 5 + rlen <= raw_buf.len() {
+                        offset += 5 + rlen;
+                        complete = true;
+                    } else {
+                        break;
+                    }
+                }
+                if complete && offset == raw_buf.len() {
+                    let _ = tokio::time::timeout(
+                        Duration::from_millis(100),
+                        detect_stream.inner.read(&mut tmp),
+                    )
+                    .await;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    let mut post_handshake_lens = Vec::new();
+    let mut data = &raw_buf[..];
+    while data.len() >= 5 && data[..3] == [23, 3, 3] {
+        let rlen = u16::from_be_bytes([data[3], data[4]]) as usize;
+        let total_len = 5 + rlen;
+        if total_len > data.len() {
+            break;
+        }
+        post_handshake_lens.push(total_len);
+        data = &data[total_len..];
+    }
+
+    Ok(post_handshake_lens)
+}
+
+pub fn detect_post_handshake_records_lens(settings: Arc<RealityInboundSettings>) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    handle.spawn(async move {
+        for sni in &settings.server_names {
+            for alpn in 0..3 {
+                let dest_str = settings.dest.to_string();
+                let key = format!("{dest_str} {sni} {alpn}");
+                {
+                    let mut map = GLOBAL_POST_HANDSHAKE_RECORDS_LENS.write().unwrap();
+                    if map.contains_key(&key) {
+                        continue;
+                    }
+                    map.insert(key.clone(), None);
+                }
+
+                let settings_clone = Arc::clone(&settings);
+                let sni = sni.clone();
+                let key = key.clone();
+                tokio::spawn(async move {
+                    let lens = probe_dest_post_handshake_lens(
+                        &settings_clone.dest,
+                        settings_clone.xver,
+                        &sni,
+                        alpn,
+                    )
+                    .await;
+                    let mut map = GLOBAL_POST_HANDSHAKE_RECORDS_LENS.write().unwrap();
+                    map.insert(key, Some(lens.unwrap_or_default()));
+                });
+            }
+        }
+    });
+}
+
 impl RealityServer {
     pub fn new(
         settings: RealityInboundSettings,
@@ -277,8 +543,11 @@ impl RealityServer {
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         };
 
+        let settings_arc = Arc::new(settings);
+        detect_post_handshake_records_lens(Arc::clone(&settings_arc));
+
         Ok(Self {
-            settings: Arc::new(settings),
+            settings: settings_arc,
             ed25519_key_pair: Arc::new(key_pair),
             ed25519_pub,
             alpn_protocols,
@@ -287,20 +556,7 @@ impl RealityServer {
     }
 
     async fn connect_dest(&self) -> io::Result<Box<dyn Stream>> {
-        let dest: Box<dyn Stream> = match &self.settings.dest {
-            FallbackDest::Tcp(host, port) => {
-                let stream = match host {
-                    crate::vless::Host::Ip(ip) => TcpStream::connect((*ip, *port)).await?,
-                    crate::vless::Host::Domain(name) => {
-                        TcpStream::connect((name.as_str(), *port)).await?
-                    }
-                };
-                let _ = stream.set_nodelay(true);
-                Box::new(stream)
-            }
-            FallbackDest::Unix(path) => Box::new(crate::fallback::connect_unix(path).await?),
-        };
-        Ok(dest)
+        connect_dest_stream(&self.settings.dest).await
     }
 
     pub async fn handle<S>(
@@ -918,6 +1174,69 @@ impl RealityServer {
             return Err(io::Error::other("client Finished verify_data mismatch"));
         }
 
+        let mut server_seq: u64 = 0;
+
+        let client_alpns = find_client_alpn(client_hello_payload);
+        let alpn_code = if client_alpns.is_empty() {
+            0
+        } else if client_alpns[0] == b"h2" {
+            2
+        } else {
+            1
+        };
+        let client_hello =
+            xray_transport::reality::parse_reality_client_hello(client_hello_payload).ok();
+        let sni = client_hello
+            .as_ref()
+            .and_then(|ch| ch.server_name.as_deref())
+            .unwrap_or("");
+        let key = format!("{} {} {}", self.settings.dest, sni, alpn_code);
+
+        let cached_lens = {
+            let map = GLOBAL_POST_HANDSHAKE_RECORDS_LENS.read().unwrap();
+            map.get(&key).cloned().flatten()
+        };
+        let lens = match cached_lens {
+            Some(l) => l,
+            None => {
+                let probed = probe_dest_post_handshake_lens(
+                    &self.settings.dest,
+                    self.settings.xver,
+                    sni,
+                    alpn_code,
+                )
+                .await
+                .unwrap_or_default();
+                let mut map = GLOBAL_POST_HANDSHAKE_RECORDS_LENS.write().unwrap();
+                map.insert(key, Some(probed.clone()));
+                probed
+            }
+        };
+
+        for length in lens {
+            if length >= 22 {
+                let pt_len = length - 21;
+                let mut pt = vec![0u8; pt_len];
+                pt[0] = 0x17; // ApplicationData
+                let nonce = compute_nonce(&server_app_iv, server_seq);
+                server_seq += 1;
+                let mut header = [0u8; 5];
+                header[0] = 0x17;
+                header[1] = 0x03;
+                header[2] = 0x03;
+                let ct_len = (length - 5) as u16;
+                header[3] = (ct_len >> 8) as u8;
+                header[4] = (ct_len & 0xff) as u8;
+                let ciphertext = aead_encrypt(cipher, &server_app_key, &nonce, &header, &pt);
+                stream.write_all(&header).await?;
+                stream.write_all(&ciphertext).await?;
+                if self.settings.show {
+                    log::info(format!("REALITY len(postHandshakeRecord): {length}"));
+                }
+            }
+        }
+        stream.flush().await?;
+
         Ok(Tls13Stream {
             inner: stream,
             cipher,
@@ -926,7 +1245,7 @@ impl RealityServer {
             client_seq: 0,
             server_app_key,
             server_app_iv,
-            server_seq: 0,
+            server_seq,
             read_buf: Vec::new(),
             read_buf_pos: 0,
             raw_read_buf: Vec::new(),
@@ -1643,16 +1962,19 @@ mod tests {
 
         // Mock dest server
         tokio::spawn(async move {
-            let (mut socket, _) = dest_listener.accept().await.unwrap();
-            let mut buf = [0u8; 64];
-            let n = socket.read(&mut buf).await.unwrap();
-            assert!(std::str::from_utf8(&buf[..n])
-                .unwrap()
-                .contains("GET /probe"));
-            socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
-                .await
-                .unwrap();
+            while let Ok((mut socket, _)) = dest_listener.accept().await {
+                let mut buf = [0u8; 1024];
+                if let Ok(n) = socket.read(&mut buf).await {
+                    if let Ok(s) = std::str::from_utf8(&buf[..n]) {
+                        if s.contains("GET /probe") {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                                .await;
+                            break;
+                        }
+                    }
+                }
+            }
         });
 
         let settings = RealityInboundSettings {
@@ -1694,5 +2016,63 @@ mod tests {
         assert!(std::str::from_utf8(&resp_bytes)
             .unwrap()
             .contains("HTTP/1.1 200 OK"));
+    }
+
+    #[tokio::test]
+    async fn test_reality_post_handshake_records_lens_probe() {
+        use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["test.local".to_string()]).unwrap();
+        let cert_der = cert.der().to_vec();
+        let key_der = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(signing_key.serialize_der()));
+
+        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der.into()], key_der)
+            .unwrap();
+
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dest_port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(sock).await.unwrap();
+            // Send 2 dummy post-handshake records with exact lengths 120 and 180
+            // Outer header is 23 03 03 len_hi len_lo
+            let mut r1 = vec![0u8; 120];
+            r1[0] = 23;
+            r1[1] = 3;
+            r1[2] = 3;
+            let ct_len1 = 120 - 5;
+            r1[3] = (ct_len1 >> 8) as u8;
+            r1[4] = (ct_len1 & 0xff) as u8;
+
+            let mut r2 = vec![0u8; 180];
+            r2[0] = 23;
+            r2[1] = 3;
+            r2[2] = 3;
+            let ct_len2 = 180 - 5;
+            r2[3] = (ct_len2 >> 8) as u8;
+            r2[4] = (ct_len2 & 0xff) as u8;
+
+            let (raw, _) = tls.get_mut();
+            raw.write_all(&r1).await.unwrap();
+            raw.write_all(&r2).await.unwrap();
+            raw.flush().await.unwrap();
+        });
+
+        let dest = FallbackDest::Tcp(
+            crate::vless::Host::Ip("127.0.0.1".parse().unwrap()),
+            dest_port,
+        );
+        let lens = probe_dest_post_handshake_lens(&dest, 0, "test.local", 2)
+            .await
+            .unwrap();
+        // 184 is rustls server's automatic NewSessionTicket, followed by the two dummy records
+        assert_eq!(lens, vec![184, 120, 180]);
     }
 }

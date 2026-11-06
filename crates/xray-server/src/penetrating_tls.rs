@@ -298,7 +298,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for ServerPenetratingTlsStrea
         let this = self.get_mut();
         match &mut this.state {
             ServerPenetratingTlsState::Tls(Some(stream))
-            | ServerPenetratingTlsState::ReadDirect { stream, .. } => Pin::new(stream).poll_flush(cx),
+            | ServerPenetratingTlsState::ReadDirect { stream, .. } => {
+                Pin::new(stream).poll_flush(cx)
+            }
             ServerPenetratingTlsState::Tls(None) => {
                 Poll::Ready(Err(io::Error::other("TLS stream was already taken")))
             }

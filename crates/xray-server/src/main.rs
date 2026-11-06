@@ -614,12 +614,14 @@ async fn accept_loop(
                 match (tls, http_obfs) {
                     (Some(acceptor), _) => {
                         let captured = penetrating_tls::CapturedStream::new(stream);
-                        match tokio::time::timeout(handshake_timeout, acceptor.accept(captured)).await
+                        match tokio::time::timeout(handshake_timeout, acceptor.accept(captured))
+                            .await
                         {
                             Ok(Ok(tls_stream)) => {
                                 let penetrating =
                                     penetrating_tls::ServerPenetratingTlsStream::new(tls_stream);
-                                dispatch(InboundStream::Tls(penetrating), peer, local, handler).await
+                                dispatch(InboundStream::Tls(penetrating), peer, local, handler)
+                                    .await
                             }
                             Ok(Err(e)) => log::debug(format!(
                                 "tls handshake from {} failed: {e}",
@@ -639,7 +641,8 @@ async fn accept_loop(
                         .await
                         {
                             Ok(Ok(stream)) => {
-                                dispatch(InboundStream::HttpObfs(stream), peer, local, handler).await
+                                dispatch(InboundStream::HttpObfs(stream), peer, local, handler)
+                                    .await
                             }
                             Ok(Err(e)) => log::debug(format!(
                                 "http obfs from {} failed: {e}",

@@ -80,6 +80,22 @@ pub enum FallbackDest {
     Unix(String),
 }
 
+impl std::fmt::Display for FallbackDest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FallbackDest::Tcp(crate::vless::Host::Ip(ip), port) => {
+                if ip.is_ipv6() {
+                    write!(f, "[{ip}]:{port}")
+                } else {
+                    write!(f, "{ip}:{port}")
+                }
+            }
+            FallbackDest::Tcp(crate::vless::Host::Domain(d), port) => write!(f, "{d}:{port}"),
+            FallbackDest::Unix(path) => write!(f, "{path}"),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Inbound {
     pub tag: String,
