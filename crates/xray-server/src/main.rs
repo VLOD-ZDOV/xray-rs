@@ -76,7 +76,7 @@ fn main() -> ExitCode {
                 return ExitCode::SUCCESS;
             }
             "run" if !arg.starts_with('-') => {}
-            "test" => test_only = true,
+            "t" | "test" => test_only = true,
             "c" | "config" => config_path = iter.next().map(str::to_owned),
             other if other.starts_with("config=") || other.starts_with("c=") => {
                 config_path = other.split_once('=').map(|(_, v)| v.to_owned());

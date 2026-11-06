@@ -969,9 +969,25 @@ fn ed25519_algorithm_identifier() -> Vec<u8> {
     vec![0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70]
 }
 
+fn der_object_identifier(bytes: &[u8]) -> Vec<u8> {
+    der_tlv(0x06, bytes)
+}
+
+fn der_octet_string(bytes: &[u8]) -> Vec<u8> {
+    der_tlv(0x04, bytes)
+}
+
 pub fn generate_reality_certificate_der(
     auth_key: &[u8; 32],
     ed25519_public_key: &[u8; 32],
+) -> Vec<u8> {
+    generate_reality_certificate_der_with_mldsa65(auth_key, ed25519_public_key, None)
+}
+
+pub fn generate_reality_certificate_der_with_mldsa65(
+    auth_key: &[u8; 32],
+    ed25519_public_key: &[u8; 32],
+    mldsa65_signature: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut mac = <HmacSha512 as KeyInit>::new_from_slice(auth_key)
         .expect("HMAC-SHA512 accepts any key length");
@@ -998,6 +1014,16 @@ pub fn generate_reality_certificate_der(
     tbs_content.extend_from_slice(&validity);
     tbs_content.extend_from_slice(&[0x30, 0x00]); // empty subject
     tbs_content.extend_from_slice(&spki);
+
+    if let Some(sig) = mldsa65_signature {
+        let mut extension_content = Vec::new();
+        extension_content.extend_from_slice(&der_object_identifier(&[0]));
+        extension_content.extend_from_slice(&der_octet_string(sig));
+        let extension = der_sequence(&extension_content);
+        let extensions = der_sequence(&extension);
+        push_der_tlv(&mut tbs_content, 0xa3, &extensions);
+    }
+
     let tbs = der_sequence(&tbs_content);
 
     let mut cert_content = Vec::new();

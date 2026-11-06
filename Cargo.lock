@@ -3243,6 +3243,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "ml-dsa",
  "prost",
  "quinn",
  "quinn-proto",

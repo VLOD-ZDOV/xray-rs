@@ -164,6 +164,7 @@ pub struct RealityInboundSettings {
     pub xver: u8,
     pub show: bool,
     pub alpn: Vec<String>,
+    pub mldsa65_seed: Option<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1032,26 +1033,7 @@ fn parse_version_opt(v: &Value) -> Option<Result<[u8; 3], String>> {
     }
 }
 
-fn parse_reality(reality: &Value, tag: &str) -> Result<Option<RealityInboundSettings>, String> {
-    if let Some(seed) = reality
-        .get("mldsa65Seed")
-        .or_else(|| reality.get("mldsa65_seed"))
-    {
-        if let Some(s) = seed.as_str() {
-            if !s.is_empty() {
-                log::warn(format!(
-                    "skipping inbound {tag:?}: realitySettings.mldsa65Seed is not supported"
-                ));
-                return Ok(None);
-            }
-        } else if !seed.is_null() {
-            log::warn(format!(
-                "skipping inbound {tag:?}: realitySettings.mldsa65Seed is not supported"
-            ));
-            return Ok(None);
-        }
-    }
-
+fn parse_reality(reality: &Value, _tag: &str) -> Result<Option<RealityInboundSettings>, String> {
     let dest = parse_dest(reality.get("dest"))?;
 
     let mut server_names = Vec::new();
@@ -1078,6 +1060,32 @@ fn parse_reality(reality: &Value, tag: &str) -> Result<Option<RealityInboundSett
         return Err("realitySettings: missing privateKey".into());
     }
     let private_key = decode_base64_32(priv_str)?;
+
+    let mldsa65_seed_str = reality
+        .get("mldsa65Seed")
+        .or_else(|| reality.get("mldsa65_seed"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let mldsa65_seed = if !mldsa65_seed_str.is_empty() {
+        if mldsa65_seed_str == priv_str {
+            return Err(format!(
+                "\"mldsa65Seed\" and \"privateKey\" can not be the same value: {mldsa65_seed_str}"
+            ));
+        }
+        let decoded = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            mldsa65_seed_str,
+        )
+        .map_err(|_| format!("invalid \"mldsa65Seed\": {mldsa65_seed_str}"))?;
+        if decoded.len() != 32 {
+            return Err(format!("invalid \"mldsa65Seed\": {mldsa65_seed_str}"));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&decoded);
+        Some(arr)
+    } else {
+        None
+    };
 
     let mut short_ids = Vec::new();
     let short_id_arr = array(reality, "shortIds");
@@ -1130,6 +1138,7 @@ fn parse_reality(reality: &Value, tag: &str) -> Result<Option<RealityInboundSett
         xver,
         show,
         alpn,
+        mldsa65_seed,
     }))
 }
 
@@ -2099,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn skips_reality_inbound_with_mldsa65_seed() {
+    fn parses_reality_inbound_with_mldsa65_seed() {
         let raw_with_seed = r#"{
           "inbounds": [
             {
@@ -2120,7 +2129,58 @@ mod tests {
           ]
         }"#;
         let inbounds = parse(raw_with_seed).unwrap().inbounds;
-        assert_eq!(inbounds.len(), 0);
+        assert_eq!(inbounds.len(), 1);
+        assert!(inbounds[0].reality.as_ref().unwrap().mldsa65_seed.is_some());
+
+        let raw_same_seed = r#"{
+          "inbounds": [
+            {
+              "tag": "reality-same-seed",
+              "port": 443,
+              "protocol": "vless",
+              "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                  "dest": "www.yahoo.com:443",
+                  "serverNames": ["www.yahoo.com"],
+                  "privateKey": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10",
+                  "mldsa65Seed": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10"
+                }
+              }
+            }
+          ]
+        }"#;
+        let err = match parse(raw_same_seed) {
+            Err(e) => e,
+            Ok(_) => panic!("expected err"),
+        };
+        assert!(err.contains("\"mldsa65Seed\" and \"privateKey\" can not be the same value"));
+
+        let raw_invalid_seed = r#"{
+          "inbounds": [
+            {
+              "tag": "reality-invalid-seed",
+              "port": 443,
+              "protocol": "vless",
+              "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                  "dest": "www.yahoo.com:443",
+                  "serverNames": ["www.yahoo.com"],
+                  "privateKey": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10",
+                  "mldsa65Seed": "not-valid-base64!"
+                }
+              }
+            }
+          ]
+        }"#;
+        let err = match parse(raw_invalid_seed) {
+            Err(e) => e,
+            Ok(_) => panic!("expected err"),
+        };
+        assert!(err.contains("invalid \"mldsa65Seed\""));
 
         let raw_empty_seed = r#"{
           "inbounds": [
@@ -2143,6 +2203,7 @@ mod tests {
         }"#;
         let inbounds = parse(raw_empty_seed).unwrap().inbounds;
         assert_eq!(inbounds.len(), 1);
+        assert!(inbounds[0].reality.as_ref().unwrap().mldsa65_seed.is_none());
     }
 
     #[test]

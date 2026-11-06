@@ -58,7 +58,7 @@ to run noise.
 ## Not supported yet
 
 - Skipped with a warning: WireGuard inbound, XHTTP over HTTP/3, mKCP, fallbacks selected
-  by `name` or `alpn`, fakedns, `realitySettings.mldsa65Seed`.
+  by `name` or `alpn`, fakedns.
 - `policy` levels other than 0, `reverse`, `metrics`, observatory and the
   `leastPing` / `leastLoad` balancer strategies.
 

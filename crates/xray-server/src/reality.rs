@@ -31,6 +31,7 @@ pub struct RealityServer {
     ed25519_pub: [u8; 32],
     alpn_protocols: Vec<Vec<u8>>,
     inbound_port: u16,
+    mldsa65_key: Option<ml_dsa::SigningKey<ml_dsa::MlDsa65>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -543,6 +544,11 @@ impl RealityServer {
             vec![b"h2".to_vec(), b"http/1.1".to_vec()]
         };
 
+        let mldsa65_key = settings
+            .mldsa65_seed
+            .as_ref()
+            .map(|seed| ml_dsa::SigningKey::<ml_dsa::MlDsa65>::from_seed(&(*seed).into()));
+
         let settings_arc = Arc::new(settings);
         detect_post_handshake_records_lens(Arc::clone(&settings_arc));
 
@@ -552,6 +558,7 @@ impl RealityServer {
             ed25519_pub,
             alpn_protocols,
             inbound_port,
+            mldsa65_key,
         })
     }
 
@@ -1035,8 +1042,23 @@ impl RealityServer {
         transcript.update(&ee_msg);
 
         // 5. Construct Certificate
-        let cert_der =
-            xray_transport::reality::generate_reality_certificate_der(auth_key, &self.ed25519_pub);
+        let cert_der = if let Some(mldsa_key) = &self.mldsa65_key {
+            use ml_dsa::Signer;
+            let mut mac = <hmac::Hmac<sha2::Sha512> as hmac::KeyInit>::new_from_slice(auth_key)
+                .expect("HMAC-SHA512 accepts any key length");
+            mac.update(&self.ed25519_pub);
+            mac.update(client_hello_payload);
+            mac.update(&server_hello_msg);
+            let message = mac.finalize().into_bytes();
+            let mldsa_sig = mldsa_key.sign(message.as_slice());
+            xray_transport::reality::generate_reality_certificate_der_with_mldsa65(
+                auth_key,
+                &self.ed25519_pub,
+                Some(&mldsa_sig.encode()),
+            )
+        } else {
+            xray_transport::reality::generate_reality_certificate_der(auth_key, &self.ed25519_pub)
+        };
         let cert_msg = build_certificate_msg(&cert_der);
         transcript.update(&cert_msg);
 
@@ -1369,15 +1391,18 @@ fn build_certificate_msg(cert_der: &[u8]) -> Vec<u8> {
 
     let mut msg = Vec::with_capacity(4 + body_len);
     msg.push(0x0b); // Certificate
-    msg.push(0);
-    msg.extend_from_slice(&(body_len as u16).to_be_bytes());
+    msg.push((body_len >> 16) as u8);
+    msg.push((body_len >> 8) as u8);
+    msg.push(body_len as u8);
     msg.push(0); // request context len 0
-    msg.push(0); // list len (24 bit)
-    msg.extend_from_slice(&(list_len as u16).to_be_bytes());
+    msg.push((list_len >> 16) as u8);
+    msg.push((list_len >> 8) as u8);
+    msg.push(list_len as u8);
 
     // Single cert entry
-    msg.push(0); // cert len (24 bit)
-    msg.extend_from_slice(&(cert_der.len() as u16).to_be_bytes());
+    msg.push((cert_der.len() >> 16) as u8);
+    msg.push((cert_der.len() >> 8) as u8);
+    msg.push(cert_der.len() as u8);
     msg.extend_from_slice(cert_der);
     msg.extend_from_slice(&[0x00, 0x00]); // extensions len 0
     msg
@@ -2149,6 +2174,7 @@ mod tests {
             xver: 0,
             show: false,
             alpn: vec!["h2".to_string()],
+            mldsa65_seed: None,
         };
         let srv = RealityServer::new(settings, 443, false, false).unwrap();
         assert_eq!(srv.ed25519_pub.len(), 32);
@@ -2191,6 +2217,7 @@ mod tests {
             xver: 0,
             show: false,
             alpn: vec![],
+            mldsa65_seed: None,
         };
         let srv = RealityServer::new(settings, 8443, false, false).unwrap();
 

@@ -821,6 +821,37 @@ mod reality_tests {
     }
 
     #[test]
+    fn generate_reality_certificate_der_with_mldsa65_verifies() {
+        use xray_transport::reality::generate_reality_certificate_der_with_mldsa65;
+        let auth_key = [0x31; 32];
+        let public_key = [0x42; 32];
+        let client_hello = b"\x01\x00\x00\x20client hello";
+        let server_hello = b"\x02\x00\x00\x20server hello";
+        let seed = [0x42; 32];
+        let signing_key = SigningKey::<MlDsa65>::from_seed(&seed.into());
+        let verifying_key = signing_key.verifying_key();
+        let mut mac = <HmacSha512 as KeyInit>::new_from_slice(&auth_key).unwrap();
+        mac.update(&public_key);
+        mac.update(client_hello);
+        mac.update(server_hello);
+        let mldsa65_signature = signing_key.sign(mac.finalize().into_bytes().as_slice());
+        let leaf_der = generate_reality_certificate_der_with_mldsa65(
+            &auth_key,
+            &public_key,
+            Some(&mldsa65_signature.encode()),
+        );
+        let encoded_key: EncodedVerifyingKey<MlDsa65> = verifying_key.encode();
+        let mldsa = RealityMldsa65CertificateInput {
+            verifying_key: encoded_key.as_slice(),
+            client_hello,
+            server_hello,
+        };
+        let result =
+            verify_reality_certificate_der_with_mldsa65(&auth_key, &leaf_der, Some(mldsa)).unwrap();
+        assert_eq!(result, RealityCertificateVerification::Verified);
+    }
+
+    #[test]
     fn reality_certificate_der_adapter_rejects_changed_mldsa65_signature_message() {
         let auth_key = [0x31; 32];
         let public_key = [0x42; 32];

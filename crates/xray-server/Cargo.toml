@@ -31,6 +31,7 @@ aws-lc-rs.workspace = true
 aes-gcm.workspace = true
 blake2.workspace = true
 chacha20poly1305.workspace = true
+ml-dsa.workspace = true
 h3.workspace = true
 h3-quinn.workspace = true
 hkdf.workspace = true
