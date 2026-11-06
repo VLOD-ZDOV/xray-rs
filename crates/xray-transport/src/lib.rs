@@ -21,6 +21,7 @@ use std::os::windows::io::AsRawSocket;
 mod connected_quic;
 
 mod dialer;
+pub mod fake_dns;
 mod fragment;
 pub use fragment::TcpFragmentConfig;
 mod dns;

@@ -24,6 +24,7 @@ pub struct Config {
     pub router: Router,
     pub dns: Option<xray_config::DnsConfig>,
     pub policy: policy::PolicySettings,
+    pub fakedns: Option<crate::fakedns::FakeDnsMulti>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -285,6 +286,7 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         None => None,
     };
     let policy = policy::PolicySettings::from_config(&root);
+    let fakedns = parse_fakedns(&root, dns.as_ref(), &inbounds)?;
     Ok(Config {
         log,
         api,
@@ -293,6 +295,7 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         router,
         dns,
         policy,
+        fakedns,
     })
 }
 
@@ -870,6 +873,97 @@ fn inline_or_file(cert: &Value, inline_key: &str, file_key: &str) -> Result<Vec<
     fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))
 }
 
+fn parse_fakedns_pool(item: &Value) -> Result<crate::fakedns::FakeDnsPoolConfig, String> {
+    let ip_pool = str_field(item, "ipPool");
+    if ip_pool.is_empty() {
+        return Err("invalid fakeDNS setting".to_owned());
+    }
+    let pool_size = item
+        .get("poolSize")
+        .and_then(Value::as_u64)
+        .unwrap_or(65535) as usize;
+    if pool_size == 0 {
+        return Err("invalid fakeDNS setting".to_owned());
+    }
+    Ok(crate::fakedns::FakeDnsPoolConfig {
+        ip_pool: ip_pool.to_owned(),
+        pool_size,
+    })
+}
+
+fn parse_fakedns(
+    root: &Value,
+    dns: Option<&xray_config::DnsConfig>,
+    inbounds: &[Inbound],
+) -> Result<Option<crate::fakedns::FakeDnsMulti>, String> {
+    let mut pools = Vec::new();
+    if let Some(fakedns_val) = root.get("fakedns") {
+        match fakedns_val {
+            Value::Object(_) => {
+                pools.push(parse_fakedns_pool(fakedns_val)?);
+            }
+            Value::Array(arr) => {
+                for item in arr {
+                    pools.push(parse_fakedns_pool(item)?);
+                }
+            }
+            _ => return Err("invalid fakedns config".to_owned()),
+        }
+    } else {
+        let fake_dns_in_use = dns.is_some_and(|d| {
+            d.servers.iter().any(|s| match s.endpoint() {
+                xray_config::DnsServerEndpoint::Domain { domain, .. } => {
+                    domain.eq_ignore_ascii_case("fakedns")
+                }
+                _ => false,
+            })
+        });
+        if fake_dns_in_use {
+            let strategy = dns
+                .map(|d| d.query_strategy)
+                .unwrap_or(xray_config::DnsQueryStrategy::UseIp);
+            match strategy {
+                xray_config::DnsQueryStrategy::UseIp => {
+                    pools.push(crate::fakedns::FakeDnsPoolConfig {
+                        ip_pool: "198.18.0.0/15".to_owned(),
+                        pool_size: 32768,
+                    });
+                    pools.push(crate::fakedns::FakeDnsPoolConfig {
+                        ip_pool: "fc00::/18".to_owned(),
+                        pool_size: 32768,
+                    });
+                }
+                xray_config::DnsQueryStrategy::UseIpv4 => {
+                    pools.push(crate::fakedns::FakeDnsPoolConfig {
+                        ip_pool: "198.18.0.0/15".to_owned(),
+                        pool_size: 65535,
+                    });
+                }
+                xray_config::DnsQueryStrategy::UseIpv6 => {
+                    pools.push(crate::fakedns::FakeDnsPoolConfig {
+                        ip_pool: "fc00::/18".to_owned(),
+                        pool_size: 65535,
+                    });
+                }
+            }
+        }
+    }
+
+    if pools.is_empty() {
+        return Ok(None);
+    }
+
+    let has_fakedns_sniffer = inbounds.iter().any(|inbound| {
+        inbound.sniffing.enabled() && (inbound.sniffing.fakedns || inbound.sniffing.fakedns_other)
+    });
+    if !has_fakedns_sniffer {
+        log::warn("Defined FakeDNS but haven't enabled FakeDNS destOverride at any inbound.");
+    }
+
+    let multi = crate::fakedns::FakeDnsMulti::from_configs(&pools)?;
+    Ok(Some(multi))
+}
+
 fn parse_sniffing(item: &Value, tag: &str) -> crate::vless::Sniffing {
     let mut sniffing = crate::vless::Sniffing::default();
     let flag = |key| item.get(key).and_then(Value::as_bool).unwrap_or(false);
@@ -884,7 +978,8 @@ fn parse_sniffing(item: &Value, tag: &str) -> crate::vless::Sniffing {
             "http" => sniffing.http = true,
             "tls" => sniffing.tls = true,
             "quic" => sniffing.quic = true,
-            "fakedns" | "fakedns+others" => {} // reserved for future fakedns
+            "fakedns" => sniffing.fakedns = true,
+            "fakedns+others" => sniffing.fakedns_other = true,
             other => ignored.push(other),
         }
     }
@@ -1751,6 +1846,8 @@ mod tests {
             http: false,
             tls: true,
             quic: true,
+            fakedns: false,
+            fakedns_other: false,
             route_only: true,
             metadata_only: false,
             domains_excluded: std::sync::Arc::new(Vec::new()),

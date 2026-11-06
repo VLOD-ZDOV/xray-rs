@@ -161,14 +161,24 @@ pub struct Sniffing {
     pub http: bool,
     pub tls: bool,
     pub quic: bool,
+    pub fakedns: bool,
+    pub fakedns_other: bool,
     pub route_only: bool,
     pub metadata_only: bool,
     pub domains_excluded: std::sync::Arc<Vec<String>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SniffOutput {
+    pub domain: String,
+    pub protocol: &'static str,
+    pub is_fake_ip: bool,
+}
+
 impl Sniffing {
     pub fn enabled(&self) -> bool {
-        (self.http || self.tls || self.quic) && !self.metadata_only
+        (self.http || self.tls || self.quic || self.fakedns || self.fakedns_other)
+            && (!self.metadata_only || self.fakedns || self.fakedns_other)
     }
 
     pub fn is_excluded(&self, domain: &str) -> bool {
@@ -180,6 +190,65 @@ impl Sniffing {
         })
     }
 
+    pub fn sniff(&self, payload: &[u8], host: &Host) -> Option<SniffOutput> {
+        if let Host::Ip(ip) = host {
+            if self.fakedns || self.fakedns_other {
+                if let Some(domain) = crate::fakedns::get_domain_from_fake_ip(ip) {
+                    if !self.is_excluded(&domain) {
+                        return Some(SniffOutput {
+                            domain,
+                            protocol: "fakedns",
+                            is_fake_ip: true,
+                        });
+                    }
+                }
+            }
+            if self.fakedns_other && crate::fakedns::is_ip_in_pool(ip) {
+                if !self.metadata_only {
+                    let sniffed = routing::sniff_tls_sni(payload)
+                        .or_else(|| routing::sniff_http_host(payload));
+                    if let Some(domain) = sniffed {
+                        if !self.is_excluded(&domain) {
+                            return Some(SniffOutput {
+                                domain,
+                                protocol: "fakedns+others",
+                                is_fake_ip: true,
+                            });
+                        }
+                    }
+                }
+                return None;
+            }
+        }
+
+        if self.metadata_only {
+            return None;
+        }
+
+        let tls = self.tls.then(|| routing::sniff_tls_sni(payload)).flatten();
+        let sniffed = tls.map(|d| (d, "tls")).or_else(|| {
+            self.http
+                .then(|| routing::sniff_http_host(payload))
+                .flatten()
+                .map(|d| (d, "http"))
+        });
+
+        let (domain, protocol) = sniffed?;
+        if self.is_excluded(&domain) {
+            return None;
+        }
+        let is_fake_ip = match host {
+            Host::Ip(ip) => crate::fakedns::is_ip_in_pool(ip),
+            _ => false,
+        };
+        Some(SniffOutput {
+            domain,
+            protocol,
+            is_fake_ip,
+        })
+    }
+
+    #[allow(dead_code)]
     pub fn domain(&self, payload: &[u8]) -> Option<String> {
         if self.metadata_only {
             return None;
@@ -195,9 +264,13 @@ impl Sniffing {
 
     /// Like Xray, the sniffed domain replaces the destination unless `routeOnly` is set.
     pub fn override_host(&self, payload: &[u8], host: &mut Host) {
-        if !self.route_only && !self.metadata_only {
-            if let Some(domain) = self.domain(payload) {
-                *host = Host::Domain(domain);
+        if let Some(sniffed) = self.sniff(payload, host) {
+            let keep_original = self.route_only
+                && sniffed.protocol != "fakedns"
+                && sniffed.protocol != "fakedns+others"
+                && !sniffed.is_fake_ip;
+            if !keep_original {
+                *host = Host::Domain(sniffed.domain);
             }
         }
     }
@@ -601,21 +674,28 @@ pub(crate) struct RouteRequest<'a> {
 impl RouteRequest<'_> {
     /// Routes the request and writes the access log line. None means blocked.
     pub(crate) async fn allow(&self, router: &Router, first_payload: &[u8]) -> Option<Decision> {
-        let sniffed_domain = self.sniffing.domain(first_payload);
-        let (domain, ip) = if let Some(ref d) = sniffed_domain {
-            // With routeOnly the original IP is still dialed, so IP rules must see it.
+        let sniffed = self.sniffing.sniff(first_payload, self.host);
+        let sniffed_domain = sniffed.as_ref().map(|s| s.domain.as_str());
+        let sniffed_protocol = sniffed.as_ref().map(|s| s.protocol);
+        let is_fake_ip = sniffed.as_ref().is_some_and(|s| s.is_fake_ip);
+
+        let (domain, ip) = if let Some(d) = sniffed_domain {
+            // With routeOnly the original IP is still dialed, so IP rules must see it,
+            // UNLESS it's a fake IP or fakedns/fakedns+others.
             let ip = match self.host {
-                Host::Ip(ip) if self.sniffing.route_only => Some(*ip),
+                Host::Ip(ip) if self.sniffing.route_only && !is_fake_ip => Some(*ip),
                 _ => None,
             };
-            (Some(d.as_str()), ip)
+            (Some(d), ip)
         } else {
             match self.host {
                 Host::Domain(name) => (Some(name.as_str()), None),
                 Host::Ip(ip) => (None, Some(*ip)),
             }
         };
-        let protocol = if router.needs_sniff() {
+        let protocol = if let Some(p) = sniffed_protocol {
+            Some(p)
+        } else if router.needs_sniff() {
             routing::sniff(first_payload, self.network)
         } else {
             None
@@ -640,8 +720,8 @@ impl RouteRequest<'_> {
         } else {
             "udp"
         };
-        let label = if let Some(ref d) = sniffed_domain {
-            d.clone()
+        let label = if let Some(d) = sniffed_domain {
+            d.to_owned()
         } else {
             host_label(self.host)
         };
@@ -1260,6 +1340,7 @@ mod tests {
                 "example.com".to_owned(),
                 "test.org".to_owned(),
             ]),
+            ..Default::default()
         };
         let http_excluded = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
         assert_eq!(sniffing.domain(http_excluded), None);
@@ -1278,6 +1359,58 @@ mod tests {
             ..sniffing
         };
         assert_eq!(metadata_sniffing.domain(http_allowed), None);
+    }
+
+    #[tokio::test]
+    async fn fakedns_sniffing_and_dest_override() {
+        let pool = xray_transport::fake_dns::FakeDnsPoolConfig {
+            ip_pool: "198.18.0.0/15".to_string(),
+            pool_size: 1000,
+        };
+        let multi = xray_transport::fake_dns::FakeDnsMulti::from_configs(&[pool]).unwrap();
+        crate::fakedns::init(multi);
+
+        let fake_ips = crate::fakedns::get_fake_ip_for_domain("fakedomain.test", true, false);
+        assert_eq!(fake_ips.len(), 1);
+        let fake_ip = fake_ips[0];
+
+        let sniff_fakedns = Sniffing {
+            fakedns: true,
+            route_only: true,
+            ..Default::default()
+        };
+
+        let mut host = Host::Ip(fake_ip);
+        let payload = b"";
+        let sniffed = sniff_fakedns.sniff(payload, &host);
+        assert!(sniffed.is_some());
+        let res = sniffed.unwrap();
+        assert_eq!(res.domain, "fakedomain.test");
+        assert_eq!(res.protocol, "fakedns");
+        assert!(res.is_fake_ip);
+
+        // override_host turns host into Host::Domain("fakedomain.test") even with route_only: true
+        sniff_fakedns.override_host(payload, &mut host);
+        assert_eq!(host, Host::Domain("fakedomain.test".to_string()));
+
+        // Test fakedns+others: unmapped IP in pool sniffs payload
+        let unmapped_in_pool: std::net::IpAddr = "198.18.254.254".parse().unwrap();
+        let sniff_fakedns_other = Sniffing {
+            fakedns_other: true,
+            ..Default::default()
+        };
+        let http_payload = b"GET / HTTP/1.1\r\nHost: unmapped.test\r\n\r\n";
+        let sniffed = sniff_fakedns_other.sniff(http_payload, &Host::Ip(unmapped_in_pool));
+        assert!(sniffed.is_some());
+        let res = sniffed.unwrap();
+        assert_eq!(res.domain, "unmapped.test");
+        assert_eq!(res.protocol, "fakedns+others");
+        assert!(res.is_fake_ip);
+
+        // Test fakedns+others: IP outside pool is NOT sniffed
+        let outside_pool: std::net::IpAddr = "1.2.3.4".parse().unwrap();
+        let sniffed_outside = sniff_fakedns_other.sniff(http_payload, &Host::Ip(outside_pool));
+        assert!(sniffed_outside.is_none());
     }
 
     #[tokio::test]

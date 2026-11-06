@@ -237,10 +237,8 @@ where
                         let _ = out_tx.send(end_frame(frame.id, false)).await;
                         continue;
                     }
-                    if !udp {
-                        let data = frame.data.as_deref().unwrap_or_default();
-                        info.sniffing.override_host(data, &mut host);
-                    }
+                    let data = frame.data.as_deref().unwrap_or_default();
+                    info.sniffing.override_host(data, &mut host);
                     let traffic = stats::get().traffic(&info.tag, &info.email, &decision.tag);
                     let dial = Dial {
                         router: info.router.clone(),

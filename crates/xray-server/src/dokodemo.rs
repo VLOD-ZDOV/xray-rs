@@ -40,16 +40,13 @@ where
         read_first(&mut stream, &mut early).await;
     }
 
-    let mut route_host = host.clone();
-    ctx.sniffing.override_host(&early, &mut route_host);
-
     let route = RouteRequest {
         ctx_tag: &ctx.tag,
         inbound_port: ctx.port,
         email: "",
         peer,
         network: Network::Tcp,
-        host: &route_host,
+        host: &host,
         port,
         sniffing: &ctx.sniffing,
     };
@@ -59,6 +56,9 @@ where
     if let Action::Block(_) = decision.action {
         return Ok(());
     }
+
+    let mut route_host = host.clone();
+    ctx.sniffing.override_host(&early, &mut route_host);
 
     let target_stream = outbound::connect(&ctx.router, &decision, &route_host, port).await?;
     let traffic = stats::get().traffic(&ctx.tag, "", &decision.tag);

@@ -1178,11 +1178,21 @@ async fn handle_handler(
                             .destination_override
                             .iter()
                             .any(|d| d.eq_ignore_ascii_case("tls"));
+                        let fakedns = s
+                            .destination_override
+                            .iter()
+                            .any(|d| d.eq_ignore_ascii_case("fakedns"));
+                        let fakedns_other = s
+                            .destination_override
+                            .iter()
+                            .any(|d| d.eq_ignore_ascii_case("fakedns+others"));
                         crate::vless::Sniffing {
                             http: s.enabled && (http || s.destination_override.is_empty()),
                             tls: s.enabled && (tls || s.destination_override.is_empty()),
                             route_only: s.route_only,
                             quic: false,
+                            fakedns: s.enabled && fakedns,
+                            fakedns_other: s.enabled && fakedns_other,
                             domains_excluded: std::sync::Arc::new(Vec::new()),
                             metadata_only: false,
                         }

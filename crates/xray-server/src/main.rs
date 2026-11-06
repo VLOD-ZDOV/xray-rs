@@ -5,6 +5,7 @@ mod config;
 mod dns;
 mod dns_outbound;
 mod dokodemo;
+mod fakedns;
 mod fallback;
 mod grpc;
 mod http_obfs;
@@ -196,6 +197,9 @@ async fn run(
 ) -> Result<(), String> {
     log::info(format!("xray-rs {} started", env!("CARGO_PKG_VERSION")));
     stats::init(config.stats);
+    if let Some(fakedns) = config.fakedns {
+        fakedns::init(fakedns);
+    }
     dns::init(config.dns);
     policy::init(config.policy);
     let router = Arc::new(config.router);

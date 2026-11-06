@@ -74,16 +74,13 @@ where
         read_first(&mut server_r, &mut early).await;
     }
 
-    let mut route_host = host.clone();
-    ctx.sniffing.override_host(&early, &mut route_host);
-
     let route = RouteRequest {
         ctx_tag: &ctx.tag,
         inbound_port: ctx.port,
         email: &user_email,
         peer,
         network,
-        host: &route_host,
+        host: &host,
         port,
         sniffing: &ctx.sniffing,
     };
@@ -91,6 +88,9 @@ where
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());
     };
+
+    let mut route_host = host.clone();
+    ctx.sniffing.override_host(&early, &mut route_host);
 
     if let Action::Block(BlockAction::Http403) = decision.action {
         if network == Network::Tcp {

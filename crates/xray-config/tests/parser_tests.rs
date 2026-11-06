@@ -3677,7 +3677,7 @@ fn rejects_invalid_dns_server_object_fields_with_precise_paths() {
 
 #[test]
 fn rejects_special_xray_dns_clients_until_their_transport_is_implemented() {
-    for address in ["localhost", "LOCALHOST", "fakedns", "FakeDns"] {
+    for address in ["localhost", "LOCALHOST"] {
         let raw = raw_with_dns_servers(&format!(r#"{{ "address": "{address}" }}"#));
         assert_parse_error_path(&raw, "$.dns.servers[0].address");
 
@@ -3686,6 +3686,19 @@ fn rejects_special_xray_dns_clients_until_their_transport_is_implemented() {
 
         let raw = raw_with_dns_servers(&format!(r#""192.0.2.53", "{address}""#));
         assert_parse_error_path(&raw, "$.dns.servers[1]");
+    }
+}
+
+#[test]
+fn accepts_fakedns_dns_server() {
+    for address in ["fakedns", "FakeDns", "FAKEDNS"] {
+        let raw = raw_with_dns_servers(&format!(r#"{{ "address": "{address}" }}"#));
+        let parsed = parse_xray_json(&raw).expect("fakedns object should parse");
+        assert_eq!(parsed.config.dns.servers.len(), 1);
+
+        let raw = raw_with_dns_servers(&format!(r#""{address}""#));
+        let parsed = parse_xray_json(&raw).expect("fakedns string should parse");
+        assert_eq!(parsed.config.dns.servers.len(), 1);
     }
 }
 

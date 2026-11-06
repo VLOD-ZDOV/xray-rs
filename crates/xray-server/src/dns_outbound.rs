@@ -122,7 +122,7 @@ impl DnsOutbound {
             return Ok(resp);
         }
 
-        let ips: Vec<IpAddr> = match crate::dns::resolve_all(&qname, 0).await {
+        let ips: Vec<IpAddr> = match crate::dns::resolve_dns_query(&qname, 0).await {
             Ok(addrs) => addrs
                 .into_iter()
                 .map(|a| a.ip())
@@ -153,7 +153,12 @@ impl DnsOutbound {
             resp.extend_from_slice(&[0xC0, 0x0C]); // Pointer to QNAME at byte 12
             resp.extend_from_slice(&qtype.to_be_bytes());
             resp.extend_from_slice(&1u16.to_be_bytes()); // Class IN
-            resp.extend_from_slice(&60u32.to_be_bytes()); // TTL = 60s
+            let ttl: u32 = if crate::fakedns::is_ip_in_pool(&ip) {
+                1
+            } else {
+                60
+            };
+            resp.extend_from_slice(&ttl.to_be_bytes());
             match ip {
                 IpAddr::V4(v4) => {
                     resp.extend_from_slice(&4u16.to_be_bytes());

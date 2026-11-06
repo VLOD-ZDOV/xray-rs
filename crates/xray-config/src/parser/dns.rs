@@ -5,7 +5,7 @@ use super::*;
 const MAX_DNS_HOST_RCODE: u8 = 15;
 
 fn is_special_dns_server(address: &str) -> bool {
-    address.eq_ignore_ascii_case("localhost") || address.eq_ignore_ascii_case("fakedns")
+    address.eq_ignore_ascii_case("localhost")
 }
 
 pub(super) fn is_tun_reserved_ip(ip: IpAddr) -> bool {
