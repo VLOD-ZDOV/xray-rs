@@ -248,8 +248,90 @@ pub fn load(path: &str) -> Result<Config, String> {
     parse(&raw)
 }
 
+/// Xray's top-level sections. Go matches JSON names without case, so
+/// `fakeDns` and `fakedns` are the same section.
+const SECTIONS: [&str; 17] = [
+    "log",
+    "api",
+    "dns",
+    "routing",
+    "policy",
+    "inbounds",
+    "outbounds",
+    "transport",
+    "stats",
+    "reverse",
+    "fakedns",
+    "metrics",
+    "observatory",
+    "burstObservatory",
+    "version",
+    "geodata",
+    "env",
+];
+
+fn normalize_sections(root: &mut Value) {
+    let Some(map) = root.as_object_mut() else {
+        return;
+    };
+    let keys: Vec<String> = map.keys().cloned().collect();
+    for key in keys {
+        if let Some(canonical) = SECTIONS
+            .iter()
+            .find(|s| s.eq_ignore_ascii_case(&key) && **s != key)
+        {
+            if !map.contains_key(*canonical) {
+                if let Some(value) = map.remove(&key) {
+                    map.insert((*canonical).to_owned(), value);
+                }
+            }
+        }
+    }
+    for section in ["reverse", "transport", "env", "geodata"] {
+        if map.get(section).is_some_and(|v| !v.is_null()) {
+            log::warn(format!("config: {section:?} is not supported yet, ignored"));
+        }
+    }
+}
+
+/// `version.min` / `version.max` against the Xray version this core stands in for.
+fn check_version(root: &Value) -> Result<(), String> {
+    fn compare(a: &str, b: &str) -> Result<std::cmp::Ordering, String> {
+        let parts = |v: &str| -> Result<Vec<i64>, String> {
+            v.split('.')
+                .map(|p| {
+                    p.parse()
+                        .map_err(|_| format!("invalid version component {p} in {v}"))
+                })
+                .collect()
+        };
+        let (mut a, mut b) = (parts(a)?, parts(b)?);
+        let len = a.len().max(b.len());
+        a.resize(len, 0);
+        b.resize(len, 0);
+        Ok(a.cmp(&b))
+    }
+    let section = root.get("version").unwrap_or(&Value::Null);
+    let core = crate::COMPAT_VERSION;
+    let min = str_field(section, "min");
+    if !min.is_empty() && compare(min, core)?.is_gt() {
+        return Err(format!(
+            "this config must be run on version {min} or higher"
+        ));
+    }
+    let max = str_field(section, "max");
+    if !max.is_empty() && compare(max, core)?.is_lt() {
+        return Err(format!(
+            "this config should be run on version {max} or lower"
+        ));
+    }
+    Ok(())
+}
+
 pub fn parse(raw: &str) -> Result<Config, String> {
-    let root: Value = serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
+    let mut root: Value = serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
+    normalize_sections(&mut root);
+    check_version(&root)?;
     let api_tag = root
         .get("api")
         .map(|api| str_field(api, "tag"))
@@ -342,10 +424,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         "vless" => InboundProtocol::Vless,
         "trojan" => InboundProtocol::Trojan,
         "vmess" => InboundProtocol::Vmess,
-        "socks" => InboundProtocol::Socks,
+        "socks" | "mixed" => InboundProtocol::Socks,
         "http" => InboundProtocol::Http,
         "shadowsocks" => InboundProtocol::Shadowsocks,
-        "dokodemo-door" | "dokodemo" => InboundProtocol::Dokodemo,
+        "dokodemo-door" | "dokodemo" | "tunnel" => InboundProtocol::Dokodemo,
         "hysteria" | "hysteria2" => InboundProtocol::Hysteria,
         other => {
             log::warn(format!(
@@ -2483,5 +2565,33 @@ mod tests {
         assert_eq!(queue.tcp_fast_open, Some(64));
         assert_eq!(queue.tcp_user_timeout_ms, Some(10000));
         assert!(parse(serde_json::json!({"tcpFastOpen": "yes"})).is_err());
+    }
+
+    #[test]
+    fn reads_sections_and_aliases_like_xray() {
+        let raw = r#"{
+          "Log": {"loglevel": "warning"},
+          "version": {"min": "26.10", "max": "26.10.31"},
+          "inbounds": [
+            {"tag": "m", "port": 1080, "listen": "127.0.0.1", "protocol": "mixed"},
+            {"tag": "t", "port": 1081, "listen": "127.0.0.1", "protocol": "tunnel",
+             "settings": {"address": "127.0.0.1", "port": 80}}
+          ],
+          "outbounds": [{"tag": "d", "protocol": "direct"}, {"tag": "b", "protocol": "block"}]
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.log.level, "warning");
+        assert_eq!(config.inbounds[0].protocol, InboundProtocol::Socks);
+        assert_eq!(config.inbounds[1].protocol, InboundProtocol::Dokodemo);
+        let too_new = r#"{"version": {"min": "26.11"}, "inbounds": []}"#;
+        assert_eq!(
+            parse(too_new).err().unwrap(),
+            "this config must be run on version 26.11 or higher"
+        );
+        let too_old = r#"{"version": {"max": "26.10.30"}, "inbounds": []}"#;
+        assert_eq!(
+            parse(too_old).err().unwrap(),
+            "this config should be run on version 26.10.30 or lower"
+        );
     }
 }

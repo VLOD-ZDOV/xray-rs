@@ -59,7 +59,7 @@ use tokio_rustls::TlsAcceptor;
 use config::{Config, Inbound, InboundProtocol, InboundTransport, TlsSettings};
 
 // 3x-ui reads the second word of `-version` output as the core version.
-const COMPAT_VERSION: &str = "26.10.31";
+pub(crate) const COMPAT_VERSION: &str = "26.10.31";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();

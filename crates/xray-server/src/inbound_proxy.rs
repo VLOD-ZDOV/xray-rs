@@ -9,13 +9,15 @@ use tokio::time::timeout;
 use xray_config::Network;
 use xray_proxy::inbound::{
     copy_body_chunked, copy_body_length, encode_socks5_udp_datagram, negotiate_socks5,
-    parse_socks5_request_message, parse_socks5_udp_datagram, read_http_request_head,
-    read_http_response, write_socks5_command_not_supported, write_socks5_success,
-    write_socks5_success_with_bind, HttpBody, HttpInboundAccounts, PlainHttpError,
-    PlainHttpRequest, SocksCommand, SocksInboundAuth,
+    parse_socks4_connect, parse_socks5_request_message, parse_socks5_udp_datagram,
+    read_http_request_head, read_http_response, write_socks5_command_not_supported,
+    write_socks5_success, write_socks5_success_with_bind, HttpBody, HttpInboundAccounts,
+    PlainHttpError, PlainHttpRequest, SocksCommand, SocksInboundAuth, SOCKS4_GRANTED,
+    SOCKS4_REJECTED, SOCKS4_VERSION,
 };
 use xray_routing::{Target, TargetAddr};
 
+use crate::httpupgrade::PrefixedStream;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, Query};
 use crate::vless::{
@@ -23,7 +25,76 @@ use crate::vless::{
 };
 use crate::{log, stats};
 
+/// Xray's SOCKS inbound (also named `mixed`): the first byte picks SOCKS 5,
+/// SOCKS 4/4a, or HTTP on the same port.
 pub async fn serve_socks<S>(
+    mut stream: S,
+    auth: &SocksInboundAuth,
+    udp_enabled: bool,
+    ctx: &Context,
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut first = [0u8; 1];
+    timeout(
+        crate::policy::get().handshake,
+        stream.read_exact(&mut first),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks handshake timeout"))??;
+    match first[0] {
+        SOCKS4_VERSION => serve_socks4(stream, auth, ctx, peer).await,
+        5 => {
+            let stream = PrefixedStream::new(stream, first.to_vec());
+            serve_socks5(stream, auth, udp_enabled, ctx, peer, local).await
+        }
+        _ => serve_http(PrefixedStream::new(stream, first.to_vec()), auth, ctx, peer).await,
+    }
+}
+
+async fn serve_socks4<S>(
+    mut stream: S,
+    auth: &SocksInboundAuth,
+    ctx: &Context,
+    peer: SocketAddr,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    if matches!(auth, SocksInboundAuth::Password(_)) {
+        stream.write_all(&SOCKS4_REJECTED).await?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "socks 4 is not allowed when auth is required.",
+        ));
+    }
+    let request = timeout(
+        crate::policy::get().handshake,
+        parse_socks4_connect(&mut stream),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks handshake timeout"))?;
+    let target = match request {
+        Ok(target) => target,
+        Err(e) => {
+            stream.write_all(&SOCKS4_REJECTED).await?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("socks4: {e}"),
+            ));
+        }
+    };
+    stream.write_all(&SOCKS4_GRANTED).await?;
+    stream.flush().await?;
+    let _online = stats::get().connect("", 0, peer.ip());
+    let (host, port) = target_to_host_port(&target);
+    relay_tcp(stream, ctx, "", peer, host, port, Vec::new()).await
+}
+
+async fn serve_socks5<S>(
     mut stream: S,
     auth: &SocksInboundAuth,
     udp_enabled: bool,
