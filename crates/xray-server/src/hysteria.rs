@@ -37,6 +37,8 @@ use xray_config::Network;
 
 const SALT_LEN: usize = 8;
 
+const MAX_REASSEMBLERS: usize = 256;
+
 fn key(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(password.as_bytes());
@@ -595,6 +597,7 @@ async fn handle_udp_datagrams(
     let reassemblers: Arc<Mutex<HashMap<u32, Reassembler>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let sessions_sweep = sessions.clone();
+    let reassemblers_sweep = reassemblers.clone();
     let sweep_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         loop {
@@ -602,6 +605,12 @@ async fn handle_udp_datagrams(
             let now = Instant::now();
             let mut s = sessions_sweep.lock().unwrap_or_else(|e| e.into_inner());
             s.retain(|_, (_, last_active)| now.duration_since(*last_active) < udp_idle_timeout);
+            drop(s);
+            let mut r = reassemblers_sweep.lock().unwrap_or_else(|e| e.into_inner());
+            r.retain(|_, reassembler| {
+                reassembler.expire(now);
+                reassembler.buffered_payload_bytes() > 0
+            });
         }
     });
 
@@ -615,6 +624,10 @@ async fn handle_udp_datagrams(
             (message.address.to_owned(), message.payload.to_vec())
         } else {
             let mut r_map = reassemblers.lock().unwrap_or_else(|e| e.into_inner());
+            // Each partial packet holds up to 64 KiB; cap them per connection.
+            if r_map.len() >= MAX_REASSEMBLERS && !r_map.contains_key(&message.session_id) {
+                continue;
+            }
             let reassembler = r_map.entry(message.session_id).or_insert_with(|| {
                 Reassembler::new(message.session_id, 65535, Duration::from_secs(10))
                     .expect("valid reassembler")
