@@ -464,6 +464,7 @@ pub struct FreedomSettings {
     pub noises: Vec<FreedomNoiseSetting>,
     pub send_through: Option<SendThrough>,
     pub dialer_proxy: Option<String>,
+    pub sockopt: Option<Arc<crate::config::SockoptSettings>>,
 }
 
 impl From<FreedomStrategy> for FreedomSettings {
@@ -475,6 +476,7 @@ impl From<FreedomStrategy> for FreedomSettings {
             noises: Vec::new(),
             send_through: None,
             dialer_proxy: None,
+            sockopt: None,
         }
     }
 }
@@ -1077,6 +1079,13 @@ impl Router {
                     let noises = parse_freedom_noises(settings)?;
                     let send_through = parse_send_through(outbound.get("sendThrough"))?;
                     let dialer_proxy = parse_dialer_proxy(outbound, &tag)?;
+                    let sockopt = crate::config::parse_sockopt(
+                        outbound
+                            .pointer("/streamSettings/sockopt")
+                            .unwrap_or(&Value::Null),
+                        &format!("outbound {tag:?}"),
+                    )?
+                    .map(Arc::new);
                     let freedom_settings = FreedomSettings {
                         strategy: domain_strategy,
                         redirect,
@@ -1084,6 +1093,7 @@ impl Router {
                         noises,
                         send_through,
                         dialer_proxy,
+                        sockopt,
                     };
                     for (index, raw) in array(settings, "finalRules").iter().enumerate() {
                         let action = match str_field(raw, "action") {
@@ -1149,6 +1159,16 @@ impl Router {
                 }
             };
             default_tag.get_or_insert_with(|| tag.clone());
+            let sockopt = outbound
+                .pointer("/streamSettings/sockopt")
+                .unwrap_or(&Value::Null);
+            if protocol != "freedom"
+                && crate::config::parse_sockopt(sockopt, &format!("outbound {tag:?}"))?.is_some()
+            {
+                log::warn(format!(
+                    "outbound {tag:?}: sockopt is only applied to freedom outbounds yet, ignored"
+                ));
+            }
             if let Some(proxy_tag) = parse_dialer_proxy(outbound, &tag)? {
                 dialer_proxies.push((tag.clone(), proxy_tag));
             }

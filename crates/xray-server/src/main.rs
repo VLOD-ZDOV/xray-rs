@@ -26,6 +26,7 @@ mod reality;
 mod routing;
 mod shadowsocks;
 mod shadowsocks_outbound;
+mod sockopt;
 mod socks;
 mod stats;
 mod trojan;
@@ -369,8 +370,13 @@ pub(crate) async fn start_inbound(
         None
     };
     let http_obfs = inbound.http_obfs.clone().map(Arc::new);
+    let tproxy = inbound
+        .sockopt
+        .as_ref()
+        .map_or(config::TproxyMode::Off, |s| s.tproxy);
     let tcp_task = tokio::spawn(accept_loop(
         listener,
+        tproxy,
         inbound.accept_proxy_protocol,
         acceptor,
         reality,
@@ -412,6 +418,27 @@ pub(crate) async fn start_inbound(
 
 async fn bind(inbound: &Inbound) -> Result<TcpListener, String> {
     let port = inbound.port;
+    if let Some(sockopt) = &inbound.sockopt {
+        let candidates: Vec<SocketAddr> = if inbound.listen.is_empty() {
+            vec![
+                SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)),
+                SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),
+            ]
+        } else {
+            let addr = format!("{}:{port}", bracket(&inbound.listen));
+            vec![addr
+                .parse()
+                .map_err(|_| format!("invalid listen address {addr}"))?]
+        };
+        let mut last = None;
+        for addr in candidates {
+            match sockopt::bind_tcp(addr, sockopt) {
+                Ok(listener) => return Ok(listener),
+                Err(e) => last = Some(format!("failed to listen on {addr}: {e}")),
+            }
+        }
+        return Err(last.unwrap_or_default());
+    }
     if !inbound.listen.is_empty() {
         let addr = format!("{}:{port}", bracket(&inbound.listen));
         return TcpListener::bind(&addr)
@@ -573,6 +600,7 @@ impl xray_proxy::vless::VisionStreamIo for InboundStream {
 
 async fn accept_loop(
     listener: TcpListener,
+    tproxy: config::TproxyMode,
     accept_proxy_protocol: proxy_proto::ProxyProtocolAccept,
     tls: Option<TlsAcceptor>,
     reality: Option<Arc<reality::RealityServer>>,
@@ -590,6 +618,13 @@ async fn accept_loop(
         };
         let _ = stream.set_nodelay(true);
         let local = stream.local_addr().ok();
+        // Where a transparently proxied connection was going, as Xray's TCP hub
+        // records it for dokodemo-door followRedirect.
+        let original = match tproxy {
+            config::TproxyMode::Off => None,
+            config::TproxyMode::Tproxy => local,
+            config::TproxyMode::Redirect => sockopt::original_destination(&stream),
+        };
         let (tls, reality, handler, http_obfs) = (
             tls.clone(),
             reality.clone(),
@@ -629,7 +664,14 @@ async fn accept_loop(
             if let Some(reality) = reality {
                 match reality.handle(stream, peer).await {
                     Ok(Some(tls_stream)) => {
-                        dispatch(InboundStream::Reality(tls_stream), peer, local, handler).await
+                        dispatch(
+                            InboundStream::Reality(tls_stream),
+                            peer,
+                            local,
+                            original,
+                            handler,
+                        )
+                        .await
                     }
                     Ok(None) => {}
                     Err(e) => log::debug(format!(
@@ -647,8 +689,14 @@ async fn accept_loop(
                             Ok(Ok(tls_stream)) => {
                                 let penetrating =
                                     penetrating_tls::ServerPenetratingTlsStream::new(tls_stream);
-                                dispatch(InboundStream::Tls(penetrating), peer, local, handler)
-                                    .await
+                                dispatch(
+                                    InboundStream::Tls(penetrating),
+                                    peer,
+                                    local,
+                                    original,
+                                    handler,
+                                )
+                                .await
                             }
                             Ok(Err(e)) => log::debug(format!(
                                 "tls handshake from {} failed: {e}",
@@ -668,8 +716,14 @@ async fn accept_loop(
                         .await
                         {
                             Ok(Ok(stream)) => {
-                                dispatch(InboundStream::HttpObfs(stream), peer, local, handler)
-                                    .await
+                                dispatch(
+                                    InboundStream::HttpObfs(stream),
+                                    peer,
+                                    local,
+                                    original,
+                                    handler,
+                                )
+                                .await
                             }
                             Ok(Err(e)) => log::debug(format!(
                                 "http obfs from {} failed: {e}",
@@ -681,7 +735,7 @@ async fn accept_loop(
                         }
                     }
                     (None, None) => {
-                        dispatch(InboundStream::Plain(stream), peer, local, handler).await
+                        dispatch(InboundStream::Plain(stream), peer, local, original, handler).await
                     }
                 }
             }
@@ -693,6 +747,7 @@ async fn dispatch(
     stream: InboundStream,
     peer: SocketAddr,
     local: Option<SocketAddr>,
+    original: Option<SocketAddr>,
     handler: InboundHandler,
 ) {
     let f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = match handler {
@@ -829,7 +884,7 @@ async fn dispatch(
             }
         }),
         InboundHandler::Dokodemo(ctx, settings) => Box::pin(async move {
-            if let Err(e) = dokodemo::serve_tcp(stream, &settings, &ctx, peer).await {
+            if let Err(e) = dokodemo::serve_tcp(stream, &settings, &ctx, peer, original).await {
                 log::info(format!("dokodemo from {} rejected: {e}", log::mask(peer)));
             }
         }),

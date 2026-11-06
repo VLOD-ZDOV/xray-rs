@@ -1556,6 +1556,7 @@ async fn handle_handler(
                 hysteria_udp_idle_timeout: None,
                 has_udphop: false,
                 vless_encryption: None,
+                sockopt: None,
             };
             match crate::start_inbound(&inbound, None, inbound_manager.router().clone()).await {
                 Ok((ctx, tcp_abort, udp_abort)) => {

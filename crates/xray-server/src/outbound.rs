@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use rand::Rng;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
@@ -370,22 +370,18 @@ async fn connect_direct(
             continue;
         }
         let connect_fut = async {
-            if let Some(ip) = bind_ip {
-                let socket = if ip.is_ipv4() {
-                    tokio::net::TcpSocket::new_v4()?
-                } else {
-                    tokio::net::TcpSocket::new_v6()?
-                };
-                socket.bind(SocketAddr::new(ip, 0))?;
-                socket.connect(addr).await
+            let socket = if addr.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()?
             } else {
-                TcpStream::connect(addr).await
+                tokio::net::TcpSocket::new_v6()?
+            };
+            if let Some(ip) = bind_ip {
+                socket.bind(SocketAddr::new(ip, 0))?;
             }
+            crate::sockopt::connect(socket, addr, settings.sockopt.as_deref()).await
         };
         match timeout(CONNECT_TIMEOUT, connect_fut).await {
-            Ok(Ok(stream)) => {
-                stream.set_nodelay(true)?;
-                let boxed: Box<dyn Stream> = Box::new(stream);
+            Ok(Ok(boxed)) => {
                 if let Some(ref fragment) = settings.fragment {
                     return Ok(Box::new(FragmentWriterStream::new(boxed, fragment.clone())));
                 }
@@ -446,7 +442,7 @@ impl UdpLink {
                         }
                     }
                 };
-                let socket = UdpSocket::bind(bind).await?;
+                let socket = crate::sockopt::bind_udp(bind, settings.sockopt.as_deref())?;
                 socket.connect(target).await?;
                 send_udp_noises(&socket, &settings.noises, target).await?;
                 Ok(Self::Direct(socket))
@@ -563,12 +559,11 @@ impl ConeUdp {
                     .send_through
                     .as_ref()
                     .and_then(|st| st.resolve_ip());
+                let sockopt = settings.sockopt.as_deref();
                 let socket = match bind_ip {
-                    Some(ip) => UdpSocket::bind(SocketAddr::new(ip, 0)).await?,
-                    None => match UdpSocket::bind(("::", 0)).await {
-                        Ok(socket) => socket,
-                        Err(_) => UdpSocket::bind(("0.0.0.0", 0)).await?,
-                    },
+                    Some(ip) => crate::sockopt::bind_udp(SocketAddr::new(ip, 0), sockopt)?,
+                    None => crate::sockopt::bind_udp(([0u16; 8], 0).into(), sockopt)
+                        .or_else(|_| crate::sockopt::bind_udp(([0, 0, 0, 0], 0).into(), sockopt))?,
                 };
                 let dual_stack = socket.local_addr()?.is_ipv6();
                 Ok(Self::Direct {

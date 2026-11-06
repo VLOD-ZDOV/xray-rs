@@ -50,6 +50,29 @@ pub enum InboundProtocol {
     Hysteria,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TproxyMode {
+    Off,
+    Tproxy,
+    Redirect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SockoptSettings {
+    pub mark: u32,
+    /// As Xray builds it: 256 for `true`, -1 for `false`, else the number.
+    pub tcp_fast_open: Option<i32>,
+    pub tproxy: TproxyMode,
+    pub tcp_keep_alive_interval: Option<i32>,
+    pub tcp_keep_alive_idle: Option<i32>,
+    pub tcp_congestion: Option<String>,
+    pub tcp_user_timeout_ms: Option<u32>,
+    pub tcp_max_seg: Option<u32>,
+    pub v6only: bool,
+    pub mptcp: bool,
+    pub interface: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct DokodemoSettings {
     pub address: Option<crate::vless::Host>,
@@ -127,6 +150,7 @@ pub struct Inbound {
     pub hysteria_udp_idle_timeout: Option<u64>,
     pub has_udphop: bool,
     pub vless_encryption: Option<Arc<xray_vless_encryption::Server>>,
+    pub sockopt: Option<SockoptSettings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,6 +639,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         .or_else(|| item.get("sockopt"))
         .unwrap_or(&Value::Null);
     let accept_proxy_protocol = parse_accept_proxy_protocol(sockopt.get("acceptProxyProtocol"));
+    let sockopt_settings = parse_sockopt(sockopt, &format!("inbound {tag:?}"))?;
 
     let (shadowsocks_top_method, shadowsocks_top_password) =
         if protocol == InboundProtocol::Shadowsocks {
@@ -764,6 +789,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         hysteria_udp_idle_timeout,
         has_udphop,
         vless_encryption,
+        sockopt: sockopt_settings,
     }))
 }
 
@@ -816,6 +842,74 @@ fn parse_accept_proxy_protocol(val: Option<&Value>) -> crate::proxy_proto::Proxy
         },
         _ => crate::proxy_proto::ProxyProtocolAccept::None,
     }
+}
+
+pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSettings>, String> {
+    let Some(map) = sockopt.as_object() else {
+        return Ok(None);
+    };
+    for key in [
+        "tcpWindowClamp",
+        "customSockopt",
+        "penetrate",
+        "addressPortStrategy",
+        "happyEyeballs",
+        "trustedXForwardedFor",
+    ] {
+        if map.get(key).is_some_and(|v| !v.is_null()) {
+            log::warn(format!(
+                "{owner}: sockopt.{key} is not supported yet, ignored"
+            ));
+        }
+    }
+    let int = |key: &str| map.get(key).and_then(Value::as_i64);
+    let tcp_fast_open = match map.get("tcpFastOpen") {
+        None | Some(Value::Null) => None,
+        Some(Value::Bool(true)) => Some(256),
+        Some(Value::Bool(false)) => Some(-1),
+        Some(Value::Number(n)) => Some(n.as_f64().unwrap_or(0.0).min(i32::MAX as f64) as i32),
+        Some(_) => return Err("tcpFastOpen: only boolean and integer value is acceptable".into()),
+    };
+    let tproxy = match str_field(sockopt, "tproxy").to_ascii_lowercase().as_str() {
+        "tproxy" => TproxyMode::Tproxy,
+        "redirect" => TproxyMode::Redirect,
+        _ => TproxyMode::Off,
+    };
+    let positive = |key: &str| int(key).filter(|v| *v > 0).map(|v| v as u32);
+    let settings = SockoptSettings {
+        mark: int("mark").unwrap_or(0) as u32,
+        tcp_fast_open,
+        tproxy,
+        tcp_keep_alive_interval: int("tcpKeepAliveInterval").map(|v| v as i32),
+        tcp_keep_alive_idle: int("tcpKeepAliveIdle").map(|v| v as i32),
+        tcp_congestion: Some(str_field(sockopt, "tcpCongestion"))
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        tcp_user_timeout_ms: positive("tcpUserTimeout"),
+        tcp_max_seg: positive("tcpMaxSeg"),
+        v6only: map.get("v6only").and_then(Value::as_bool).unwrap_or(false),
+        mptcp: map
+            .get("tcpMptcp")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        interface: Some(str_field(sockopt, "interface"))
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+    };
+    let unset = SockoptSettings {
+        mark: 0,
+        tcp_fast_open: None,
+        tproxy: TproxyMode::Off,
+        tcp_keep_alive_interval: None,
+        tcp_keep_alive_idle: None,
+        tcp_congestion: None,
+        tcp_user_timeout_ms: None,
+        tcp_max_seg: None,
+        v6only: false,
+        mptcp: false,
+        interface: None,
+    };
+    Ok((settings != unset).then_some(settings))
 }
 
 fn parse_tls(tls: &Value) -> Result<TlsSettings, String> {
@@ -2357,5 +2451,31 @@ mod tests {
             config.policy.for_level(0).conn_idle,
             std::time::Duration::from_secs(120)
         );
+    }
+
+    #[test]
+    fn parses_sockopt_like_xray() {
+        let parse = |v: serde_json::Value| parse_sockopt(&v, "test");
+        assert_eq!(parse(serde_json::json!({})).unwrap(), None);
+        assert_eq!(
+            parse(serde_json::json!({"acceptProxyProtocol": true})).unwrap(),
+            None
+        );
+        let on = parse(serde_json::json!({"tcpFastOpen": true, "tproxy": "Redirect", "mark": 7}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(on.tcp_fast_open, Some(256));
+        assert_eq!(on.tproxy, TproxyMode::Redirect);
+        assert_eq!(on.mark, 7);
+        let off = parse(serde_json::json!({"tcpFastOpen": false}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(off.tcp_fast_open, Some(-1));
+        let queue = parse(serde_json::json!({"tcpFastOpen": 64, "tcpUserTimeout": 10000}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(queue.tcp_fast_open, Some(64));
+        assert_eq!(queue.tcp_user_timeout_ms, Some(10000));
+        assert!(parse(serde_json::json!({"tcpFastOpen": "yes"})).is_err());
     }
 }

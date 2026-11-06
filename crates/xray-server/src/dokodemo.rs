@@ -23,17 +23,22 @@ pub async fn serve_tcp<S>(
     settings: &DokodemoSettings,
     ctx: &Context,
     peer: SocketAddr,
+    original: Option<SocketAddr>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let host = settings
-        .address
-        .clone()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "dokodemo address missing"))?;
-    let port = settings
-        .port
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "dokodemo port missing"))?;
+    let redirected = original.filter(|_| settings.follow_redirect);
+    let (host, port) = match (redirected, &settings.address, settings.port) {
+        (Some(addr), _, _) => (Host::Ip(addr.ip().to_canonical()), addr.port()),
+        (None, Some(host), Some(port)) => (host.clone(), port),
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unable to get destination",
+            ))
+        }
+    };
 
     let mut early = Vec::new();
     if ctx.router.needs_sniff() || ctx.sniffing.enabled() {
