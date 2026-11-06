@@ -27,6 +27,7 @@ const STATS: &str = "/xray.app.stats.command.StatsService/";
 const HANDLER: &str = "/xray.app.proxyman.command.HandlerService/";
 const LOGGER: &str = "/xray.app.log.command.LoggerService/";
 const ROUTER: &str = "/xray.app.router.command.RoutingService/";
+const OBSERVATORY: &str = "/xray.core.app.observatory.command.ObservatoryService/";
 const ADD_USER: &str = "xray.app.proxyman.command.AddUserOperation";
 const REMOVE_USER: &str = "xray.app.proxyman.command.RemoveUserOperation";
 const VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
@@ -562,11 +563,104 @@ pub struct RestartLoggerRequest {}
 #[derive(Clone, PartialEq, Message)]
 pub struct RestartLoggerResponse {}
 
+#[derive(Clone, PartialEq, Message)]
+pub struct GetOutboundStatusRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetOutboundStatusResponse {
+    #[prost(message, optional, tag = "1")]
+    pub status: Option<ObservationResultProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ObservationResultProto {
+    #[prost(message, repeated, tag = "1")]
+    pub status: Vec<OutboundStatusProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct OutboundStatusProto {
+    #[prost(bool, tag = "1")]
+    pub alive: bool,
+    #[prost(int64, tag = "2")]
+    pub delay: i64,
+    #[prost(string, tag = "3")]
+    pub last_error_reason: String,
+    #[prost(string, tag = "4")]
+    pub outbound_tag: String,
+    #[prost(int64, tag = "5")]
+    pub last_seen_time: i64,
+    #[prost(int64, tag = "6")]
+    pub last_try_time: i64,
+    #[prost(message, optional, tag = "7")]
+    pub health_ping: Option<HealthPingMeasurementResultProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HealthPingMeasurementResultProto {
+    #[prost(int64, tag = "1")]
+    pub all: i64,
+    #[prost(int64, tag = "2")]
+    pub fail: i64,
+    #[prost(int64, tag = "3")]
+    pub deviation: i64,
+    #[prost(int64, tag = "4")]
+    pub average: i64,
+    #[prost(int64, tag = "5")]
+    pub max: i64,
+    #[prost(int64, tag = "6")]
+    pub min: i64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetBalancerInfoRequest {
+    #[prost(string, tag = "1")]
+    pub tag: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct GetBalancerInfoResponse {
+    #[prost(message, optional, tag = "1")]
+    pub balancer: Option<BalancerMsg>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BalancerMsg {
+    #[prost(message, optional, tag = "5")]
+    pub override_info: Option<OverrideInfo>,
+    #[prost(message, optional, tag = "6")]
+    pub principle_target: Option<PrincipleTargetInfo>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PrincipleTargetInfo {
+    #[prost(string, repeated, tag = "1")]
+    pub tag: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct OverrideInfo {
+    #[prost(string, tag = "2")]
+    pub target: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct OverrideBalancerTargetRequest {
+    #[prost(string, tag = "1")]
+    pub balancer_tag: String,
+    #[prost(string, tag = "2")]
+    pub target: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct OverrideBalancerTargetResponse {}
+
 enum ServiceType<'a> {
     Stats(&'a str),
     Handler(&'a str),
     Logger(&'a str),
     Router(&'a str),
+    Observatory(&'a str),
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -680,6 +774,7 @@ pub async fn serve(
     addr: SocketAddr,
     inbound_manager: Arc<InboundManager>,
     router: Arc<Router>,
+    observatory: Option<Arc<crate::observatory::Observatory>>,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(addr)
         .await
@@ -692,11 +787,17 @@ pub async fn serve(
             };
             let inbound_manager = inbound_manager.clone();
             let router = router.clone();
+            let observatory = observatory.clone();
             tokio::spawn(async move {
                 let service = service_fn(|req| {
                     let inbound_manager = inbound_manager.clone();
                     let router = router.clone();
-                    async move { Ok::<_, Infallible>(handle(req, &inbound_manager, &router).await) }
+                    let observatory = observatory.clone();
+                    async move {
+                        Ok::<_, Infallible>(
+                            handle(req, &inbound_manager, &router, &observatory).await,
+                        )
+                    }
                 });
                 let _ = auto::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(stream), service)
@@ -711,6 +812,7 @@ async fn handle(
     req: Request<Incoming>,
     inbound_manager: &Arc<InboundManager>,
     router: &Arc<Router>,
+    observatory: &Option<Arc<crate::observatory::Observatory>>,
 ) -> Response<Body> {
     let path = req.uri().path().to_owned();
     let svc = if let Some(m) = path.strip_prefix(STATS) {
@@ -721,6 +823,8 @@ async fn handle(
         ServiceType::Logger(m)
     } else if let Some(m) = path.strip_prefix(ROUTER) {
         ServiceType::Router(m)
+    } else if let Some(m) = path.strip_prefix(OBSERVATORY) {
+        ServiceType::Observatory(m)
     } else {
         return status(UNIMPLEMENTED, "unknown service");
     };
@@ -747,6 +851,7 @@ async fn handle(
         }
         ServiceType::Logger(_) => status(UNIMPLEMENTED, "unknown method"),
         ServiceType::Router(method) => handle_router(method, message, router).await,
+        ServiceType::Observatory(method) => handle_observatory(method, message, observatory).await,
         ServiceType::Stats(method) => handle_stats(method, message),
     }
 }
@@ -969,6 +1074,102 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                 let decision = router.route(&query).await;
                 rc.outbound_tag = decision.tag;
                 reply(&rc)
+            }
+            Err(e) => status(INVALID_ARGUMENT, &e.to_string()),
+        },
+        "GetBalancerInfo" => match GetBalancerInfoRequest::decode(message) {
+            Ok(req) => {
+                if let Some(b) = router.balancers.get(&req.tag) {
+                    let override_target = b
+                        .override_target
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    let override_info = override_target.map(|t| OverrideInfo { target: t });
+                    let outbounds = router
+                        .outbounds
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let obs = router
+                        .observatory
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let principle_target = b.get_principle_target(&outbounds, obs.as_deref());
+                    let resp = GetBalancerInfoResponse {
+                        balancer: Some(BalancerMsg {
+                            override_info,
+                            principle_target: Some(PrincipleTargetInfo {
+                                tag: principle_target,
+                            }),
+                        }),
+                    };
+                    reply(&resp)
+                } else {
+                    status(NOT_FOUND, "cannot find tag")
+                }
+            }
+            Err(e) => status(INVALID_ARGUMENT, &e.to_string()),
+        },
+        "OverrideBalancerTarget" => match OverrideBalancerTargetRequest::decode(message) {
+            Ok(req) => {
+                if let Some(b) = router.balancers.get(&req.balancer_tag) {
+                    let mut lock = b
+                        .override_target
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if req.target.is_empty() {
+                        *lock = None;
+                    } else {
+                        *lock = Some(req.target);
+                    }
+                    reply(&OverrideBalancerTargetResponse {})
+                } else {
+                    status(NOT_FOUND, "cannot find tag")
+                }
+            }
+            Err(e) => status(INVALID_ARGUMENT, &e.to_string()),
+        },
+        _ => status(UNIMPLEMENTED, "unknown method"),
+    }
+}
+
+async fn handle_observatory(
+    method: &str,
+    message: Bytes,
+    observatory: &Option<Arc<crate::observatory::Observatory>>,
+) -> Response<Body> {
+    match method {
+        "GetOutboundStatus" => match GetOutboundStatusRequest::decode(message) {
+            Ok(_) => {
+                let status_list = if let Some(obs) = observatory {
+                    obs.get_observation()
+                        .into_iter()
+                        .map(|s| OutboundStatusProto {
+                            alive: s.alive,
+                            delay: s.delay,
+                            last_error_reason: s.last_error_reason,
+                            outbound_tag: s.outbound_tag,
+                            last_seen_time: s.last_seen_time,
+                            last_try_time: s.last_try_time,
+                            health_ping: s.health_ping.map(|h| HealthPingMeasurementResultProto {
+                                all: h.all,
+                                fail: h.fail,
+                                deviation: h.deviation,
+                                average: h.average,
+                                max: h.max,
+                                min: h.min,
+                            }),
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let resp = GetOutboundStatusResponse {
+                    status: Some(ObservationResultProto {
+                        status: status_list,
+                    }),
+                };
+                reply(&resp)
             }
             Err(e) => status(INVALID_ARGUMENT, &e.to_string()),
         },

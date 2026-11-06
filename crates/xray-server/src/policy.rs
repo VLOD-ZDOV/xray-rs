@@ -95,15 +95,21 @@ static POLICY_MANAGER: RwLock<Option<PolicyManager>> = RwLock::new(None);
 
 pub fn init(manager: PolicyManager) {
     if let Ok(mut lock) = POLICY_MANAGER.write() {
-        *lock = Some(manager);
+        if let Some(existing) = lock.as_mut() {
+            existing.levels.extend(manager.levels);
+            existing.default_policy = manager.default_policy;
+        } else {
+            *lock = Some(manager);
+        }
     }
 }
 
 #[allow(dead_code)]
 pub fn init_single(settings: PolicySettings) {
-    let mut mgr = PolicyManager::default();
-    mgr.levels.insert(0, settings);
-    init(mgr);
+    if let Ok(mut lock) = POLICY_MANAGER.write() {
+        let mgr = lock.get_or_insert_with(PolicyManager::default);
+        mgr.levels.insert(0, settings);
+    }
 }
 
 pub fn for_level(level: u32) -> PolicySettings {

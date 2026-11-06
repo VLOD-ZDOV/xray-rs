@@ -25,6 +25,7 @@ pub struct Config {
     pub dns: Option<xray_config::DnsConfig>,
     pub policy: policy::PolicyManager,
     pub fakedns: Option<crate::fakedns::FakeDnsMulti>,
+    pub observatory: Option<Arc<crate::observatory::Observatory>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +290,10 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     };
     let policy = policy::PolicyManager::from_config(&root);
     let fakedns = parse_fakedns(&root, dns.as_ref(), &inbounds)?;
+    let observatory = crate::observatory::Observatory::from_config(&root)?;
+    if let Some(obs) = &observatory {
+        router.set_observatory(obs.clone());
+    }
     Ok(Config {
         log,
         api,
@@ -298,6 +303,7 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         dns,
         policy,
         fakedns,
+        observatory,
     })
 }
 

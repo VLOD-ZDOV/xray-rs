@@ -15,6 +15,7 @@ mod hysteria;
 mod inbound_proxy;
 mod log;
 mod mux;
+mod observatory;
 mod outbound;
 mod outbound_transport;
 mod padding;
@@ -203,6 +204,9 @@ async fn run(
     dns::init(config.dns);
     policy::init(config.policy);
     let router = Arc::new(config.router);
+    if let Some(obs) = config.observatory.clone() {
+        obs.start(router.clone());
+    }
     let inbound_manager = Arc::new(api::InboundManager::new(router.clone()));
     for (inbound, acceptor) in config.inbounds.into_iter().zip(tls) {
         let tag = inbound.tag.clone();
@@ -210,7 +214,13 @@ async fn run(
         inbound_manager.insert_initial(tag, ctx, tcp_abort, udp_abort);
     }
     if let Some(addr) = config.api {
-        api::serve(addr, inbound_manager, router.clone()).await?;
+        api::serve(
+            addr,
+            inbound_manager,
+            router.clone(),
+            config.observatory.clone(),
+        )
+        .await?;
     }
     let _ = tokio::signal::ctrl_c().await;
     Ok(())

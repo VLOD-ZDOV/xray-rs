@@ -100,7 +100,7 @@ enum LegacyDnsNonIpMode {
     Skip,
 }
 
-fn parse_xray_duration(raw: &str) -> Option<std::time::Duration> {
+pub fn parse_xray_duration(raw: &str) -> Option<std::time::Duration> {
     if raw.is_empty() || raw.starts_with(['-', '+']) {
         return None;
     }

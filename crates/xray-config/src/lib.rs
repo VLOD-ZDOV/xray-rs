@@ -43,8 +43,9 @@ pub use model::{
     SocksInboundSettings, SocksOutboundSettings, TproxySettings, UdpNoiseItem, UdpNoiseSettings,
 };
 pub use parser::{
-    parse_xray_json, parse_xray_json_with_exclusive_geodata_dirs, parse_xray_json_with_geodata_dir,
-    parse_xray_json_with_geodata_dirs, ConfigParseError, ParsedConfig, MAX_CONFIG_DOMAIN_MATCHERS,
+    parse_xray_duration, parse_xray_json, parse_xray_json_with_exclusive_geodata_dirs,
+    parse_xray_json_with_geodata_dir, parse_xray_json_with_geodata_dirs, ConfigParseError,
+    ParsedConfig, MAX_CONFIG_DOMAIN_MATCHERS,
 };
 
 pub fn version() -> &'static str {

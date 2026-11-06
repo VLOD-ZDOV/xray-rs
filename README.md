@@ -59,8 +59,7 @@ to run noise.
 
 - Skipped with a warning: WireGuard inbound, XHTTP over HTTP/3, mKCP, fallbacks selected
   by `name` or `alpn`.
-- `reverse`, `metrics`, observatory and the
-  `leastPing` / `leastLoad` balancer strategies.
+- `reverse`, `metrics`.
 
 ## Build
 

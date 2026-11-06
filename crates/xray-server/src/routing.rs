@@ -214,11 +214,31 @@ impl From<FreedomStrategy> for FreedomSettings {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+use std::time::Duration;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrategyWeight {
+    pub regexp: bool,
+    pub match_str: String,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeastLoadConfig {
+    pub costs: Vec<StrategyWeight>,
+    pub baselines: Vec<Duration>,
+    pub expected: i32,
+    pub max_rtt: Duration,
+    pub tolerance: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum BalancerStrategy {
     #[default]
     Random,
     RoundRobin,
+    LeastPing,
+    LeastLoad(LeastLoadConfig),
 }
 
 pub struct Balancer {
@@ -226,7 +246,153 @@ pub struct Balancer {
     pub selectors: Vec<String>,
     pub strategy: BalancerStrategy,
     pub fallback_tag: Option<String>,
+    pub override_target: std::sync::RwLock<Option<String>>,
     counter: AtomicUsize,
+}
+
+#[allow(dead_code)]
+pub struct LeastLoadNode {
+    pub tag: String,
+    pub count_all: i64,
+    pub count_fail: i64,
+    pub rtt_average: Duration,
+    pub rtt_deviation: Duration,
+    pub rtt_deviation_cost: Duration,
+}
+
+fn leastload_sort(nodes: &mut [LeastLoadNode]) {
+    nodes.sort_by(|left, right| {
+        left.rtt_deviation_cost
+            .cmp(&right.rtt_deviation_cost)
+            .then_with(|| left.rtt_average.cmp(&right.rtt_average))
+            .then_with(|| left.count_fail.cmp(&right.count_fail))
+            .then_with(|| right.count_all.cmp(&left.count_all))
+            .then_with(|| left.tag.cmp(&right.tag))
+    });
+}
+
+static NUMBER_FINDER: std::sync::LazyLock<Regex> =
+    std::sync::LazyLock::new(|| Regex::new(r"\d+(\.\d+)?").unwrap());
+
+fn apply_cost(tag: &str, value: Duration, costs: &[StrategyWeight]) -> Duration {
+    let mut weight = 1.0f64;
+    for w in costs {
+        let matched = if w.regexp {
+            if let Ok(re) = Regex::new(&w.match_str) {
+                re.find(tag).is_some()
+            } else {
+                false
+            }
+        } else {
+            tag.contains(&w.match_str)
+        };
+        if matched {
+            if w.value > 0.0 {
+                weight = w.value;
+                break;
+            }
+            if let Some(num_re) = NUMBER_FINDER.find(&w.match_str) {
+                if let Ok(num) = num_re.as_str().parse::<f64>() {
+                    weight = num;
+                    break;
+                }
+            }
+        }
+    }
+    let scaled = value.as_secs_f64() * weight.powf(0.5);
+    Duration::from_secs_f64(scaled)
+}
+
+pub fn select_least_load_nodes(
+    candidates: &[&str],
+    observatory: &crate::observatory::Observatory,
+    config: &LeastLoadConfig,
+) -> Vec<LeastLoadNode> {
+    let mut qualified = Vec::new();
+    for tag in candidates {
+        if let Some(status) = observatory.get_status_for(tag) {
+            if !status.alive {
+                continue;
+            }
+            if !config.max_rtt.is_zero() && status.delay >= config.max_rtt.as_millis() as i64 {
+                continue;
+            }
+            if let Some(hp) = &status.health_ping {
+                if hp.all > 0 && config.tolerance > 0.0 {
+                    let fail_rate = hp.fail as f64 / hp.all as f64;
+                    if fail_rate > config.tolerance {
+                        continue;
+                    }
+                }
+            }
+
+            let (count_all, count_fail, rtt_average, rtt_deviation) =
+                if let Some(hp) = &status.health_ping {
+                    (
+                        hp.all,
+                        hp.fail,
+                        Duration::from_nanos(hp.average.max(0) as u64),
+                        Duration::from_nanos(hp.deviation.max(0) as u64),
+                    )
+                } else {
+                    (
+                        1,
+                        1,
+                        Duration::from_millis(status.delay.max(0) as u64),
+                        Duration::from_millis(status.delay.max(0) as u64),
+                    )
+                };
+
+            let rtt_deviation_cost = apply_cost(tag, rtt_deviation, &config.costs);
+
+            qualified.push(LeastLoadNode {
+                tag: (*tag).to_owned(),
+                count_all,
+                count_fail,
+                rtt_average,
+                rtt_deviation,
+                rtt_deviation_cost,
+            });
+        }
+    }
+
+    if qualified.is_empty() {
+        return Vec::new();
+    }
+
+    leastload_sort(&mut qualified);
+
+    let expected = if config.expected <= 0 {
+        1
+    } else {
+        config.expected as usize
+    };
+    let available = qualified.len();
+    if expected > available {
+        return qualified;
+    }
+    if config.baselines.is_empty() {
+        qualified.truncate(expected);
+        return qualified;
+    }
+
+    let mut count = 0;
+    for b in &config.baselines {
+        for (i, node) in qualified.iter().enumerate().take(available).skip(count) {
+            if node.rtt_deviation_cost >= *b {
+                break;
+            }
+            count = i + 1;
+        }
+        if count >= expected {
+            break;
+        }
+    }
+    if config.expected > 0 && count < expected {
+        count = expected;
+    }
+    qualified.truncate(count.min(available));
+    qualified
 }
 
 impl Balancer {
@@ -265,10 +431,61 @@ impl Balancer {
             match strat_str.to_ascii_lowercase().as_str() {
                 "random" | "" => BalancerStrategy::Random,
                 "roundrobin" => BalancerStrategy::RoundRobin,
-                "leastping" | "leastload" => {
-                    return Err(err(&format!(
-                        "balancer strategy {strat_str:?} is not supported without observatory"
-                    )));
+                "leastping" => BalancerStrategy::LeastPing,
+                "leastload" => {
+                    let settings_val = strat.get("settings").unwrap_or(&Value::Null);
+                    let mut costs = Vec::new();
+                    if let Some(arr) = settings_val.get("costs").and_then(Value::as_array) {
+                        for c in arr {
+                            let regexp = c.get("regexp").and_then(Value::as_bool).unwrap_or(false);
+                            let match_str = c
+                                .get("match")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_owned();
+                            let value = c.get("value").and_then(Value::as_f64).unwrap_or(0.0);
+                            costs.push(StrategyWeight {
+                                regexp,
+                                match_str,
+                                value,
+                            });
+                        }
+                    }
+                    let mut baselines = Vec::new();
+                    if let Some(arr) = settings_val.get("baselines").and_then(Value::as_array) {
+                        for b in arr {
+                            if let Some(s) = b.as_str() {
+                                if let Some(d) = xray_config::parse_xray_duration(s) {
+                                    baselines.push(d);
+                                }
+                            } else if let Some(n) = b.as_i64() {
+                                if n > 0 {
+                                    baselines.push(Duration::from_nanos(n as u64));
+                                }
+                            }
+                        }
+                    }
+                    let expected = settings_val
+                        .get("expected")
+                        .and_then(Value::as_i64)
+                        .unwrap_or(0) as i32;
+                    let max_rtt = settings_val
+                        .get("maxRTT")
+                        .and_then(Value::as_str)
+                        .and_then(xray_config::parse_xray_duration)
+                        .unwrap_or_default();
+                    let tolerance = settings_val
+                        .get("tolerance")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0);
+
+                    BalancerStrategy::LeastLoad(LeastLoadConfig {
+                        costs,
+                        baselines,
+                        expected,
+                        max_rtt,
+                        tolerance,
+                    })
                 }
                 other => return Err(err(&format!("unsupported strategy {other:?}"))),
             }
@@ -287,6 +504,7 @@ impl Balancer {
             selectors,
             strategy,
             fallback_tag,
+            override_target: std::sync::RwLock::new(None),
             counter: AtomicUsize::new(0),
         })
     }
@@ -294,7 +512,14 @@ impl Balancer {
     pub fn select<'a>(
         &self,
         outbounds: &'a HashMap<String, Action>,
+        observatory: Option<&crate::observatory::Observatory>,
     ) -> Option<(&'a str, &'a Action)> {
+        if let Some(target) = self.override_target.read().unwrap().as_ref() {
+            if let Some((tag, action)) = outbounds.get_key_value(target) {
+                return Some((tag.as_str(), action));
+            }
+        }
+
         let mut candidates: Vec<(&str, &Action)> = outbounds
             .iter()
             .filter(|(tag, _)| self.selectors.iter().any(|prefix| tag.starts_with(prefix)))
@@ -311,16 +536,125 @@ impl Balancer {
             return None;
         }
 
-        let index = match self.strategy {
+        match &self.strategy {
             BalancerStrategy::Random => {
-                let r = rand::random::<usize>();
-                r % candidates.len()
+                let mut valid = candidates;
+                if let Some(obs) = observatory {
+                    valid.retain(|(t, _)| obs.get_status_for(t).is_none_or(|s| s.alive));
+                }
+                if valid.is_empty() {
+                    if let Some(fallback) = &self.fallback_tag {
+                        if let Some((tag, action)) = outbounds.get_key_value(fallback) {
+                            return Some((tag.as_str(), action));
+                        }
+                    }
+                    return None;
+                }
+                let index = rand::random::<usize>() % valid.len();
+                Some(valid[index])
             }
             BalancerStrategy::RoundRobin => {
-                self.counter.fetch_add(1, Ordering::Relaxed) % candidates.len()
+                let mut valid = candidates;
+                if let Some(obs) = observatory {
+                    valid.retain(|(t, _)| obs.get_status_for(t).is_none_or(|s| s.alive));
+                }
+                if valid.is_empty() {
+                    if let Some(fallback) = &self.fallback_tag {
+                        if let Some((tag, action)) = outbounds.get_key_value(fallback) {
+                            return Some((tag.as_str(), action));
+                        }
+                    }
+                    return None;
+                }
+                let index = self.counter.fetch_add(1, Ordering::Relaxed) % valid.len();
+                Some(valid[index])
             }
-        };
-        Some(candidates[index])
+            BalancerStrategy::LeastPing => {
+                let mut least_ping = i64::MAX;
+                let mut selected = None;
+                if let Some(obs) = observatory {
+                    for (tag, action) in &candidates {
+                        if let Some(status) = obs.get_status_for(tag) {
+                            if status.alive && status.delay < least_ping {
+                                least_ping = status.delay;
+                                selected = Some((*tag, *action));
+                            }
+                        }
+                    }
+                }
+                if let Some(best) = selected {
+                    return Some(best);
+                }
+                if let Some(fallback) = &self.fallback_tag {
+                    if let Some((tag, action)) = outbounds.get_key_value(fallback) {
+                        return Some((tag.as_str(), action));
+                    }
+                }
+                None
+            }
+            BalancerStrategy::LeastLoad(settings) => {
+                let candidate_tags: Vec<&str> = candidates.iter().map(|(t, _)| *t).collect();
+                if let Some(obs) = observatory {
+                    let nodes = select_least_load_nodes(&candidate_tags, obs, settings);
+                    if !nodes.is_empty() {
+                        let idx = rand::random::<usize>() % nodes.len();
+                        let chosen_tag = &nodes[idx].tag;
+                        if let Some(found) = candidates.into_iter().find(|(t, _)| *t == chosen_tag)
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+                if let Some(fallback) = &self.fallback_tag {
+                    if let Some((tag, action)) = outbounds.get_key_value(fallback) {
+                        return Some((tag.as_str(), action));
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    pub fn get_principle_target(
+        &self,
+        outbounds: &HashMap<String, Action>,
+        observatory: Option<&crate::observatory::Observatory>,
+    ) -> Vec<String> {
+        let mut candidates: Vec<&str> = outbounds
+            .keys()
+            .filter(|tag| self.selectors.iter().any(|prefix| tag.starts_with(prefix)))
+            .map(|s| s.as_str())
+            .collect();
+        candidates.sort();
+
+        match &self.strategy {
+            BalancerStrategy::Random | BalancerStrategy::RoundRobin => {
+                candidates.into_iter().map(str::to_owned).collect()
+            }
+            BalancerStrategy::LeastPing => {
+                let mut least_ping = i64::MAX;
+                let mut selected = None;
+                if let Some(obs) = observatory {
+                    for tag in candidates {
+                        if let Some(status) = obs.get_status_for(tag) {
+                            if status.alive && status.delay < least_ping {
+                                least_ping = status.delay;
+                                selected = Some(tag.to_owned());
+                            }
+                        }
+                    }
+                }
+                selected.into_iter().collect()
+            }
+            BalancerStrategy::LeastLoad(settings) => {
+                if let Some(obs) = observatory {
+                    let nodes = select_least_load_nodes(&candidates, obs, settings);
+                    nodes.into_iter().map(|n| n.tag).collect()
+                } else {
+                    Vec::new()
+                }
+            }
+        }
     }
 }
 
@@ -403,6 +737,7 @@ pub struct Router {
     pub sniff: bool,
     pub final_rules: std::sync::RwLock<HashMap<String, Vec<(Action, RoutingRule)>>>,
     pub asset_dirs: Vec<PathBuf>,
+    pub observatory: Arc<std::sync::RwLock<Option<Arc<crate::observatory::Observatory>>>>,
 }
 
 pub struct Rule {
@@ -603,7 +938,23 @@ impl Router {
             sniff,
             final_rules: std::sync::RwLock::new(final_rules),
             asset_dirs: asset_dirs.to_vec(),
+            observatory: Arc::new(std::sync::RwLock::new(None)),
         })
+    }
+
+    pub fn set_observatory(&self, obs: Arc<crate::observatory::Observatory>) {
+        *self
+            .observatory
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(obs);
+    }
+
+    pub fn decision_for_tag(&self, tag: &str) -> Decision {
+        let outbounds = self
+            .outbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.decision(&outbounds, tag)
     }
 
     pub fn add_rule(&self, rule: Rule, should_append: bool) {
@@ -809,7 +1160,11 @@ impl Router {
             RuleTarget::Outbound(tag) => self.decision(&outbounds, tag),
             RuleTarget::Balancer(balancer_tag) => {
                 if let Some(balancer) = self.balancers.get(balancer_tag) {
-                    if let Some((tag, action)) = balancer.select(&outbounds) {
+                    let obs = self
+                        .observatory
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some((tag, action)) = balancer.select(&outbounds, obs.as_deref()) {
                         return Decision {
                             tag: tag.to_owned(),
                             action: action.clone(),
@@ -1578,31 +1933,42 @@ mod tests {
     }
 
     #[test]
-    fn rejects_leastping_and_leastload_balancer_strategies() {
+    fn parses_leastping_and_leastload_balancer_strategies() {
         let val = json!({
             "tag": "b1",
             "selector": ["node-"],
             "strategy": "leastPing"
         });
-        let err = match Balancer::parse(0, &val) {
-            Err(e) => e,
-            Ok(_) => panic!("Expected error for leastPing"),
-        };
-        assert!(err.contains("not supported without observatory"), "{err}");
+        let b1 = Balancer::parse(0, &val).expect("leastPing must parse");
+        assert_eq!(b1.strategy, BalancerStrategy::LeastPing);
 
         let val_obj = json!({
             "tag": "b2",
             "selector": ["node-"],
-            "strategy": { "type": "leastLoad" }
+            "strategy": {
+                "type": "leastLoad",
+                "settings": {
+                    "expected": 2,
+                    "maxRTT": "500ms",
+                    "tolerance": 0.2,
+                    "baselines": ["100ms", "200ms"],
+                    "costs": [
+                        {"match": "node-1", "value": 1.5}
+                    ]
+                }
+            }
         });
-        let err_obj = match Balancer::parse(1, &val_obj) {
-            Err(e) => e,
-            Ok(_) => panic!("Expected error for leastLoad"),
-        };
-        assert!(
-            err_obj.contains("not supported without observatory"),
-            "{err_obj}"
-        );
+        let b2 = Balancer::parse(1, &val_obj).expect("leastLoad must parse");
+        match b2.strategy {
+            BalancerStrategy::LeastLoad(cfg) => {
+                assert_eq!(cfg.expected, 2);
+                assert_eq!(cfg.max_rtt, Duration::from_millis(500));
+                assert_eq!(cfg.tolerance, 0.2);
+                assert_eq!(cfg.baselines.len(), 2);
+                assert_eq!(cfg.costs.len(), 1);
+            }
+            _ => panic!("expected LeastLoad"),
+        }
     }
 
     #[tokio::test]

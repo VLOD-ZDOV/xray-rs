@@ -326,11 +326,11 @@ mod tests {
 
     #[test]
     fn tracks_online_ips() {
-        let panel = json!({"stats": {}, "policy": {"levels": {"0": {"statsUserOnline": true}}}});
+        let panel = json!({"stats": {}, "policy": {"levels": {"99": {"statsUserOnline": true}}}});
         crate::policy::init(crate::policy::PolicyManager::from_config(&panel));
         let stats = leaked(Policy::from_config(&panel));
-        let a = stats.connect("bob", 0, "1.2.3.4".parse().unwrap());
-        let b = stats.connect("bob", 0, "::ffff:1.2.3.4".parse().unwrap());
+        let a = stats.connect("bob", 99, "1.2.3.4".parse().unwrap());
+        let b = stats.connect("bob", 99, "::ffff:1.2.3.4".parse().unwrap());
         assert_eq!(stats.online_users()[0].1.len(), 1);
         drop(a);
         assert_eq!(stats.online_users().len(), 1);
