@@ -88,6 +88,25 @@ impl Stats {
         lock(&self.counters).entry(name).or_default().clone()
     }
 
+    /// Xray creates an inbound's or outbound's counters with its handler, so
+    /// they are listed at zero before any traffic.
+    pub fn register(&self, kind: &str, tag: &str) {
+        let p = self.policy;
+        let (up, down) = match kind {
+            "inbound" => (p.inbound_uplink, p.inbound_downlink),
+            _ => (p.outbound_uplink, p.outbound_downlink),
+        };
+        if !self.policy.enabled || tag.is_empty() {
+            return;
+        }
+        if up {
+            self.counter(format!("{kind}>>>{tag}>>>traffic>>>uplink"));
+        }
+        if down {
+            self.counter(format!("{kind}>>>{tag}>>>traffic>>>downlink"));
+        }
+    }
+
     /// Counters for one proxied connection, honoring the policy flags.
     pub fn traffic(&self, inbound: &str, email: &str, level: u32, outbound: &str) -> Traffic {
         if !self.policy.enabled {

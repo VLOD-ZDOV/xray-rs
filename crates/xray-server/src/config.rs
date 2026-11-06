@@ -26,6 +26,8 @@ pub struct Config {
     pub policy: policy::PolicyManager,
     pub fakedns: Option<crate::fakedns::FakeDnsMulti>,
     pub observatory: Option<Arc<crate::observatory::Observatory>>,
+    pub metrics_listen: Option<SocketAddr>,
+    pub api_tag: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,6 +332,8 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         policy,
         fakedns,
         observatory,
+        metrics_listen: crate::metrics::parse(&root)?.and_then(|m| m.listen),
+        api_tag: api_tag.map(str::to_owned),
     })
 }
 

@@ -14,6 +14,7 @@ mod httpupgrade;
 mod hysteria;
 mod inbound_proxy;
 mod log;
+mod metrics;
 mod mux;
 mod observatory;
 mod outbound;
@@ -206,8 +207,18 @@ async fn run(
     policy::init(config.policy);
     let router = Arc::new(config.router);
     router.init_chained_outbounds(&router);
+    for tag in router.outbound_tags() {
+        stats::get().register("outbound", &tag);
+    }
+    if let Some(tag) = &config.api_tag {
+        stats::get().register("inbound", tag);
+    }
     if let Some(obs) = config.observatory.clone() {
         obs.start(router.clone());
+    }
+    metrics::init(config.observatory.clone());
+    if let Some(addr) = config.metrics_listen {
+        metrics::listen(addr).await?;
     }
     let inbound_manager = Arc::new(api::InboundManager::new(router.clone()));
     for (inbound, acceptor) in config.inbounds.into_iter().zip(tls) {
@@ -240,6 +251,7 @@ pub(crate) async fn start_inbound(
     ),
     String,
 > {
+    stats::get().register("inbound", &inbound.tag);
     let ctx = Arc::new(vless::Context {
         tag: inbound.tag.clone(),
         port: inbound.port,

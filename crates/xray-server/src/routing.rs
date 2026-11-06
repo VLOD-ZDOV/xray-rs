@@ -949,6 +949,8 @@ pub enum Action {
     Http(Arc<HttpOutbound>),
     Dns(Arc<DnsOutbound>),
     Loopback(String),
+    /// The `metrics` section's tag: connections reach its HTTP server.
+    Metrics,
 }
 
 impl PartialEq for Action {
@@ -1178,6 +1180,9 @@ impl Router {
             }
             outbounds.insert(tag, action);
         }
+        if let Some(metrics) = crate::metrics::parse(root)? {
+            outbounds.insert(metrics.tag, Action::Metrics);
+        }
 
         let routing = root.get("routing").cloned().unwrap_or(Value::Null);
         let mut balancers = HashMap::new();
@@ -1339,7 +1344,19 @@ impl Router {
         parse_single_rule(raw, &self.asset_dirs)
     }
 
+    /// Tags of the configured outbounds, without internal ones like metrics.
+    pub fn outbound_tags(&self) -> Vec<String> {
+        self.outbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(_, action)| !matches!(action, Action::Metrics))
+            .map(|(tag, _)| tag.clone())
+            .collect()
+    }
+
     pub fn add_outbound(&self, tag: String, action: Action) {
+        crate::stats::get().register("outbound", &tag);
         let mut outbounds = self
             .outbounds
             .write()

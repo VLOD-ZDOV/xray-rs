@@ -80,6 +80,11 @@ pub async fn connect(
             let next = router.route(&query).await;
             Box::pin(connect(router, &next, host, port)).await
         }
+        Action::Metrics => {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            tokio::spawn(crate::metrics::serve(server));
+            Ok(Box::new(client))
+        }
         Action::Block(_) => Err(blocked(&decision.tag)),
     }
 }
