@@ -250,7 +250,7 @@ where
     if let Action::Block(BlockAction::Http403) = decision.action {
         if request.command == Command::Tcp {
             downlink
-                .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nCache-Control: max-age=600\r\nContent-Length: 0\r\n\r\n")
+                .write_all(crate::routing::BLACKHOLE_HTTP_RESPONSE)
                 .await?;
             downlink.flush().await?;
         }

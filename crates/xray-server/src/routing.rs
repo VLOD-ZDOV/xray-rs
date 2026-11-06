@@ -456,6 +456,10 @@ fn parse_u64_range(v: &Value) -> Result<(u64, u64), String> {
     }
 }
 
+/// Xray-core's blackhole `http` response: Go's `http.Response.Write` of a
+/// 403 with sorted headers.
+pub const BLACKHOLE_HTTP_RESPONSE: &[u8] = b"HTTP/1.1 403 Forbidden\r\nCache-Control: max-age=3600, public\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct FreedomSettings {
     pub strategy: FreedomStrategy,

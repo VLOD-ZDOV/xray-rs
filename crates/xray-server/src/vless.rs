@@ -592,7 +592,7 @@ where
         if request.command == Command::Tcp {
             stream.write_all(&[request.version, 0]).await?;
             stream
-                .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nCache-Control: max-age=600\r\nContent-Length: 0\r\n\r\n")
+                .write_all(crate::routing::BLACKHOLE_HTTP_RESPONSE)
                 .await?;
             stream.flush().await?;
         }
@@ -900,7 +900,7 @@ pub(crate) async fn relay_policy(
     Ok(())
 }
 
-async fn idle_for(activity: &Activity, limit: Duration) {
+pub(crate) async fn idle_for(activity: &Activity, limit: Duration) {
     loop {
         let left = limit.saturating_sub(activity.idle());
         if left.is_zero() {
