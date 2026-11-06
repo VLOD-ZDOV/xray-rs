@@ -34,6 +34,8 @@ const TROJAN_ACCOUNT: &str = "xray.proxy.trojan.Account";
 const VMESS_ACCOUNT: &str = "xray.proxy.vmess.Account";
 const SHADOWSOCKS_ACCOUNT: &str = "xray.proxy.shadowsocks.Account";
 const SHADOWSOCKS_2022_ACCOUNT: &str = "xray.proxy.shadowsocks_2022.Account";
+const HYSTERIA_ACCOUNT: &str = "xray.proxy.hysteria.account.Account";
+const HYSTERIA_ACCOUNT_ALT: &str = "xray.proxy.hysteria.Account";
 const MAX_REQUEST: usize = 1 << 20;
 
 // grpc-status codes.
@@ -212,6 +214,12 @@ pub struct ShadowsocksAccount {
     pub cipher_type: i32,
     #[prost(bool, tag = "3")]
     pub iv_check: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HysteriaAccount {
+    #[prost(string, tag = "1")]
+    pub auth: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
@@ -1233,11 +1241,14 @@ async fn handle_handler(
                 crate::config::InboundProtocol::Socks
             } else if proxy_type.contains("http") {
                 crate::config::InboundProtocol::Http
+            } else if proxy_type.contains("hysteria") {
+                crate::config::InboundProtocol::Hysteria
             } else {
                 crate::config::InboundProtocol::Vless
             };
             let mut parsed_users = Vec::new();
             let mut parsed_ss_users = Vec::new();
+            let mut parsed_hysteria_users = Vec::new();
             let mut ss_method = None;
             let mut ss_pass = None;
             if let Some(ref ps) = inbound_cfg.proxy_settings {
@@ -1292,6 +1303,15 @@ async fn handle_handler(
                                     }
                                 }
                             }
+                            HYSTERIA_ACCOUNT | HYSTERIA_ACCOUNT_ALT => {
+                                if let Ok(acc) = HysteriaAccount::decode(account.value) {
+                                    parsed_hysteria_users.push(crate::vless::HysteriaUser {
+                                        auth: acc.auth,
+                                        email,
+                                        level: u.level,
+                                    });
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1316,6 +1336,11 @@ async fn handle_handler(
                 reality: None,
                 transport,
                 accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept::None,
+                hysteria_users: parsed_hysteria_users,
+                hysteria_salamander: None,
+                hysteria_gecko: None,
+                hysteria_udp_idle_timeout: None,
+                has_udphop: false,
             };
             match crate::start_inbound(&inbound, None, inbound_manager.router().clone()).await {
                 Ok((ctx, tcp_abort, udp_abort)) => {
@@ -1465,6 +1490,14 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 },
             )
         }
+        HYSTERIA_ACCOUNT | HYSTERIA_ACCOUNT_ALT => {
+            let account = HysteriaAccount::decode(account.value).map_err(|e| e.to_string())?;
+            ctx.add_hysteria_user(crate::vless::HysteriaUser {
+                auth: account.auth,
+                email: user.email,
+                level: user.level,
+            })
+        }
         other => Err(format!("account type {other:?} is not supported")),
     }
 }
@@ -1584,6 +1617,7 @@ mod tests {
             tag: "test_in".into(),
             port: 1234,
             users: std::sync::RwLock::new(Vec::new()),
+            hysteria_users: std::sync::RwLock::new(Vec::new()),
             ss_users: std::sync::RwLock::new(Vec::new()),
             ss_method: std::sync::RwLock::new(Some("aes-128-gcm".into())),
             ss_password: std::sync::RwLock::new(None),

@@ -10,6 +10,7 @@ mod grpc;
 mod http_obfs;
 mod http_outbound;
 mod httpupgrade;
+mod hysteria;
 mod inbound_proxy;
 mod log;
 mod mux;
@@ -223,12 +224,6 @@ pub(crate) async fn start_inbound(
     ),
     String,
 > {
-    let listener = bind(inbound).await?;
-    log::info(format!(
-        "listening {} on {}",
-        inbound.tag,
-        listener.local_addr().map_err(|e| e.to_string())?
-    ));
     let ctx = Arc::new(vless::Context {
         tag: inbound.tag.clone(),
         port: inbound.port,
@@ -236,6 +231,7 @@ pub(crate) async fn start_inbound(
         ss_users: RwLock::new(inbound.shadowsocks_users.clone()),
         ss_method: RwLock::new(inbound.shadowsocks_top_method.clone()),
         ss_password: RwLock::new(inbound.shadowsocks_top_password.clone()),
+        hysteria_users: RwLock::new(inbound.hysteria_users.clone()),
         router: router.clone(),
         sniffing: inbound.sniffing.clone(),
         fallbacks: inbound.fallbacks.clone(),
@@ -246,6 +242,18 @@ pub(crate) async fn start_inbound(
             xray_proxy::shadowsocks2022::SaltPool::default_ss2022(),
         )),
     });
+
+    if inbound.protocol == InboundProtocol::Hysteria {
+        let abort = hysteria::start(inbound, ctx.clone(), router).await?;
+        return Ok((ctx, Some(abort), None));
+    }
+
+    let listener = bind(inbound).await?;
+    log::info(format!(
+        "listening {} on {}",
+        inbound.tag,
+        listener.local_addr().map_err(|e| e.to_string())?
+    ));
     let is_ss_udp = inbound.protocol == InboundProtocol::Shadowsocks && inbound.udp;
     let is_dokodemo_udp = inbound.protocol == InboundProtocol::Dokodemo && inbound.udp;
     let dokodemo_settings = inbound.dokodemo.clone();
@@ -327,6 +335,9 @@ pub(crate) async fn start_inbound(
                 "inbound {}: {:?} over gRPC is not supported",
                 inbound.tag, other
             ));
+        }
+        (InboundProtocol::Hysteria, _) | (_, InboundTransport::Hysteria) => {
+            unreachable!("hysteria is handled above")
         }
     };
     let reality = if let Some(reality_settings) = &inbound.reality {
@@ -925,11 +936,11 @@ impl rustls::server::ResolvesServerCert for SniCheckingResolver {
     }
 }
 
-fn tls_acceptor(
+pub(crate) fn build_rustls_server_config(
     settings: &TlsSettings,
-    is_xhttp: bool,
-    is_grpc: bool,
-) -> Result<TlsAcceptor, String> {
+    alpn: Vec<Vec<u8>>,
+    only_tls13: bool,
+) -> Result<rustls::ServerConfig, String> {
     let certs = CertificateDer::pem_slice_iter(&settings.cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("invalid certificate: {e}"))?;
@@ -965,13 +976,17 @@ fn tls_acceptor(
         reject_unknown_sni: settings.reject_unknown_sni,
     });
 
-    let versions: &[&'static rustls::SupportedProtocolVersion] = match (
-        settings.min_version.as_deref(),
-        settings.max_version.as_deref(),
-    ) {
-        (Some("1.3"), _) => &[&rustls::version::TLS13],
-        (_, Some("1.2")) => &[&rustls::version::TLS12],
-        _ => rustls::ALL_VERSIONS,
+    let versions: &[&'static rustls::SupportedProtocolVersion] = if only_tls13 {
+        &[&rustls::version::TLS13]
+    } else {
+        match (
+            settings.min_version.as_deref(),
+            settings.max_version.as_deref(),
+        ) {
+            (Some("1.3"), _) => &[&rustls::version::TLS13],
+            (_, Some("1.2")) => &[&rustls::version::TLS12],
+            _ => rustls::ALL_VERSIONS,
+        }
     };
 
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
@@ -979,13 +994,22 @@ fn tls_acceptor(
         .map_err(|e| e.to_string())?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
+    config.alpn_protocols = alpn;
+    Ok(config)
+}
+
+fn tls_acceptor(
+    settings: &TlsSettings,
+    is_xhttp: bool,
+    is_grpc: bool,
+) -> Result<TlsAcceptor, String> {
     let alpn: Vec<Vec<u8>> = settings
         .alpn
         .iter()
         .filter(|p| *p != "h3")
         .map(|p| p.as_bytes().to_vec())
         .collect();
-    config.alpn_protocols = if !alpn.is_empty() {
+    let alpn = if !alpn.is_empty() {
         alpn
     } else if is_grpc {
         vec![b"h2".to_vec()]
@@ -994,6 +1018,7 @@ fn tls_acceptor(
     } else {
         Vec::new()
     };
+    let config = build_rustls_server_config(settings, alpn, false)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 

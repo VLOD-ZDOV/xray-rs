@@ -3,7 +3,7 @@
 
 pub(crate) mod carrier;
 mod client;
-mod gecko;
+pub mod gecko;
 mod tcp;
 mod udp;
 

@@ -24,6 +24,12 @@ jobs:
         run: >-
           RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=."
           cargo build --release -p xray-server
+      - name: Check glibc requirement
+        # README promises glibc 2.34; src/compat.c covers newer C23 symbols.
+        run: |
+          need=$(objdump -T target/release/xray-server | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "requires $need"
+          [ "$(printf '%s\nGLIBC_2.34\n' "$need" | sort -V | tail -1)" = GLIBC_2.34 ]
       - name: Package
         run: |
           cp target/release/xray-server xray-linux-amd64

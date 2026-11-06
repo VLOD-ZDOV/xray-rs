@@ -12,3 +12,11 @@ int __isoc23_sscanf(const char *s, const char *format, ...) {
     va_end(ap);
     return ret;
 }
+
+extern long strtol(const char *s, char **end, int base);
+
+/* C23 also reads a 0b prefix; aws-lc only calls it with base 10, where both agree. */
+__attribute__((weak))
+long __isoc23_strtol(const char *s, char **end, int base) {
+    return strtol(s, end, base);
+}

@@ -52,13 +52,13 @@ impl GeckoPacketSize {
         Some(Self { min, max }).filter(|size| size.is_valid())
     }
 
-    pub(crate) fn is_valid(self) -> bool {
+    pub fn is_valid(self) -> bool {
         self.min > 0 && self.min <= self.max && self.max <= MAX_PACKET_SIZE
     }
 }
 
 /// Gecko fragments a datagram whose first byte has the QUIC long-header bit.
-pub(crate) fn is_fragmented(datagram: &[u8]) -> bool {
+pub fn is_fragmented(datagram: &[u8]) -> bool {
     datagram
         .first()
         .is_some_and(|byte| byte & FRAGMENT_FLAG != 0)
@@ -66,7 +66,7 @@ pub(crate) fn is_fragmented(datagram: &[u8]) -> bool {
 
 /// The frames for one long-header datagram: a random count of near-equal
 /// chunks, the last taking the remainder, each with random padding.
-pub(crate) fn fragment(
+pub fn fragment(
     datagram: &[u8],
     message: u8,
     size: GeckoPacketSize,
@@ -110,15 +110,15 @@ fn padding_len(size: GeckoPacketSize, chunk_len: usize, rng: &mut impl Rng) -> u
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Frame<'a> {
-    message: u8,
-    index: u8,
-    chunks: u8,
-    payload: &'a [u8],
+pub struct Frame<'a> {
+    pub message: u8,
+    pub index: u8,
+    pub chunks: u8,
+    pub payload: &'a [u8],
 }
 
 /// Parses one decrypted frame; malformed frames are dropped by the caller.
-pub(crate) fn parse_frame(input: &[u8]) -> Option<Frame<'_>> {
+pub fn parse_frame(input: &[u8]) -> Option<Frame<'_>> {
     if input.len() < HEADER_LEN || input[0] & FRAGMENT_FLAG == 0 {
         return None;
     }
@@ -145,7 +145,7 @@ struct Message {
 
 /// Reassembly for the one peer a carrier socket accepts datagrams from.
 #[derive(Default)]
-pub(crate) struct Reassembly {
+pub struct Reassembly {
     messages: Vec<Message>,
 }
 
@@ -154,7 +154,7 @@ impl Reassembly {
     /// Like Gecko, it drops a chunk for a new message while eight are
     /// incomplete, a chunk whose count disagrees with its message, and a
     /// duplicate.
-    pub(crate) fn accept(&mut self, now: Instant, frame: Frame<'_>) -> Option<Vec<u8>> {
+    pub fn accept(&mut self, now: Instant, frame: Frame<'_>) -> Option<Vec<u8>> {
         self.messages.retain(|message| message.deadline >= now);
         let position = match self.messages.iter().position(|m| m.id == frame.message) {
             Some(position) if self.messages[position].chunks.len() == usize::from(frame.chunks) => {

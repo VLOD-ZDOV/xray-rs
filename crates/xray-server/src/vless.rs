@@ -211,6 +211,14 @@ pub(crate) async fn read_first<R: AsyncRead + Unpin>(reader: &mut R, early: &mut
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct HysteriaUser {
+    pub auth: String,
+    pub email: String,
+    #[allow(dead_code)]
+    pub level: u32,
+}
+
 pub struct Context {
     pub tag: String,
     pub port: u16,
@@ -218,6 +226,7 @@ pub struct Context {
     pub ss_users: RwLock<Vec<crate::config::ShadowsocksUser>>,
     pub ss_method: RwLock<Option<String>>,
     pub ss_password: RwLock<Option<String>>,
+    pub hysteria_users: RwLock<Vec<HysteriaUser>>,
     pub router: Arc<Router>,
     pub sniffing: Sniffing,
     pub fallbacks: Vec<crate::config::Fallback>,
@@ -271,6 +280,47 @@ impl Context {
         Ok(())
     }
 
+    pub fn add_hysteria_user(&self, user: HysteriaUser) -> Result<(), String> {
+        if !user.email.is_empty() {
+            let h_users = self
+                .hysteria_users
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            if h_users
+                .iter()
+                .any(|u| u.email.eq_ignore_ascii_case(&user.email))
+            {
+                return Err(format!("User {} already exists.", user.email));
+            }
+        }
+        let mut h_users = self
+            .hysteria_users
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !user.email.is_empty()
+            && h_users
+                .iter()
+                .any(|u| u.email.eq_ignore_ascii_case(&user.email))
+        {
+            return Err(format!("User {} already exists.", user.email));
+        }
+        h_users.retain(|u| u.auth != user.auth);
+        h_users.push(user.clone());
+        let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
+        if !user.email.is_empty()
+            && !users
+                .iter()
+                .any(|u| u.email.eq_ignore_ascii_case(&user.email))
+        {
+            users.push(User {
+                id: crate::config::user_id(&user.email),
+                hash: [0u8; 56],
+                email: user.email,
+            });
+        }
+        Ok(())
+    }
+
     pub fn remove_user(&self, email: &str) -> Result<(), String> {
         if email.is_empty() {
             return Err("Email must not be empty.".into());
@@ -280,11 +330,17 @@ impl Context {
             .ss_users
             .write()
             .unwrap_or_else(PoisonError::into_inner);
+        let mut h_users = self
+            .hysteria_users
+            .write()
+            .unwrap_or_else(PoisonError::into_inner);
         let before_u = users.len();
         users.retain(|u| !u.email.eq_ignore_ascii_case(email));
         let before_ss = ss_users.len();
         ss_users.retain(|u| !u.email.eq_ignore_ascii_case(email));
-        if users.len() == before_u && ss_users.len() == before_ss {
+        let before_h = h_users.len();
+        h_users.retain(|u| !u.email.eq_ignore_ascii_case(email));
+        if users.len() == before_u && ss_users.len() == before_ss && h_users.len() == before_h {
             return Err(format!("User {email} not found."));
         }
         Ok(())
@@ -1113,6 +1169,7 @@ mod tests {
             tag: "vless-in".into(),
             port: 443,
             users: RwLock::new(vec![]),
+            hysteria_users: RwLock::new(vec![]),
             ss_users: RwLock::new(vec![]),
             ss_method: RwLock::new(None),
             ss_password: RwLock::new(None),

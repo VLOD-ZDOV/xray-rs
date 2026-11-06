@@ -33,6 +33,7 @@ pub enum InboundTransport {
     HttpUpgrade(crate::httpupgrade::HttpUpgradeSettings),
     Grpc(crate::grpc::GrpcSettings),
     Xhttp(Box<XhttpSettings>),
+    Hysteria,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +45,7 @@ pub enum InboundProtocol {
     Http,
     Shadowsocks,
     Dokodemo,
+    Hysteria,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +118,11 @@ pub struct Inbound {
     pub reality: Option<RealityInboundSettings>,
     pub transport: InboundTransport,
     pub accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept,
+    pub hysteria_users: Vec<crate::vless::HysteriaUser>,
+    pub hysteria_salamander: Option<String>,
+    pub hysteria_gecko: Option<xray_transport::hysteria::gecko::GeckoPacketSize>,
+    pub hysteria_udp_idle_timeout: Option<u64>,
+    pub has_udphop: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +303,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         "http" => InboundProtocol::Http,
         "shadowsocks" => InboundProtocol::Shadowsocks,
         "dokodemo-door" | "dokodemo" => InboundProtocol::Dokodemo,
+        "hysteria" | "hysteria2" => InboundProtocol::Hysteria,
         other => {
             log::warn(format!(
                 "skipping inbound {tag:?}: protocol {other:?} is not supported yet"
@@ -307,13 +315,21 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let network = str_field(stream, "network");
     let security = str_field(stream, "security");
 
+    let is_hysteria =
+        protocol == InboundProtocol::Hysteria || matches!(network, "hysteria" | "hysteria2");
     let is_tcp = matches!(network, "" | "tcp" | "raw");
     let is_ws = matches!(network, "ws" | "websocket");
     let is_httpupgrade = network == "httpupgrade";
     let is_grpc = matches!(network, "grpc" | "gun");
     let is_xhttp = matches!(network, "xhttp" | "splithttp");
     let supported_security = matches!(security, "" | "none" | "tls" | "reality");
-    if (!is_tcp && !is_ws && !is_httpupgrade && !is_grpc && !is_xhttp) || !supported_security {
+    if is_hysteria {
+        if security != "tls" {
+            log::warn(format!("skipping inbound {tag:?}: Hysteria requires TLS"));
+            return Ok(None);
+        }
+    } else if (!is_tcp && !is_ws && !is_httpupgrade && !is_grpc && !is_xhttp) || !supported_security
+    {
         log::warn(format!(
             "skipping inbound {tag:?}: {:?}/{}/{} is not supported yet",
             protocol,
@@ -496,7 +512,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     } else {
         None
     };
-    let transport = if is_tcp {
+    let transport = if is_hysteria {
+        InboundTransport::Hysteria
+    } else if is_tcp {
         InboundTransport::Tcp
     } else if is_ws {
         InboundTransport::Websocket(parse_ws(stream.get("wsSettings").unwrap_or(&Value::Null))?)
@@ -570,6 +588,119 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             (None, None)
         };
 
+    let mut hysteria_users = Vec::new();
+    let mut hysteria_salamander = None;
+    let mut hysteria_gecko = None;
+    let mut hysteria_udp_idle_timeout = None;
+    let mut has_udphop = false;
+
+    if is_hysteria {
+        let users_arr = array(settings, "users");
+        let clients_arr = array(settings, "clients");
+        let user_list = if !users_arr.is_empty() {
+            users_arr
+        } else {
+            clients_arr
+        };
+        for u in user_list {
+            let auth = str_field(u, "auth");
+            if !auth.is_empty() {
+                hysteria_users.push(crate::vless::HysteriaUser {
+                    auth: auth.to_owned(),
+                    email: str_field(u, "email").to_owned(),
+                    level: u.get("level").and_then(Value::as_u64).unwrap_or(0) as u32,
+                });
+            }
+        }
+        let h_settings = stream.get("hysteriaSettings").unwrap_or(&Value::Null);
+        let top_auth = str_field(settings, "auth");
+        let stream_auth = str_field(h_settings, "auth");
+        let single_auth = if !top_auth.is_empty() {
+            top_auth
+        } else {
+            stream_auth
+        };
+        if !single_auth.is_empty() && hysteria_users.is_empty() {
+            hysteria_users.push(crate::vless::HysteriaUser {
+                auth: single_auth.to_owned(),
+                email: String::new(),
+                level: 0,
+            });
+        }
+        if let Some(t) = h_settings.get("udpIdleTimeout").and_then(Value::as_u64) {
+            hysteria_udp_idle_timeout = Some(t);
+        }
+
+        if let Some(masks) = stream
+            .get("finalmask")
+            .and_then(|f| f.get("udp"))
+            .and_then(Value::as_array)
+        {
+            for mask in masks {
+                let mask_type = str_field(mask, "type");
+                let m_settings = mask.get("settings").unwrap_or(&Value::Null);
+                if mask_type.eq_ignore_ascii_case("udphop") {
+                    has_udphop = true;
+                } else if mask_type.eq_ignore_ascii_case("salamander") {
+                    let pwd = str_field(m_settings, "password");
+                    if !pwd.is_empty() {
+                        hysteria_salamander = Some(pwd.to_owned());
+                        if let Some(ps) = m_settings.get("packetSize") {
+                            if let Some(n) = ps.as_u64() {
+                                if n > 0 && n <= 2048 {
+                                    hysteria_gecko =
+                                        xray_transport::hysteria::gecko::GeckoPacketSize::new(
+                                            n as u16, n as u16,
+                                        );
+                                }
+                            } else if let Some(s) = ps.as_str() {
+                                if let Some((left, right)) = s.split_once('-') {
+                                    if let (Ok(l), Ok(r)) =
+                                        (left.parse::<u16>(), right.parse::<u16>())
+                                    {
+                                        let min = l.min(r);
+                                        let max = l.max(r);
+                                        hysteria_gecko =
+                                            xray_transport::hysteria::gecko::GeckoPacketSize::new(
+                                                min, max,
+                                            );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let obfs = stream.get("obfs").or_else(|| settings.get("obfs"));
+        if let Some(obfs) = obfs {
+            let obfs_type = str_field(obfs, "type");
+            if obfs_type.eq_ignore_ascii_case("salamander") {
+                let s_obj = obfs.get("salamander").unwrap_or(obfs);
+                let pwd = str_field(s_obj, "password");
+                if !pwd.is_empty() {
+                    hysteria_salamander = Some(pwd.to_owned());
+                }
+            } else if obfs_type.eq_ignore_ascii_case("gecko") {
+                let g_obj = obfs.get("gecko").unwrap_or(obfs);
+                let pwd = str_field(g_obj, "password");
+                if !pwd.is_empty() {
+                    hysteria_salamander = Some(pwd.to_owned());
+                    let min = g_obj
+                        .get("minPacketSize")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(512) as u16;
+                    let max = g_obj
+                        .get("maxPacketSize")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(1200) as u16;
+                    hysteria_gecko =
+                        xray_transport::hysteria::gecko::GeckoPacketSize::new(min, max);
+                }
+            }
+        }
+    }
+
     Ok(Some(Inbound {
         tag,
         listen,
@@ -589,6 +720,11 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         reality,
         transport,
         accept_proxy_protocol,
+        hysteria_users,
+        hysteria_salamander,
+        hysteria_gecko,
+        hysteria_udp_idle_timeout,
+        has_udphop,
     }))
 }
 

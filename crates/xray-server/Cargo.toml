@@ -29,10 +29,16 @@ sha1.workspace = true
 sha2.workspace = true
 aws-lc-rs.workspace = true
 aes-gcm.workspace = true
+blake2.workspace = true
 chacha20poly1305.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
+quinn.workspace = true
+quinn-proto.workspace = true
 x25519-dalek.workspace = true
+zeroize.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tokio-rustls.workspace = true
 uuid = { workspace = true, features = ["v5"] }
