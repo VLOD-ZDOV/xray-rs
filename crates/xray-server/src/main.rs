@@ -16,6 +16,7 @@ mod mux;
 mod outbound;
 mod outbound_transport;
 mod padding;
+mod penetrating_tls;
 mod policy;
 mod proxy_proto;
 mod reality;
@@ -37,6 +38,7 @@ mod xhttp;
 use crate::routing::Router;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 
@@ -46,7 +48,7 @@ use hyper_util::server::conn::auto;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
 use config::{Config, Inbound, InboundProtocol, InboundTransport, TlsSettings};
@@ -420,6 +422,128 @@ fn bracket(host: &str) -> String {
     }
 }
 
+pub enum InboundStream {
+    Plain(httpupgrade::PrefixedStream<TcpStream>),
+    Tls(penetrating_tls::ServerPenetratingTlsStream<httpupgrade::PrefixedStream<TcpStream>>),
+    Reality(reality::Tls13Stream<httpupgrade::PrefixedStream<TcpStream>>),
+    HttpObfs(http_obfs::PrefixedStream<httpupgrade::PrefixedStream<TcpStream>>),
+}
+
+impl AsyncRead for InboundStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Reality(s) => Pin::new(s).poll_read(cx, buf),
+            Self::HttpObfs(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for InboundStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Reality(s) => Pin::new(s).poll_write(cx, buf),
+            Self::HttpObfs(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            Self::Tls(s) => Pin::new(s).poll_flush(cx),
+            Self::Reality(s) => Pin::new(s).poll_flush(cx),
+            Self::HttpObfs(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Reality(s) => Pin::new(s).poll_shutdown(cx),
+            Self::HttpObfs(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+impl xray_proxy::vless::VisionStreamIo for InboundStream {
+    fn release_record_alignment(&mut self) {
+        match self {
+            Self::Plain(_) => {}
+            Self::Tls(s) => s.release_record_alignment(),
+            Self::Reality(_) => {}
+            Self::HttpObfs(_) => {}
+        }
+    }
+
+    fn poll_read_direct(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        output: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read_direct(cx, output),
+            Self::Tls(s) => Pin::new(s).poll_read_direct(cx, output),
+            Self::Reality(s) => Pin::new(s).poll_read_direct(cx, output),
+            Self::HttpObfs(s) => Pin::new(s).poll_read_direct(cx, output),
+        }
+    }
+
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        input: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write_direct(cx, input),
+            Self::Tls(s) => Pin::new(s).poll_write_direct(cx, input),
+            Self::Reality(s) => Pin::new(s).poll_write_direct(cx, input),
+            Self::HttpObfs(s) => Pin::new(s).poll_write_direct(cx, input),
+        }
+    }
+
+    fn poll_flush_direct(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush_direct(cx),
+            Self::Tls(s) => Pin::new(s).poll_flush_direct(cx),
+            Self::Reality(s) => Pin::new(s).poll_flush_direct(cx),
+            Self::HttpObfs(s) => Pin::new(s).poll_flush_direct(cx),
+        }
+    }
+
+    fn poll_shutdown_direct(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown_direct(cx),
+            Self::Tls(s) => Pin::new(s).poll_shutdown_direct(cx),
+            Self::Reality(s) => Pin::new(s).poll_shutdown_direct(cx),
+            Self::HttpObfs(s) => Pin::new(s).poll_shutdown_direct(cx),
+        }
+    }
+}
+
 async fn accept_loop(
     listener: TcpListener,
     accept_proxy_protocol: proxy_proto::ProxyProtocolAccept,
@@ -477,7 +601,9 @@ async fn accept_loop(
             let stream = httpupgrade::PrefixedStream::new(stream, leftover);
             if let Some(reality) = reality {
                 match reality.handle(stream, peer).await {
-                    Ok(Some(tls_stream)) => dispatch(tls_stream, peer, local, handler).await,
+                    Ok(Some(tls_stream)) => {
+                        dispatch(InboundStream::Reality(tls_stream), peer, local, handler).await
+                    }
                     Ok(None) => {}
                     Err(e) => log::debug(format!(
                         "reality handling from {} failed: {e}",
@@ -487,9 +613,14 @@ async fn accept_loop(
             } else {
                 match (tls, http_obfs) {
                     (Some(acceptor), _) => {
-                        match tokio::time::timeout(handshake_timeout, acceptor.accept(stream)).await
+                        let captured = penetrating_tls::CapturedStream::new(stream);
+                        match tokio::time::timeout(handshake_timeout, acceptor.accept(captured)).await
                         {
-                            Ok(Ok(stream)) => dispatch(stream, peer, local, handler).await,
+                            Ok(Ok(tls_stream)) => {
+                                let penetrating =
+                                    penetrating_tls::ServerPenetratingTlsStream::new(tls_stream);
+                                dispatch(InboundStream::Tls(penetrating), peer, local, handler).await
+                            }
                             Ok(Err(e)) => log::debug(format!(
                                 "tls handshake from {} failed: {e}",
                                 log::mask(peer)
@@ -507,7 +638,9 @@ async fn accept_loop(
                         )
                         .await
                         {
-                            Ok(Ok(stream)) => dispatch(stream, peer, local, handler).await,
+                            Ok(Ok(stream)) => {
+                                dispatch(InboundStream::HttpObfs(stream), peer, local, handler).await
+                            }
                             Ok(Err(e)) => log::debug(format!(
                                 "http obfs from {} failed: {e}",
                                 log::mask(peer)
@@ -517,25 +650,24 @@ async fn accept_loop(
                             }
                         }
                     }
-                    (None, None) => dispatch(stream, peer, local, handler).await,
+                    (None, None) => {
+                        dispatch(InboundStream::Plain(stream), peer, local, handler).await
+                    }
                 }
             }
         });
     }
 }
 
-async fn dispatch<I>(
-    stream: I,
+async fn dispatch(
+    stream: InboundStream,
     peer: SocketAddr,
     local: Option<SocketAddr>,
     handler: InboundHandler,
-) where
-    I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+) {
     let f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = match handler {
         InboundHandler::VlessTcp(ctx) => Box::pin(async move {
-            let (r, w) = tokio::io::split(stream);
-            if let Err(e) = vless::serve(r, w, &ctx, peer).await {
+            if let Err(e) = vless::serve_stream(stream, &ctx, peer).await {
                 log::info(format!("vless from {} rejected: {e}", log::mask(peer)));
             }
         }),

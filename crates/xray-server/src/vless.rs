@@ -299,14 +299,35 @@ impl Context {
 }
 
 pub async fn serve<R, W>(
-    mut uplink: R,
-    mut downlink: W,
+    uplink: R,
+    downlink: W,
     ctx: &Context,
     peer: SocketAddr,
 ) -> io::Result<()>
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    serve_stream(
+        DirectIoWrapper {
+            inner: CombinedStream {
+                r: uplink,
+                w: downlink,
+            },
+        },
+        ctx,
+        peer,
+    )
+    .await
+}
+
+pub async fn serve_stream<S>(
+    mut stream: S,
+    ctx: &Context,
+    peer: SocketAddr,
+) -> io::Result<()>
+where
+    S: VisionStreamIo + Send + 'static,
 {
     let mut buf = Vec::with_capacity(512);
     let handshake_res = timeout(crate::policy::get().handshake, async {
@@ -333,7 +354,7 @@ where
                 }
                 Err(ParseError::Incomplete) => {}
             }
-            let n = uplink.read(&mut chunk).await?;
+            let n = stream.read(&mut chunk).await?;
             if n == 0 {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
@@ -346,7 +367,8 @@ where
         Ok(Ok(parsed)) => parsed,
         Ok(Err(_)) => {
             if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, &buf) {
-                return crate::fallback::serve(uplink, downlink, fb, buf, peer, ctx.port).await;
+                let (r, w) = tokio::io::split(stream);
+                return crate::fallback::serve(r, w, fb, buf, peer, ctx.port).await;
             }
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -364,8 +386,8 @@ where
 
     let _online = stats::get().connect(&user.email, peer.ip());
     if request.command == Command::Mux {
-        downlink.write_all(&[request.version, 0]).await?;
-        downlink.flush().await?;
+        stream.write_all(&[request.version, 0]).await?;
+        stream.flush().await?;
         let info = mux::Info {
             peer,
             tag: ctx.tag.clone(),
@@ -374,12 +396,13 @@ where
             router: ctx.router.clone(),
             sniffing: ctx.sniffing.clone(),
         };
+        let (mut r, mut w) = tokio::io::split(stream);
         let mut reader = PrefixedReader {
             early,
             pos: 0,
-            inner: &mut uplink,
+            inner: &mut r,
         };
-        return mux::serve(&mut reader, &mut downlink, &info).await;
+        return mux::serve(&mut reader, &mut w, &info).await;
     }
     let network = if request.command == Command::Tcp {
         Network::Tcp
@@ -390,7 +413,7 @@ where
         && early.is_empty()
         && (ctx.router.needs_sniff() || ctx.sniffing.enabled())
     {
-        read_first(&mut uplink, &mut early).await;
+        read_first(&mut stream, &mut early).await;
     }
     // UDP early data is length-prefixed packets.
     let payload = if network == Network::Udp {
@@ -414,11 +437,11 @@ where
     ctx.sniffing.override_host(payload, &mut request.host);
     if let Action::Block(BlockAction::Http403) = decision.action {
         if request.command == Command::Tcp {
-            downlink.write_all(&[request.version, 0]).await?;
-            downlink
+            stream.write_all(&[request.version, 0]).await?;
+            stream
                 .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\nCache-Control: max-age=600\r\nContent-Length: 0\r\n\r\n")
                 .await?;
-            downlink.flush().await?;
+            stream.flush().await?;
         }
         return Ok(());
     }
@@ -436,30 +459,20 @@ where
                 });
                 let mut resp_header = vec![request.version, resp_addons.len() as u8];
                 resp_header.extend_from_slice(&resp_addons);
-                downlink.write_all(&resp_header).await?;
-                downlink.flush().await?;
+                stream.write_all(&resp_header).await?;
+                stream.flush().await?;
 
-                let client_reader = PrefixedReader {
-                    early,
-                    pos: 0,
-                    inner: &mut uplink,
-                };
-                let client_stream = CombinedStream {
-                    r: client_reader,
-                    w: &mut downlink,
-                };
+                let client_stream = PrefixedStreamIo::new(stream, early);
                 let vision_client = VisionStream::new(
-                    DirectIoWrapper {
-                        inner: client_stream,
-                    },
+                    client_stream,
                     user.id,
                     DEFAULT_VISION_SEED,
                 );
                 let (mut client_r, mut client_w) = tokio::io::split(vision_client);
 
-                let stream =
+                let target =
                     outbound::connect(&ctx.router, &decision, &request.host, request.port).await?;
-                let (mut target_r, mut target_w) = tokio::io::split(stream);
+                let (mut target_r, mut target_w) = tokio::io::split(target);
 
                 let activity = Activity::new();
                 relay(
@@ -469,13 +482,15 @@ where
                 )
                 .await
             } else {
-                let stream =
+                let target =
                     outbound::connect(&ctx.router, &decision, &request.host, request.port).await?;
-                let (mut target_r, mut target_w) = tokio::io::split(stream);
+                let (mut target_r, mut target_w) = tokio::io::split(target);
                 target_w.write_all(&early).await?;
                 traffic.up(early.len());
-                downlink.write_all(&[request.version, 0]).await?;
-                downlink.flush().await?;
+                stream.write_all(&[request.version, 0]).await?;
+                stream.flush().await?;
+
+                let (mut uplink, mut downlink) = tokio::io::split(stream);
                 let activity = Activity::new();
                 relay(
                     copy(&mut uplink, &mut target_w, &activity, |n| traffic.up(n)),
@@ -487,6 +502,7 @@ where
         }
         Command::Mux => unreachable!("handled above"),
         Command::Udp => {
+            let (mut uplink, mut downlink) = tokio::io::split(stream);
             let link = UdpLink::open(&ctx.router, &decision, &request.host, request.port).await?;
             downlink.write_all(&[request.version, 0]).await?;
             downlink.flush().await?;
@@ -725,6 +741,105 @@ where
         writer.flush().await?;
         count(n);
         activity.touch();
+    }
+}
+
+pub(crate) struct PrefixedStreamIo<S> {
+    pub(crate) inner: S,
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) pos: usize,
+}
+
+impl<S> PrefixedStreamIo<S> {
+    pub(crate) fn new(inner: S, prefix: Vec<u8>) -> Self {
+        Self {
+            inner,
+            prefix,
+            pos: 0,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for PrefixedStreamIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        if this.pos < this.prefix.len() {
+            let to_copy = (this.prefix.len() - this.pos).min(output.remaining());
+            output.put_slice(&this.prefix[this.pos..this.pos + to_copy]);
+            this.pos += to_copy;
+            if this.pos == this.prefix.len() {
+                this.prefix = Vec::new();
+                this.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read(cx, output)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStreamIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, input)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
+impl<S: VisionStreamIo> VisionStreamIo for PrefixedStreamIo<S> {
+    fn release_record_alignment(&mut self) {
+        self.inner.release_record_alignment();
+    }
+
+    fn poll_read_direct(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        if this.pos < this.prefix.len() {
+            let to_copy = (this.prefix.len() - this.pos).min(output.remaining());
+            output.put_slice(&this.prefix[this.pos..this.pos + to_copy]);
+            this.pos += to_copy;
+            if this.pos == this.prefix.len() {
+                this.prefix = Vec::new();
+                this.pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut this.inner).poll_read_direct(cx, output)
+    }
+
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write_direct(cx, input)
+    }
+
+    fn poll_flush_direct(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush_direct(cx)
+    }
+
+    fn poll_shutdown_direct(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown_direct(cx)
     }
 }
 

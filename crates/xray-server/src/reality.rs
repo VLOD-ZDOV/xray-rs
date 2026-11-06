@@ -19,6 +19,7 @@ use tokio::net::TcpStream;
 use crate::config::{FallbackDest, RealityInboundSettings};
 use crate::fallback::Stream;
 use crate::log;
+use xray_proxy::vless::VisionStreamIo;
 
 pub struct RealityServer {
     settings: Arc<RealityInboundSettings>,
@@ -306,7 +307,7 @@ impl RealityServer {
         &self,
         mut stream: S,
         peer: SocketAddr,
-    ) -> io::Result<Option<Box<dyn Stream>>>
+    ) -> io::Result<Option<Tls13Stream<S>>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -422,7 +423,7 @@ impl RealityServer {
             Ok(tls_stream) => {
                 // Drop dest connection, client is successfully authenticated and served
                 drop(dest);
-                Ok(Some(Box::new(tls_stream)))
+                Ok(Some(tls_stream))
             }
             Err(e) => {
                 log::debug(format!("REALITY handshake from {peer} failed: {e}"));
@@ -1287,6 +1288,29 @@ pub struct Tls13Stream<S> {
     write_buf_pos: usize,
 }
 
+impl<S> Tls13Stream<S> {
+    pub fn raw_stream(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn raw_stream_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    pub fn undecrypted_leftover(&self) -> &[u8] {
+        &self.raw_read_buf
+    }
+
+    pub fn into_parts(self) -> (S, Vec<u8>, Vec<u8>) {
+        let decrypted = if self.read_buf_pos < self.read_buf.len() {
+            self.read_buf[self.read_buf_pos..].to_vec()
+        } else {
+            Vec::new()
+        };
+        (self.inner, self.raw_read_buf, decrypted)
+    }
+}
+
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
@@ -1385,7 +1409,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
             )
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TLS 1.3 decrypt failed"))?;
 
-            self.raw_read_buf.clear();
+            self.raw_read_buf.drain(..total_len);
 
             let mut end = plaintext.len();
             while end > 0 && plaintext[end - 1] == 0 {
@@ -1522,6 +1546,69 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         ready!(self.as_mut().poll_flush(cx))?;
         Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> VisionStreamIo for Tls13Stream<S> {
+    fn poll_read_direct(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.as_mut().get_mut();
+
+        if this.read_buf_pos < this.read_buf.len() {
+            let to_copy =
+                std::cmp::min(output.remaining(), this.read_buf.len() - this.read_buf_pos);
+            output.put_slice(&this.read_buf[this.read_buf_pos..this.read_buf_pos + to_copy]);
+            this.read_buf_pos += to_copy;
+            if this.read_buf_pos == this.read_buf.len() {
+                this.read_buf.clear();
+                this.read_buf_pos = 0;
+            }
+            return Poll::Ready(Ok(()));
+        }
+
+        if !this.raw_read_buf.is_empty() {
+            let to_copy = std::cmp::min(output.remaining(), this.raw_read_buf.len());
+            output.put_slice(&this.raw_read_buf[..to_copy]);
+            this.raw_read_buf.drain(..to_copy);
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut this.inner).poll_read(cx, output)
+    }
+
+    fn poll_write_direct(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.as_mut().get_mut();
+        while this.write_buf_pos < this.write_buf.len() {
+            let to_write = &this.write_buf[this.write_buf_pos..];
+            match Pin::new(&mut this.inner).poll_write(cx, to_write) {
+                Poll::Ready(Ok(n)) => {
+                    this.write_buf_pos += n;
+                    if this.write_buf_pos == this.write_buf.len() {
+                        this.write_buf.clear();
+                        this.write_buf_pos = 0;
+                        break;
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Pin::new(&mut this.inner).poll_write(cx, input)
+    }
+
+    fn poll_flush_direct(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_flush(cx)
+    }
+
+    fn poll_shutdown_direct(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 

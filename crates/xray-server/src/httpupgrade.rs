@@ -77,6 +77,24 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PrefixedStream<S> {
     }
 }
 
+impl<S: AsyncRead + AsyncWrite + Unpin> xray_proxy::vless::VisionStreamIo for PrefixedStream<S> {
+    fn poll_read_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.poll_read(cx, output)
+    }
+
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_write(cx, input)
+    }
+}
+
 pub async fn accept<S>(
     mut stream: S,
     settings: &HttpUpgradeSettings,
