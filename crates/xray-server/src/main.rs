@@ -204,6 +204,7 @@ async fn run(
     dns::init(config.dns);
     policy::init(config.policy);
     let router = Arc::new(config.router);
+    router.init_chained_outbounds(&router);
     if let Some(obs) = config.observatory.clone() {
         obs.start(router.clone());
     }

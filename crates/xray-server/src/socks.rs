@@ -3,13 +3,14 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::time::timeout;
 
-use crate::vless::{resolve_all, Host, CONNECT_TIMEOUT};
+use crate::vless::{resolve, resolve_all, Host, CONNECT_TIMEOUT};
 
 const VERSION: u8 = 5;
 const NO_AUTH: u8 = 0;
@@ -17,18 +18,30 @@ const USER_PASS: u8 = 2;
 const CMD_CONNECT: u8 = 1;
 const CMD_UDP_ASSOCIATE: u8 = 3;
 
-#[derive(Debug)]
 pub struct SocksOutbound {
     tag: String,
     server: (Host, u16),
     auth: Option<(String, String)>,
+    pub send_through: Option<crate::routing::SendThrough>,
+    pub chained_connector:
+        Arc<std::sync::RwLock<Option<Arc<dyn xray_transport::ResolvedTcpConnector>>>>,
+}
+
+impl std::fmt::Debug for SocksOutbound {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SocksOutbound")
+            .field("tag", &self.tag)
+            .field("server", &self.server)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SocksOutbound {
     /// Accepts Xray's `servers: [{address, port, users: [{user, pass}]}]` and the flat
     /// `{address, port, user, pass}` form.
-    pub fn parse(tag: &str, settings: &Value) -> Result<Self, String> {
+    pub fn parse(tag: &str, outbound: &Value) -> Result<Self, String> {
         let err = |m: &str| format!("outbound {tag:?} (socks): {m}");
+        let settings = outbound.get("settings").unwrap_or(outbound);
         let server = settings
             .get("servers")
             .and_then(Value::as_array)
@@ -68,16 +81,27 @@ impl SocksOutbound {
             Ok(ip) => Host::Ip(ip),
             Err(_) => Host::Domain(address.to_owned()),
         };
+        let send_through = crate::routing::parse_send_through(outbound.get("sendThrough"))?;
+        let _dialer_proxy = crate::routing::parse_dialer_proxy(outbound, tag)?;
         Ok(Self {
             tag: tag.to_owned(),
             server: (host, port),
             auth: (!name.is_empty()).then_some((name, pass)),
+            send_through,
+            chained_connector: Arc::new(std::sync::RwLock::new(None)),
         })
     }
 
-    pub async fn connect(&self, host: &Host, port: u16) -> io::Result<TcpStream> {
+    pub fn set_chained_connector(&self, connector: Arc<dyn xray_transport::ResolvedTcpConnector>) {
+        *self.chained_connector.write().unwrap() = Some(connector);
+    }
+
+    pub async fn connect(
+        &self,
+        host: &Host,
+        port: u16,
+    ) -> io::Result<Box<dyn crate::outbound::Stream>> {
         let (stream, _) = self.handshake(CMD_CONNECT, host, port).await?;
-        stream.set_nodelay(true)?;
         Ok(stream)
     }
 
@@ -87,7 +111,8 @@ impl SocksOutbound {
         let (control, mut relay) = self.handshake(CMD_UDP_ASSOCIATE, &unspecified, 0).await?;
         // Servers commonly answer 0.0.0.0, meaning "the address you reached me at".
         if relay.ip().is_unspecified() {
-            relay.set_ip(control.peer_addr()?.ip());
+            let server_ip = resolve(&self.server.0, self.server.1).await?.ip();
+            relay.set_ip(server_ip);
         }
         let bind: SocketAddr = if relay.is_ipv4() {
             (Ipv4Addr::UNSPECIFIED, 0).into()
@@ -97,7 +122,7 @@ impl SocksOutbound {
         let socket = UdpSocket::bind(bind).await?;
         socket.connect(relay).await?;
         Ok(SocksUdp {
-            _control: control,
+            _control: tokio::sync::Mutex::new(control),
             socket,
         })
     }
@@ -107,7 +132,7 @@ impl SocksOutbound {
         command: u8,
         host: &Host,
         port: u16,
-    ) -> io::Result<(TcpStream, SocketAddr)> {
+    ) -> io::Result<(Box<dyn crate::outbound::Stream>, SocketAddr)> {
         let work = async {
             let mut stream = self.dial().await?;
             let method = if self.auth.is_some() {
@@ -148,11 +173,46 @@ impl SocksOutbound {
             .map_err(|_| self.error("handshake timed out".into()))?
     }
 
-    async fn dial(&self) -> io::Result<TcpStream> {
+    async fn dial(&self) -> io::Result<Box<dyn crate::outbound::Stream>> {
+        let chained = self.chained_connector.read().unwrap().clone();
+        if let Some(connector) = chained {
+            let target = xray_routing::Target::new(
+                match &self.server.0 {
+                    Host::Ip(ip) => xray_routing::TargetAddr::Ip(*ip),
+                    Host::Domain(d) => xray_routing::TargetAddr::Domain(d.clone()),
+                },
+                self.server.1,
+                xray_routing::Network::Tcp,
+            );
+            let candidates = resolve_all(&self.server.0, self.server.1).await?;
+            let stream = connector
+                .connect_resolved(&target, &candidates, None)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            return Ok(Box::new(stream));
+        }
+
+        let bind_ip = self.send_through.as_ref().and_then(|st| st.resolve_ip());
         let mut last = None;
         for addr in resolve_all(&self.server.0, self.server.1).await? {
-            match TcpStream::connect(addr).await {
-                Ok(stream) => return Ok(stream),
+            let connect_fut = async {
+                if let Some(ip) = bind_ip {
+                    let socket = if ip.is_ipv4() {
+                        tokio::net::TcpSocket::new_v4()?
+                    } else {
+                        tokio::net::TcpSocket::new_v6()?
+                    };
+                    socket.bind(SocketAddr::new(ip, 0))?;
+                    socket.connect(addr).await
+                } else {
+                    TcpStream::connect(addr).await
+                }
+            };
+            match connect_fut.await {
+                Ok(stream) => {
+                    stream.set_nodelay(true)?;
+                    return Ok(Box::new(stream));
+                }
                 Err(e) => last = Some(e),
             }
         }
@@ -165,9 +225,8 @@ impl SocksOutbound {
 }
 
 /// One UDP association; each datagram carries the RFC 1928 header.
-#[derive(Debug)]
 pub struct SocksUdp {
-    _control: TcpStream,
+    _control: tokio::sync::Mutex<Box<dyn crate::outbound::Stream>>,
     socket: UdpSocket,
 }
 
@@ -217,7 +276,9 @@ fn put_address(out: &mut Vec<u8>, host: &Host, port: u16) -> io::Result<()> {
 }
 
 /// Reads ATYP + address + port; a domain in the reply resolves to the unspecified address.
-async fn read_address(stream: &mut TcpStream) -> io::Result<SocketAddr> {
+async fn read_address<S: tokio::io::AsyncReadExt + Unpin + ?Sized>(
+    stream: &mut S,
+) -> io::Result<SocketAddr> {
     let ip = match stream.read_u8().await? {
         1 => {
             let mut b = [0u8; 4];

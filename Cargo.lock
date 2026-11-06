@@ -3228,6 +3228,7 @@ name = "xray-server"
 version = "0.2.0"
 dependencies = [
  "aes-gcm",
+ "async-trait",
  "aws-lc-rs",
  "base64 0.23.1",
  "blake2 0.11.0",

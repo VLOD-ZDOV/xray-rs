@@ -440,6 +440,328 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MuxUdp443 {
+    Reject,
+    Allow,
+    Skip,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MuxSettings {
+    pub enabled: bool,
+    pub concurrency: i16,
+    pub xudp_concurrency: i16,
+    pub udp443: MuxUdp443,
+}
+
+impl MuxSettings {
+    pub fn parse(v: Option<&serde_json::Value>) -> Option<Self> {
+        let v = v?;
+        let enabled = v
+            .get("enabled")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !enabled {
+            return None;
+        }
+        let concurrency = v
+            .get("concurrency")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(8) as i16;
+        let xudp_concurrency = v
+            .get("xudpConcurrency")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(16) as i16;
+        let udp443_str = v
+            .get("xudpProxyUDP443")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("reject");
+        let udp443 = match udp443_str.to_ascii_lowercase().as_str() {
+            "allow" => MuxUdp443::Allow,
+            "skip" => MuxUdp443::Skip,
+            _ => MuxUdp443::Reject,
+        };
+        Some(Self {
+            enabled,
+            concurrency: if concurrency == 0 { 8 } else { concurrency },
+            xudp_concurrency: if xudp_concurrency == 0 {
+                16
+            } else {
+                xudp_concurrency
+            },
+            udp443,
+        })
+    }
+}
+
+pub struct MuxClientPool {
+    pub concurrency: u16,
+    parents: tokio::sync::Mutex<Vec<Arc<MuxParent>>>,
+}
+
+struct MuxParent {
+    writer_tx: mpsc::Sender<Bytes>,
+    sessions: Arc<tokio::sync::Mutex<HashMap<u16, mpsc::Sender<Bytes>>>>,
+    active_count: Arc<std::sync::atomic::AtomicU16>,
+    next_id: std::sync::atomic::AtomicU16,
+    concurrency: u16,
+    is_closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl MuxClientPool {
+    pub fn new(concurrency: u16) -> Self {
+        Self {
+            concurrency: if concurrency == 0 { 8 } else { concurrency },
+            parents: tokio::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    pub async fn open_sub_session<F, Fut>(
+        &self,
+        open_parent: F,
+        host: &Host,
+        port: u16,
+    ) -> io::Result<Box<dyn crate::outbound::Stream>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = io::Result<Box<dyn crate::outbound::Stream>>>,
+    {
+        use std::sync::atomic::Ordering;
+
+        let mut parents = self.parents.lock().await;
+        parents.retain(|p| !p.is_closed.load(Ordering::Relaxed));
+
+        let parent = match parents
+            .iter()
+            .find(|p| p.active_count.load(Ordering::Relaxed) < p.concurrency)
+        {
+            Some(p) => Arc::clone(p),
+            None => {
+                let raw_stream = open_parent().await?;
+                let (reader, writer) = tokio::io::split(raw_stream);
+                let (writer_tx, mut writer_rx) = mpsc::channel::<Bytes>(512);
+                let sessions: Arc<tokio::sync::Mutex<HashMap<u16, mpsc::Sender<Bytes>>>> =
+                    Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+                let is_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+                let is_closed_w = Arc::clone(&is_closed);
+                tokio::spawn(async move {
+                    let mut writer = writer;
+                    while let Some(bytes) = writer_rx.recv().await {
+                        if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err()
+                        {
+                            is_closed_w.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                });
+
+                let sessions_r = Arc::clone(&sessions);
+                let is_closed_r = Arc::clone(&is_closed);
+                tokio::spawn(async move {
+                    let mut reader = reader;
+                    while let Ok(frame) = read_frame(&mut reader).await {
+                        match frame.status {
+                            STATUS_KEEP => {
+                                let lock = sessions_r.lock().await;
+                                if let Some(tx) = lock.get(&frame.id) {
+                                    if let Some(data) = frame.data {
+                                        let _ = tx.send(Bytes::from(data)).await;
+                                    }
+                                }
+                            }
+                            STATUS_END => {
+                                let mut lock = sessions_r.lock().await;
+                                lock.remove(&frame.id);
+                            }
+                            _ => {}
+                        }
+                    }
+                    is_closed_r.store(true, Ordering::Relaxed);
+                    let mut lock = sessions_r.lock().await;
+                    lock.clear();
+                });
+
+                let p = Arc::new(MuxParent {
+                    writer_tx,
+                    sessions,
+                    active_count: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+                    next_id: std::sync::atomic::AtomicU16::new(1),
+                    concurrency: self.concurrency,
+                    is_closed,
+                });
+                parents.push(Arc::clone(&p));
+                p
+            }
+        };
+
+        let session_id = loop {
+            let id = parent.next_id.fetch_add(1, Ordering::Relaxed);
+            let id = if id == 0 {
+                parent.next_id.store(2, Ordering::Relaxed);
+                1
+            } else {
+                id
+            };
+            let s = parent.sessions.lock().await;
+            if !s.contains_key(&id) {
+                break id;
+            }
+        };
+
+        let (sub_tx, sub_rx) = mpsc::channel(64);
+        {
+            let mut s = parent.sessions.lock().await;
+            s.insert(session_id, sub_tx);
+            parent.active_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let target = xray_routing::Target::new(
+            match host {
+                Host::Ip(ip) => xray_routing::TargetAddr::Ip(*ip),
+                Host::Domain(d) => xray_routing::TargetAddr::Domain(d.clone()),
+            },
+            port,
+            xray_routing::Network::Tcp,
+        );
+        let new_frame = xray_proxy::mux::Frame {
+            session_id,
+            status: xray_proxy::mux::Status::New,
+            error: false,
+            target: Some(target),
+            global_id: None,
+            payload: None,
+        };
+        let wire = xray_proxy::mux::encode(&new_frame)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        parent
+            .writer_tx
+            .send(Bytes::from(wire))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Mux parent closed"))?;
+
+        Ok(Box::new(MuxSubStream {
+            session_id,
+            writer_tx: parent.writer_tx.clone(),
+            sessions: Arc::clone(&parent.sessions),
+            active_count: Arc::clone(&parent.active_count),
+            rx: sub_rx,
+            buffer: Bytes::new(),
+            closed: false,
+        }))
+    }
+}
+
+pub struct MuxSubStream {
+    session_id: u16,
+    writer_tx: mpsc::Sender<Bytes>,
+    sessions: Arc<tokio::sync::Mutex<HashMap<u16, mpsc::Sender<Bytes>>>>,
+    active_count: Arc<std::sync::atomic::AtomicU16>,
+    rx: mpsc::Receiver<Bytes>,
+    buffer: Bytes,
+    closed: bool,
+}
+
+impl AsyncRead for MuxSubStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if !self.buffer.is_empty() {
+            let to_read = std::cmp::min(buf.remaining(), self.buffer.len());
+            buf.put_slice(&self.buffer.split_to(to_read));
+            return std::task::Poll::Ready(Ok(()));
+        }
+        match self.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(chunk)) => {
+                let to_read = std::cmp::min(buf.remaining(), chunk.len());
+                buf.put_slice(&chunk[..to_read]);
+                if to_read < chunk.len() {
+                    self.buffer = chunk.slice(to_read..);
+                }
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+impl AsyncWrite for MuxSubStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        if self.closed {
+            return std::task::Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "Mux session closed",
+            )));
+        }
+        let chunk_len = std::cmp::min(buf.len(), 8192);
+        let frame = xray_proxy::mux::Frame {
+            session_id: self.session_id,
+            status: xray_proxy::mux::Status::Keep,
+            error: false,
+            target: None,
+            global_id: None,
+            payload: Some(&buf[..chunk_len]),
+        };
+        let wire = xray_proxy::mux::encode(&frame)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        match self.writer_tx.try_send(Bytes::from(wire)) {
+            Ok(()) => std::task::Poll::Ready(Ok(chunk_len)),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => std::task::Poll::Ready(Err(
+                io::Error::new(io::ErrorKind::BrokenPipe, "Mux parent closed"),
+            )),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        if !self.closed {
+            self.closed = true;
+            let end = end_frame(self.session_id, false);
+            let _ = self.writer_tx.try_send(end);
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl Drop for MuxSubStream {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            let end = end_frame(self.session_id, false);
+            let _ = self.writer_tx.try_send(end);
+        }
+        self.active_count
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let sessions = Arc::clone(&self.sessions);
+        let id = self.session_id;
+        tokio::spawn(async move {
+            let mut s = sessions.lock().await;
+            s.remove(&id);
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

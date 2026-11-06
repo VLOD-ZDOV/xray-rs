@@ -9,6 +9,7 @@ use std::task::{Context, Poll};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::CertificateDer;
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::timeout;
 use xray_routing::{Target, TargetAddr};
@@ -17,16 +18,127 @@ use xray_transport::stream::{
     WebSocketConfig,
 };
 use xray_transport::{
-    BoxedTransportStream, ConnectorConfig, RealityClientConfig, TlsClientConfig, TransportDialer,
+    BoxedTransportStream, ConnectorConfig, HappyEyeballsConfig, RealityClientConfig,
+    ResolvedTcpConnector, TlsClientConfig, TransportDialer, TransportError, TransportStream,
 };
 
 use crate::vless::{resolve_all, Host, CONNECT_TIMEOUT};
+
+pub struct TransportStreamWrapper<S>(pub S);
+
+impl<S: AsyncRead + AsyncWrite + Send + Unpin> AsyncRead for TransportStreamWrapper<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_read(cx, buf)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Send + Unpin> AsyncWrite for TransportStreamWrapper<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Send + Unpin> TransportStream for TransportStreamWrapper<S> {
+    fn poll_read_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        AsyncRead::poll_read(self, cx, output)
+    }
+
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        AsyncWrite::poll_write(self, cx, input)
+    }
+}
+
+pub struct ChainedTcpConnector {
+    pub router: Arc<crate::routing::Router>,
+    pub proxy_tag: String,
+}
+
+#[async_trait::async_trait]
+impl ResolvedTcpConnector for ChainedTcpConnector {
+    async fn connect_resolved(
+        &self,
+        original_target: &Target,
+        _candidates: &[std::net::SocketAddr],
+        _happy_eyeballs: Option<&HappyEyeballsConfig>,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        let decision = self.router.decision_for_tag(&self.proxy_tag);
+        let host = match &original_target.addr {
+            TargetAddr::Ip(ip) => Host::Ip(*ip),
+            TargetAddr::Domain(d) => Host::Domain(d.clone()),
+        };
+        let stream = crate::outbound::connect(&self.router, &decision, &host, original_target.port)
+            .await
+            .map_err(TransportError::Tcp)?;
+        Ok(Box::new(TransportStreamWrapper(stream)))
+    }
+}
+
+pub struct SendThroughConnector {
+    pub send_through: crate::routing::SendThrough,
+}
+
+#[async_trait::async_trait]
+impl ResolvedTcpConnector for SendThroughConnector {
+    async fn connect_resolved(
+        &self,
+        original_target: &Target,
+        candidates: &[std::net::SocketAddr],
+        _happy_eyeballs: Option<&HappyEyeballsConfig>,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        let Some(addr) = candidates.first().copied() else {
+            return Err(TransportError::NoResolvedAddress(
+                format!("{:?}", original_target.addr),
+                original_target.port,
+            ));
+        };
+        let bind_ip = self.send_through.resolve_ip().unwrap_or(if addr.is_ipv4() {
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        } else {
+            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+        });
+        let socket = if bind_ip.is_ipv4() {
+            tokio::net::TcpSocket::new_v4().map_err(TransportError::Tcp)?
+        } else {
+            tokio::net::TcpSocket::new_v6().map_err(TransportError::Tcp)?
+        };
+        socket
+            .bind(std::net::SocketAddr::new(bind_ip, 0))
+            .map_err(TransportError::Tcp)?;
+        let stream = socket.connect(addr).await.map_err(TransportError::Tcp)?;
+        stream.set_nodelay(true).map_err(TransportError::Tcp)?;
+        Ok(Box::new(stream))
+    }
+}
 
 pub struct ServerConnector {
     pub tag: String,
     pub protocol: String,
     pub server: (Host, u16),
-    pub dialer: TransportDialer,
+    pub dialer: std::sync::RwLock<TransportDialer>,
     pub connector: ConnectorConfig,
     pub transport: TransportLayer,
 }
@@ -252,16 +364,35 @@ impl ServerConnector {
             }
         };
 
-        let dialer = TransportDialer::system().map_err(|e| err(&format!("dialer error: {e}")))?;
+        let send_through = crate::routing::parse_send_through(outbound.get("sendThrough"))?;
+        let _dialer_proxy = crate::routing::parse_dialer_proxy(outbound, tag)?;
+
+        let mut dialer =
+            TransportDialer::system().map_err(|e| err(&format!("dialer error: {e}")))?;
+        if let Some(ref st) = send_through {
+            dialer = dialer.with_resolved_tcp_connector(Arc::new(SendThroughConnector {
+                send_through: st.clone(),
+            }));
+        }
 
         Ok(Self {
             tag: tag.to_owned(),
             protocol: protocol.to_owned(),
             server: (host, port),
-            dialer,
+            dialer: std::sync::RwLock::new(dialer),
             connector,
             transport,
         })
+    }
+
+    pub fn set_chained_connector(&self, connector: Arc<dyn ResolvedTcpConnector>) {
+        let dialer = self
+            .dialer
+            .read()
+            .unwrap()
+            .clone()
+            .with_resolved_tcp_connector(connector);
+        *self.dialer.write().unwrap() = dialer;
     }
 
     pub async fn connect(&self) -> io::Result<BoxedTransportStream> {
@@ -282,15 +413,10 @@ impl ServerConnector {
             xray_routing::Network::Tcp,
         );
 
+        let dialer = self.dialer.read().unwrap().clone();
         timeout(
             CONNECT_TIMEOUT,
-            self.dialer.connect_stream(
-                &self.connector,
-                &self.transport,
-                &target,
-                &candidates,
-                None,
-            ),
+            dialer.connect_stream(&self.connector, &self.transport, &target, &candidates, None),
         )
         .await
         .map_err(|_| {

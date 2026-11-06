@@ -111,97 +111,359 @@ pub fn parse_redirect(s: &str) -> Result<Option<RedirectSetting>, String> {
     }
 }
 
-pub fn parse_fragment(v: &Value) -> Result<Arc<TcpFragmentConfig>, String> {
-    let err = |m: &str| format!("freedom.fragment: {m}");
-    if let Some(packets) = v.get("packets").and_then(Value::as_str) {
-        if !packets.eq_ignore_ascii_case("tlshello") && !packets.is_empty() {
-            return Err(err(&format!(
-                "unsupported packets {packets:?}, only 'tlshello' is supported"
-            )));
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreedomFragmentPackets {
+    TlsHello,
+    All,
+    Range(u64, u64),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreedomFragmentSetting {
+    pub packets: FreedomFragmentPackets,
+    pub length: (u64, u64),
+    pub interval: (u64, u64),
+    pub max_split: (u64, u64),
+    pub tcp_fragment: Option<Arc<TcpFragmentConfig>>,
+}
+
+pub fn parse_fragment(v: &Value) -> Result<FreedomFragmentSetting, String> {
+    let packets_str = v
+        .get("packets")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let packets = match packets_str.to_ascii_lowercase().as_str() {
+        "tlshello" | "1" => FreedomFragmentPackets::TlsHello,
+        "" | "all" => FreedomFragmentPackets::All,
+        range_s => {
+            let (from, to) =
+                parse_u64_range_str(range_s).map_err(|e| format!("Invalid PacketsFrom: {e}"))?;
+            if from == 0 {
+                return Err("PacketsFrom can't be 0".to_string());
+            }
+            FreedomFragmentPackets::Range(from, to)
         }
-    }
+    };
+
     let length_val = v
         .get("length")
         .or_else(|| v.get("lengths"))
-        .ok_or_else(|| err("missing length"))?;
-    let lengths = parse_u32_ranges(length_val).map_err(|e| err(&format!("invalid length: {e}")))?;
+        .ok_or("Length can't be empty")?;
+    let (len_min, len_max) =
+        parse_u64_range(length_val).map_err(|_| "Length can't be empty".to_string())?;
+    if len_min == 0 {
+        return Err("LengthMin can't be 0".to_string());
+    }
 
-    let delays = if let Some(d) = v
+    let interval_val = v
         .get("interval")
         .or_else(|| v.get("intervals"))
         .or_else(|| v.get("delay"))
         .or_else(|| v.get("delays"))
-    {
-        parse_u32_ranges(d).map_err(|e| err(&format!("invalid interval: {e}")))?
-    } else {
-        vec![0..=0]
-    };
+        .ok_or("Interval can't be empty")?;
+    let (int_min, int_max) =
+        parse_u64_range(interval_val).map_err(|_| "Interval can't be empty".to_string())?;
 
     let max_split = if let Some(ms) = v.get("maxSplit") {
-        let ranges = parse_u32_ranges(ms).map_err(|e| err(&format!("invalid maxSplit: {e}")))?;
-        ranges.first().cloned().unwrap_or(0..=0)
+        parse_u64_range(ms).unwrap_or((0, 0))
     } else {
-        0..=0
+        (0, 0)
     };
 
-    let config =
-        TcpFragmentConfig::new(lengths, delays, max_split).map_err(|e| err(&e.to_string()))?;
-    Ok(Arc::new(config))
+    let tcp_fragment = if matches!(packets, FreedomFragmentPackets::TlsHello) {
+        let lengths = vec![(len_min as u32)..=(len_max as u32)];
+        let delays = vec![(int_min as u32)..=(int_max as u32)];
+        let split = if max_split.1 > 0 {
+            (max_split.0 as u32)..=(max_split.1 as u32)
+        } else {
+            0..=0
+        };
+        TcpFragmentConfig::new(lengths, delays, split)
+            .ok()
+            .map(Arc::new)
+    } else {
+        None
+    };
+
+    Ok(FreedomFragmentSetting {
+        packets,
+        length: (len_min, len_max),
+        interval: (int_min, int_max),
+        max_split,
+        tcp_fragment,
+    })
 }
 
-fn parse_u32_ranges(v: &Value) -> Result<Vec<std::ops::RangeInclusive<u32>>, String> {
-    let mut result = Vec::new();
-    match v {
-        Value::Number(n) => {
-            let val = n
-                .as_u64()
-                .and_then(|u| u32::try_from(u).ok())
-                .ok_or("number out of range")?;
-            result.push(val..=val);
-        }
-        Value::String(s) => {
-            for part in s.split(',') {
-                let part = part.trim();
-                if part.is_empty() {
-                    continue;
-                }
-                if let Some((start_s, end_s)) = part.split_once('-') {
-                    let start: u32 = start_s
-                        .trim()
-                        .parse()
-                        .map_err(|_| format!("invalid range start in {part:?}"))?;
-                    let end: u32 = end_s
-                        .trim()
-                        .parse()
-                        .map_err(|_| format!("invalid range end in {part:?}"))?;
-                    result.push(start..=end);
-                } else {
-                    let val: u32 = part
-                        .parse()
-                        .map_err(|_| format!("invalid number {part:?}"))?;
-                    result.push(val..=val);
-                }
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                let sub = parse_u32_ranges(item)?;
-                result.extend(sub);
-            }
-        }
-        _ => return Err("expected number, string or array".into()),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreedomNoiseFamily {
+    Ip,
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreedomNoisePacket {
+    Bytes(Vec<u8>),
+    Random(u64, u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreedomNoiseSetting {
+    pub apply_to: FreedomNoiseFamily,
+    pub packet: FreedomNoisePacket,
+    pub delay_ms: (u64, u64),
+}
+
+pub fn parse_freedom_noises(settings: &Value) -> Result<Vec<FreedomNoiseSetting>, String> {
+    if settings.get("noise").is_some() {
+        return Err("The feature noise = { ... } has been removed and migrated to noises = [ { ... } ]. Please update your config(s) according to release note and documentation.".to_string());
     }
-    if result.is_empty() {
-        return Err("empty ranges".into());
+    let Some(noises_val) = settings.get("noises").and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut result = Vec::new();
+    for n in noises_val {
+        let noise_type = n.get("type").and_then(Value::as_str).unwrap_or("rand");
+        let packet_val = n.get("packet").and_then(Value::as_str).unwrap_or("").trim();
+        let packet = match noise_type {
+            "rand" => {
+                let (min, max) = parse_u64_range_str(packet_val)
+                    .map_err(|e| format!("invalid value for rand Length: {e}"))?;
+                if min == 0 {
+                    return Err("rand lengthMin or lengthMax cannot be 0".to_string());
+                }
+                FreedomNoisePacket::Random(min, max)
+            }
+            "str" => FreedomNoisePacket::Bytes(packet_val.as_bytes().to_vec()),
+            "hex" => {
+                let clean = packet_val.strip_prefix("0x").unwrap_or(packet_val);
+                let bytes = decode_hex(clean).map_err(|_| "Invalid hex string".to_string())?;
+                FreedomNoisePacket::Bytes(bytes)
+            }
+            "base64" => {
+                use base64::Engine;
+                let clean = packet_val
+                    .replace('+', "-")
+                    .replace('/', "_")
+                    .replace('=', "");
+                let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&clean)
+                    .or_else(|_| base64::engine::general_purpose::STANDARD.decode(packet_val))
+                    .map_err(|_| "Invalid base64 string".to_string())?;
+                FreedomNoisePacket::Bytes(bytes)
+            }
+            _ => return Err("Invalid packet, only rand/str/hex/base64 are supported".to_string()),
+        };
+
+        let delay_ms = if let Some(d) = n.get("delay") {
+            parse_u64_range(d).unwrap_or((0, 0))
+        } else {
+            (0, 0)
+        };
+
+        let apply_to = match n
+            .get("applyTo")
+            .and_then(Value::as_str)
+            .unwrap_or("ip")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "" | "ip" | "all" => FreedomNoiseFamily::Ip,
+            "ipv4" => FreedomNoiseFamily::Ipv4,
+            "ipv6" => FreedomNoiseFamily::Ipv6,
+            _ => return Err("Invalid applyTo, only ip/ipv4/ipv6 are supported".to_string()),
+        };
+
+        result.push(FreedomNoiseSetting {
+            apply_to,
+            packet,
+            delay_ms,
+        });
     }
     Ok(result)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendThrough {
+    Ip(IpAddr),
+    Cidr(IpAddr, u8),
+    SrcIp,
+    Origin,
+}
+
+impl SendThrough {
+    pub fn resolve_ip(&self) -> Option<IpAddr> {
+        use rand::Rng;
+        match self {
+            Self::Ip(ip) => Some(*ip),
+            Self::Cidr(base, prefix) => {
+                let mask_bits = *prefix;
+                match base {
+                    IpAddr::V4(v4) => {
+                        let total_bits = 32u8;
+                        if mask_bits >= total_bits {
+                            return Some(IpAddr::V4(*v4));
+                        }
+                        let host_bits = total_bits - mask_bits;
+                        let max_offset = 1u64 << host_bits;
+                        let offset = rand::thread_rng().gen_range(0..max_offset) as u32;
+                        let ip_num = u32::from(*v4);
+                        let mask = !((1u32 << host_bits) - 1);
+                        let network = ip_num & mask;
+                        Some(IpAddr::V4(std::net::Ipv4Addr::from(network | offset)))
+                    }
+                    IpAddr::V6(v6) => {
+                        let total_bits = 128u8;
+                        if mask_bits >= total_bits {
+                            return Some(IpAddr::V6(*v6));
+                        }
+                        let host_bits = total_bits - mask_bits;
+                        let ip_num = u128::from(*v6);
+                        let offset: u128 = if host_bits <= 64 {
+                            rand::thread_rng().gen_range(0..(1u64 << host_bits)) as u128
+                        } else {
+                            rand::random::<u128>() & ((1u128 << host_bits) - 1)
+                        };
+                        let mask = !((1u128 << host_bits) - 1);
+                        let network = ip_num & mask;
+                        Some(IpAddr::V6(std::net::Ipv6Addr::from(network | offset)))
+                    }
+                }
+            }
+            Self::SrcIp | Self::Origin => None,
+        }
+    }
+}
+
+pub fn parse_send_through(v: Option<&Value>) -> Result<Option<SendThrough>, String> {
+    let Some(v) = v else { return Ok(None) };
+    let s = v
+        .as_str()
+        .ok_or_else(|| "sendThrough must be a string".to_string())?;
+    let s = s.trim();
+    if s.is_empty() {
+        return Ok(None);
+    }
+    if s.eq_ignore_ascii_case("srcip") {
+        return Ok(Some(SendThrough::SrcIp));
+    }
+    if s.eq_ignore_ascii_case("origin") {
+        return Ok(Some(SendThrough::Origin));
+    }
+    if let Some((ip_s, cidr_s)) = s.split_once('/') {
+        let ip = ip_s
+            .parse::<IpAddr>()
+            .map_err(|_| format!("unable to send through: {s}"))?;
+        let prefix = cidr_s
+            .parse::<u8>()
+            .map_err(|_| format!("unable to send through: {s}"))?;
+        let max_prefix = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix > max_prefix {
+            return Err(format!("unable to send through: {s}"));
+        }
+        return Ok(Some(SendThrough::Cidr(ip, prefix)));
+    }
+    let ip = s
+        .parse::<IpAddr>()
+        .map_err(|_| format!("unable to send through: {s}"))?;
+    Ok(Some(SendThrough::Ip(ip)))
+}
+
+pub fn parse_dialer_proxy(outbound: &Value, _tag: &str) -> Result<Option<String>, String> {
+    let dialer = outbound
+        .pointer("/streamSettings/sockopt/dialerProxy")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let proxy = outbound.get("proxySettings").filter(|v| !v.is_null());
+
+    if let Some(dialer_tag) = dialer {
+        if proxy.is_some() {
+            return Err("proxySettings and sockopt.dialerProxy cannot be combined".to_string());
+        }
+        return Ok(Some(dialer_tag.to_string()));
+    }
+
+    if let Some(proxy_val) = proxy {
+        if !proxy_val.is_object() {
+            return Err("outbound proxySettings must be an object".to_string());
+        }
+        let ptag = proxy_val
+            .get("tag")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "outbound proxySettings tag must be a non-empty string".to_string())?;
+        let transport_layer = proxy_val
+            .get("transportLayer")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !transport_layer {
+            return Err(
+                "only transport-layer outbound chaining is supported; transportLayer must be true"
+                    .to_string(),
+            );
+        }
+        return Ok(Some(ptag.to_string()));
+    }
+
+    Ok(None)
+}
+
+fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
+    if !s.len().is_multiple_of(2) {
+        return Err(());
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
+        .collect()
+}
+
+fn parse_u64_range_str(s: &str) -> Result<(u64, u64), String> {
+    let s = s.trim();
+    if let Some((start_s, end_s)) = s.split_once('-') {
+        let start: u64 = start_s
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid range start in {s:?}"))?;
+        let end: u64 = end_s
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid range end in {s:?}"))?;
+        Ok((start, end))
+    } else {
+        let val: u64 = s.parse().map_err(|_| format!("invalid number in {s:?}"))?;
+        Ok((val, val))
+    }
+}
+
+fn parse_u64_range(v: &Value) -> Result<(u64, u64), String> {
+    match v {
+        Value::Number(n) => {
+            let val = n.as_u64().ok_or("number out of range")?;
+            Ok((val, val))
+        }
+        Value::String(s) => parse_u64_range_str(s),
+        Value::Object(obj) => {
+            let from = obj.get("from").and_then(Value::as_u64).unwrap_or(0);
+            let to = obj.get("to").and_then(Value::as_u64).unwrap_or(from);
+            Ok((from, to))
+        }
+        Value::Array(arr) if !arr.is_empty() => parse_u64_range(&arr[0]),
+        _ => Err("expected number, string or range object".into()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct FreedomSettings {
     pub strategy: FreedomStrategy,
     pub redirect: Option<RedirectSetting>,
-    pub fragment: Option<Arc<TcpFragmentConfig>>,
+    pub fragment: Option<FreedomFragmentSetting>,
+    pub noises: Vec<FreedomNoiseSetting>,
+    pub send_through: Option<SendThrough>,
+    pub dialer_proxy: Option<String>,
 }
 
 impl From<FreedomStrategy> for FreedomSettings {
@@ -210,6 +472,9 @@ impl From<FreedomStrategy> for FreedomSettings {
             strategy,
             redirect: None,
             fragment: None,
+            noises: Vec::new(),
+            send_through: None,
+            dialer_proxy: None,
         }
     }
 }
@@ -701,6 +966,20 @@ impl PartialEq for Action {
 
 impl Eq for Action {}
 
+impl Action {
+    pub fn set_chained_connector(&self, connector: Arc<dyn xray_transport::ResolvedTcpConnector>) {
+        match self {
+            Action::Socks(socks) => socks.set_chained_connector(connector),
+            Action::Vless(vless) => vless.set_chained_connector(connector),
+            Action::Vmess(vmess) => vmess.connector.set_chained_connector(connector),
+            Action::Trojan(trojan) => trojan.connector.set_chained_connector(connector),
+            Action::Shadowsocks(ss) => ss.connector.set_chained_connector(connector),
+            Action::Http(http) => http.connector.set_chained_connector(connector),
+            _ => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     pub tag: String,
@@ -738,6 +1017,7 @@ pub struct Router {
     pub final_rules: std::sync::RwLock<HashMap<String, Vec<(Action, RoutingRule)>>>,
     pub asset_dirs: Vec<PathBuf>,
     pub observatory: Arc<std::sync::RwLock<Option<Arc<crate::observatory::Observatory>>>>,
+    pub dialer_proxies: Vec<(String, String)>,
 }
 
 pub struct Rule {
@@ -765,6 +1045,7 @@ impl Router {
         let mut default_tag = None;
         let mut synth_rules = Vec::new();
         let mut pending_final = Vec::new();
+        let mut dialer_proxies = Vec::new();
         for outbound in array(root, "outbounds") {
             let tag = str_field(outbound, "tag").to_owned();
             let protocol = str_field(outbound, "protocol");
@@ -793,10 +1074,16 @@ impl Router {
                     } else {
                         None
                     };
+                    let noises = parse_freedom_noises(settings)?;
+                    let send_through = parse_send_through(outbound.get("sendThrough"))?;
+                    let dialer_proxy = parse_dialer_proxy(outbound, &tag)?;
                     let freedom_settings = FreedomSettings {
                         strategy: domain_strategy,
                         redirect,
                         fragment,
+                        noises,
+                        send_through,
+                        dialer_proxy,
                     };
                     for (index, raw) in array(settings, "finalRules").iter().enumerate() {
                         let action = match str_field(raw, "action") {
@@ -839,10 +1126,7 @@ impl Router {
                     &tag,
                     outbound.get("settings").unwrap_or(&Value::Null),
                 )?)),
-                "socks" => Action::Socks(Arc::new(SocksOutbound::parse(
-                    &tag,
-                    outbound.get("settings").unwrap_or(&Value::Null),
-                )?)),
+                "socks" => Action::Socks(Arc::new(SocksOutbound::parse(&tag, outbound)?)),
                 "vless" => Action::Vless(Arc::new(VlessOutbound::parse(&tag, outbound)?)),
                 "vmess" => Action::Vmess(Arc::new(VmessOutbound::parse(&tag, outbound)?)),
                 "trojan" => Action::Trojan(Arc::new(TrojanOutbound::parse(&tag, outbound)?)),
@@ -865,6 +1149,9 @@ impl Router {
                 }
             };
             default_tag.get_or_insert_with(|| tag.clone());
+            if let Some(proxy_tag) = parse_dialer_proxy(outbound, &tag)? {
+                dialer_proxies.push((tag.clone(), proxy_tag));
+            }
             outbounds.insert(tag, action);
         }
 
@@ -929,6 +1216,23 @@ impl Router {
             _ => RoutingDomainStrategy::AsIs,
         };
 
+        for (tag, proxy_tag) in &dialer_proxies {
+            if !outbounds.contains_key(proxy_tag) {
+                return Err("there is no outbound handler for dialerProxy".to_string());
+            }
+            let mut visited = std::collections::HashSet::new();
+            visited.insert(tag.clone());
+            let mut curr = proxy_tag;
+            while let Some((_, next)) = dialer_proxies.iter().find(|(t, _)| t == curr) {
+                if !visited.insert(next.clone()) {
+                    return Err(format!(
+                        "cycle detected in dialerProxy / proxySettings: {next}"
+                    ));
+                }
+                curr = next;
+            }
+        }
+
         Ok(Self {
             rules: std::sync::RwLock::new(rules),
             strategy,
@@ -939,7 +1243,24 @@ impl Router {
             final_rules: std::sync::RwLock::new(final_rules),
             asset_dirs: asset_dirs.to_vec(),
             observatory: Arc::new(std::sync::RwLock::new(None)),
+            dialer_proxies,
         })
+    }
+
+    pub fn init_chained_outbounds(&self, router: &Arc<Router>) {
+        let outbounds = self
+            .outbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (tag, proxy_tag) in &self.dialer_proxies {
+            let connector = Arc::new(crate::outbound_transport::ChainedTcpConnector {
+                router: router.clone(),
+                proxy_tag: proxy_tag.clone(),
+            });
+            if let Some(action) = outbounds.get(tag) {
+                action.set_chained_connector(connector);
+            }
+        }
     }
 
     pub fn set_observatory(&self, obs: Arc<crate::observatory::Observatory>) {
@@ -2007,10 +2328,10 @@ mod tests {
             "maxSplit": 4
         });
         let config = parse_fragment(&valid).unwrap();
-        assert_eq!(
-            *config,
-            TcpFragmentConfig::new(vec![100..=200], vec![10..=20], 4..=4).unwrap()
-        );
+        assert_eq!(config.packets, FreedomFragmentPackets::TlsHello);
+        assert_eq!(config.length, (100, 200));
+        assert_eq!(config.interval, (10, 20));
+        assert_eq!(config.max_split, (4, 4));
 
         let invalid_packets = json!({
             "packets": "invalid",

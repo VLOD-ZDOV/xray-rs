@@ -1,12 +1,16 @@
 //! Dialing the routed outbound: direct (freedom), WireGuard, SOCKS5, VLESS, VMess, Trojan, Shadowsocks, HTTP, DNS, Loopback.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncWrite};
+use rand::Rng;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
 use tokio::task::JoinHandle;
@@ -15,7 +19,10 @@ use xray_config::Network;
 use xray_wireguard::UdpSession;
 
 use crate::dns_outbound::DnsUdpSession;
-use crate::routing::{Action, Decision, FreedomSettings, FreedomStrategy, Query, Router};
+use crate::routing::{
+    Action, Decision, FreedomFragmentPackets, FreedomFragmentSetting, FreedomNoiseFamily,
+    FreedomNoisePacket, FreedomNoiseSetting, FreedomSettings, FreedomStrategy, Query, Router,
+};
 use crate::shadowsocks_outbound::{ShadowsocksConeUdp, ShadowsocksUdpLink};
 use crate::socks::SocksUdp;
 use crate::trojan_outbound::{TrojanConeUdp, TrojanUdpLink};
@@ -112,6 +119,224 @@ pub fn apply_strategy(addrs: &mut Vec<SocketAddr>, strategy: FreedomStrategy) ->
     Ok(())
 }
 
+fn rand_between(min: u64, max: u64) -> u64 {
+    if min >= max {
+        min
+    } else {
+        rand::thread_rng().gen_range(min..=max)
+    }
+}
+
+pub struct FragmentWriterStream {
+    inner: Box<dyn Stream>,
+    setting: FreedomFragmentSetting,
+    count: u64,
+    pending: VecDeque<Vec<u8>>,
+    current_offset: usize,
+    sleep_timer: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl FragmentWriterStream {
+    pub fn new(inner: Box<dyn Stream>, setting: FreedomFragmentSetting) -> Self {
+        Self {
+            inner,
+            setting,
+            count: 0,
+            pending: VecDeque::new(),
+            current_offset: 0,
+            sleep_timer: None,
+        }
+    }
+
+    fn poll_flush_pending(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while let Some(chunk) = self.pending.front() {
+            if let Some(ref mut timer) = self.sleep_timer {
+                if timer.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+                self.sleep_timer = None;
+            }
+
+            match Pin::new(&mut self.inner).poll_write(cx, &chunk[self.current_offset..]) {
+                Poll::Ready(Ok(n)) => {
+                    self.current_offset += n;
+                    if self.current_offset == chunk.len() {
+                        self.pending.pop_front();
+                        self.current_offset = 0;
+                        if !self.pending.is_empty() {
+                            let delay_ms =
+                                rand_between(self.setting.interval.0, self.setting.interval.1);
+                            if delay_ms > 0 {
+                                let mut timer = Box::pin(tokio::time::sleep(
+                                    std::time::Duration::from_millis(delay_ms),
+                                ));
+                                if timer.as_mut().poll(cx).is_pending() {
+                                    self.sleep_timer = Some(timer);
+                                    return Poll::Pending;
+                                }
+                            }
+                        }
+                    }
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncRead for FragmentWriterStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for FragmentWriterStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        if self.poll_flush_pending(cx)?.is_pending() {
+            return Poll::Pending;
+        }
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        self.count += 1;
+        let count = self.count;
+
+        let should_fragment_tls = match self.setting.packets {
+            FreedomFragmentPackets::TlsHello => count == 1 && buf.len() > 5 && buf[0] == 22,
+            _ => false,
+        };
+
+        if should_fragment_tls {
+            let record_len = 5 + (((buf[3] as usize) << 8) | (buf[4] as usize));
+            if buf.len() >= record_len {
+                let data = &buf[5..record_len];
+                let max_split = rand_between(self.setting.max_split.0, self.setting.max_split.1);
+                let mut split_num = 0;
+                let mut from = 0;
+                let mut combined_hello = Vec::new();
+
+                while from < data.len() {
+                    let chunk_size =
+                        rand_between(self.setting.length.0, self.setting.length.1) as usize;
+                    split_num += 1;
+                    let mut to = from + chunk_size;
+                    if to > data.len() || (max_split > 0 && split_num >= max_split) {
+                        to = data.len();
+                    }
+                    let l = to - from;
+                    let header = [buf[0], buf[1], buf[2], (l >> 8) as u8, l as u8];
+                    let mut chunk = Vec::with_capacity(5 + l);
+                    chunk.extend_from_slice(&header);
+                    chunk.extend_from_slice(&data[from..to]);
+                    from = to;
+
+                    if self.setting.interval.1 == 0 {
+                        combined_hello.extend_from_slice(&chunk);
+                    } else {
+                        self.pending.push_back(chunk);
+                    }
+                }
+
+                if self.setting.interval.1 == 0 && !combined_hello.is_empty() {
+                    self.pending.push_back(combined_hello);
+                }
+
+                if buf.len() > record_len {
+                    self.pending.push_back(buf[record_len..].to_vec());
+                }
+
+                let _ = self.poll_flush_pending(cx);
+                return Poll::Ready(Ok(buf.len()));
+            }
+        }
+
+        let in_range = match self.setting.packets {
+            FreedomFragmentPackets::All => true,
+            FreedomFragmentPackets::Range(from, to) => count >= from && count <= to,
+            FreedomFragmentPackets::TlsHello => false,
+        };
+
+        if in_range {
+            let max_split = rand_between(self.setting.max_split.0, self.setting.max_split.1);
+            let mut split_num = 0;
+            let mut from = 0;
+            while from < buf.len() {
+                let chunk_size =
+                    rand_between(self.setting.length.0, self.setting.length.1) as usize;
+                split_num += 1;
+                let mut to = from + chunk_size;
+                if to > buf.len() || (max_split > 0 && split_num >= max_split) {
+                    to = buf.len();
+                }
+                self.pending.push_back(buf[from..to].to_vec());
+                from = to;
+            }
+            let _ = self.poll_flush_pending(cx);
+            return Poll::Ready(Ok(buf.len()));
+        }
+
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.poll_flush_pending(cx)?.is_pending() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.poll_flush_pending(cx)?.is_pending() {
+            return Poll::Pending;
+        }
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+async fn send_udp_noises(
+    socket: &UdpSocket,
+    noises: &[FreedomNoiseSetting],
+    target: SocketAddr,
+) -> io::Result<()> {
+    if target.port() == 53 || noises.is_empty() {
+        return Ok(());
+    }
+    for n in noises {
+        match n.apply_to {
+            FreedomNoiseFamily::Ipv4 if !target.is_ipv4() => continue,
+            FreedomNoiseFamily::Ipv6 if !target.is_ipv6() => continue,
+            _ => {}
+        }
+        let noise_bytes: Vec<u8> = match &n.packet {
+            FreedomNoisePacket::Bytes(b) => b.clone(),
+            FreedomNoisePacket::Random(min, max) => {
+                let len = rand_between(*min, *max) as usize;
+                let mut b = vec![0u8; len];
+                rand::thread_rng().fill(&mut b[..]);
+                b
+            }
+        };
+        socket.send_to(&noise_bytes, target).await?;
+        let delay_ms = rand_between(n.delay_ms.0, n.delay_ms.1);
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+    }
+    Ok(())
+}
+
 /// Tries each resolved address that passes the outbound's finalRules and matches domainStrategy.
 async fn connect_direct(
     router: &Router,
@@ -120,6 +345,22 @@ async fn connect_direct(
     host: &Host,
     port: u16,
 ) -> io::Result<Box<dyn Stream>> {
+    if let Some(ref proxy_tag) = settings.dialer_proxy {
+        let decision = router.decision_for_tag(proxy_tag);
+        let stream = Box::pin(connect(router, &decision, host, port)).await?;
+        if let Some(ref fragment) = settings.fragment {
+            return Ok(Box::new(FragmentWriterStream::new(
+                stream,
+                fragment.clone(),
+            )));
+        }
+        return Ok(stream);
+    }
+
+    let bind_ip = settings
+        .send_through
+        .as_ref()
+        .and_then(|st| st.resolve_ip());
     let mut last_error = None;
     let mut addrs = resolve_all(host, port).await?;
     apply_strategy(&mut addrs, settings.strategy)?;
@@ -128,57 +369,34 @@ async fn connect_direct(
             last_error = Some(e);
             continue;
         }
-        if let Some(fragment) = &settings.fragment {
-            let dialer = xray_transport::TransportDialer::system()
-                .map_err(|e| io::Error::other(e.to_string()))?
-                .with_tcp_fragment(fragment.clone());
-            let target = xray_routing::Target::new(
-                match host {
-                    Host::Ip(ip) => xray_routing::TargetAddr::Ip(*ip),
-                    Host::Domain(d) => xray_routing::TargetAddr::Domain(d.clone()),
-                },
-                port,
-                xray_routing::Network::Tcp,
-            );
-            match timeout(
-                CONNECT_TIMEOUT,
-                dialer.connect_stream(
-                    &xray_transport::ConnectorConfig::Tcp,
-                    &xray_transport::stream::TransportLayer::Raw,
-                    &target,
-                    &[addr],
-                    None,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(stream)) => return Ok(Box::new(stream)),
-                Ok(Err(e)) => {
-                    last_error = Some(io::Error::new(
-                        io::ErrorKind::ConnectionRefused,
-                        e.to_string(),
-                    ))
-                }
-                Err(_) => {
-                    last_error = Some(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("connect to {addr} timed out"),
-                    ))
-                }
+        let connect_fut = async {
+            if let Some(ip) = bind_ip {
+                let socket = if ip.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()?
+                } else {
+                    tokio::net::TcpSocket::new_v6()?
+                };
+                socket.bind(SocketAddr::new(ip, 0))?;
+                socket.connect(addr).await
+            } else {
+                TcpStream::connect(addr).await
             }
-        } else {
-            match timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
-                Ok(Ok(stream)) => {
-                    stream.set_nodelay(true)?;
-                    return Ok(Box::new(stream));
+        };
+        match timeout(CONNECT_TIMEOUT, connect_fut).await {
+            Ok(Ok(stream)) => {
+                stream.set_nodelay(true)?;
+                let boxed: Box<dyn Stream> = Box::new(stream);
+                if let Some(ref fragment) = settings.fragment {
+                    return Ok(Box::new(FragmentWriterStream::new(boxed, fragment.clone())));
                 }
-                Ok(Err(e)) => last_error = Some(e),
-                Err(_) => {
-                    last_error = Some(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("connect to {addr} timed out"),
-                    ))
-                }
+                return Ok(boxed);
+            }
+            Ok(Err(e)) => last_error = Some(e),
+            Err(_) => {
+                last_error = Some(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to {addr} timed out"),
+                ))
             }
         }
     }
@@ -214,13 +432,23 @@ impl UdpLink {
                 apply_strategy(&mut addrs, settings.strategy)?;
                 let target = addrs[0];
                 check_final(router, &decision.tag, Network::Udp, target)?;
-                let bind: SocketAddr = if target.is_ipv4() {
-                    ([0, 0, 0, 0], 0).into()
-                } else {
-                    ([0u16; 8], 0).into()
+                let bind_ip = settings
+                    .send_through
+                    .as_ref()
+                    .and_then(|st| st.resolve_ip());
+                let bind: SocketAddr = match bind_ip {
+                    Some(ip) => SocketAddr::new(ip, 0),
+                    None => {
+                        if target.is_ipv4() {
+                            ([0, 0, 0, 0], 0).into()
+                        } else {
+                            ([0u16; 8], 0).into()
+                        }
+                    }
                 };
                 let socket = UdpSocket::bind(bind).await?;
                 socket.connect(target).await?;
+                send_udp_noises(&socket, &settings.noises, target).await?;
                 Ok(Self::Direct(socket))
             }
             Action::Wireguard(wg) => Ok(Self::Wireguard(
@@ -311,6 +539,7 @@ pub enum ConeUdp {
         router: Arc<Router>,
         outbound: String,
         settings: FreedomSettings,
+        noised_targets: Arc<Mutex<HashSet<SocketAddr>>>,
     },
     Wireguard {
         wg: Arc<WgOutbound>,
@@ -330,9 +559,16 @@ impl ConeUdp {
     pub async fn open(router: Arc<Router>, decision: &Decision) -> io::Result<Self> {
         match &decision.action {
             Action::Direct(settings) => {
-                let socket = match UdpSocket::bind(("::", 0)).await {
-                    Ok(socket) => socket,
-                    Err(_) => UdpSocket::bind(("0.0.0.0", 0)).await?,
+                let bind_ip = settings
+                    .send_through
+                    .as_ref()
+                    .and_then(|st| st.resolve_ip());
+                let socket = match bind_ip {
+                    Some(ip) => UdpSocket::bind(SocketAddr::new(ip, 0)).await?,
+                    None => match UdpSocket::bind(("::", 0)).await {
+                        Ok(socket) => socket,
+                        Err(_) => UdpSocket::bind(("0.0.0.0", 0)).await?,
+                    },
                 };
                 let dual_stack = socket.local_addr()?.is_ipv6();
                 Ok(Self::Direct {
@@ -341,6 +577,7 @@ impl ConeUdp {
                     router,
                     outbound: decision.tag.clone(),
                     settings: settings.clone(),
+                    noised_targets: Arc::new(Mutex::new(HashSet::new())),
                 })
             }
             Action::Wireguard(wg) => {
@@ -412,7 +649,11 @@ impl ConeUdp {
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
         match self {
             Self::Direct {
-                socket, dual_stack, ..
+                socket,
+                dual_stack,
+                settings,
+                noised_targets,
+                ..
             } => {
                 let addr = match addr {
                     SocketAddr::V4(v4) if *dual_stack => {
@@ -420,6 +661,12 @@ impl ConeUdp {
                     }
                     other => other,
                 };
+                if !settings.noises.is_empty() && addr.port() != 53 {
+                    let mut targets = noised_targets.lock().await;
+                    if targets.insert(addr) {
+                        send_udp_noises(socket, &settings.noises, addr).await?;
+                    }
+                }
                 socket.send_to(data, addr).await.map(|_| ())
             }
             Self::Wireguard {

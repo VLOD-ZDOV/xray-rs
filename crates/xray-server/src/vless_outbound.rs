@@ -106,9 +106,11 @@ pub struct VlessOutbound {
     pub user_id: Uuid,
     pub flow: Option<String>,
     pub packet_encoding: Option<String>,
-    pub dialer: TransportDialer,
+    pub dialer: std::sync::RwLock<TransportDialer>,
     pub connector: ConnectorConfig,
     pub transport: TransportLayer,
+    pub mux_settings: Option<crate::mux::MuxSettings>,
+    pub mux_pool: Option<Arc<crate::mux::MuxClientPool>>,
 }
 
 impl fmt::Debug for VlessOutbound {
@@ -332,7 +334,26 @@ impl VlessOutbound {
             }
         };
 
-        let dialer = TransportDialer::system().map_err(|e| err(&format!("dialer error: {e}")))?;
+        let mut dialer =
+            TransportDialer::system().map_err(|e| err(&format!("dialer error: {e}")))?;
+        let send_through = crate::routing::parse_send_through(outbound.get("sendThrough"))?;
+        let _dialer_proxy = crate::routing::parse_dialer_proxy(outbound, tag)?;
+        let mux_settings = crate::mux::MuxSettings::parse(outbound.get("mux"));
+        let mux_pool = mux_settings.as_ref().map(|m| {
+            Arc::new(crate::mux::MuxClientPool::new(if m.concurrency <= 0 {
+                8
+            } else {
+                m.concurrency as u16
+            }))
+        });
+
+        if let Some(ref st) = send_through {
+            dialer = dialer.with_resolved_tcp_connector(Arc::new(
+                crate::outbound_transport::SendThroughConnector {
+                    send_through: st.clone(),
+                },
+            ));
+        }
 
         let packet_encoding = settings
             .get("packetEncoding")
@@ -346,10 +367,22 @@ impl VlessOutbound {
             user_id,
             flow,
             packet_encoding,
-            dialer,
+            dialer: std::sync::RwLock::new(dialer),
             connector,
             transport,
+            mux_settings,
+            mux_pool,
         })
+    }
+
+    pub fn set_chained_connector(&self, connector: Arc<dyn xray_transport::ResolvedTcpConnector>) {
+        let new_dialer = self
+            .dialer
+            .read()
+            .unwrap()
+            .clone()
+            .with_resolved_tcp_connector(connector);
+        *self.dialer.write().unwrap() = new_dialer;
     }
 
     pub fn is_xudp(&self) -> bool {
@@ -382,15 +415,10 @@ impl VlessOutbound {
             xray_routing::Network::Tcp,
         );
 
+        let dialer = self.dialer.read().unwrap().clone();
         let carrier = timeout(
             CONNECT_TIMEOUT,
-            self.dialer.connect_stream(
-                &self.connector,
-                &self.transport,
-                &target,
-                &candidates,
-                None,
-            ),
+            dialer.connect_stream(&self.connector, &self.transport, &target, &candidates, None),
         )
         .await
         .map_err(|_| {
@@ -445,6 +473,28 @@ impl VlessOutbound {
     }
 
     pub async fn connect(
+        self: &Arc<Self>,
+        host: &Host,
+        port: u16,
+    ) -> io::Result<Box<dyn crate::outbound::Stream>> {
+        if let Some(ref pool) = self.mux_pool {
+            let this = Arc::clone(self);
+            let h = host.clone();
+            return pool
+                .open_sub_session(
+                    move || async move {
+                        this.connect_unmultiplexed(&Host::Domain("v1.mux.cool".to_string()), 666)
+                            .await
+                    },
+                    &h,
+                    port,
+                )
+                .await;
+        }
+        self.connect_unmultiplexed(host, port).await
+    }
+
+    async fn connect_unmultiplexed(
         &self,
         host: &Host,
         port: u16,
@@ -740,6 +790,19 @@ impl VlessConeUdp {
     }
 
     pub async fn send_to(&self, data: &[u8], addr: SocketAddr) -> io::Result<()> {
+        if let Some(ref mux) = self.vless.mux_settings {
+            if addr.port() == 443 {
+                match mux.udp443 {
+                    crate::mux::MuxUdp443::Reject => {
+                        return Err(io::Error::other("XUDP rejected UDP/443 traffic"));
+                    }
+                    crate::mux::MuxUdp443::Skip => {
+                        return self.send_to_per_conn(data, addr).await;
+                    }
+                    crate::mux::MuxUdp443::Allow => {}
+                }
+            }
+        }
         if self.vless.is_xudp() {
             let conn = self.get_or_open_xudp_conn().await?;
             conn.send_to(data, addr).await
@@ -1080,7 +1143,7 @@ mod tests {
             }
         });
 
-        let outbound = VlessOutbound::parse("vless-test", &config).unwrap();
+        let outbound = Arc::new(VlessOutbound::parse("vless-test", &config).unwrap());
         let mut stream = outbound
             .connect(&Host::Ip("1.2.3.4".parse().unwrap()), 80)
             .await
