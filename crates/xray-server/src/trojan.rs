@@ -148,6 +148,7 @@ pub async fn serve<R, W>(
     mut downlink: W,
     ctx: &Context,
     peer: SocketAddr,
+    tls: &crate::fallback::TlsInfo,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -189,7 +190,7 @@ where
     let (mut request, header_len, user) = match handshake_res {
         Ok(Ok(parsed)) => parsed,
         Ok(Err(_)) => {
-            if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, &buf) {
+            if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, tls, &buf) {
                 return crate::fallback::serve(uplink, downlink, fb, buf, peer, ctx.port).await;
             }
             return Err(io::Error::new(

@@ -162,6 +162,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerPenetratingTlsStream<S> {
         }
     }
 
+    /// SNI and ALPN, which select a fallback.
+    pub fn handshake_info(&self) -> crate::fallback::TlsInfo {
+        let stream = match &self.state {
+            ServerPenetratingTlsState::Tls(Some(stream))
+            | ServerPenetratingTlsState::ReadDirect { stream, .. } => stream,
+            ServerPenetratingTlsState::Tls(None) => return Default::default(),
+        };
+        let conn = stream.get_ref().1;
+        crate::fallback::TlsInfo::new(
+            conn.server_name().unwrap_or_default(),
+            conn.alpn_protocol().unwrap_or_default(),
+        )
+    }
+
     fn ensure_read_direct(&mut self) -> io::Result<()> {
         let ServerPenetratingTlsState::Tls(tls) = &mut self.state else {
             return Ok(());

@@ -1281,6 +1281,13 @@ impl RealityServer {
             write_buf: Vec::new(),
             write_buf_pos: 0,
             scratch_buf: Vec::with_capacity(16384 + 256),
+            handshake: Box::new(crate::fallback::TlsInfo::new(
+                &xray_transport::reality::parse_reality_client_hello(client_hello_payload)
+                    .ok()
+                    .and_then(|hello| hello.server_name)
+                    .unwrap_or_default(),
+                negotiated_alpn.as_deref().unwrap_or_default(),
+            )),
         })
     }
 
@@ -1716,9 +1723,15 @@ pub struct Tls13Stream<S> {
     write_buf: Vec<u8>,
     write_buf_pos: usize,
     scratch_buf: Vec<u8>,
+    handshake: Box<crate::fallback::TlsInfo>,
 }
 
 impl<S> Tls13Stream<S> {
+    /// SNI and ALPN, which select a fallback.
+    pub fn handshake_info(&self) -> crate::fallback::TlsInfo {
+        (*self.handshake).clone()
+    }
+
     pub fn raw_stream(&self) -> &S {
         &self.inner
     }
@@ -2329,6 +2342,7 @@ mod tests {
             write_buf: Vec::new(),
             write_buf_pos: 0,
             scratch_buf: Vec::new(),
+            handshake: Box::default(),
         };
 
         // Client writes header with length > 16384 + 256 = 16640
@@ -2373,6 +2387,7 @@ mod tests {
             write_buf: Vec::new(),
             write_buf_pos: 0,
             scratch_buf: Vec::new(),
+            handshake: Box::default(),
         };
 
         // Client sends an unexpected handshake record: ClientHello (type 0x01)
@@ -2424,6 +2439,7 @@ mod tests {
             write_buf: Vec::new(),
             write_buf_pos: 0,
             scratch_buf: Vec::new(),
+            handshake: Box::default(),
         };
 
         let (mut client_r, mut client_w) = tokio::io::split(client_io);

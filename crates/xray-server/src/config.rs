@@ -96,6 +96,8 @@ pub struct ShadowsocksUser {
 
 #[derive(Clone, Debug)]
 pub struct Fallback {
+    pub name: String,
+    pub alpn: String,
     pub path: String,
     pub dest: FallbackDest,
     pub xver: u8,
@@ -1111,11 +1113,9 @@ fn parse_sniffing(item: &Value, tag: &str) -> crate::vless::Sniffing {
 }
 
 fn parse_fallback(item: &Value) -> Result<Fallback, String> {
-    // name and alpn select a fallback by the TLS handshake, which is not tracked here.
-    for key in ["name", "alpn"] {
-        if !str_field(item, key).is_empty() {
-            return Err(format!("{key} is not supported"));
-        }
+    let path = str_field(item, "path");
+    if !path.is_empty() && !path.starts_with('/') {
+        return Err(r#""path" must be empty or start with "/""#.into());
     }
     let dest = parse_dest(item.get("dest"))?;
     let xver = match item.get("xver").and_then(Value::as_u64).unwrap_or(0) {
@@ -1123,7 +1123,9 @@ fn parse_fallback(item: &Value) -> Result<Fallback, String> {
         x => return Err(format!("xver {x} is not 0, 1 or 2")),
     };
     Ok(Fallback {
-        path: str_field(item, "path").to_owned(),
+        name: str_field(item, "name").to_owned(),
+        alpn: str_field(item, "alpn").to_owned(),
+        path: path.to_owned(),
         dest,
         xver,
     })

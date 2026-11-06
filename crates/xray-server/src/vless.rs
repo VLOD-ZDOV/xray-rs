@@ -445,11 +445,17 @@ where
         },
         ctx,
         peer,
+        &Default::default(),
     )
     .await
 }
 
-pub async fn serve_stream<S>(stream: S, ctx: &Context, peer: SocketAddr) -> io::Result<()>
+pub async fn serve_stream<S>(
+    stream: S,
+    ctx: &Context,
+    peer: SocketAddr,
+    tls: &crate::fallback::TlsInfo,
+) -> io::Result<()>
 where
     S: VisionStreamIo + Send + 'static,
 {
@@ -511,7 +517,7 @@ where
     let (mut request, header_len, user) = match handshake_res {
         Ok(Ok(parsed)) => parsed,
         Ok(Err(_)) => {
-            if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, &buf) {
+            if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, tls, &buf) {
                 let (r, w) = tokio::io::split(stream);
                 return crate::fallback::serve(r, w, fb, buf, peer, ctx.port).await;
             }

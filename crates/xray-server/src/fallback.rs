@@ -1,5 +1,6 @@
 //! Fallback routing for VLESS and Trojan when authentication or protocol validation fails.
 
+use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
 
@@ -9,12 +10,93 @@ use tokio::net::{TcpStream, UnixStream};
 use crate::config::{Fallback, FallbackDest};
 use crate::vless::{copy, relay, Activity, Host};
 
-/// Picks the fallback the way Xray does: an exact `path` match on an HTTP/1 request
-/// line, else the entry without a path.
-pub fn find_fallback<'a>(fallbacks: &'a [Fallback], first: &[u8]) -> Option<&'a Fallback> {
-    request_path(first)
-        .and_then(|path| fallbacks.iter().find(|fb| fb.path == path))
-        .or_else(|| fallbacks.iter().find(|fb| fb.path.is_empty()))
+/// SNI and ALPN of the TLS or REALITY handshake, lowercased as Xray reads them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TlsInfo {
+    pub name: String,
+    pub alpn: String,
+}
+
+impl TlsInfo {
+    pub fn new(name: &str, alpn: &[u8]) -> Self {
+        Self {
+            name: name.to_ascii_lowercase(),
+            alpn: String::from_utf8_lossy(alpn).to_ascii_lowercase(),
+        }
+    }
+}
+
+type PathMap<'a> = HashMap<&'a str, &'a Fallback>;
+type AlpnMap<'a> = HashMap<&'a str, PathMap<'a>>;
+
+/// Picks the fallback as Xray's VLESS and Trojan inbounds do: by `name`
+/// (the longest one the SNI contains), then `alpn`, then the request
+/// `path`, each falling back to the empty entry. Entries without a name or
+/// alpn fill the gaps of the others, as Xray merges its fallback maps.
+pub fn find_fallback<'a>(
+    fallbacks: &'a [Fallback],
+    tls: &TlsInfo,
+    first: &[u8],
+) -> Option<&'a Fallback> {
+    let mut napfb: HashMap<&str, AlpnMap<'a>> = HashMap::new();
+    for fb in fallbacks {
+        napfb
+            .entry(fb.name.as_str())
+            .or_default()
+            .entry(fb.alpn.as_str())
+            .or_default()
+            .insert(fb.path.as_str(), fb);
+    }
+    let default = napfb.get("").cloned();
+    if let Some(default) = &default {
+        for (_, apfb) in napfb.iter_mut().filter(|(n, _)| !n.is_empty()) {
+            for alpn in default.keys() {
+                apfb.entry(alpn).or_default();
+            }
+        }
+    }
+    for apfb in napfb.values_mut() {
+        if let Some(any_alpn) = apfb.get("").cloned() {
+            for (_, pfb) in apfb.iter_mut().filter(|(a, _)| !a.is_empty()) {
+                for (path, fb) in &any_alpn {
+                    pfb.entry(path).or_insert(fb);
+                }
+            }
+        }
+    }
+    // Xray reads the unnamed entries again here, after the step above filled them.
+    let default = napfb.get("").cloned();
+    if let Some(default) = &default {
+        for (_, apfb) in napfb.iter_mut().filter(|(n, _)| !n.is_empty()) {
+            for (alpn, pfb) in default {
+                let target = apfb.entry(alpn).or_default();
+                for (path, fb) in pfb {
+                    target.entry(path).or_insert(fb);
+                }
+            }
+        }
+    }
+
+    let mut name = tls.name.as_str();
+    if (napfb.len() > 1 || !napfb.contains_key("")) && !name.is_empty() && !napfb.contains_key(name)
+    {
+        name = napfb
+            .keys()
+            .filter(|n| !n.is_empty() && tls.name.contains(**n))
+            .max_by_key(|n| n.len())
+            .copied()
+            .unwrap_or("");
+    }
+    let apfb = napfb.get(name).or_else(|| napfb.get(""))?;
+    let pfb = apfb.get(tls.alpn.as_str()).or_else(|| apfb.get(""))?;
+    let path = if pfb.len() > 1 || !pfb.contains_key("") {
+        request_path(first)
+            .filter(|p| pfb.contains_key(p))
+            .unwrap_or("")
+    } else {
+        ""
+    };
+    pfb.get(path).copied()
 }
 
 /// Xray's scan: the path starts within bytes 5..=9 and ends at ' ' or '?' before byte 64.
@@ -152,6 +234,8 @@ mod tests {
 
     fn fallback(path: &str, port: u16) -> Fallback {
         Fallback {
+            name: String::new(),
+            alpn: String::new(),
             path: path.to_owned(),
             dest: FallbackDest::Tcp(Host::Domain("localhost".into()), port),
             xver: 0,
@@ -161,12 +245,61 @@ mod tests {
     #[test]
     fn matches_paths_like_xray() {
         let fbs = [fallback("/ws", 1), fallback("", 2)];
-        let pick = |first: &[u8]| find_fallback(&fbs, first).map(|fb| fb.path.as_str());
+        let none = TlsInfo::default();
+        let pick = |first: &[u8]| find_fallback(&fbs, &none, first).map(|fb| fb.path.as_str());
         assert_eq!(pick(b"GET /ws HTTP/1.1\r\nHost: a\r\n"), Some("/ws"));
         assert_eq!(pick(b"POST /ws?x=1 HTTP/1.1\r\nHost: a\r\n"), Some("/ws"));
         assert_eq!(pick(b"GET /wsx HTTP/1.1\r\nHost: a\r\n"), Some(""));
         assert_eq!(pick(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), Some(""));
         assert_eq!(pick(b"\x16\x03\x01\x02\x00"), Some(""));
-        assert!(find_fallback(&fbs[..1], b"GET /other HTTP/1.1\r\n\r\n").is_none());
+        assert!(find_fallback(&fbs[..1], &none, b"GET /other HTTP/1.1\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn matches_name_and_alpn_like_xray() {
+        let entry = |name: &str, alpn: &str, path: &str, port| Fallback {
+            name: name.into(),
+            alpn: alpn.into(),
+            ..fallback(path, port)
+        };
+        let fbs = [
+            entry("", "", "", 1),
+            entry("", "h2", "", 2),
+            entry("a.example", "", "", 3),
+            entry("example", "", "/ws", 4),
+        ];
+        let port = |name: &str, alpn: &[u8], first: &[u8]| match find_fallback(
+            &fbs,
+            &TlsInfo::new(name, alpn),
+            first,
+        )
+        .map(|fb| &fb.dest)
+        {
+            Some(FallbackDest::Tcp(_, port)) => *port,
+            other => panic!("unexpected {other:?}"),
+        };
+        let get = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n";
+        assert_eq!(port("", b"", get), 1);
+        assert_eq!(port("", b"h2", get), 2);
+        // The longest name the SNI contains wins. Its own alpn "" entry fills its
+        // h2 gap before the unnamed entries do, as in Xray's merge order.
+        assert_eq!(port("A.Example", b"", get), 3);
+        assert_eq!(port("x.a.example.com", b"h2", get), 3);
+        assert_eq!(port("b.example", b"", b"GET /ws HTTP/1.1\r\n\r\n"), 4);
+        assert_eq!(port("b.example", b"", get), 1);
+        assert_eq!(port("other.net", b"http/1.1", get), 1);
+
+        // An alpn entry with only a path gets the unnamed alpn "" entry, and named
+        // entries see that merged result.
+        let fbs = [
+            entry("", "", "", 1),
+            entry("", "http/1.1", "/api", 5),
+            entry("example", "", "/ws", 4),
+        ];
+        let pick = |name: &str| match find_fallback(&fbs, &TlsInfo::new(name, b"http/1.1"), get) {
+            Some(fb) => fb.path.clone(),
+            None => "none".into(),
+        };
+        assert_eq!(pick("b.example"), "");
     }
 }
