@@ -1213,6 +1213,9 @@ impl RealityServer {
             }
         };
 
+        let client_cipher = AeadCipher::new(cipher, &client_app_key);
+        let server_cipher = AeadCipher::new(cipher, &server_app_key);
+
         for length in lens {
             if length >= 22 {
                 let pt_len = length - 21;
@@ -1227,7 +1230,9 @@ impl RealityServer {
                 let ct_len = (length - 5) as u16;
                 header[3] = (ct_len >> 8) as u8;
                 header[4] = (ct_len & 0xff) as u8;
-                let ciphertext = aead_encrypt(cipher, &server_app_key, &nonce, &header, &pt);
+                let ciphertext = server_cipher.encrypt(&nonce, &header, &pt).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "AEAD encrypt failed")
+                })?;
                 stream.write_all(&header).await?;
                 stream.write_all(&ciphertext).await?;
                 if self.settings.show {
@@ -1240,17 +1245,20 @@ impl RealityServer {
         Ok(Tls13Stream {
             inner: stream,
             cipher,
-            client_app_key,
+            client_app_secret,
             client_app_iv,
             client_seq: 0,
-            server_app_key,
+            client_cipher,
+            server_app_secret,
             server_app_iv,
             server_seq,
+            server_cipher,
             read_buf: Vec::new(),
             read_buf_pos: 0,
             raw_read_buf: Vec::new(),
             write_buf: Vec::new(),
             write_buf_pos: 0,
+            scratch_buf: Vec::with_capacity(16384 + 256),
         })
     }
 
@@ -1591,20 +1599,98 @@ fn find_client_alpn(payload: &[u8]) -> Vec<Vec<u8>> {
     alpn
 }
 
+#[derive(Clone)]
+pub(crate) struct AeadCipher(Arc<aws_lc_rs::aead::LessSafeKey>);
+
+impl AeadCipher {
+    pub(crate) fn new(cipher: CipherType, key: &[u8]) -> Self {
+        let alg = match cipher {
+            CipherType::Aes128Gcm => &aws_lc_rs::aead::AES_128_GCM,
+            CipherType::Aes256Gcm => &aws_lc_rs::aead::AES_256_GCM,
+            CipherType::ChaCha20Poly1305 => &aws_lc_rs::aead::CHACHA20_POLY1305,
+        };
+        let unbound = aws_lc_rs::aead::UnboundKey::new(alg, key).expect("valid AEAD key");
+        Self(Arc::new(aws_lc_rs::aead::LessSafeKey::new(unbound)))
+    }
+
+    pub(crate) fn encrypt(
+        &self,
+        nonce: &[u8; 12],
+        ad: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, io::Error> {
+        let mut buf = plaintext.to_vec();
+        self.encrypt_in_place(nonce, ad, &mut buf)?;
+        Ok(buf)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn decrypt(
+        &self,
+        nonce: &[u8; 12],
+        ad: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, io::Error> {
+        let mut buf = ciphertext.to_vec();
+        self.decrypt_in_place(nonce, ad, &mut buf)?;
+        Ok(buf)
+    }
+
+    pub(crate) fn encrypt_in_place(
+        &self,
+        nonce: &[u8; 12],
+        ad: &[u8],
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), io::Error> {
+        let tag = self
+            .0
+            .seal_in_place_separate_tag(
+                aws_lc_rs::aead::Nonce::assume_unique_for_key(*nonce),
+                aws_lc_rs::aead::Aad::from(ad),
+                buffer,
+            )
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "AEAD encrypt failed"))?;
+        buffer.extend_from_slice(tag.as_ref());
+        Ok(())
+    }
+
+    pub(crate) fn decrypt_in_place(
+        &self,
+        nonce: &[u8; 12],
+        ad: &[u8],
+        buffer: &mut Vec<u8>,
+    ) -> Result<(), io::Error> {
+        let out = self
+            .0
+            .open_in_place(
+                aws_lc_rs::aead::Nonce::assume_unique_for_key(*nonce),
+                aws_lc_rs::aead::Aad::from(ad),
+                buffer,
+            )
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TLS 1.3 decrypt failed"))?;
+        let len = out.len();
+        buffer.truncate(len);
+        Ok(())
+    }
+}
+
 pub struct Tls13Stream<S> {
     inner: S,
     cipher: CipherType,
-    client_app_key: Vec<u8>,
+    client_app_secret: Vec<u8>,
     client_app_iv: [u8; 12],
     client_seq: u64,
-    server_app_key: Vec<u8>,
+    client_cipher: AeadCipher,
+    server_app_secret: Vec<u8>,
     server_app_iv: [u8; 12],
     server_seq: u64,
+    server_cipher: AeadCipher,
     read_buf: Vec<u8>,
     read_buf_pos: usize,
     raw_read_buf: Vec<u8>,
     write_buf: Vec<u8>,
     write_buf_pos: usize,
+    scratch_buf: Vec<u8>,
 }
 
 impl<S> Tls13Stream<S> {
@@ -1628,36 +1714,84 @@ impl<S> Tls13Stream<S> {
         };
         (self.inner, self.raw_read_buf, decrypted)
     }
+
+    fn queue_key_update(&mut self) -> io::Result<()> {
+        let key_update_msg = [0x18, 0x00, 0x00, 0x01, 0x00];
+        let mut pt = Vec::with_capacity(key_update_msg.len() + 1);
+        pt.extend_from_slice(&key_update_msg);
+        pt.push(0x16); // Handshake content type
+
+        let nonce = compute_nonce(&self.server_app_iv, self.server_seq);
+        self.server_seq += 1;
+
+        let ct_len = pt.len() + 16;
+        let header = [0x17, 0x03, 0x03, (ct_len >> 8) as u8, (ct_len & 0xff) as u8];
+        let ciphertext = self
+            .server_cipher
+            .encrypt(&nonce, &header, &pt)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "KeyUpdate encrypt failed"))?;
+
+        self.write_buf.extend_from_slice(&header);
+        self.write_buf.extend_from_slice(&ciphertext);
+
+        // Update server application traffic secret and keys (RFC 8446 7.2)
+        self.server_app_secret = hkdf_expand_label(
+            self.cipher,
+            &self.server_app_secret,
+            "traffic upd",
+            &[],
+            self.cipher.hash_len() as u16,
+        );
+        let server_key = hkdf_expand_label(
+            self.cipher,
+            &self.server_app_secret,
+            "key",
+            &[],
+            self.cipher.key_len() as u16,
+        );
+        self.server_app_iv.copy_from_slice(&hkdf_expand_label(
+            self.cipher,
+            &self.server_app_secret,
+            "iv",
+            &[],
+            12,
+        ));
+        self.server_seq = 0;
+        self.server_cipher = AeadCipher::new(self.cipher, &server_key);
+
+        Ok(())
+    }
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
         loop {
-            if self.read_buf_pos < self.read_buf.len() {
+            if this.read_buf_pos < this.read_buf.len() {
                 let to_copy =
-                    std::cmp::min(buf.remaining(), self.read_buf.len() - self.read_buf_pos);
-                buf.put_slice(&self.read_buf[self.read_buf_pos..self.read_buf_pos + to_copy]);
-                self.read_buf_pos += to_copy;
-                if self.read_buf_pos == self.read_buf.len() {
-                    self.read_buf.clear();
-                    self.read_buf_pos = 0;
+                    std::cmp::min(buf.remaining(), this.read_buf.len() - this.read_buf_pos);
+                buf.put_slice(&this.read_buf[this.read_buf_pos..this.read_buf_pos + to_copy]);
+                this.read_buf_pos += to_copy;
+                if this.read_buf_pos == this.read_buf.len() {
+                    this.read_buf.clear();
+                    this.read_buf_pos = 0;
                 }
                 return Poll::Ready(Ok(()));
             }
 
             // Read 5-byte header
-            if self.raw_read_buf.len() < 5 {
+            if this.raw_read_buf.len() < 5 {
                 let mut temp = [0u8; 5];
-                let mut temp_buf = ReadBuf::new(&mut temp[..5 - self.raw_read_buf.len()]);
-                match Pin::new(&mut self.inner).poll_read(cx, &mut temp_buf) {
+                let mut temp_buf = ReadBuf::new(&mut temp[..5 - this.raw_read_buf.len()]);
+                match Pin::new(&mut this.inner).poll_read(cx, &mut temp_buf) {
                     Poll::Ready(Ok(())) => {
                         let n = temp_buf.filled().len();
                         if n == 0 {
-                            if self.raw_read_buf.is_empty() {
+                            if this.raw_read_buf.is_empty() {
                                 return Poll::Ready(Ok(())); // EOF
                             } else {
                                 return Poll::Ready(Err(io::Error::new(
@@ -1666,8 +1800,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
                                 )));
                             }
                         }
-                        self.raw_read_buf.extend_from_slice(temp_buf.filled());
-                        if self.raw_read_buf.len() < 5 {
+                        this.raw_read_buf.extend_from_slice(temp_buf.filled());
+                        if this.raw_read_buf.len() < 5 {
                             continue;
                         }
                     }
@@ -1676,15 +1810,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
                 }
             }
 
-            let rec_len = u16::from_be_bytes([self.raw_read_buf[3], self.raw_read_buf[4]]) as usize;
+            let rec_len = u16::from_be_bytes([this.raw_read_buf[3], this.raw_read_buf[4]]) as usize;
+            if rec_len > 16384 + 256 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record overflow: record exceeds 16384 + 256 bytes",
+                )));
+            }
+            if rec_len < 16 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "record too short: less than AEAD tag size",
+                )));
+            }
             let total_len = 5 + rec_len;
 
             // Read record payload
-            if self.raw_read_buf.len() < total_len {
-                let needed = total_len - self.raw_read_buf.len();
+            if this.raw_read_buf.len() < total_len {
+                let needed = total_len - this.raw_read_buf.len();
                 let mut chunk = vec![0u8; needed];
                 let mut chunk_buf = ReadBuf::new(&mut chunk);
-                match Pin::new(&mut self.inner).poll_read(cx, &mut chunk_buf) {
+                match Pin::new(&mut this.inner).poll_read(cx, &mut chunk_buf) {
                     Poll::Ready(Ok(())) => {
                         let n = chunk_buf.filled().len();
                         if n == 0 {
@@ -1693,8 +1839,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
                                 "truncated TLS record payload",
                             )));
                         }
-                        self.raw_read_buf.extend_from_slice(chunk_buf.filled());
-                        if self.raw_read_buf.len() < total_len {
+                        this.raw_read_buf.extend_from_slice(chunk_buf.filled());
+                        if this.raw_read_buf.len() < total_len {
                             continue;
                         }
                     }
@@ -1704,34 +1850,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
             }
 
             // Decrypt complete record
-            let mut nonce = self.client_app_iv;
-            let seq_bytes = self.client_seq.to_be_bytes();
-            for i in 0..8 {
-                nonce[4 + i] ^= seq_bytes[i];
-            }
-            self.client_seq += 1;
+            let nonce = compute_nonce(&this.client_app_iv, this.client_seq);
+            this.client_seq += 1;
 
             let header = [
-                self.raw_read_buf[0],
-                self.raw_read_buf[1],
-                self.raw_read_buf[2],
-                self.raw_read_buf[3],
-                self.raw_read_buf[4],
+                this.raw_read_buf[0],
+                this.raw_read_buf[1],
+                this.raw_read_buf[2],
+                this.raw_read_buf[3],
+                this.raw_read_buf[4],
             ];
-            let ciphertext = &self.raw_read_buf[5..total_len];
-            let plaintext = aead_decrypt(
-                self.cipher,
-                &self.client_app_key,
-                &nonce,
-                &header,
-                ciphertext,
-            )
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "TLS 1.3 decrypt failed"))?;
+            let ciphertext = &this.raw_read_buf[5..total_len];
+            this.scratch_buf.clear();
+            this.scratch_buf.extend_from_slice(ciphertext);
+            this.client_cipher
+                .decrypt_in_place(&nonce, &header, &mut this.scratch_buf)
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "TLS 1.3 decrypt failed")
+                })?;
 
-            self.raw_read_buf.drain(..total_len);
+            this.raw_read_buf.drain(..total_len);
 
-            let mut end = plaintext.len();
-            while end > 0 && plaintext[end - 1] == 0 {
+            let mut end = this.scratch_buf.len();
+            while end > 0 && this.scratch_buf[end - 1] == 0 {
                 end -= 1;
             }
             if end == 0 {
@@ -1740,13 +1881,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
                     "TLS 1.3 record has no content type",
                 )));
             }
-            let content_type = plaintext[end - 1];
-            let data = &plaintext[..end - 1];
+            let content_type = this.scratch_buf[end - 1];
+            let data = &this.scratch_buf[..end - 1];
 
             match content_type {
                 0x17 => {
-                    self.read_buf.extend_from_slice(data);
-                    self.read_buf_pos = 0;
+                    this.read_buf.extend_from_slice(data);
+                    this.read_buf_pos = 0;
                     // Loop to serve to caller
                 }
                 0x15 => {
@@ -1759,9 +1900,75 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for Tls13Stream<S> {
                         "TLS alert received",
                     )));
                 }
-                _ => {
-                    // Ignore other records (key_update, etc.) and read next
-                    continue;
+                0x16 => {
+                    if data.len() >= 4 && data[0] == 0x18 {
+                        let len = ((data[1] as usize) << 16)
+                            | ((data[2] as usize) << 8)
+                            | (data[3] as usize);
+                        if len != 1 || data.len() < 5 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid KeyUpdate handshake length",
+                            )));
+                        }
+                        let request_update = data[4];
+                        if request_update > 1 {
+                            return Poll::Ready(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid KeyUpdateRequest value",
+                            )));
+                        }
+
+                        if request_update == 1 {
+                            this.queue_key_update()?;
+                            if this.write_buf_pos < this.write_buf.len() {
+                                let to_write = &this.write_buf[this.write_buf_pos..];
+                                if let Poll::Ready(Ok(n)) =
+                                    Pin::new(&mut this.inner).poll_write(cx, to_write)
+                                {
+                                    this.write_buf_pos += n;
+                                    if this.write_buf_pos == this.write_buf.len() {
+                                        this.write_buf.clear();
+                                        this.write_buf_pos = 0;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Update client application traffic keys (RFC 8446 7.2)
+                        let next_secret = hkdf_expand_label(
+                            this.cipher,
+                            &this.client_app_secret,
+                            "traffic upd",
+                            &[],
+                            this.cipher.hash_len() as u16,
+                        );
+                        let client_key = hkdf_expand_label(
+                            this.cipher,
+                            &next_secret,
+                            "key",
+                            &[],
+                            this.cipher.key_len() as u16,
+                        );
+                        let client_iv = hkdf_expand_label(this.cipher, &next_secret, "iv", &[], 12);
+                        this.client_app_secret = next_secret;
+                        this.client_app_iv.copy_from_slice(&client_iv);
+                        this.client_seq = 0;
+                        this.client_cipher = AeadCipher::new(this.cipher, &client_key);
+                        continue;
+                    }
+
+                    let msg_type = data.first().copied().unwrap_or(0);
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected post-handshake record type: 0x{msg_type:02x}"),
+                    )));
+                }
+                other => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("unexpected content type: 0x{other:02x}"),
+                    )));
                 }
             }
         }
@@ -1798,29 +2005,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Tls13Stream<S> {
         let chunk_size = std::cmp::min(buf.len(), 16384);
         let chunk = &buf[..chunk_size];
 
-        let mut plaintext = Vec::with_capacity(chunk_size + 1);
-        plaintext.extend_from_slice(chunk);
-        plaintext.push(0x17); // ApplicationData content type
+        let ct_len = chunk_size + 1 + 16;
+        let header = [0x17, 0x03, 0x03, (ct_len >> 8) as u8, (ct_len & 0xff) as u8];
 
-        let mut nonce = this.server_app_iv;
-        let seq_bytes = this.server_seq.to_be_bytes();
-        for i in 0..8 {
-            nonce[4 + i] ^= seq_bytes[i];
-        }
+        let nonce = compute_nonce(&this.server_app_iv, this.server_seq);
         this.server_seq += 1;
 
-        let ct_len = plaintext.len() + 16;
-        let header = [0x17, 0x03, 0x03, (ct_len >> 8) as u8, (ct_len & 0xff) as u8];
-        let ciphertext = aead_encrypt(
-            this.cipher,
-            &this.server_app_key,
-            &nonce,
-            &header,
-            &plaintext,
-        );
+        this.scratch_buf.clear();
+        this.scratch_buf.extend_from_slice(chunk);
+        this.scratch_buf.push(0x17); // ApplicationData content type
+        this.server_cipher
+            .encrypt_in_place(&nonce, &header, &mut this.scratch_buf)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "AEAD encrypt failed"))?;
 
+        this.write_buf.clear();
         this.write_buf.extend_from_slice(&header);
-        this.write_buf.extend_from_slice(&ciphertext);
+        this.write_buf.extend_from_slice(&this.scratch_buf);
         this.write_buf_pos = 0;
 
         while this.write_buf_pos < this.write_buf.len() {
@@ -2074,5 +2274,205 @@ mod tests {
             .unwrap();
         // 184 is rustls server's automatic NewSessionTicket, followed by the two dummy records
         assert_eq!(lens, vec![184, 120, 180]);
+    }
+
+    #[tokio::test]
+    async fn test_tls13_stream_bounds_inbound_records() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let cipher = CipherType::Aes128Gcm;
+        let client_secret = vec![1u8; 32];
+        let server_secret = vec![2u8; 32];
+        let client_key = hkdf_expand_label(cipher, &client_secret, "key", &[], 16);
+        let server_key = hkdf_expand_label(cipher, &server_secret, "key", &[], 16);
+
+        let mut stream = Tls13Stream {
+            inner: server_io,
+            cipher,
+            client_app_secret: client_secret,
+            client_app_iv: [3u8; 12],
+            client_seq: 0,
+            client_cipher: AeadCipher::new(cipher, &client_key),
+            server_app_secret: server_secret,
+            server_app_iv: [4u8; 12],
+            server_seq: 0,
+            server_cipher: AeadCipher::new(cipher, &server_key),
+            read_buf: Vec::new(),
+            read_buf_pos: 0,
+            raw_read_buf: Vec::new(),
+            write_buf: Vec::new(),
+            write_buf_pos: 0,
+            scratch_buf: Vec::new(),
+        };
+
+        // Client writes header with length > 16384 + 256 = 16640
+        let (_client_r, mut client_w) = tokio::io::split(client_io);
+        let oversized_len: u16 = 16641;
+        let mut hdr = [0x17, 0x03, 0x03, 0, 0];
+        hdr[3] = (oversized_len >> 8) as u8;
+        hdr[4] = (oversized_len & 0xff) as u8;
+        client_w.write_all(&hdr).await.unwrap();
+
+        let mut buf = [0u8; 128];
+        let err = stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("record overflow"));
+    }
+
+    #[tokio::test]
+    async fn test_tls13_stream_rejects_unexpected_handshake() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let cipher = CipherType::Aes128Gcm;
+        let client_secret = vec![1u8; 32];
+        let server_secret = vec![2u8; 32];
+        let client_key = hkdf_expand_label(cipher, &client_secret, "key", &[], 16);
+        let server_key = hkdf_expand_label(cipher, &server_secret, "key", &[], 16);
+        let client_iv = [3u8; 12];
+        let client_cipher = AeadCipher::new(cipher, &client_key);
+
+        let mut stream = Tls13Stream {
+            inner: server_io,
+            cipher,
+            client_app_secret: client_secret,
+            client_app_iv: client_iv,
+            client_seq: 0,
+            client_cipher,
+            server_app_secret: server_secret,
+            server_app_iv: [4u8; 12],
+            server_seq: 0,
+            server_cipher: AeadCipher::new(cipher, &server_key),
+            read_buf: Vec::new(),
+            read_buf_pos: 0,
+            raw_read_buf: Vec::new(),
+            write_buf: Vec::new(),
+            write_buf_pos: 0,
+            scratch_buf: Vec::new(),
+        };
+
+        // Client sends an unexpected handshake record: ClientHello (type 0x01)
+        let mut unexpected_hs = vec![0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00];
+        unexpected_hs.push(0x16); // content type Handshake
+        let nonce = compute_nonce(&client_iv, 0);
+        let ct_len = unexpected_hs.len() + 16;
+        let hdr = [0x17, 0x03, 0x03, (ct_len >> 8) as u8, (ct_len & 0xff) as u8];
+        let ct = AeadCipher::new(cipher, &client_key)
+            .encrypt(&nonce, &hdr, &unexpected_hs)
+            .unwrap();
+
+        let (_client_r, mut client_w) = tokio::io::split(client_io);
+        client_w.write_all(&hdr).await.unwrap();
+        client_w.write_all(&ct).await.unwrap();
+
+        let mut buf = [0u8; 128];
+        let err = stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("unexpected post-handshake record"));
+    }
+
+    #[tokio::test]
+    async fn test_tls13_stream_handles_key_update() {
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let cipher = CipherType::Aes128Gcm;
+        let mut client_secret = vec![1u8; 32];
+        let mut server_secret = vec![2u8; 32];
+        let client_key = hkdf_expand_label(cipher, &client_secret, "key", &[], 16);
+        let server_key = hkdf_expand_label(cipher, &server_secret, "key", &[], 16);
+        let mut client_iv = [3u8; 12];
+        let mut server_iv = [4u8; 12];
+        let mut client_seq = 0u64;
+
+        let mut stream = Tls13Stream {
+            inner: server_io,
+            cipher,
+            client_app_secret: client_secret.clone(),
+            client_app_iv: client_iv,
+            client_seq: 0,
+            client_cipher: AeadCipher::new(cipher, &client_key),
+            server_app_secret: server_secret.clone(),
+            server_app_iv: server_iv,
+            server_seq: 0,
+            server_cipher: AeadCipher::new(cipher, &server_key),
+            read_buf: Vec::new(),
+            read_buf_pos: 0,
+            raw_read_buf: Vec::new(),
+            write_buf: Vec::new(),
+            write_buf_pos: 0,
+            scratch_buf: Vec::new(),
+        };
+
+        let (mut client_r, mut client_w) = tokio::io::split(client_io);
+
+        // 1. Client sends KeyUpdate with request_update = 1 (update_requested)
+        let mut key_update = vec![0x18, 0x00, 0x00, 0x01, 0x01];
+        key_update.push(0x16); // ContentType Handshake
+        let nonce = compute_nonce(&client_iv, client_seq);
+        let ct_len = key_update.len() + 16;
+        let hdr = [0x17, 0x03, 0x03, (ct_len >> 8) as u8, (ct_len & 0xff) as u8];
+        let ct = AeadCipher::new(cipher, &client_key)
+            .encrypt(&nonce, &hdr, &key_update)
+            .unwrap();
+        client_w.write_all(&hdr).await.unwrap();
+        client_w.write_all(&ct).await.unwrap();
+
+        // 2. Client derives its next generation secret and key
+        client_secret = hkdf_expand_label(cipher, &client_secret, "traffic upd", &[], 32);
+        let next_client_key = hkdf_expand_label(cipher, &client_secret, "key", &[], 16);
+        client_iv.copy_from_slice(&hkdf_expand_label(cipher, &client_secret, "iv", &[], 12));
+        client_seq = 0; // reset
+
+        // 3. Client sends application data encrypted with next generation key
+        let mut app_data = b"ping after key update".to_vec();
+        app_data.push(0x17); // ContentType ApplicationData
+        let nonce = compute_nonce(&client_iv, client_seq);
+        let _ = client_seq; // sequence used for nonce
+        let ct_len = app_data.len() + 16;
+        let hdr = [0x17, 0x03, 0x03, (ct_len >> 8) as u8, (ct_len & 0xff) as u8];
+        let ct = AeadCipher::new(cipher, &next_client_key)
+            .encrypt(&nonce, &hdr, &app_data)
+            .unwrap();
+        client_w.write_all(&hdr).await.unwrap();
+        client_w.write_all(&ct).await.unwrap();
+
+        // 4. Server reads the application data (KeyUpdate was handled transparently)
+        let mut buf = [0u8; 64];
+        let n = stream.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ping after key update");
+
+        // 5. Verify server responded with its own KeyUpdate (request_update = 0)
+        let mut srv_hdr = [0u8; 5];
+        client_r.read_exact(&mut srv_hdr).await.unwrap();
+        assert_eq!(&srv_hdr[..3], &[0x17, 0x03, 0x03]);
+        let srv_rec_len = u16::from_be_bytes([srv_hdr[3], srv_hdr[4]]) as usize;
+        let mut srv_ct = vec![0u8; srv_rec_len];
+        client_r.read_exact(&mut srv_ct).await.unwrap();
+
+        // Decrypt server KeyUpdate with initial server key
+        let srv_nonce = compute_nonce(&server_iv, 0);
+        let srv_pt = AeadCipher::new(cipher, &server_key)
+            .decrypt(&srv_nonce, &srv_hdr, &srv_ct)
+            .unwrap();
+        assert_eq!(srv_pt.last(), Some(&0x16)); // Handshake
+        assert_eq!(&srv_pt[..5], &[0x18, 0x00, 0x00, 0x01, 0x00]); // KeyUpdate(update_not_requested)
+
+        // 6. Server sends application data using next generation key
+        stream.write_all(b"pong from server").await.unwrap();
+        stream.flush().await.unwrap();
+
+        // Client derives server's next generation secret and key
+        server_secret = hkdf_expand_label(cipher, &server_secret, "traffic upd", &[], 32);
+        let next_server_key = hkdf_expand_label(cipher, &server_secret, "key", &[], 16);
+        server_iv.copy_from_slice(&hkdf_expand_label(cipher, &server_secret, "iv", &[], 12));
+
+        let mut srv_app_hdr = [0u8; 5];
+        client_r.read_exact(&mut srv_app_hdr).await.unwrap();
+        let srv_app_len = u16::from_be_bytes([srv_app_hdr[3], srv_app_hdr[4]]) as usize;
+        let mut srv_app_ct = vec![0u8; srv_app_len];
+        client_r.read_exact(&mut srv_app_ct).await.unwrap();
+
+        let srv_app_nonce = compute_nonce(&server_iv, 0);
+        let srv_app_pt = AeadCipher::new(cipher, &next_server_key)
+            .decrypt(&srv_app_nonce, &srv_app_hdr, &srv_app_ct)
+            .unwrap();
+        assert_eq!(srv_app_pt.last(), Some(&0x17));
+        assert_eq!(&srv_app_pt[..srv_app_pt.len() - 1], b"pong from server");
     }
 }
