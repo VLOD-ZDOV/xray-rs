@@ -105,22 +105,39 @@ pub fn check_final(
 }
 
 /// Applies freedom's domainStrategy filtering to candidate addresses.
-pub fn apply_strategy(addrs: &mut Vec<SocketAddr>, strategy: FreedomStrategy) -> io::Result<()> {
-    match strategy {
-        FreedomStrategy::AsIs | FreedomStrategy::UseIP => {}
-        FreedomStrategy::UseIPv4 => {
-            addrs.retain(SocketAddr::is_ipv4);
-        }
-        FreedomStrategy::UseIPv6 => {
-            addrs.retain(SocketAddr::is_ipv6);
-        }
+/// Xray's freedom resolve strategy, for domains only: the preferred family,
+/// else the fallback one; when neither has an address, `Force*` fails and
+/// `Use*` dials what the resolver gave.
+pub fn apply_strategy(
+    host: &Host,
+    addrs: &mut Vec<SocketAddr>,
+    strategy: FreedomStrategy,
+) -> io::Result<()> {
+    let (mode, prefer, fallback) = strategy.table();
+    if mode == 0 || matches!(host, Host::Ip(_)) {
+        return Ok(());
     }
-    if addrs.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("no addresses matched freedom domainStrategy {strategy:?}"),
-        ));
+    let of = |family: u8| -> Vec<SocketAddr> {
+        addrs
+            .iter()
+            .copied()
+            .filter(|a| family == 0 || (family == 4) == a.is_ipv4())
+            .collect()
+    };
+    let mut picked = of(prefer);
+    if picked.is_empty() && fallback != 0 {
+        picked = of(fallback);
     }
+    if picked.is_empty() {
+        if mode == 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no addresses matched freedom domainStrategy {strategy:?}"),
+            ));
+        }
+        return Ok(());
+    }
+    *addrs = picked;
     Ok(())
 }
 
@@ -368,7 +385,7 @@ async fn connect_direct(
         .and_then(|st| st.resolve_ip());
     let mut last_error = None;
     let mut addrs = resolve_all(host, port).await?;
-    apply_strategy(&mut addrs, settings.strategy)?;
+    apply_strategy(host, &mut addrs, settings.strategy)?;
     for addr in addrs {
         if let Err(e) = check_final(router, outbound, Network::Tcp, addr) {
             last_error = Some(e);
@@ -430,7 +447,7 @@ impl UdpLink {
                     None => (host.clone(), port),
                 };
                 let mut addrs = resolve_all(&target_host, target_port).await?;
-                apply_strategy(&mut addrs, settings.strategy)?;
+                apply_strategy(&target_host, &mut addrs, settings.strategy)?;
                 let target = addrs[0];
                 check_final(router, &decision.tag, Network::Udp, target)?;
                 let bind_ip = settings
@@ -631,7 +648,7 @@ impl ConeUdp {
                     None => (host.clone(), port),
                 };
                 let mut addrs = resolve_all(&target_host, target_port).await?;
-                apply_strategy(&mut addrs, settings.strategy)?;
+                apply_strategy(&target_host, &mut addrs, settings.strategy)?;
                 let addr = addrs[0];
                 check_final(router, outbound, Network::Udp, addr)?;
                 Ok(addr)
@@ -778,21 +795,34 @@ mod tests {
     fn freedom_domain_strategy_filtering() {
         let v4: SocketAddr = "1.2.3.4:80".parse().unwrap();
         let v6: SocketAddr = "[2001:db8::1]:80".parse().unwrap();
-
-        let mut addrs = vec![v4, v6];
-        apply_strategy(&mut addrs, FreedomStrategy::AsIs).unwrap();
-        assert_eq!(addrs, vec![v4, v6]);
-
-        let mut addrs = vec![v4, v6];
-        apply_strategy(&mut addrs, FreedomStrategy::UseIPv4).unwrap();
-        assert_eq!(addrs, vec![v4]);
-
-        let mut addrs = vec![v4, v6];
-        apply_strategy(&mut addrs, FreedomStrategy::UseIPv6).unwrap();
-        assert_eq!(addrs, vec![v6]);
-
-        let mut addrs = vec![v4];
-        assert!(apply_strategy(&mut addrs, FreedomStrategy::UseIPv6).is_err());
+        let domain = Host::Domain("example.com".into());
+        let pick = |addrs: &[SocketAddr], strategy| {
+            let mut addrs = addrs.to_vec();
+            apply_strategy(&domain, &mut addrs, strategy).map(|()| addrs)
+        };
+        assert_eq!(
+            pick(&[v4, v6], FreedomStrategy::AsIs).unwrap(),
+            vec![v4, v6]
+        );
+        assert_eq!(pick(&[v4, v6], FreedomStrategy::UseIPv4).unwrap(), vec![v4]);
+        assert_eq!(pick(&[v4, v6], FreedomStrategy::UseIPv6).unwrap(), vec![v6]);
+        assert_eq!(
+            pick(&[v4, v6], FreedomStrategy::UseIPv6v4).unwrap(),
+            vec![v6]
+        );
+        assert_eq!(pick(&[v4], FreedomStrategy::UseIPv6v4).unwrap(), vec![v4]);
+        // Use* falls back to what the resolver gave, Force* fails.
+        assert_eq!(pick(&[v4], FreedomStrategy::UseIPv6).unwrap(), vec![v4]);
+        assert!(pick(&[v4], FreedomStrategy::ForceIPv6).is_err());
+        assert_eq!(pick(&[v4], FreedomStrategy::ForceIPv6v4).unwrap(), vec![v4]);
+        // IP targets are dialed as they are.
+        let mut ip = vec![v4];
+        apply_strategy(&Host::Ip(v4.ip()), &mut ip, FreedomStrategy::ForceIPv6).unwrap();
+        assert_eq!(
+            FreedomStrategy::parse("useIPv4v6"),
+            Some(FreedomStrategy::UseIPv4v6)
+        );
+        assert_eq!(FreedomStrategy::parse("UseIP4"), None);
     }
 
     #[test]

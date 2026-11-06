@@ -48,6 +48,51 @@ pub enum FreedomStrategy {
     UseIP,
     UseIPv4,
     UseIPv6,
+    UseIPv4v6,
+    UseIPv6v4,
+    ForceIP,
+    ForceIPv4,
+    ForceIPv6,
+    ForceIPv4v6,
+    ForceIPv6v4,
+}
+
+impl FreedomStrategy {
+    /// Xray's names, read without case.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "" | "asis" => Self::AsIs,
+            "useip" => Self::UseIP,
+            "useipv4" => Self::UseIPv4,
+            "useipv6" => Self::UseIPv6,
+            "useipv4v6" => Self::UseIPv4v6,
+            "useipv6v4" => Self::UseIPv6v4,
+            "forceip" => Self::ForceIP,
+            "forceipv4" => Self::ForceIPv4,
+            "forceipv6" => Self::ForceIPv6,
+            "forceipv4v6" => Self::ForceIPv4v6,
+            "forceipv6v4" => Self::ForceIPv6v4,
+            _ => return None,
+        })
+    }
+
+    /// Xray's strategy table: (none 0 / use 1 / force 2, preferred family,
+    /// fallback family), a family being 4, 6 or 0 for both.
+    pub fn table(self) -> (u8, u8, u8) {
+        match self {
+            Self::AsIs => (0, 0, 0),
+            Self::UseIP => (1, 0, 0),
+            Self::UseIPv4 => (1, 4, 0),
+            Self::UseIPv6 => (1, 6, 0),
+            Self::UseIPv4v6 => (1, 4, 6),
+            Self::UseIPv6v4 => (1, 6, 4),
+            Self::ForceIP => (2, 0, 0),
+            Self::ForceIPv4 => (2, 4, 0),
+            Self::ForceIPv6 => (2, 6, 0),
+            Self::ForceIPv4v6 => (2, 4, 6),
+            Self::ForceIPv6v4 => (2, 6, 4),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1058,19 +1103,16 @@ impl Router {
             let tag = str_field(outbound, "tag").to_owned();
             let protocol = str_field(outbound, "protocol");
             let action = match protocol {
-                "freedom" => {
+                "freedom" | "direct" => {
                     let settings = outbound.get("settings").unwrap_or(&Value::Null);
-                    let domain_strategy = match str_field(settings, "domainStrategy") {
-                        "" | "AsIs" => FreedomStrategy::AsIs,
-                        "UseIP" => FreedomStrategy::UseIP,
-                        "UseIPv4" | "UseIP4" => FreedomStrategy::UseIPv4,
-                        "UseIPv6" | "UseIP6" => FreedomStrategy::UseIPv6,
-                        other => {
-                            return Err(format!(
-                                "outbound {tag:?}: unknown domainStrategy {other:?}"
-                            ))
-                        }
+                    // Xray reads targetStrategy first, then the older domainStrategy.
+                    let name = match str_field(settings, "targetStrategy") {
+                        "" => str_field(settings, "domainStrategy"),
+                        name => name,
                     };
+                    let domain_strategy = FreedomStrategy::parse(name).ok_or_else(|| {
+                        format!("outbound {tag:?}: unsupported domain strategy: {name}")
+                    })?;
                     let redirect = if let Some(r) = settings.get("redirect").and_then(Value::as_str)
                     {
                         parse_redirect(r)?
@@ -1123,7 +1165,7 @@ impl Router {
                     }
                     Action::Direct(freedom_settings)
                 }
-                "blackhole" => {
+                "blackhole" | "block" => {
                     let settings = outbound.get("settings").unwrap_or(&Value::Null);
                     let resp = settings.get("response").unwrap_or(&Value::Null);
                     let block_action = match str_field(resp, "type") {
@@ -1168,7 +1210,7 @@ impl Router {
             let sockopt = outbound
                 .pointer("/streamSettings/sockopt")
                 .unwrap_or(&Value::Null);
-            if protocol != "freedom"
+            if !matches!(protocol, "freedom" | "direct")
                 && crate::config::parse_sockopt(sockopt, &format!("outbound {tag:?}"))?.is_some()
             {
                 log::warn(format!(
@@ -1238,10 +1280,12 @@ impl Router {
             }
         }
 
-        let strategy = match str_field(&routing, "domainStrategy") {
-            "AsIs" | "" => RoutingDomainStrategy::AsIs,
-            "IPIfNonMatch" => RoutingDomainStrategy::IpIfNonMatch,
-            "IPOnDemand" => RoutingDomainStrategy::IpOnDemand,
+        let strategy = match str_field(&routing, "domainStrategy")
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "ipifnonmatch" => RoutingDomainStrategy::IpIfNonMatch,
+            "ipondemand" => RoutingDomainStrategy::IpOnDemand,
             _ => RoutingDomainStrategy::AsIs,
         };
 
