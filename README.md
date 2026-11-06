@@ -59,7 +59,7 @@ to run noise.
 
 - Skipped with a warning: VLESS encryption (`decryption` other than `none`),
   WireGuard and Hysteria2 inbounds, XHTTP over HTTP/3, mKCP, fallbacks selected
-  by `name` or `alpn`, fakedns.
+  by `name` or `alpn`, fakedns, `realitySettings.mldsa65Seed`.
 - `policy` levels other than 0, `reverse`, `metrics`, observatory and the
   `leastPing` / `leastLoad` balancer strategies.
 
