@@ -8,9 +8,10 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use xray_config::Network;
 use xray_proxy::inbound::{
-    encode_socks5_udp_datagram, negotiate_socks5, parse_socks5_request_message,
-    parse_socks5_udp_datagram, read_http_request_head, write_socks5_command_not_supported,
-    write_socks5_success, write_socks5_success_with_bind, HttpInboundAccounts, PlainHttpError,
+    copy_body_chunked, copy_body_length, encode_socks5_udp_datagram, negotiate_socks5,
+    parse_socks5_request_message, parse_socks5_udp_datagram, read_http_request_head,
+    read_http_response, write_socks5_command_not_supported, write_socks5_success,
+    write_socks5_success_with_bind, HttpBody, HttpInboundAccounts, PlainHttpError,
     PlainHttpRequest, SocksCommand, SocksInboundAuth,
 };
 use xray_routing::{Target, TargetAddr};
@@ -247,6 +248,17 @@ where
     .await
 }
 
+const HTTP_CONNECT_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
+const HTTP_PROXY_AUTH_REQUIRED: &[u8] =
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
+const HTTP_BAD_REQUEST: &[u8] =
+    b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nProxy-Connection: close\r\nContent-Length: 0\r\n\r\n";
+const HTTP_SERVICE_UNAVAILABLE: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nProxy-Connection: close\r\nContent-Length: 0\r\n\r\n";
+
+/// Xray's HTTP server: `CONNECT` is answered before routing; other requests
+/// are forwarded one by one, each routed on its own, and the connection takes
+/// another request after a response of known length when the client sent
+/// `Proxy-Connection: keep-alive`.
 pub async fn serve_http<S>(
     mut stream: S,
     auth: &SocksInboundAuth,
@@ -256,68 +268,204 @@ pub async fn serve_http<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let head = timeout(
-        crate::policy::get().handshake,
-        read_http_request_head(&mut stream),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http request timeout"))?
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("http request: {e}")))?;
-    let proxy_authorization = head.proxy_authorization.as_deref().map(|v| v.as_slice());
-
-    let Some(user) = HttpInboundAccounts::from(auth).basic_user(proxy_authorization) else {
-        stream
-            .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n")
-            .await?;
-        stream.flush().await?;
-        return Ok(());
-    };
-    let email = user
-        .as_ref()
-        .map(|u| u.as_str().to_owned())
-        .unwrap_or_default();
-    let _online = stats::get().connect(&email, 0, peer.ip());
-
-    if let Some(target) = head.connect_target() {
-        let target = target.map_err(|e| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("http request: {e}"))
-        })?;
-        stream
-            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            .await?;
-        stream.flush().await?;
-        let (host, port) = target_to_host_port(&target);
-        return relay_tcp(stream, ctx, &email, peer, host, port, Vec::new()).await;
-    }
-    // Plain requests: the first one is forwarded with Connection: close, as
-    // Xray does, and the rest of the connection is relayed as is.
-    let request = match PlainHttpRequest::new(&head) {
-        Ok(request) => request,
-        Err(PlainHttpError::NoHost) => {
-            stream
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-                .await?;
+    let accounts = HttpInboundAccounts::from(auth);
+    loop {
+        let head = timeout(
+            crate::policy::get().handshake,
+            read_http_request_head(&mut stream),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http request timeout"))?
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("http request: {e}")))?;
+        let proxy_authorization = head.proxy_authorization.as_deref().map(|v| v.as_slice());
+        let Some(user) = accounts.basic_user(proxy_authorization) else {
+            stream.write_all(HTTP_PROXY_AUTH_REQUIRED).await?;
             stream.flush().await?;
             return Ok(());
+        };
+        let email = user
+            .as_ref()
+            .map(|u| u.as_str().to_owned())
+            .unwrap_or_default();
+        let _online = stats::get().connect(&email, 0, peer.ip());
+
+        if let Some(target) = head.connect_target() {
+            let target = target.map_err(|e| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("http request: {e}"))
+            })?;
+            stream.write_all(HTTP_CONNECT_ESTABLISHED).await?;
+            stream.flush().await?;
+            let (host, port) = target_to_host_port(&target);
+            return relay_tcp(stream, ctx, &email, peer, host, port, Vec::new()).await;
         }
-        Err(PlainHttpError::Malformed) => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "http request: malformed",
-            ))
+        let request = match PlainHttpRequest::new(&head) {
+            Ok(request) => request,
+            Err(PlainHttpError::NoHost) => {
+                stream.write_all(HTTP_BAD_REQUEST).await?;
+                stream.flush().await?;
+                return Ok(());
+            }
+            Err(PlainHttpError::Malformed) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "http request: malformed",
+                ))
+            }
+        };
+        let reusable = forward_plain(&mut stream, &request, ctx, &email, peer).await?;
+        if !(reusable && request.keep_alive) {
+            return Ok(());
         }
-    };
+    }
+}
+
+/// Sends one request on with `Connection: close` and its response back, and
+/// tells whether the client connection can take another: when the response's
+/// length was known and every byte went through.
+async fn forward_plain<S>(
+    stream: &mut S,
+    request: &PlainHttpRequest,
+    ctx: &Context,
+    email: &str,
+    peer: SocketAddr,
+) -> io::Result<bool>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let forwarded = request.forwarded_head();
     let (host, port) = target_to_host_port(&request.destination);
-    relay_tcp(
-        stream,
-        ctx,
-        &email,
+    let route = RouteRequest {
+        ctx_tag: &ctx.tag,
+        inbound_port: ctx.port,
+        email,
         peer,
-        host,
+        network: Network::Tcp,
+        host: &host,
         port,
-        request.forwarded_head(),
-    )
-    .await
+        sniffing: &crate::vless::Sniffing::default(),
+    };
+    let Some(decision) = route.allow(&ctx.router, &forwarded).await else {
+        stream.write_all(HTTP_SERVICE_UNAVAILABLE).await?;
+        return Ok(false);
+    };
+    let target: Box<dyn outbound::Stream> = match decision.action {
+        // Xray reads the blackhole's `http` answer back like any response.
+        Action::Block(_) => Box::new(tokio::io::join(
+            crate::routing::BLACKHOLE_HTTP_RESPONSE,
+            tokio::io::sink(),
+        )),
+        _ => match outbound::connect(&ctx.router, &decision, &host, port).await {
+            Ok(target) => target,
+            Err(e) => {
+                log::info(format!("http forward to {}:{port}: {e}", host_label(&host)));
+                stream.write_all(HTTP_SERVICE_UNAVAILABLE).await?;
+                return Ok(false);
+            }
+        },
+    };
+    let traffic = stats::get().traffic(&ctx.tag, email, 0, &decision.tag);
+    let activity = Activity::new();
+    let (target_r, mut target_w) = tokio::io::split(Touch {
+        inner: target,
+        activity: &activity,
+    });
+    let mut target_r = tokio::io::BufReader::new(target_r);
+    let (mut client_r, mut client_w) = tokio::io::split(stream);
+
+    let upload = async {
+        target_w.write_all(&forwarded).await?;
+        traffic.up(forwarded.len());
+        let body = match request.body {
+            HttpBody::Length(length) => {
+                copy_body_length(&mut client_r, &mut target_w, length).await?;
+                length
+            }
+            HttpBody::Chunked => copy_body_chunked(&mut client_r, &mut target_w).await?,
+            HttpBody::None | HttpBody::UntilClose => 0,
+        };
+        traffic.up(body as usize);
+        target_w.flush().await
+    };
+    let download = async {
+        let Ok(response) = read_http_response(&mut target_r, &request.method).await else {
+            client_w.write_all(HTTP_SERVICE_UNAVAILABLE).await?;
+            return Ok(false);
+        };
+        if let Some(informational) = &response.informational {
+            client_w.write_all(informational).await?;
+        }
+        let head = response.head;
+        let client_head = head.client_head(&request.method);
+        client_w.write_all(&client_head).await?;
+        let body = match head.body {
+            HttpBody::Length(length) => {
+                copy_body_length(&mut target_r, &mut client_w, length).await?;
+                length
+            }
+            HttpBody::Chunked => copy_body_chunked(&mut target_r, &mut client_w).await?,
+            HttpBody::UntilClose => tokio::io::copy(&mut target_r, &mut client_w).await?,
+            HttpBody::None => 0,
+        };
+        traffic.down(client_head.len() + body as usize);
+        client_w.flush().await?;
+        io::Result::Ok(head.keeps_alive())
+    };
+    let policy = crate::policy::get();
+    tokio::select! {
+        (uploaded, downloaded) = async { tokio::join!(upload, download) } => {
+            Ok(uploaded.is_ok() && downloaded.unwrap_or(false))
+        }
+        () = crate::vless::idle_for(&activity, policy.conn_idle) => Ok(false),
+    }
+}
+
+/// Marks activity whenever bytes move to or from the target.
+struct Touch<'a, S> {
+    inner: S,
+    activity: &'a Activity,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Touch<'_, S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        let filled = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+        if buf.filled().len() > filled {
+            self.activity.touch();
+        }
+        poll
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Touch<'_, S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, data);
+        if matches!(poll, std::task::Poll::Ready(Ok(n)) if n > 0) {
+            self.activity.touch();
+        }
+        poll
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 fn target_to_host_port(target: &Target) -> (Host, u16) {
