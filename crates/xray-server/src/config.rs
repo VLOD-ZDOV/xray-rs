@@ -123,6 +123,7 @@ pub struct Inbound {
     pub hysteria_gecko: Option<xray_transport::hysteria::gecko::GeckoPacketSize>,
     pub hysteria_udp_idle_timeout: Option<u64>,
     pub has_udphop: bool,
+    pub vless_encryption: Option<Arc<xray_vless_encryption::Server>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -368,10 +369,27 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     };
 
     let settings = item.get("settings").unwrap_or(&Value::Null);
+    let mut vless_encryption = None;
     if protocol == InboundProtocol::Vless {
         let decryption = str_field(settings, "decryption");
-        if !decryption.is_empty() && decryption != "none" {
-            return Err("VLESS encryption (decryption != none) is not supported".into());
+        if decryption.is_empty() {
+            if settings.get("decryption").is_some() {
+                return Err(
+                    "VLESS settings: please add/set \"decryption\":\"none\" to every settings"
+                        .into(),
+                );
+            }
+        } else if decryption != "none" {
+            if settings.get("fallbacks").is_some() {
+                return Err(
+                    "VLESS settings: \"fallbacks\" can not be used together with \"decryption\""
+                        .into(),
+                );
+            }
+            use std::str::FromStr;
+            let server_cfg = xray_vless_encryption::ServerConfig::from_str(decryption)
+                .map_err(|_| format!("VLESS settings: unsupported \"decryption\": {decryption}"))?;
+            vless_encryption = Some(Arc::new(xray_vless_encryption::Server::new(server_cfg)));
         }
     }
     let mut users = Vec::new();
@@ -725,6 +743,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         hysteria_gecko,
         hysteria_udp_idle_timeout,
         has_udphop,
+        vless_encryption,
     }))
 }
 
@@ -1473,6 +1492,74 @@ mod tests {
         assert_eq!(inbound.transport, InboundTransport::Tcp);
         assert_eq!(inbound.port, 443);
         assert_eq!(inbound.users[0].email, "alice");
+        assert!(inbound.vless_encryption.is_none());
+    }
+
+    #[test]
+    fn parses_vless_decryption_inbound() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "vless-enc", "port": 443, "protocol": "vless",
+             "settings": {
+               "clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "email": "alice"}],
+               "decryption": "mlkem768x25519plus.native.600s.UKfUEMDdjlEnycTMBP0a08acky8vRRKSrM1MRnaYk3s"
+             },
+             "streamSettings": {"network": "tcp", "security": "none"}}
+          ]
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.inbounds.len(), 1);
+        let inbound = &config.inbounds[0];
+        assert!(inbound.vless_encryption.is_some());
+    }
+
+    #[test]
+    fn rejects_vless_decryption_errors_matching_xray() {
+        // Empty decryption string
+        let raw_empty = r#"{
+          "inbounds": [
+            {"tag": "vless-in", "port": 443, "protocol": "vless",
+             "settings": {"clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811"}], "decryption": ""}}
+          ]
+        }"#;
+        let err = match parse(raw_empty) {
+            Err(e) => e,
+            Ok(_) => panic!("expected err"),
+        };
+        assert!(err
+            .contains("VLESS settings: please add/set \"decryption\":\"none\" to every settings"));
+
+        // Unsupported decryption
+        let raw_unsupported = r#"{
+          "inbounds": [
+            {"tag": "vless-in", "port": 443, "protocol": "vless",
+             "settings": {"clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811"}], "decryption": "invalid.format"}}
+          ]
+        }"#;
+        let err = match parse(raw_unsupported) {
+            Err(e) => e,
+            Ok(_) => panic!("expected err"),
+        };
+        assert!(err.contains("VLESS settings: unsupported \"decryption\": invalid.format"));
+
+        // Decryption with fallbacks
+        let raw_fallbacks = r#"{
+          "inbounds": [
+            {"tag": "vless-in", "port": 443, "protocol": "vless",
+             "settings": {
+               "clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+               "decryption": "mlkem768x25519plus.native.600s.UKfUEMDdjlEnycTMBP0a08acky8vRRKSrM1MRnaYk3s",
+               "fallbacks": [{"dest": 80}]
+             }}
+          ]
+        }"#;
+        let err = match parse(raw_fallbacks) {
+            Err(e) => e,
+            Ok(_) => panic!("expected err"),
+        };
+        assert!(err.contains(
+            "VLESS settings: \"fallbacks\" can not be used together with \"decryption\""
+        ));
     }
 
     #[test]

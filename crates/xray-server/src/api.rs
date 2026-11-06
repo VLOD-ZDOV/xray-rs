@@ -1341,6 +1341,7 @@ async fn handle_handler(
                 hysteria_gecko: None,
                 hysteria_udp_idle_timeout: None,
                 has_udphop: false,
+                vless_encryption: None,
             };
             match crate::start_inbound(&inbound, None, inbound_manager.router().clone()).await {
                 Ok((ctx, tcp_abort, udp_abort)) => {
@@ -1630,6 +1631,7 @@ mod tests {
             ss2022_salt_pool: Arc::new(std::sync::Mutex::new(
                 xray_proxy::shadowsocks2022::SaltPool::default_ss2022(),
             )),
+            vless_encryption: None,
         };
 
         // Add VMess user

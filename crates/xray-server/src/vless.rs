@@ -232,6 +232,7 @@ pub struct Context {
     pub fallbacks: Vec<crate::config::Fallback>,
     pub vmess_filter: Arc<std::sync::Mutex<xray_proxy::vmess::server::AuthIdFilter>>,
     pub ss2022_salt_pool: Arc<std::sync::Mutex<xray_proxy::shadowsocks2022::SaltPool>>,
+    pub vless_encryption: Option<Arc<xray_vless_encryption::Server>>,
 }
 
 impl Context {
@@ -372,10 +373,31 @@ where
     .await
 }
 
-pub async fn serve_stream<S>(mut stream: S, ctx: &Context, peer: SocketAddr) -> io::Result<()>
+pub async fn serve_stream<S>(stream: S, ctx: &Context, peer: SocketAddr) -> io::Result<()>
 where
     S: VisionStreamIo + Send + 'static,
 {
+    let mut stream = if let Some(enc) = &ctx.vless_encryption {
+        let timeout_dur = crate::policy::get().handshake;
+        match timeout(timeout_dur, enc.handshake(stream)).await {
+            Ok(Ok(encrypted)) => MaybeEncrypted::Encrypted(Box::new(encrypted)),
+            Ok(Err(e)) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("ML-KEM-768 handshake failed: {e}"),
+                ));
+            }
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ML-KEM-768 handshake timeout",
+                ));
+            }
+        }
+    } else {
+        MaybeEncrypted::Plain(stream)
+    };
+
     let mut buf = Vec::with_capacity(512);
     let handshake_res = timeout(crate::policy::get().handshake, async {
         let mut chunk = [0u8; 512];
@@ -993,6 +1015,102 @@ impl<T: AsyncRead + AsyncWrite + Unpin> VisionStreamIo for DirectIoWrapper<T> {
     }
 }
 
+pub enum MaybeEncrypted<S> {
+    Plain(S),
+    Encrypted(Box<xray_vless_encryption::EncryptedStream<S>>),
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for MaybeEncrypted<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Encrypted(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeEncrypted<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Encrypted(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush(cx),
+            Self::Encrypted(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        match self.get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Encrypted(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+impl<S: VisionStreamIo> VisionStreamIo for MaybeEncrypted<S> {
+    fn release_record_alignment(&mut self) {
+        match self {
+            Self::Plain(s) => s.release_record_alignment(),
+            Self::Encrypted(s) => s.get_mut().release_record_alignment(),
+        }
+    }
+
+    fn poll_read_direct(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_read_direct(cx, output),
+            Self::Encrypted(s) => s.poll_read_vision_direct(cx, output),
+        }
+    }
+
+    fn poll_write_direct(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_write_direct(cx, input),
+            Self::Encrypted(s) => s.poll_write_vision_direct(cx, input),
+        }
+    }
+
+    fn poll_flush_direct(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_flush_direct(cx),
+            Self::Encrypted(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown_direct(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+    ) -> Poll<io::Result<()>> {
+        match self.as_mut().get_mut() {
+            Self::Plain(s) => Pin::new(s).poll_shutdown_direct(cx),
+            Self::Encrypted(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
 async fn udp_up<R: AsyncRead + Unpin>(
     mut reader: PrefixedReader<'_, R>,
     link: &UdpLink,
@@ -1182,6 +1300,7 @@ mod tests {
             ss2022_salt_pool: Arc::new(std::sync::Mutex::new(
                 xray_proxy::shadowsocks2022::SaltPool::new(60, 65536),
             )),
+            vless_encryption: None,
         };
 
         crate::policy::init(crate::policy::PolicySettings {

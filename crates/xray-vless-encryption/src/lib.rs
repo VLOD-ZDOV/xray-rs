@@ -10,11 +10,13 @@ mod config;
 mod crypto;
 mod handshake;
 mod padding;
+mod server;
 mod session;
 mod stream;
 
 pub use config::{ClientConfig, ConfigError, Encryption, Rtt, XorMode};
 pub use crypto::CipherSuite;
+pub use server::{Server, ServerConfig};
 pub use session::Client;
 pub use stream::EncryptedStream;
 

@@ -96,6 +96,12 @@ impl Aead {
             .map(|plain| plain.len())
             .map_err(|_| invalid_data())
     }
+
+    pub(crate) fn seal_server_hello(&self, data: &mut Vec<u8>) -> io::Result<()> {
+        self.key
+            .seal_in_place_append_tag(Nonce::assume_unique_for_key(MAX_NONCE), Aad::empty(), data)
+            .map_err(|_| crypto_error())
+    }
 }
 
 pub(crate) struct HeaderMask(ctr::Ctr128BE<Aes256>);

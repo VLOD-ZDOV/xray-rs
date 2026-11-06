@@ -48,6 +48,7 @@ xray-config = { path = "../xray-config" }
 xray-proxy = { path = "../xray-proxy" }
 xray-routing = { path = "../xray-routing" }
 xray-transport = { path = "../xray-transport" }
+xray-vless-encryption = { path = "../xray-vless-encryption" }
 xray-wireguard = { path = "../xray-wireguard" }
 
 [build-dependencies]

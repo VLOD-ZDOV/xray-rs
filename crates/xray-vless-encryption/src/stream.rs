@@ -104,6 +104,14 @@ impl DirectHeader {
 }
 
 impl<S> EncryptedStream<S> {
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
     pub(crate) fn new(
         inner: S,
         united: Zeroizing<[u8; 96]>,
@@ -144,6 +152,10 @@ impl<S> EncryptedStream<S> {
             lease: None,
             confirmation_deadline: None,
         }
+    }
+
+    pub(crate) fn set_prewrite(&mut self, prewrite: Vec<u8>) {
+        self.prewrite = Some(Zeroizing::new(prewrite));
     }
 
     pub(crate) fn resumed(

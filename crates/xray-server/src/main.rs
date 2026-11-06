@@ -241,6 +241,7 @@ pub(crate) async fn start_inbound(
         ss2022_salt_pool: Arc::new(std::sync::Mutex::new(
             xray_proxy::shadowsocks2022::SaltPool::default_ss2022(),
         )),
+        vless_encryption: inbound.vless_encryption.clone(),
     });
 
     if inbound.protocol == InboundProtocol::Hysteria {

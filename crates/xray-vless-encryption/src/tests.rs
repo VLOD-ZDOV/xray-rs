@@ -22,6 +22,22 @@ fn unhex(s: &str) -> Vec<u8> {
 }
 
 #[test]
+fn test_fips203_keygen_matches_xray() {
+    use fips203::ml_kem_768;
+    use fips203::traits::{KeyGen, SerDes};
+    let seed_b64 =
+        "XsiCNMKehpFcsC_2D-_VWCJ2H3yfQTJyV3FqC1fGiMHXuKywrHGhLYjLkf5FeFXlneghqy6jSUA2MIluNguLwA";
+    let client_b64 = "zXiCKGpLXMWjfGJzvxd3_8mPawo492HOgwtIl-KwMrxAHkNIK-lLgWdVTmhtwXOttfRb30IRSidNL1JARYdL7sS7sOoKbzK8GQtn8oxaBIGGDckjmeaOx9gak-s1fXtErKRyx5Ymbkx6jnoFmhGPCDawioxlCWSoyXCRySe56BePhhqI9OUFuCGLfgLM_3sW_9STn9ZjT7Krc4uvjHKc7TiVw_jPOhQMVpIYVbJYa4qJYjMi2VvA_ECwowwZA7pNQVamF3rJglgdUfNDdYFtsZS6sEqKeapYYamZHBcS7krGLrqyJKCpdhzHZ3m3kmlIeME5iWY-sqiJZElcmRZXGgUb8eDGdWBrBtOwvui1RvoHKUxehQd6gkS5CkY88bTOctI_NZd0EBSA6SuHxSQUZNg8-eGMGLokdTjEAIW0H7aqHTcYZgNajprGU6CLYaGGvhHEemlE_NRAvsXGrnFMn8mu4ZqHYpSjz5S84ghX6NEZxbgLbhod4dVNpnG5txfALjNSBGFn8kZtByJN5QvM25hFdRJSHQhns_QdZcuo_PKyfUuuxJCdW5nHBKAIipoHzQTQlNZlJBxm07Yek6GR-vuCabkvVDRyrEBTdUOFraIpMzoMATrEYIAav5Z7tJsXBDSIDeDPtCojq1Ge49QPQgEVIDe5HXkAjJNQfNZM_dOmWZmsGDCrYliBixSnfirB3rEruSl9TCMRLZAJOsREheAaeXZLQnaRK9rI8ppowksqH7lSHrSBgscHtieFdENsCUtIsRxXOnhnwgkk2gOOnbpsYne6UFoKbzbKyderitGpeNG1DidPgAOaRRJMGjlMk6kEfawJjFPCo5Wy6CA1BVEu8rsaW6ikcZIWp0hpYBV5m_c4o9iHpTA9HmdTfwwFmox_sfg2bcCipEu-0fd-RNzGiNJJBrkg5YtFmuIjhnu1-OhxQHmhE6g6qJSsMYKJcQgdD5nFFDC7vDjInGcNO7rOzke41Pp6TblGnFcrXbh0BcacIOM5JioRD1YIauDMwcKvo9tEq4LJvLa4J4eaXnh2izMZNWMKj_Vz1RKwE2ZTkVQRfeJG_Xyi7eCdnvipyImGfmCmAbKV7uoBqhpRaboBx7HF3CsnSflEkgATCrai6vNeFgDNb8g1cGkOPOgQaQQ5dklkX_SDRsalVvDNFRVedTDLAqYw_Ewhu-m9WPGO-TGKBhY6KTx_OCaWxdEeH6KkzngqXarLYcQFyJOCB1qQtQI_alXI9aIma_aJb2txnNy600UzF3lEe3ee85ARmnhIMhIgjOK4qrF3pDF1F2W-vTbC3UccIdAO76kAdKonjrpWIVgJTwEtwbaNCGJpJWu5MOuBrLAEJFCug8Ey-xpjzMFJ61SB9LE5tcpFyKBBCHWynjaz3DRBUXN6E9ZuDwaipjrJeKNRRKgvrvmQ7Qleu3qrDWIiPDqINBlqaPWqRmae86x9Mcy-2QMwT-ZBZYCUABaCtJsOZ9FUPgJdIoKHEktZvGlYDDGLPwUaGna7keU3NQlznOQ0IsdVtMZj6NAX6-puTXjHi6xVKbB44w3I4GVp_KZ52iPfR9z8sks";
+    let seed_bytes = URL_SAFE_NO_PAD.decode(seed_b64).unwrap();
+    let client_bytes = URL_SAFE_NO_PAD.decode(client_b64).unwrap();
+    let seed_array: [u8; 64] = seed_bytes.try_into().unwrap();
+    let d: [u8; 32] = seed_array[..32].try_into().unwrap();
+    let z: [u8; 32] = seed_array[32..].try_into().unwrap();
+    let (ek, _dk) = ml_kem_768::KG::keygen_from_seed(d, z);
+    assert_eq!(ek.into_bytes().as_slice(), client_bytes.as_slice());
+}
+
+#[test]
 fn binary_kdf_and_both_aeads_match_pinned_go_vectors() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/vless-encryption/primitives.json"
@@ -525,4 +541,97 @@ async fn vision_direct_cannot_recover_poisoned_or_incomplete_records() {
             .is_err()
     );
     assert!(right.read(&mut bytes).await.is_err());
+}
+
+#[tokio::test]
+async fn client_server_handshake_roundtrip() {
+    for mode in ["native", "xorpub", "random"] {
+        let secret = x25519_dalek::StaticSecret::from([0x55; 32]);
+        let public = x25519_dalek::PublicKey::from(&secret);
+        let s_key_b64 = URL_SAFE_NO_PAD.encode([0x55; 32]);
+        let c_key_b64 = URL_SAFE_NO_PAD.encode(public.as_bytes());
+
+        let dec_str = format!("mlkem768x25519plus.{mode}.600s.{s_key_b64}");
+        let enc_str = format!("mlkem768x25519plus.{mode}.1rtt.{c_key_b64}");
+
+        let server_cfg: ServerConfig = dec_str.parse().unwrap();
+        let server = Server::new(server_cfg);
+
+        let enc: Encryption = enc_str.parse().unwrap();
+        let client = Client::new(enc.client().unwrap().clone());
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let mut stream = server.handshake(server_io).await.unwrap();
+                let mut buf = [0u8; 12];
+                stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"hello server");
+                stream.write_all(b"hello client").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+
+        let client_task = tokio::spawn({
+            async move {
+                let mut stream = client.connect(client_io).await.unwrap();
+                stream.write_all(b"hello server").await.unwrap();
+                stream.flush().await.unwrap();
+                let mut buf = [0u8; 12];
+                stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"hello client");
+            }
+        });
+
+        let (r1, r2) = tokio::join!(server_task, client_task);
+        r1.unwrap();
+        r2.unwrap();
+
+        // Test ML-KEM-768 key
+        use fips203::traits::{KeyGen, SerDes};
+        let d = [0x42u8; 32];
+        let z = [0x99u8; 32];
+        let (ek, _dk) = fips203::ml_kem_768::KG::keygen_from_seed(d, z);
+        let mut seed = [0u8; 64];
+        seed[..32].copy_from_slice(&d);
+        seed[32..].copy_from_slice(&z);
+        let s_pq_b64 = URL_SAFE_NO_PAD.encode(seed);
+        let c_pq_b64 = URL_SAFE_NO_PAD.encode(ek.into_bytes());
+
+        let dec_pq_str = format!("mlkem768x25519plus.{mode}.600s.{s_pq_b64}");
+        let enc_pq_str = format!("mlkem768x25519plus.{mode}.1rtt.{c_pq_b64}");
+
+        let server_cfg: ServerConfig = dec_pq_str.parse().unwrap();
+        let server = Server::new(server_cfg);
+        let enc: Encryption = enc_pq_str.parse().unwrap();
+        let client = Client::new(enc.client().unwrap().clone());
+
+        let (client_io, server_io) = tokio::io::duplex(65536);
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let mut stream = server.handshake(server_io).await.unwrap();
+                let mut buf = [0u8; 12];
+                stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"hello server");
+                stream.write_all(b"hello client").await.unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        let client_task = tokio::spawn({
+            async move {
+                let mut stream = client.connect(client_io).await.unwrap();
+                stream.write_all(b"hello server").await.unwrap();
+                stream.flush().await.unwrap();
+                let mut buf = [0u8; 12];
+                stream.read_exact(&mut buf).await.unwrap();
+                assert_eq!(&buf, b"hello client");
+            }
+        });
+        let (r1, r2) = tokio::join!(server_task, client_task);
+        r1.unwrap();
+        r2.unwrap();
+    }
 }

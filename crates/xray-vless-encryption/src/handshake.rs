@@ -16,7 +16,7 @@ use crate::{
 
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn x25519_secret() -> io::Result<StaticSecret> {
+pub(crate) fn x25519_secret() -> io::Result<StaticSecret> {
     let mut bytes = Zeroizing::new([0; 32]);
     OsRng
         .try_fill_bytes(bytes.as_mut())
@@ -24,7 +24,10 @@ fn x25519_secret() -> io::Result<StaticSecret> {
     Ok(StaticSecret::from(*bytes))
 }
 
-fn agree(secret: &StaticSecret, public: &[u8]) -> io::Result<x25519_dalek::SharedSecret> {
+pub(crate) fn agree(
+    secret: &StaticSecret,
+    public: &[u8],
+) -> io::Result<x25519_dalek::SharedSecret> {
     let bytes: [u8; 32] = public.try_into().map_err(|_| invalid_data())?;
     let shared = secret.diffie_hellman(&PublicKey::from(bytes));
     if !shared.was_contributory() {
