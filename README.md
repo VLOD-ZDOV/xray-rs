@@ -26,7 +26,7 @@ The server crate and every workspace crate it is built from (`xray-config`,
 | DNS and policy | built-in `dns` section (servers, `hosts`, `queryStrategy`); `policy` level 0 timeouts and `bufferSize` |
 | 3x-ui | `-c`, `run -test -c`, `-version`; gRPC `StatsService`, `HandlerService` (users for VLESS, VMess, Trojan and Shadowsocks, `AddInbound`, `RemoveInbound`, `AddOutbound`, `RemoveOutbound`), `RoutingService`, `LoggerService`; the `log` section (`loglevel`, `access`, `error`, `maskAddress`, `dnsLog`) |
 
-Tested against the official Xray-core 26.10.21 as client, outbound peer,
+Tested against the official Xray-core 26.10.31 as client, outbound peer,
 WireGuard peer and `xray api` client.
 
 ## Resource use
