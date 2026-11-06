@@ -1475,6 +1475,7 @@ async fn handle_handler(
                                         hash: crate::trojan::trojan_password_hash(&acc.id),
                                         email,
                                         level: u.level,
+                                        flow: acc.flow,
                                     });
                                 }
                             }
@@ -1485,6 +1486,7 @@ async fn handle_handler(
                                         hash: crate::trojan::trojan_password_hash(&acc.password),
                                         email,
                                         level: u.level,
+                                        flow: String::new(),
                                     });
                                 }
                             }
@@ -1627,11 +1629,18 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
             if !account.encryption.is_empty() && account.encryption != "none" {
                 return Err("VLESS encryption is not supported".into());
             }
+            if !matches!(account.flow.as_str(), "" | crate::config::VISION_FLOW) {
+                return Err(format!(
+                    r#"VLESS users: "flow" doesn't support "{}" in this version"#,
+                    account.flow
+                ));
+            }
             ctx.add_user(InboundUser {
                 id: user_id(&account.id),
                 hash: crate::trojan::trojan_password_hash(&account.id),
                 email: user.email,
                 level: user.level,
+                flow: account.flow,
             })
         }
         TROJAN_ACCOUNT => {
@@ -1641,6 +1650,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 hash: crate::trojan::trojan_password_hash(&account.password),
                 email: user.email,
                 level: user.level,
+                flow: String::new(),
             })
         }
         VMESS_ACCOUNT => {
@@ -1650,6 +1660,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 hash: crate::trojan::trojan_password_hash(&account.id),
                 email: user.email,
                 level: user.level,
+                flow: String::new(),
             })
         }
         SHADOWSOCKS_ACCOUNT => {

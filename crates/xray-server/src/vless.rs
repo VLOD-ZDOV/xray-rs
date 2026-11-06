@@ -19,6 +19,8 @@ use crate::{log, mux};
 use xray_config::Network;
 use xray_proxy::vless::{VisionStream, VisionStreamIo, DEFAULT_VISION_SEED};
 
+use crate::config::VISION_FLOW;
+
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Addons {
     #[prost(string, tag = "1")]
@@ -351,6 +353,7 @@ impl Context {
                 hash: [0u8; 56],
                 email,
                 level,
+                flow: String::new(),
             });
         }
         Ok(())
@@ -393,6 +396,7 @@ impl Context {
                 hash: [0u8; 56],
                 email: user.email,
                 level: user.level,
+                flow: String::new(),
             });
         }
         Ok(())
@@ -535,11 +539,12 @@ where
     };
     let mut early = buf.split_off(header_len);
 
+    // VLESS encryption carries Vision too, as Xray's CommonConn does.
+    let vision_capable = tls.vision_capable || ctx.vless_encryption.is_some();
+    let vision = check_flow(&request, &user, vision_capable, &early)?;
     let user_policy = crate::policy::for_level(user.level);
     let _online = stats::get().connect(&user.email, user.level, peer.ip());
     if request.command == Command::Mux {
-        stream.write_all(&[request.version, 0]).await?;
-        stream.flush().await?;
         let info = mux::Info {
             peer,
             tag: ctx.tag.clone(),
@@ -549,6 +554,20 @@ where
             router: ctx.router.clone(),
             sniffing: ctx.sniffing.clone(),
         };
+        if vision {
+            // Mux under Vision (XUDP from a Vision client) keeps the padding but
+            // never switches to direct copy.
+            write_vision_response(&mut stream, request.version).await?;
+            let client = VisionStream::new(
+                PrefixedStreamIo::new(stream, early),
+                user.id,
+                DEFAULT_VISION_SEED,
+            );
+            let (mut r, mut w) = tokio::io::split(client);
+            return mux::serve(&mut r, &mut w, &info).await;
+        }
+        stream.write_all(&[request.version, 0]).await?;
+        stream.flush().await?;
         let (mut r, mut w) = tokio::io::split(stream);
         let mut reader = PrefixedReader {
             early,
@@ -602,18 +621,8 @@ where
 
     match request.command {
         Command::Tcp => {
-            let is_vision = matches!(
-                request.flow.as_deref(),
-                Some("xtls-rprx-vision" | "xtls-rprx-vision-udp443")
-            );
-            if is_vision {
-                let resp_addons = prost::Message::encode_to_vec(&Addons {
-                    flow: "xtls-rprx-vision".to_owned(),
-                });
-                let mut resp_header = vec![request.version, resp_addons.len() as u8];
-                resp_header.extend_from_slice(&resp_addons);
-                stream.write_all(&resp_header).await?;
-                stream.flush().await?;
+            if vision {
+                write_vision_response(&mut stream, request.version).await?;
 
                 let client_stream = PrefixedStreamIo::new(stream, early);
                 let vision_client = VisionStream::new(client_stream, user.id, DEFAULT_VISION_SEED);
@@ -1297,6 +1306,58 @@ async fn udp_down<W: AsyncWrite + Unpin>(
     }
 }
 
+async fn write_vision_response<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    version: u8,
+) -> io::Result<()> {
+    let addons = prost::Message::encode_to_vec(&Addons {
+        flow: VISION_FLOW.to_owned(),
+    });
+    let mut header = vec![version, addons.len() as u8];
+    header.extend_from_slice(&addons);
+    stream.write_all(&header).await?;
+    stream.flush().await
+}
+
+/// Xray's flow rules: Vision only for users configured with it, only over
+/// TLS 1.3, REALITY or VLESS encryption, never for plain UDP; and a Vision user without the
+/// flow may only send UDP, directly or as XUDP over Mux.
+fn check_flow(
+    request: &Request,
+    user: &User,
+    vision_capable: bool,
+    first: &[u8],
+) -> io::Result<bool> {
+    let reject = |msg: String| Err(io::Error::new(io::ErrorKind::PermissionDenied, msg));
+    let account = uuid::Uuid::from_bytes(user.id);
+    match request.flow.as_deref().unwrap_or("") {
+        VISION_FLOW if user.flow == VISION_FLOW => {
+            if request.command == Command::Udp {
+                return reject(format!("{VISION_FLOW} doesn't support UDP"));
+            }
+            if !vision_capable {
+                return reject("XTLS only supports TLS and REALITY directly for now.".into());
+            }
+            Ok(true)
+        }
+        VISION_FLOW => reject(format!(
+            "account {account} is not able to use the flow {VISION_FLOW}"
+        )),
+        "" => {
+            // Xray's isMuxAndNotXUDP: the first Mux frame opens session 0 over UDP.
+            let mux_not_xudp = request.command == Command::Mux
+                && !(first.len() >= 7 && first[2] == 0 && first[3] == 0 && first[6] == 2);
+            if user.flow == VISION_FLOW && (request.command == Command::Tcp || mux_not_xudp) {
+                return reject(format!(
+                    "account {account} is rejected since the client flow is empty. Note that the pure TLS proxy has certain TLS in TLS characters."
+                ));
+            }
+            Ok(false)
+        }
+        other => reject(format!("unknown request flow {other}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1307,6 +1368,7 @@ mod tests {
             hash: [0; 56],
             email: "u".into(),
             level: 0,
+            flow: String::new(),
         }]
     }
 

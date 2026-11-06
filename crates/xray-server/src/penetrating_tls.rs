@@ -170,10 +170,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerPenetratingTlsStream<S> {
             ServerPenetratingTlsState::Tls(None) => return Default::default(),
         };
         let conn = stream.get_ref().1;
-        crate::fallback::TlsInfo::new(
-            conn.server_name().unwrap_or_default(),
-            conn.alpn_protocol().unwrap_or_default(),
-        )
+        crate::fallback::TlsInfo {
+            vision_capable: conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3),
+            ..crate::fallback::TlsInfo::new(
+                conn.server_name().unwrap_or_default(),
+                conn.alpn_protocol().unwrap_or_default(),
+            )
+        }
     }
 
     fn ensure_read_direct(&mut self) -> io::Result<()> {

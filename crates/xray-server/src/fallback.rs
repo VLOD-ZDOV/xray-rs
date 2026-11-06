@@ -15,6 +15,8 @@ use crate::vless::{copy, relay, Activity, Host};
 pub struct TlsInfo {
     pub name: String,
     pub alpn: String,
+    /// TLS 1.3 or REALITY right on the connection, which XTLS Vision needs.
+    pub vision_capable: bool,
 }
 
 impl TlsInfo {
@@ -22,6 +24,7 @@ impl TlsInfo {
         Self {
             name: name.to_ascii_lowercase(),
             alpn: String::from_utf8_lossy(alpn).to_ascii_lowercase(),
+            vision_capable: true,
         }
     }
 }

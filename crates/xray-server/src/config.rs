@@ -163,7 +163,11 @@ pub struct User {
     pub hash: [u8; 56],
     pub email: String,
     pub level: u32,
+    /// VLESS: `xtls-rprx-vision` or empty.
+    pub flow: String,
 }
+
+pub const VISION_FLOW: &str = "xtls-rprx-vision";
 
 /// Like Xray, a non-UUID id maps to UUIDv5 in the nil namespace.
 pub fn user_id(id: &str) -> [u8; 16] {
@@ -517,10 +521,31 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         }
     }
     let mut users = Vec::new();
+    let default_flow = str_field(settings, "flow");
+    if protocol == InboundProtocol::Vless && !matches!(default_flow, "" | VISION_FLOW) {
+        return Err(format!(
+            r#"VLESS "settings.flow" doesn't support "{default_flow}" in this version"#
+        ));
+    }
     for client in array(settings, "clients") {
-        let flow = str_field(client, "flow");
-        if !flow.is_empty() {
-            log::warn(format!("inbound {tag:?}: flow {flow:?} is ignored"));
+        let flow = match (protocol, str_field(client, "flow")) {
+            (InboundProtocol::Vless, "") => default_flow,
+            (InboundProtocol::Vless, VISION_FLOW) => VISION_FLOW,
+            (InboundProtocol::Vless, other) => {
+                return Err(format!(
+                    r#"VLESS users: "flow" doesn't support "{other}" in this version"#
+                ))
+            }
+            _ => "",
+        };
+        // Xray lets such a user open only a reverse tunnel, never a forward proxy.
+        if protocol == InboundProtocol::Vless && client.get("reverse").is_some_and(|r| !r.is_null())
+        {
+            log::warn(format!(
+                "inbound {tag:?}: user {:?} with \"reverse\" skipped, reverse is not supported yet",
+                str_field(client, "email")
+            ));
+            continue;
         }
         let id_str = str_field(client, "id");
         let pass_str = str_field(client, "password");
@@ -535,6 +560,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             hash: crate::trojan::trojan_password_hash(key),
             email: str_field(client, "email").to_owned(),
             level,
+            flow: flow.to_owned(),
         });
     }
 

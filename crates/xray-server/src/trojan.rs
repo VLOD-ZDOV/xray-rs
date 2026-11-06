@@ -386,6 +386,7 @@ mod tests {
             hash: trojan_password_hash("secret"),
             email: "alice@example.com".into(),
             level: 0,
+            flow: String::new(),
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&user.hash);
@@ -413,6 +414,7 @@ mod tests {
             hash: trojan_password_hash("secret"),
             email: "bob@example.com".into(),
             level: 0,
+            flow: String::new(),
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&user.hash);
@@ -438,6 +440,7 @@ mod tests {
             hash: trojan_password_hash("secret"),
             email: "bob@example.com".into(),
             level: 0,
+            flow: String::new(),
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&[b'a'; 56]);
