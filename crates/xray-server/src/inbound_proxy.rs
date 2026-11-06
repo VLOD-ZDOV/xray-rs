@@ -8,10 +8,10 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 use xray_config::Network;
 use xray_proxy::inbound::{
-    encode_socks5_udp_datagram, negotiate_socks5, parse_http_inbound_request,
-    parse_socks5_request_message, parse_socks5_udp_datagram, write_socks5_command_not_supported,
-    write_socks5_success, write_socks5_success_with_bind, HttpInboundRequest, SocksCommand,
-    SocksInboundAuth,
+    encode_socks5_udp_datagram, negotiate_socks5, parse_socks5_request_message,
+    parse_socks5_udp_datagram, read_http_request_head, write_socks5_command_not_supported,
+    write_socks5_success, write_socks5_success_with_bind, HttpInboundAccounts, PlainHttpError,
+    PlainHttpRequest, SocksCommand, SocksInboundAuth,
 };
 use xray_routing::{Target, TargetAddr};
 
@@ -256,47 +256,68 @@ pub async fn serve_http<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let req = timeout(
+    let head = timeout(
         crate::policy::get().handshake,
-        parse_http_inbound_request(&mut stream),
+        read_http_request_head(&mut stream),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http request timeout"))?
     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("http request: {e}")))?;
+    let proxy_authorization = head.proxy_authorization.as_deref().map(|v| v.as_slice());
 
-    if !auth.admits_http_basic(req.proxy_authorization()) {
+    let Some(user) = HttpInboundAccounts::from(auth).basic_user(proxy_authorization) else {
         stream
             .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n")
             .await?;
         stream.flush().await?;
         return Ok(());
-    }
-
-    let user = auth.http_basic_user(req.proxy_authorization()).flatten();
+    };
     let email = user
         .as_ref()
         .map(|u| u.as_str().to_owned())
         .unwrap_or_default();
     let _online = stats::get().connect(&email, peer.ip());
 
-    match req {
-        HttpInboundRequest::Connect(connect) => {
+    if let Some(target) = head.connect_target() {
+        let target = target.map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("http request: {e}"))
+        })?;
+        stream
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await?;
+        stream.flush().await?;
+        let (host, port) = target_to_host_port(&target);
+        return relay_tcp(stream, ctx, &email, peer, host, port, Vec::new()).await;
+    }
+    // Plain requests: the first one is forwarded with Connection: close, as
+    // Xray does, and the rest of the connection is relayed as is.
+    let request = match PlainHttpRequest::new(&head) {
+        Ok(request) => request,
+        Err(PlainHttpError::NoHost) => {
             stream
-                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
                 .await?;
             stream.flush().await?;
-            let (host, port) = target_to_host_port(&connect.target);
-            relay_tcp(stream, ctx, &email, peer, host, port, Vec::new()).await
+            return Ok(());
         }
-        HttpInboundRequest::Plain {
-            target,
-            forwarded_request,
-            ..
-        } => {
-            let (host, port) = target_to_host_port(&target);
-            relay_tcp(stream, ctx, &email, peer, host, port, forwarded_request).await
+        Err(PlainHttpError::Malformed) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "http request: malformed",
+            ))
         }
-    }
+    };
+    let (host, port) = target_to_host_port(&request.destination);
+    relay_tcp(
+        stream,
+        ctx,
+        &email,
+        peer,
+        host,
+        port,
+        request.forwarded_head(),
+    )
+    .await
 }
 
 fn target_to_host_port(target: &Target) -> (Host, u16) {

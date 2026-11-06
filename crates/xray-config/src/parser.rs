@@ -2,8 +2,10 @@ mod blackhole;
 mod dns;
 mod fragment;
 mod freedom;
+mod http_inbound;
 mod http_outbound;
 mod hysteria;
+mod loopback;
 mod noise;
 mod routing;
 mod shadowsocks;
@@ -380,6 +382,23 @@ impl Parser<'_> {
 
     fn validate_top_level_fields(&mut self) {
         self.reject_unknown_fields(self.root, "$", &surface::ROOT);
+        // Subscription labels: Remnawave's XRAY_JSON names every profile in
+        // `remarks` and may describe it in `meta`. Xray-core decodes the root
+        // without these keys, so they never reach its runtime.
+        if self
+            .root
+            .get("remarks")
+            .is_some_and(|remarks| !remarks.is_string() && !remarks.is_null())
+        {
+            self.error("$.remarks", "field `remarks` must be a string or null");
+        }
+        if self
+            .root
+            .get("meta")
+            .is_some_and(|meta| !meta.is_object() && !meta.is_null())
+        {
+            self.error("$.meta", "field `meta` must be an object or null");
+        }
     }
 
     fn parse_observatory(&mut self) -> Option<ObservatoryConfig> {
@@ -645,7 +664,7 @@ impl Parser<'_> {
             Some("socks" | "mixed") => {
                 InboundProtocol::Socks(self.parse_socks_inbound_settings(inbound, index))
             }
-            Some("http") => InboundProtocol::Http,
+            Some("http") => InboundProtocol::Http(self.parse_http_inbound_settings(inbound, index)),
             Some("tun") => InboundProtocol::Tun,
             // Xray registers `tunnel` as the newer name of `dokodemo-door`.
             Some("dokodemo-door" | "tunnel") => {
@@ -678,8 +697,10 @@ impl Parser<'_> {
             .to_owned();
         let allow_unauthenticated_lan =
             self.parse_allow_unauthenticated_lan(inbound, index, &protocol);
-        if matches!(protocol, InboundProtocol::Socks(_) | InboundProtocol::Http)
-            && !is_loopback_listener(&listen)
+        if matches!(
+            protocol,
+            InboundProtocol::Socks(_) | InboundProtocol::Http(_)
+        ) && !is_loopback_listener(&listen)
         {
             if allow_unauthenticated_lan {
                 if !matches!(listen.as_str(), "0.0.0.0" | "::") {
@@ -719,7 +740,10 @@ impl Parser<'_> {
         index: usize,
         protocol: &InboundProtocol,
     ) -> bool {
-        if !matches!(protocol, InboundProtocol::Socks(_) | InboundProtocol::Http) {
+        if !matches!(
+            protocol,
+            InboundProtocol::Socks(_) | InboundProtocol::Http(_)
+        ) {
             return false;
         }
         let Some(settings) = inbound.get("settings").filter(|value| value.is_object()) else {
@@ -757,7 +781,7 @@ impl Parser<'_> {
 
         match protocol {
             InboundProtocol::Socks(_) => self.validate_socks_inbound_settings(settings, index),
-            InboundProtocol::Http => self.validate_http_inbound_settings(settings, index),
+            InboundProtocol::Http(_) => self.validate_http_inbound_settings(settings, index),
             InboundProtocol::Tun => self.validate_tun_inbound_settings(settings, index),
             InboundProtocol::Tproxy(_) => {}
         }
@@ -796,11 +820,24 @@ impl Parser<'_> {
         inbound: &Value,
         index: usize,
     ) -> Option<InboundSniffingConfig> {
+        self.parse_sniffing(
+            inbound.get("sniffing"),
+            &format!("$.inbounds[{index}].sniffing"),
+        )
+    }
+
+    /// Xray-core's `SniffingConfig`, as inbounds and loopback outbounds take
+    /// it: `None` unless it is enabled.
+    fn parse_sniffing(
+        &mut self,
+        sniffing: Option<&Value>,
+        sniffing_path: &str,
+    ) -> Option<InboundSniffingConfig> {
         // Go leaves a `null` object unset.
-        let sniffing = inbound.get("sniffing").filter(|value| !value.is_null())?;
-        let sniffing_path = format!("$.inbounds[{index}].sniffing");
+        let sniffing = sniffing.filter(|value| !value.is_null())?;
+        let sniffing_path = sniffing_path.to_owned();
         if !sniffing.is_object() {
-            self.error(sniffing_path, "inbound sniffing must be an object");
+            self.error(sniffing_path, "sniffing must be an object");
             return None;
         }
 
@@ -925,6 +962,10 @@ impl Parser<'_> {
 
     fn validate_socks_inbound_settings(&mut self, settings: &Value, index: usize) {
         let settings_path = format!("$.inbounds[{index}].settings");
+        // Xray-core reads `null` settings as none.
+        if settings.is_null() {
+            return;
+        }
         if !settings.is_object() {
             self.error(settings_path, "socks inbound settings must be an object");
             return;
@@ -935,13 +976,16 @@ impl Parser<'_> {
 
     fn validate_http_inbound_settings(&mut self, settings: &Value, index: usize) {
         let settings_path = format!("$.inbounds[{index}].settings");
+        // Xray-core reads `null` settings as none.
+        if settings.is_null() {
+            return;
+        }
         if !settings.is_object() {
             self.error(settings_path, "http inbound settings must be an object");
             return;
         }
 
         self.reject_unknown_fields(settings, &settings_path, &surface::HTTP_SETTINGS);
-        self.reject_non_empty_array(settings, "accounts", format!("{settings_path}.accounts"));
 
         if matches!(
             self.optional_bool_at(
@@ -1002,6 +1046,7 @@ impl Parser<'_> {
             Some("hysteria") => OutboundProtocol::Hysteria,
             Some("wireguard") => OutboundProtocol::Wireguard,
             Some("blackhole" | "block") => OutboundProtocol::Blackhole,
+            Some("loopback") => OutboundProtocol::Loopback,
             Some("socks") => OutboundProtocol::Socks,
             Some("http") => OutboundProtocol::Http,
             Some(protocol) => {
@@ -1045,6 +1090,9 @@ impl Parser<'_> {
             }
             OutboundProtocol::Blackhole => {
                 OutboundSettings::Blackhole(self.parse_blackhole_settings(outbound, index)?)
+            }
+            OutboundProtocol::Loopback => {
+                OutboundSettings::Loopback(self.parse_loopback_settings(outbound, index)?)
             }
             OutboundProtocol::Socks => {
                 OutboundSettings::Socks(self.parse_socks_outbound_settings(outbound, index)?)
@@ -1118,8 +1166,6 @@ impl Parser<'_> {
         }
         self.validate_hysteria_pair(&settings, &stream, proxy_settings.is_some(), index);
         self.validate_trojan_stream(&settings, &stream, index);
-        self.validate_socks_outbound_stream(&settings, &stream, index);
-        self.validate_http_outbound_stream(&settings, &stream, index);
 
         // Xray v26.7.28 applies this policy only to its simplified top-level
         // VLESS settings. Its legacy `vnext` path bypasses that validation.
@@ -1143,6 +1189,7 @@ impl Parser<'_> {
             | OutboundSettings::Shadowsocks2022(_)
             | OutboundSettings::Wireguard(_)
             | OutboundSettings::Blackhole(_)
+            | OutboundSettings::Loopback(_)
             // SOCKS5 and HTTP proxies are commonly plaintext; RFC 1929 and
             // Basic credentials then travel in cleartext, which is
             // documented, not rejected.
@@ -1373,6 +1420,7 @@ impl Parser<'_> {
             proxy_protocol: self
                 .freedom_proxy_protocol(settings, &format!("{settings_path}.proxyProtocol")),
             final_rules: self.freedom_final_rules(settings, &format!("{settings_path}.finalRules")),
+            noises: self.freedom_noises(settings, &settings_path),
         }
     }
 
@@ -1997,17 +2045,6 @@ impl Parser<'_> {
                     format!("unsupported field `{key}`"),
                 );
             }
-        }
-    }
-
-    fn reject_non_empty_array(&mut self, value: &Value, key: &str, path: String) {
-        let Some(raw) = value.get(key) else {
-            return;
-        };
-        match raw.as_array() {
-            Some(values) if values.is_empty() => {}
-            Some(_) => self.error(path, format!("field `{key}` is unsupported")),
-            None => self.error(path, format!("field `{key}` must be an array")),
         }
     }
 }

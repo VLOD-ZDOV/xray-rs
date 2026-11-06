@@ -1,6 +1,11 @@
 mod vmess;
 pub use vmess::VmessOutbound;
+mod first_payload;
 mod protocol_stream;
+use first_payload::{
+    flush_header_alone, FirstPayloadDeadline, HeldHeader, TROJAN_FIRST_PAYLOAD_WAIT,
+    VLESS_FIRST_PAYLOAD_WAIT,
+};
 mod shadowsocks;
 pub use shadowsocks::Shadowsocks2022Outbound;
 mod blackhole;
@@ -363,6 +368,8 @@ pub struct FreedomOutbound {
     proxy_protocol: Option<ProxyProtocolVersion>,
     /// Present only when there are rules.
     final_rules: Option<Arc<[FreedomFinalRule]>>,
+    /// Present only when there are noises.
+    noises: Option<Arc<[xray_config::FreedomNoise]>>,
 }
 
 #[derive(Debug, Clone)]
@@ -681,6 +688,32 @@ impl VlessTcpOutbound {
     }
 }
 
+/// Xray-core's `crypto.RandBetween`: from the lower bound up to, but not
+/// including, the upper, or the bound itself when they are equal.
+fn xray_rand_between(first: u32, second: u32) -> u32 {
+    let (low, high) = if first > second {
+        (second, first)
+    } else {
+        (first, second)
+    };
+    if low == high {
+        low
+    } else {
+        rand::thread_rng().gen_range(low..high)
+    }
+}
+
+/// Whether a noise for `family` goes to `target`. Xray-core reads an
+/// IPv4-mapped address as IPv4.
+fn noise_applies(family: xray_config::FreedomNoiseFamily, target: IpAddr) -> bool {
+    let ipv4 = target.to_canonical().is_ipv4();
+    match family {
+        xray_config::FreedomNoiseFamily::Ip => true,
+        xray_config::FreedomNoiseFamily::Ipv4 => ipv4,
+        xray_config::FreedomNoiseFamily::Ipv6 => !ipv4,
+    }
+}
+
 impl FreedomOutbound {
     fn new(settings: &FreedomOutboundSettings, stream: &StreamSettings) -> Result<Self, CoreError> {
         Ok(Self {
@@ -701,7 +734,52 @@ impl FreedomOutbound {
             proxy_protocol: settings.proxy_protocol,
             final_rules: (!settings.final_rules.is_empty())
                 .then(|| settings.final_rules.as_slice().into()),
+            noises: (!settings.noises.is_empty()).then(|| settings.noises.as_slice().into()),
         }
+    }
+
+    /// Sends `noises` before a UDP flow's first datagram, as Xray-core's
+    /// `NoisePacketWriter` does: to `target`, the address the flow goes to,
+    /// in order, skipping those for the other address family, and waiting
+    /// out each one's delay. Nothing is sent when `redirect` sends the flow
+    /// to port 53, as there. Returns the bytes sent.
+    pub(crate) async fn send_udp_noises(
+        &self,
+        socket: &tokio::net::UdpSocket,
+        target: SocketAddr,
+    ) -> io::Result<u64> {
+        let Some(noises) = self.noises.as_deref() else {
+            return Ok(0);
+        };
+        if self
+            .redirect
+            .as_deref()
+            .and_then(|redirect| redirect.port)
+            .is_some_and(|port| port.get() == 53)
+        {
+            return Ok(0);
+        }
+        let mut sent = 0;
+        for noise in noises {
+            if !noise_applies(noise.apply_to, target.ip()) {
+                continue;
+            }
+            let packet = match &noise.packet {
+                xray_config::FreedomNoisePacket::Bytes(bytes) => bytes.clone(),
+                xray_config::FreedomNoisePacket::Random(first, second) => {
+                    let mut bytes = vec![0; xray_rand_between(*first, *second) as usize];
+                    rand::thread_rng().fill(bytes.as_mut_slice());
+                    bytes
+                }
+            };
+            sent += socket.send_to(&packet, target).await? as u64;
+            let (min, max) = noise.delay_ms;
+            if (min, max) != (0, 0) {
+                let delay = xray_rand_between(min, max);
+                tokio::time::sleep(Duration::from_millis(u64::from(delay))).await;
+            }
+        }
+        Ok(sent)
     }
 
     /// `finalRules`, in order.
@@ -859,13 +937,28 @@ impl TcpOutbound {
         }
     }
 
-    /// Whether a freedom in this chain writes a PROXY protocol header, which
-    /// names the client.
-    pub(crate) fn writes_proxy_protocol(&self) -> bool {
+    /// Lets connections this outbound keeps for later flows close: an HTTP
+    /// outbound's shared HTTP/2 connection.
+    pub(crate) fn close_shared_connections(&self) {
+        match self {
+            Self::Http(http) => http.close(),
+            Self::Chained { outbound, proxy } => {
+                outbound.close_shared_connections();
+                proxy.close_shared_connections();
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether this chain names the client: a freedom in it writes a PROXY
+    /// protocol header, or an HTTP outbound's custom headers name the
+    /// source.
+    pub(crate) fn names_the_client(&self) -> bool {
         match self {
             Self::Freedom(freedom) => freedom.proxy_protocol.is_some(),
+            Self::Http(http) => http.names_the_client(),
             Self::Chained { outbound, proxy } => {
-                outbound.writes_proxy_protocol() || proxy.writes_proxy_protocol()
+                outbound.names_the_client() || proxy.names_the_client()
             }
             _ => false,
         }
@@ -968,6 +1061,7 @@ impl ResolvedTcpConnector for OutboundProxyTcpConnector {
                     &self.server_candidates,
                     &[],
                     &self.transport_dialer,
+                    self.source.map(|source| source.addr),
                 )
                 .await
                 .map_err(|error| TransportError::ChainedOutbound(error.to_string())),
@@ -1136,6 +1230,7 @@ enum CachedOutboundError {
     InvalidXhttpConfiguration(String),
     UnsupportedOutboundProxyNetwork(&'static str),
     BlackholeOutbound,
+    LoopbackOutbound,
 }
 
 impl CachedOutboundError {
@@ -1159,6 +1254,7 @@ impl CachedOutboundError {
                 Self::UnsupportedOutboundProxyNetwork(network)
             }
             CoreError::BlackholeOutbound => Self::BlackholeOutbound,
+            CoreError::LoopbackOutbound => Self::LoopbackOutbound,
             other => unreachable!("outbound compilation returned non-cacheable error: {other}"),
         }
     }
@@ -1183,6 +1279,7 @@ impl CachedOutboundError {
                 CoreError::UnsupportedOutboundProxyNetwork(network)
             }
             Self::BlackholeOutbound => CoreError::BlackholeOutbound,
+            Self::LoopbackOutbound => CoreError::LoopbackOutbound,
         }
     }
 }
@@ -1221,6 +1318,7 @@ pub enum OutboundNodeKind {
     Shadowsocks2022,
     Dns,
     Blackhole,
+    Loopback,
     Socks,
     Http,
     Selector,
@@ -1436,6 +1534,7 @@ impl OutboundGraph {
                     OutboundSettings::Wireguard(_) => OutboundNodeKind::Wireguard,
                     OutboundSettings::Dns(_) => OutboundNodeKind::Dns,
                     OutboundSettings::Blackhole(_) => OutboundNodeKind::Blackhole,
+                    OutboundSettings::Loopback(_) => OutboundNodeKind::Loopback,
                     OutboundSettings::Socks(_) => OutboundNodeKind::Socks,
                     OutboundSettings::Http(_) => OutboundNodeKind::Http,
                 },
@@ -1604,6 +1703,15 @@ impl OutboundGraph {
         }
         self.config.outbounds.get(id.index)
     }
+
+    /// The `inboundTag` a loopback outbound routes its connections from
+    /// again, or `None` for any other node.
+    fn loopback_inbound_tag(&self, id: OutboundNodeId) -> Option<&str> {
+        match &self.configured_outbound(id)?.settings {
+            OutboundSettings::Loopback(settings) => Some(&settings.inbound_tag),
+            _ => None,
+        }
+    }
 }
 
 fn build_outbound_proxy_edges(
@@ -1663,6 +1771,7 @@ fn build_outbound_proxy_edges(
             }
             (OutboundSettings::Dns(_), _) => Some("DNS outbounds are not TCP carriers"),
             (OutboundSettings::Blackhole(_), _) => Some("blackhole outbounds are not TCP carriers"),
+            (OutboundSettings::Loopback(_), _) => Some("loopback outbounds are not TCP carriers"),
             (OutboundSettings::Hysteria(_), _) => Some("Hysteria chaining is unsupported"),
             (OutboundSettings::Wireguard(_), _) => Some("WireGuard chaining is unsupported"),
             (
@@ -2484,6 +2593,32 @@ struct RoutingPolicyState {
     revision: u64,
     routing: RoutingConfig,
     dns_route_prefilter: DnsRoutePrefilter,
+    sniffed_routing: SniffedRouting,
+}
+
+/// What the rules route by that only sniffing a flow tells.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SniffedRouting {
+    /// A rule has `protocol`, so inbounds sniff flows for their protocol
+    /// even where `destOverride` would not.
+    pub protocol: bool,
+    /// A rule has `attrs`, so inbounds sniff TCP flows for what Xray-core's
+    /// HTTP sniffer records.
+    pub attributes: bool,
+}
+
+impl SniffedRouting {
+    fn of(routing: &RoutingConfig) -> Self {
+        Self {
+            protocol: routing.rules.iter().any(|rule| rule.protocols.is_some()),
+            attributes: routing.rules.iter().any(|rule| rule.attributes.is_some()),
+        }
+    }
+
+    /// Whether TCP flows are sniffed for routing, which reads both.
+    pub(crate) const fn tcp(self) -> bool {
+        self.protocol || self.attributes
+    }
 }
 
 impl DnsRoutePrefilter {
@@ -2541,6 +2676,7 @@ impl OutboundRouter {
         let routing_policy = RoutingPolicyState {
             revision: 0,
             dns_route_prefilter: Self::dns_route_prefilter(graph, &routing),
+            sniffed_routing: SniffedRouting::of(&routing),
             routing,
         };
         let default_is_dns = graph
@@ -2591,6 +2727,7 @@ impl OutboundRouter {
             .ok_or(CoreError::RoutingPolicyRevisionExhausted)?;
         let next = Arc::new(RoutingPolicyState {
             revision,
+            sniffed_routing: SniffedRouting::of(&routing),
             routing,
             dns_route_prefilter,
         });
@@ -2608,6 +2745,11 @@ impl OutboundRouter {
             rule_count: policy.routing.rules.len(),
             domain_strategy: policy.routing.domain_strategy,
         }
+    }
+
+    /// What the current rules route by that only sniffing tells.
+    pub(crate) fn sniffed_routing(&self) -> SniffedRouting {
+        self.routing_policy_state().sniffed_routing
     }
 
     fn routing_policy_state(&self) -> Arc<RoutingPolicyState> {
@@ -2760,15 +2902,18 @@ impl OutboundRouter {
         self.factory.cached_tcp_outbound(node)
     }
 
+    /// Selects the outbound of a TCP session routed by `target` that goes to
+    /// `dial_target`, which loopbacks route again.
     pub(crate) async fn select_tcp_session_outbound_with_tag_and_resolver(
         &self,
         route: &RouteContext<'_>,
         target: &Target,
+        dial_target: &Target,
         include_tag: bool,
         dns_resolver: &dyn DnsResolver,
     ) -> Result<SelectedTcpSessionOutbound, CoreError> {
         let node = self
-            .select_configured_node_with_resolver(route, target, dns_resolver)
+            .select_session_node_with_resolver(route, target, dial_target, dns_resolver)
             .await?;
         let tag = include_tag
             .then(|| self.graph().node(node).and_then(|node| node.tag.clone()))
@@ -2890,7 +3035,13 @@ impl OutboundRouter {
             return Ok(None);
         }
         let node = self
-            .select_configured_node_with_resolver_in_policy(&policy, route, target, dns_resolver)
+            .select_configured_node_with_resolver_in_policy(
+                &policy,
+                route,
+                target,
+                target,
+                dns_resolver,
+            )
             .await?;
         if !self
             .graph()
@@ -2953,15 +3104,18 @@ impl OutboundRouter {
         self.factory.cached_udp_outbound(node)
     }
 
+    /// Selects the outbound of a UDP session routed by `target` that goes to
+    /// `dial_target`, which loopbacks route again.
     pub(crate) async fn select_udp_session_outbound_with_tag_and_resolver(
         &self,
         route: &RouteContext<'_>,
         target: &Target,
+        dial_target: &Target,
         include_tag: bool,
         dns_resolver: &dyn DnsResolver,
     ) -> Result<SelectedUdpSessionOutbound, CoreError> {
         let node = self
-            .select_configured_node_with_resolver(route, target, dns_resolver)
+            .select_session_node_with_resolver(route, target, dial_target, dns_resolver)
             .await?;
         let tag = include_tag
             .then(|| self.graph().node(node).and_then(|node| node.tag.clone()))
@@ -3011,6 +3165,34 @@ impl OutboundRouter {
         target_network: Option<Network>,
         target_port: Option<u16>,
     ) -> Result<OutboundNodeId, CoreError> {
+        let node = self.route_once_in_policy(
+            policy,
+            route,
+            target_domain,
+            target_ip,
+            target_network,
+            target_port,
+        )?;
+        self.follow_loopbacks(
+            policy,
+            node,
+            route,
+            target_domain,
+            target_ip,
+            target_network,
+            target_port,
+        )
+    }
+
+    fn route_once_in_policy(
+        &self,
+        policy: &RoutingPolicyState,
+        route: &RouteContext<'_>,
+        target_domain: Option<&str>,
+        target_ip: Option<&IpAddr>,
+        target_network: Option<Network>,
+        target_port: Option<u16>,
+    ) -> Result<OutboundNodeId, CoreError> {
         let routed_target = select_routed_target(
             &policy.routing,
             route,
@@ -3022,6 +3204,53 @@ impl OutboundRouter {
         match routed_target {
             Some(target) => self.node_for_target(target),
             None => self.select_default_configured_node(),
+        }
+    }
+
+    /// Follows loopback outbounds from `node`, as Xray-core's loopback
+    /// dispatches its connection again. Routing then sees the loopback's
+    /// `inboundTag` with the source, local address and user it had, but no
+    /// sniffed protocol or attributes, and checks the target given, the
+    /// address the connection goes to, without the DNS lookups of
+    /// `IPIfNonMatch` and `IPOnDemand`. Xray-core sets no limit to how many
+    /// loopbacks follow one another, and recurses until it crashes on a loop;
+    /// here more than [`MAX_LOOPBACK_HOPS`] fail the connection.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "routing takes the target in the parts the synchronous selectors have"
+    )]
+    fn follow_loopbacks(
+        &self,
+        policy: &RoutingPolicyState,
+        mut node: OutboundNodeId,
+        route: &RouteContext<'_>,
+        target_domain: Option<&str>,
+        target_ip: Option<&IpAddr>,
+        target_network: Option<Network>,
+        target_port: Option<u16>,
+    ) -> Result<OutboundNodeId, CoreError> {
+        for _ in 0..MAX_LOOPBACK_HOPS {
+            let Some(inbound_tag) = self.graph().loopback_inbound_tag(node) else {
+                return Ok(node);
+            };
+            let again = RouteContext {
+                inbound_tag: Some(inbound_tag),
+                protocol: None,
+                attributes: None,
+                ..*route
+            };
+            node = self.route_once_in_policy(
+                policy,
+                &again,
+                target_domain,
+                target_ip,
+                target_network,
+                target_port,
+            )?;
+        }
+        match self.graph().loopback_inbound_tag(node) {
+            Some(_) => Err(CoreError::LoopbackChainTooLong(MAX_LOOPBACK_HOPS)),
+            None => Ok(node),
         }
     }
 
@@ -3068,11 +3297,30 @@ impl OutboundRouter {
         target: &Target,
         dns_resolver: &dyn DnsResolver,
     ) -> Result<OutboundNodeId, CoreError> {
+        self.select_session_node_with_resolver(route, target, target, dns_resolver)
+            .await
+    }
+
+    /// Routes a session by `target`, then follows loopbacks by `dial_target`,
+    /// the address it goes to, which Xray-core's loopback routes again.
+    async fn select_session_node_with_resolver(
+        &self,
+        route: &RouteContext<'_>,
+        target: &Target,
+        dial_target: &Target,
+        dns_resolver: &dyn DnsResolver,
+    ) -> Result<OutboundNodeId, CoreError> {
         // Retain one immutable policy snapshot across any DNS await so a flow
         // never observes rules from two revisions.
         let policy = self.routing_policy_state();
-        self.select_configured_node_with_resolver_in_policy(&policy, route, target, dns_resolver)
-            .await
+        self.select_configured_node_with_resolver_in_policy(
+            &policy,
+            route,
+            target,
+            dial_target,
+            dns_resolver,
+        )
+        .await
     }
 
     async fn select_configured_node_with_resolver_in_policy(
@@ -3080,14 +3328,25 @@ impl OutboundRouter {
         policy: &RoutingPolicyState,
         route: &RouteContext<'_>,
         target: &Target,
+        dial_target: &Target,
         dns_resolver: &dyn DnsResolver,
     ) -> Result<OutboundNodeId, CoreError> {
-        match select_routed_target_with_resolver(&policy.routing, route, target, dns_resolver)
-            .await?
-        {
-            Some(target) => self.node_for_target(target),
-            None => self.select_default_configured_node(),
-        }
+        let node =
+            match select_routed_target_with_resolver(&policy.routing, route, target, dns_resolver)
+                .await?
+            {
+                Some(target) => self.node_for_target(target)?,
+                None => self.select_default_configured_node()?,
+            };
+        self.follow_loopbacks(
+            policy,
+            node,
+            route,
+            target_domain(dial_target),
+            target_ip(dial_target),
+            Some(target_network(dial_target)),
+            Some(dial_target.port),
+        )
     }
 
     fn select_configured_node_direct(
@@ -3119,6 +3378,9 @@ impl OutboundRouter {
         }
     }
 }
+
+/// How many loopback outbounds one connection may pass in a row.
+pub(crate) const MAX_LOOPBACK_HOPS: usize = 8;
 
 impl OutboundFactory {
     pub(crate) fn cached_tcp_outbound(
@@ -3325,6 +3587,9 @@ impl OutboundFactory {
     pub(crate) fn close_sessions(&self) {
         self.sessions_closed.store(true, Ordering::Release);
         for entry in &self.entries {
+            if let Some(Ok(outbound)) = entry.tcp.get() {
+                outbound.close_shared_connections();
+            }
             if let Some(Ok(outbound)) = entry.vless.get() {
                 outbound.close();
             }
@@ -3439,6 +3704,7 @@ impl OutboundFactory {
                 .map(TcpOutbound::Http)
                 .map_err(CachedOutboundError::from_core_error),
             OutboundSettings::Blackhole(_) => Err(CachedOutboundError::BlackholeOutbound),
+            OutboundSettings::Loopback(_) => Err(CachedOutboundError::LoopbackOutbound),
             OutboundSettings::Freedom(settings) => {
                 if !stream_transport_is_dialable(&outbound.stream) {
                     return Err(CachedOutboundError::UnsupportedOutboundNetwork);
@@ -3509,6 +3775,7 @@ impl OutboundFactory {
                 .map_err(CachedOutboundError::from_core_error),
             OutboundSettings::Http(_) => Err(CachedOutboundError::UnsupportedOutboundNetwork),
             OutboundSettings::Blackhole(_) => Err(CachedOutboundError::BlackholeOutbound),
+            OutboundSettings::Loopback(_) => Err(CachedOutboundError::LoopbackOutbound),
             OutboundSettings::Freedom(settings) => {
                 if !stream_transport_is_dialable(&outbound.stream) {
                     return Err(CachedOutboundError::UnsupportedOutboundNetwork);
@@ -3563,6 +3830,7 @@ impl OutboundFactory {
                     .map_err(CachedOutboundError::from_core_error)
             }
             OutboundSettings::Blackhole(_) => Err(CachedOutboundError::BlackholeOutbound),
+            OutboundSettings::Loopback(_) => Err(CachedOutboundError::LoopbackOutbound),
             OutboundSettings::Freedom(_)
             | OutboundSettings::Vless(_)
             | OutboundSettings::Hysteria(_)
@@ -3618,6 +3886,7 @@ fn build_tcp_outbound(outbound: &OutboundConfig) -> Result<TcpOutbound, CoreErro
         OutboundSettings::Socks(_) => SocksOutbound::new(outbound).map(TcpOutbound::Socks),
         OutboundSettings::Http(_) => HttpOutbound::new(outbound).map(TcpOutbound::Http),
         OutboundSettings::Blackhole(_) => Err(CoreError::BlackholeOutbound),
+        OutboundSettings::Loopback(_) => Err(CoreError::LoopbackOutbound),
         OutboundSettings::Freedom(settings) => {
             if !stream_transport_is_dialable(&outbound.stream) {
                 return Err(CoreError::UnsupportedOutboundNetwork);
@@ -3648,6 +3917,7 @@ fn build_udp_outbound(outbound: &OutboundConfig) -> Result<UdpOutbound, CoreErro
         OutboundSettings::Socks(_) => SocksOutbound::new(outbound).map(UdpOutbound::Socks),
         OutboundSettings::Http(_) => Err(CoreError::UnsupportedOutboundNetwork),
         OutboundSettings::Blackhole(_) => Err(CoreError::BlackholeOutbound),
+        OutboundSettings::Loopback(_) => Err(CoreError::LoopbackOutbound),
         OutboundSettings::Freedom(settings) => {
             if !stream_transport_is_dialable(&outbound.stream) {
                 return Err(CoreError::UnsupportedOutboundNetwork);
@@ -3957,21 +4227,35 @@ pub(crate) async fn open_tcp_stream_with_resolvers_and_dialer(
             TcpOutbound::Freedom(freedom) => freedom.domain_strategy(),
             _ => DomainStrategy::AsIs,
         };
+        let bootstrap = DomainStrategyResolver::new(bootstrap_resolver, strategy);
+        if let (Some(source), TcpOutbound::Http(http)) = (source, outbound.primary()) {
+            if http.names_the_client() {
+                return Box::pin(open_http_tcp_stream(
+                    http,
+                    target,
+                    &bootstrap,
+                    &proxy_dialer,
+                    requires_local_resolution,
+                    source.addr,
+                ))
+                .await;
+            }
+        }
         return open_plain_tcp_stream_with_resolvers_and_dialer(
             outbound.primary(),
             target,
             destination_resolver,
-            &DomainStrategyResolver::new(bootstrap_resolver, strategy),
+            &bootstrap,
             &proxy_dialer,
             requires_local_resolution,
         )
         .await;
     }
 
-    // A freedom that names the client in its header opens apart, so the
-    // common open future carries no client.
-    if let (Some(source), TcpOutbound::Freedom(freedom)) = (source, outbound) {
-        if freedom.proxy_protocol.is_some() {
+    // An outbound that names the client opens apart, so the common open
+    // future carries no client.
+    match (source, outbound) {
+        (Some(source), TcpOutbound::Freedom(freedom)) if freedom.proxy_protocol.is_some() => {
             return Box::pin(open_freedom_tcp_stream(
                 outbound,
                 freedom,
@@ -3983,6 +4267,18 @@ pub(crate) async fn open_tcp_stream_with_resolvers_and_dialer(
             ))
             .await;
         }
+        (Some(source), TcpOutbound::Http(http)) if http.names_the_client() => {
+            return Box::pin(open_http_tcp_stream(
+                http,
+                target,
+                bootstrap_resolver,
+                transport_dialer,
+                true,
+                source.addr,
+            ))
+            .await;
+        }
+        _ => {}
     }
     open_plain_tcp_stream_with_resolvers_and_dialer(
         outbound,
@@ -3993,6 +4289,25 @@ pub(crate) async fn open_tcp_stream_with_resolvers_and_dialer(
         true,
     )
     .await
+}
+
+/// Opens an HTTP tunnel whose custom headers name the client, `source`.
+/// Callers box it, as for a freedom naming the client.
+async fn open_http_tcp_stream(
+    http: &HttpOutbound,
+    target: &Target,
+    bootstrap_resolver: &dyn DnsResolver,
+    transport_dialer: &TransportDialer,
+    requires_local_resolution: bool,
+    source: SocketAddr,
+) -> Result<BoxedTransportStream, CoreError> {
+    if requires_local_resolution {
+        http.open(target, bootstrap_resolver, transport_dialer, Some(source))
+            .await
+    } else {
+        http.open_resolved(target, &[], &[], transport_dialer, Some(source))
+            .await
+    }
 }
 
 /// Opens a freedom TCP connection that has final rules or writes a PROXY
@@ -4051,9 +4366,9 @@ async fn open_plain_tcp_stream_with_resolvers_and_dialer(
         }
         TcpOutbound::Http(outbound) => {
             if requires_local_resolution {
-                Box::pin(outbound.open(target, bootstrap_resolver, transport_dialer)).await
+                Box::pin(outbound.open(target, bootstrap_resolver, transport_dialer, None)).await
             } else {
-                Box::pin(outbound.open_resolved(target, &[], &[], transport_dialer)).await
+                Box::pin(outbound.open_resolved(target, &[], &[], transport_dialer, None)).await
             }
         }
         TcpOutbound::Vmess(outbound) => {
@@ -4194,7 +4509,7 @@ async fn open_vless_tcp_stream_with_resolved_server_and_dialer(
         .carrier
         .open(resolved_server, resolved_download, transport_dialer)
         .await?;
-    let mut stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
+    let stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
     let request = VlessRequest {
         user_id: outbound.user().id,
         command: VlessCommand::Tcp,
@@ -4202,23 +4517,30 @@ async fn open_vless_tcp_stream_with_resolved_server_and_dialer(
         flow: flow.request_flow(),
     };
     let header = Zeroizing::new(encode_request_header(&request)?);
-
-    stream.write_all(&header).await?;
+    // Like Xray-core, hold the header until the first payload so both share
+    // one write; the deadline sends it alone when no payload arrives.
+    let mut stream: BoxedTransportStream = Box::new(HeldHeader::new(stream, &header));
 
     if flow.uses_vision() {
         let stream = VlessResponseStream::new(VisionTransportStream::new(stream));
-        let mut stream =
-            VisionStream::new(stream, *outbound.user().id.as_bytes(), DEFAULT_VISION_SEED);
-        stream.queue_empty_padding_frame()?;
-        stream.flush().await?;
-        return Ok(Box::new(VisionOutboundStream::new(stream)));
+        let stream = VisionStream::new(stream, *outbound.user().id.as_bytes(), DEFAULT_VISION_SEED);
+        // On timeout Xray-core pads an empty frame to hide the bare header.
+        return Ok(Box::new(FirstPayloadDeadline::new(
+            VisionOutboundStream::new(stream),
+            VLESS_FIRST_PAYLOAD_WAIT,
+            |stream| stream.inner.queue_empty_padding_frame(),
+        )));
     }
 
     // Without Vision there is no direct mode, so the transport never needs
     // record-aligned reads.
     stream.release_record_alignment();
     let stream = VlessResponseStream::new(stream);
-    Ok(Box::new(VlessOutboundStream::new(stream)))
+    Ok(Box::new(FirstPayloadDeadline::new(
+        VlessOutboundStream::new(stream),
+        VLESS_FIRST_PAYLOAD_WAIT,
+        flush_header_alone,
+    )))
 }
 
 pub async fn open_vless_udp_stream_with_resolver_and_dialer(
@@ -4540,6 +4862,8 @@ mod tests {
             default_outbound_tag: Some("proxy".to_owned()),
             routing: RoutingConfig {
                 rules: vec![RoutingRule {
+                    attributes: None,
+                    protocols: None,
                     origin: Default::default(),
                     inbound_tags: Vec::new(),
                     networks: None,
@@ -4677,6 +5001,8 @@ mod tests {
 
     fn ip_rule(tag: &str, ip: Ipv4Addr) -> RoutingRule {
         RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: Vec::new(),
             networks: None,
@@ -4690,6 +5016,8 @@ mod tests {
 
     fn domain_and_ip_rule(tag: &str, domain: &str, ip: Ipv4Addr) -> RoutingRule {
         RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: Vec::new(),
             networks: None,
@@ -4705,6 +5033,8 @@ mod tests {
 
     fn inbound_rule(inbound_tag: &str, outbound_tag: &str) -> RoutingRule {
         RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: vec![inbound_tag.to_owned()],
             networks: None,
@@ -4722,6 +5052,8 @@ mod tests {
         port_range: RoutingPortRange,
     ) -> RoutingRule {
         RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: Vec::new(),
             networks: Some(vec![network]),
@@ -5304,6 +5636,8 @@ mod tests {
             .collect::<Vec<_>>();
         inbound_tags.extend(inbound_tags.clone());
         config.routing.rules = vec![RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags,
             networks: Some(vec![Network::Udp]),
@@ -5716,7 +6050,9 @@ mod tests {
         .await
         .expect("fast failure should accelerate the next VLESS carrier candidate");
 
-        let _stream = opened.expect("open VLESS carrier through second candidate");
+        let mut stream = opened.expect("open VLESS carrier through second candidate");
+        // No payload follows, so flush the held request header on its own.
+        stream.flush().await.unwrap();
         let (mut accepted, _peer) = accepted.expect("accept VLESS fallback connection");
         let expected = encode_request_header(&VlessRequest {
             user_id: outbound.user().id,
@@ -5947,7 +6283,7 @@ mod tests {
             8443,
             RoutingNetwork::Tcp,
         );
-        let _stream = open_tcp_stream_with_resolver_and_dialer(
+        let mut stream = open_tcp_stream_with_resolver_and_dialer(
             &outbound,
             &target,
             &SystemDnsResolver,
@@ -5955,6 +6291,8 @@ mod tests {
         )
         .await
         .expect("open outer VLESS over nested carrier");
+        // No payload follows, so flush the held request headers on their own.
+        stream.flush().await.unwrap();
 
         let mut peer = connector.peers.lock().unwrap().pop().expect("nested peer");
         let primary = outbound.primary();
@@ -6258,6 +6596,94 @@ mod tests {
     }
 
     #[test]
+    fn rand_between_reads_as_xray_core_draws() {
+        // The upper bound is left out, and bounds one apart give the lower.
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..200 {
+            let drawn = xray_rand_between(16, 20);
+            assert!((16..20).contains(&drawn), "{drawn}");
+            seen.insert(drawn);
+            assert_eq!(xray_rand_between(10, 11), 10);
+            assert_eq!(xray_rand_between(11, 10), 10);
+            assert_eq!(xray_rand_between(7, 7), 7);
+            let reversed = xray_rand_between(20, 16);
+            assert!((16..20).contains(&reversed), "{reversed}");
+            seen.insert(reversed);
+        }
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), [16, 17, 18, 19]);
+    }
+
+    #[test]
+    fn noises_read_a_mapped_address_as_ipv4() {
+        use xray_config::FreedomNoiseFamily::{Ip, Ipv4, Ipv6};
+        for (target, ipv4) in [
+            ("192.0.2.1", true),
+            ("::ffff:192.0.2.1", true),
+            ("2001:db8::1", false),
+        ] {
+            let target: IpAddr = target.parse().unwrap();
+            assert!(noise_applies(Ip, target));
+            assert_eq!(noise_applies(Ipv4, target), ipv4, "{target}");
+            assert_eq!(noise_applies(Ipv6, target), !ipv4, "{target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn freedom_sends_noises_as_xray_core_does() {
+        use xray_config::{FreedomNoise, FreedomNoiseFamily, FreedomNoisePacket};
+        let noise = |packet: &[u8], apply_to| FreedomNoise {
+            packet: FreedomNoisePacket::Bytes(packet.to_vec()),
+            delay_ms: (0, 0),
+            apply_to,
+        };
+        let freedom = |redirect| {
+            let mut configured = direct_selection_freedom("direct");
+            configured.settings = OutboundSettings::Freedom(FreedomOutboundSettings {
+                redirect,
+                noises: vec![
+                    noise(b"any", FreedomNoiseFamily::Ip),
+                    noise(b"v6", FreedomNoiseFamily::Ipv6),
+                    FreedomNoise {
+                        packet: FreedomNoisePacket::Random(3, 4),
+                        delay_ms: (1, 1),
+                        apply_to: FreedomNoiseFamily::Ipv4,
+                    },
+                ],
+                ..FreedomOutboundSettings::default()
+            });
+            let UdpOutbound::Freedom(freedom) = build_udp_outbound(&configured).unwrap() else {
+                panic!("freedom compiles to freedom");
+            };
+            freedom
+        };
+        let sink = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let target = sink.local_addr().unwrap();
+
+        let sent = freedom(FreedomRedirect::default())
+            .send_udp_noises(&socket, target)
+            .await
+            .unwrap();
+        assert_eq!(sent, 6);
+        let mut buffer = [0; 64];
+        let first = sink.recv(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..first], b"any");
+        // The IPv6 noise is skipped for an IPv4 destination.
+        assert_eq!(sink.recv(&mut buffer).await.unwrap(), 3);
+
+        // Nothing goes when `redirect` sends the flow to port 53.
+        let sent = freedom(redirect_to(None, 53))
+            .send_udp_noises(&socket, target)
+            .await
+            .unwrap();
+        assert_eq!(sent, 0);
+    }
+
+    #[test]
     fn freedom_settings_reach_tcp_and_udp_outbounds() {
         let mut configured = direct_selection_freedom("direct");
         configured.settings = OutboundSettings::Freedom(FreedomOutboundSettings {
@@ -6356,7 +6782,7 @@ mod tests {
             8443,
             RoutingNetwork::Tcp,
         );
-        let _stream = open_tcp_stream_with_resolver_and_dialer(
+        let mut stream = open_tcp_stream_with_resolver_and_dialer(
             &outbound,
             &target,
             &SystemDnsResolver,
@@ -6364,6 +6790,8 @@ mod tests {
         )
         .await
         .expect("open multi-hop VLESS chain");
+        // No payload follows, so flush the held request headers on their own.
+        stream.flush().await.unwrap();
 
         let TcpOutbound::Chained {
             outbound: entry,
@@ -6448,6 +6876,8 @@ mod tests {
             fallback_tag: Some("direct".to_owned()),
         }];
         config.routing.rules = vec![RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: Vec::new(),
             networks: None,
@@ -7769,7 +8199,18 @@ mod tests {
             bbr_profile: xray_config::QuicBbrProfile::Standard,
             brutal_up_bytes_per_sec: 65_536,
             brutal_down_bytes_per_sec: 131_072,
-            udp_hop: xray_config::QuicUdpHopSettings::default(),
+            udp_hop: xray_config::QuicUdpHopSettings {
+                ports: vec![4_443, 4_444],
+                interval: xray_config::QuicIntervalRange { from: 7, to: 9 },
+                local: true,
+                remote: false,
+                remote_once: true,
+                remote_ips: vec![xray_config::IpCidr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 0)),
+                    24,
+                )
+                .unwrap()],
+            },
             init_stream_receive_window: 2_100_000,
             max_stream_receive_window: 2_100_000,
             init_connection_receive_window: 3_100_000,
@@ -7797,6 +8238,21 @@ mod tests {
         assert_eq!(quic.max_incoming_bidirectional_streams, 16);
         assert!(quic.disable_path_mtu_discovery);
         assert_eq!(quic.congestion, H3Congestion::Reno);
+        assert_eq!(
+            quic.udp_hop,
+            xray_transport::stream::H3UdpHopConfig {
+                ports: vec![4_443, 4_444],
+                interval_min: Duration::from_secs(7),
+                interval_max: Duration::from_secs(9),
+                local: true,
+                remote: false,
+                remote_once: true,
+                remote_ips: vec![(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 0)),
+                    24
+                )],
+            }
+        );
     }
 
     #[test]
@@ -7805,6 +8261,9 @@ mod tests {
             udp_hop: xray_config::QuicUdpHopSettings {
                 ports: vec![4_443],
                 interval: xray_config::QuicIntervalRange { from, to: 6 },
+                local: true,
+                remote: true,
+                ..xray_config::QuicUdpHopSettings::default()
             },
             ..QuicParamsSettings::default()
         };
@@ -8944,6 +9403,9 @@ mod tests {
         )
         .await
         .expect("open VLESS over injected REALITY stream");
+        // The header waits for the first payload and leaves in front of it.
+        stream.write_all(b"vision payload").await.unwrap();
+        stream.flush().await.unwrap();
 
         let expected_header = encode_request_header(&VlessRequest {
             user_id: outbound.user().id,
@@ -8959,19 +9421,8 @@ mod tests {
             .expect("read VLESS header from protected stream");
         assert_eq!(received_header, expected_header);
 
-        let (header_padding, content_len, padding_len) =
-            read_vision_frame(&mut protected_side, true).await;
-        assert_eq!(content_len, 0);
-        assert!((900..=1399).contains(&padding_len));
-        let unpadded = unpad_vision_block(&header_padding, outbound.user().id.as_bytes()).unwrap();
-        assert_eq!(unpadded.command, VisionCommand::Continue);
-        assert!(unpadded.payload.is_empty());
-
-        stream.write_all(b"vision payload").await.unwrap();
-        stream.flush().await.unwrap();
-
-        let (padded, content_len, padding_len) =
-            read_vision_frame(&mut protected_side, false).await;
+        // No empty padding frame: the first frame carries the UUID and payload.
+        let (padded, content_len, padding_len) = read_vision_frame(&mut protected_side, true).await;
         assert_eq!(content_len, "vision payload".len());
         assert!(padding_len <= 255);
         let unpadded = unpad_vision_block(&padded, outbound.user().id.as_bytes()).unwrap();

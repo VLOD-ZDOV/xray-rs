@@ -1010,6 +1010,7 @@ pub(crate) fn static_dns_host_target_from_index(
         match target {
             DnsHostTarget::Ip(ip) => return Some(DnsHostTarget::Ip(*ip)),
             DnsHostTarget::Ips(ips) => return Some(DnsHostTarget::Ips(ips.clone())),
+            DnsHostTarget::Rcode(rcode) => return Some(DnsHostTarget::Rcode(*rcode)),
             DnsHostTarget::Domain(alias) => {
                 let alias = normalize_dns_name(alias)?;
                 if alias == current {
@@ -1232,6 +1233,8 @@ mod tests {
             default_outbound_tag: Some("direct".to_owned()),
             routing: RoutingConfig {
                 rules: vec![RoutingRule {
+                    attributes: None,
+                    protocols: None,
                     origin: Default::default(),
                     inbound_tags: Vec::new(),
                     networks: Some(vec![network]),

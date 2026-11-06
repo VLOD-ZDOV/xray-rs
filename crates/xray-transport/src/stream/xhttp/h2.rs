@@ -88,6 +88,19 @@ impl H2ReceiveWindow {
         }
     }
 
+    /// The window of a connection no XHTTP config shapes, opened as XHTTP
+    /// opens one without a configured window: Go's 4 MiB, or a quarter of it
+    /// growing back to 4 MiB on a constrained host.
+    pub(crate) fn for_host(class: MemoryClass) -> Self {
+        match class {
+            MemoryClass::Constrained => Self::Adaptive {
+                initial: CONSTRAINED_STREAM_WINDOW_SIZE,
+                max: STREAM_WINDOW_SIZE,
+            },
+            MemoryClass::Standard => Self::Fixed(STREAM_WINDOW_SIZE),
+        }
+    }
+
     fn initial(self) -> u32 {
         match self {
             Self::Fixed(window)
@@ -108,6 +121,15 @@ impl H2ReceiveWindow {
 /// first upload of a packet-up flow dial a second connection, a whole TLS
 /// round trip, while the download held the only stream of a fresh one.
 const INITIAL_MAX_SEND_STREAMS: usize = 100;
+
+/// x/net/http2's `defaultMaxReadFrameSize`, which Xray's `http2.Transport`
+/// (no `MaxReadFrameSize` set, `transport/internet/splithttp/dialer.go`)
+/// advertises as `SETTINGS_MAX_FRAME_SIZE`.
+const GO_MAX_READ_FRAME_SIZE: u32 = 1 << 20;
+
+/// x/net/http2's `Transport.maxHeaderListSize` default (10 MiB), advertised as
+/// `SETTINGS_MAX_HEADER_LIST_SIZE`.
+const GO_MAX_HEADER_LIST_SIZE: u32 = 10 << 20;
 
 /// Bounds the copy made by one [`AsyncWrite::poll_write`] call.
 const MAX_UPLOAD_DATA_BYTES: usize = 16 * 1024;
@@ -326,8 +348,15 @@ pub async fn connect_h2_with_window(
 
     let read_idle = read_idle.filter(|duration| !duration.is_zero());
     let (io, last_read) = WatchedIo::new(io, read_idle.is_some());
+    // The opening SETTINGS frame carries what x/net/http2's
+    // `Transport.newClientConn` writes, in the same order: ENABLE_PUSH=0,
+    // INITIAL_WINDOW_SIZE, MAX_FRAME_SIZE, MAX_HEADER_LIST_SIZE. h2 encodes
+    // set values in identifier order, which is Go's order here.
     let mut builder = client::Builder::new();
     builder
+        .enable_push(false)
+        .max_frame_size(GO_MAX_READ_FRAME_SIZE)
+        .max_header_list_size(GO_MAX_HEADER_LIST_SIZE)
         .initial_window_size(window.initial())
         .initial_connection_window_size(CONNECTION_WINDOW_SIZE)
         .stream_window_update_threshold(window.update_threshold())

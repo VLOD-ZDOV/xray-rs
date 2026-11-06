@@ -277,6 +277,8 @@ async fn run_local_xray_round_robin_balancer_interop() {
     config.default_outbound_tag = Some("proxy-a".to_owned());
     config.routing = RoutingConfig {
         rules: vec![RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: vec!["socks-in".to_owned()],
             networks: Some(vec![Network::Tcp]),
@@ -3633,6 +3635,8 @@ fn bulk_interop_payload(len: usize) -> Vec<u8> {
 #[path = "local_xray_interop_tests/vless_encryption.rs"]
 mod vless_encryption;
 
+#[path = "local_xray_interop_tests/proxy_carriers.rs"]
+mod proxy_carriers;
 #[path = "local_xray_interop_tests/v08_carriers.rs"]
 mod v08_carriers;
 #[path = "local_xray_interop_tests/xhttp_download.rs"]

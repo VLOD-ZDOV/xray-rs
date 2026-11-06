@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use xray_config::{DnsFakeIpConfig, DnsQueryStrategy};
+use xray_transport::RouteProbe;
 
 /// Stateful, bounded mapping between DNS names and synthetic IPv4 addresses.
 ///
@@ -13,6 +14,9 @@ use xray_config::{DnsFakeIpConfig, DnsQueryStrategy};
 #[derive(Debug)]
 pub(crate) struct FakeIpMapper {
     query_strategy: DnsQueryStrategy,
+    /// Set for `queryStrategy: "UseSystem"`: a family without a route gets
+    /// no answers, as Xray-core's `checkSystem` leaves it.
+    route_probe: Option<Arc<dyn RouteProbe>>,
     ttl: u32,
     network_base: u32,
     address_count: u64,
@@ -44,6 +48,10 @@ struct FakeIpEntry {
 impl FakeIpMapper {
     /// Builds a mapper from core DNS configuration.
     ///
+    /// Sequential allocation starts at a random point of the pool, so a core
+    /// restart does not hand the same first addresses to different domains
+    /// while applications may still hold previously advertised fake IPs.
+    ///
     /// Returns `None` when TTL is zero, the pool is not IPv4, has no
     /// allocatable address, or is smaller than the configured mapping capacity
     /// after reservations.
@@ -51,6 +59,17 @@ impl FakeIpMapper {
         config: &DnsFakeIpConfig,
         query_strategy: DnsQueryStrategy,
         reserved_ipv4: &[Ipv4Addr],
+    ) -> Option<Self> {
+        Self::from_config_with_start(config, query_strategy, reserved_ipv4, rand::random())
+    }
+
+    /// Same as [`Self::from_config`], with allocation starting at
+    /// `start % allocatable addresses` past the first allocatable address.
+    pub(crate) fn from_config_with_start(
+        config: &DnsFakeIpConfig,
+        query_strategy: DnsQueryStrategy,
+        reserved_ipv4: &[Ipv4Addr],
+        start: u64,
     ) -> Option<Self> {
         if !config.enabled || config.ttl == 0 {
             return None;
@@ -100,6 +119,7 @@ impl FakeIpMapper {
 
         Some(Self {
             query_strategy,
+            route_probe: None,
             ttl: config.ttl,
             network_base,
             address_count,
@@ -107,7 +127,7 @@ impl FakeIpMapper {
             allocation_span,
             max_mappings: usize::try_from(config.pool_size).ok()?,
             reserved_ipv4: reserved_ipv4.into_boxed_slice(),
-            next_offset: 0,
+            next_offset: start % allocation_span,
             entries: Vec::new(),
             lease_index: BTreeSet::new(),
             by_domain: HashMap::new(),
@@ -119,8 +139,30 @@ impl FakeIpMapper {
         self.ttl
     }
 
-    pub(crate) fn query_strategy(&self) -> DnsQueryStrategy {
-        self.query_strategy
+    /// Narrows the answers to the families `probe` reports a route for.
+    pub(crate) fn with_route_probe(mut self, probe: Arc<dyn RouteProbe>) -> Self {
+        self.route_probe = Some(probe);
+        self
+    }
+
+    /// Whether an `A` query (or with `ipv6`, an `AAAA` query) may be
+    /// answered: the strategy allows the family, and with a route probe the
+    /// system has a route for it.
+    pub(crate) fn answers(&self, ipv6: bool) -> bool {
+        let allowed = match self.query_strategy {
+            DnsQueryStrategy::UseIp => true,
+            DnsQueryStrategy::UseIpv4 => !ipv6,
+            DnsQueryStrategy::UseIpv6 => ipv6,
+        };
+        allowed
+            && self.route_probe.as_ref().is_none_or(|probe| {
+                let routes = probe.families();
+                if ipv6 {
+                    routes.ipv6
+                } else {
+                    routes.ipv4
+                }
+            })
     }
 
     #[cfg(test)]
@@ -274,7 +316,8 @@ mod tests {
         let first = mapper.allocate_ipv4("Example.COM.").unwrap();
         let second = mapper.allocate_ipv4("example.com").unwrap();
 
-        assert_eq!(first, Ipv4Addr::new(198, 18, 0, 3));
+        assert_ne!(mapper.lookup_ipv4(first), FakeIpLookup::Outside);
+        assert!(![Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 2)].contains(&first));
         assert_eq!(second, first);
         assert_eq!(
             mapper.domain_for_ipv4(first).as_deref(),
@@ -291,7 +334,8 @@ mod tests {
             Ipv4Addr::new(192, 0, 2, 3),
         ];
         let mut mapper =
-            FakeIpMapper::from_config(&config, DnsQueryStrategy::UseIp, &reserved).unwrap();
+            FakeIpMapper::from_config_with_start(&config, DnsQueryStrategy::UseIp, &reserved, 0)
+                .unwrap();
 
         let first = mapper.allocate_ipv4("first.example").unwrap();
         let second = mapper.allocate_ipv4("second.example").unwrap();
@@ -303,7 +347,8 @@ mod tests {
     #[test]
     fn capacity_fails_closed_until_the_earliest_advertised_lease_expires() {
         let config = config(Ipv4Addr::new(198, 18, 0, 0), 15, 2, 120);
-        let mut mapper = FakeIpMapper::from_config(&config, DnsQueryStrategy::UseIp, &[]).unwrap();
+        let mut mapper =
+            FakeIpMapper::from_config_with_start(&config, DnsQueryStrategy::UseIp, &[], 0).unwrap();
         let start = Instant::now();
         let first = mapper.allocate_ipv4_at("first.example", start).unwrap();
         let second = mapper
@@ -399,12 +444,54 @@ mod tests {
     }
 
     #[test]
+    fn allocation_start_differs_between_mappers_so_restarts_do_not_reuse_addresses() {
+        let config = config(Ipv4Addr::new(198, 18, 0, 0), 15, 32_768, 60);
+        let reserved = [Ipv4Addr::new(198, 18, 0, 1), Ipv4Addr::new(198, 18, 0, 2)];
+        let firsts: Vec<_> = (0..8)
+            .map(|_| {
+                FakeIpMapper::from_config(&config, DnsQueryStrategy::UseIp, &reserved)
+                    .unwrap()
+                    .allocate_ipv4("example.com")
+                    .unwrap()
+            })
+            .collect();
+
+        assert!(firsts.iter().any(|ip| *ip != firsts[0]), "{firsts:?}");
+    }
+
+    #[test]
+    fn seeded_start_allocates_sequentially_and_wraps_past_reservations() {
+        let config = config(Ipv4Addr::new(192, 0, 2, 0), 29, 4, 60);
+        let reserved = [Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::new(192, 0, 2, 3)];
+        // Allocatable offsets are .1..=.6; start 4 points at .5.
+        let mut mapper =
+            FakeIpMapper::from_config_with_start(&config, DnsQueryStrategy::UseIp, &reserved, 4)
+                .unwrap();
+
+        let allocated: Vec<_> = ["a.example", "b.example", "c.example", "d.example"]
+            .into_iter()
+            .map(|domain| mapper.allocate_ipv4(domain).unwrap())
+            .collect();
+
+        assert_eq!(
+            allocated,
+            [
+                Ipv4Addr::new(192, 0, 2, 5),
+                Ipv4Addr::new(192, 0, 2, 6),
+                Ipv4Addr::new(192, 0, 2, 2),
+                Ipv4Addr::new(192, 0, 2, 4),
+            ]
+        );
+    }
+
+    #[test]
     fn response_metadata_is_preserved_from_core_config() {
         let config = config(Ipv4Addr::new(198, 18, 0, 0), 15, 2, 123);
         let mapper = FakeIpMapper::from_config(&config, DnsQueryStrategy::UseIpv6, &[]).unwrap();
 
         assert_eq!(mapper.ttl(), 123);
-        assert_eq!(mapper.query_strategy(), DnsQueryStrategy::UseIpv6);
+        assert!(mapper.answers(true));
+        assert!(!mapper.answers(false));
     }
 
     #[test]

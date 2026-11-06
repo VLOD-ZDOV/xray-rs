@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use xray_config::{
     parse_xray_json, HttpOutboundSettings, OutboundProtocol, OutboundSettings, StreamSecurity,
-    TargetAddr,
+    StreamTransport, TargetAddr,
 };
 use xray_proxy::outbound::HttpAccount;
 
@@ -96,6 +96,49 @@ fn credentials_are_optional_and_pass_defaults_to_empty() {
         settings(&profile(colon)).account,
         HttpAccount::new(USER, "a:b:c")
     );
+}
+
+#[test]
+fn custom_headers_read_as_xray_core_sets_them() {
+    let names = |headers: Value| {
+        let mut raw = flat();
+        raw["headers"] = headers;
+        settings(&profile(raw))
+            .headers
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>()
+    };
+    // Go's Header.Set canonicalizes names, and a later alike name replaces.
+    let set = names(json!({"x-lower": "a", "X-UPPER": "b", "x_under-score": "c"}));
+    assert!(set.contains(&"X-Lower".to_owned()), "{set:?}");
+    assert!(set.contains(&"X-Upper".to_owned()), "{set:?}");
+    assert!(set.contains(&"X_under-Score".to_owned()), "{set:?}");
+    let mut raw = flat();
+    raw["headers"] = json!({"x-a": "1", "X-A": "2"});
+    let headers = settings(&profile(raw)).headers;
+    assert_eq!(headers.len(), 1);
+    // serde_json keeps keys sorted, so `x-a` comes last and wins.
+    let target = xray_routing::Target::new(
+        xray_routing::TargetAddr::Domain("example.test".to_owned()),
+        443,
+        xray_routing::Network::Tcp,
+    );
+    assert_eq!(headers[0].1.render(None, &target), "1");
+    // Templates and null values are accepted in both forms; Debug shows no
+    // value.
+    for headers in [
+        json!({"X-Target": "{{.Target}}", "X-Source": "{{ .Source.Address }}", "X-Null": null}),
+        json!({"Proxy-Authorization": "Bearer synthetic-token"}),
+    ] {
+        let mut raw = flat();
+        raw["headers"] = headers.clone();
+        let parsed = settings(&profile(raw));
+        assert!(!format!("{parsed:?}").contains("synthetic-token"));
+        let mut raw = legacy();
+        raw["headers"] = headers;
+        settings(&profile(raw));
+    }
 }
 
 #[test]
@@ -211,73 +254,158 @@ fn invalid_shapes_and_credentials_are_rejected_at_their_paths_without_secrets() 
         raw["servers"][0][key] = value;
         cases.push((raw, format!("{server_path}.{key}")));
     }
-    // Custom headers are a Go-template feature that is not implemented.
-    for headers in [
-        json!({"User-Agent":"synthetic"}),
-        json!({"X-Target":"{{.Target}}"}),
-        json!([]),
-        json!("X: y"),
+    for (headers, path) in [
+        (json!([]), "headers".to_owned()),
+        (json!("X: y"), "headers".to_owned()),
+        (json!({"X-Number": 1}), "headers.X-Number".to_owned()),
+        (json!({"Bad Name": "x"}), "headers.Bad Name".to_owned()),
+        (json!({"": "x"}), "headers.".to_owned()),
+        (json!({"X-Nul": "a\u{0}b"}), "headers.X-Nul".to_owned()),
+        (
+            json!({"X-Long": "x".repeat(8 * 1024 + 1)}),
+            "headers.X-Long".to_owned(),
+        ),
+        (
+            json!({"X-Func": "{{printf \"%s\" .Target}}"}),
+            "headers.X-Func".to_owned(),
+        ),
+        (
+            json!({"X-Field": "{{.Target.Domain}}"}),
+            "headers.X-Field".to_owned(),
+        ),
+        (json!({"X-Open": "{{.Target"}), "headers.X-Open".to_owned()),
     ] {
         let mut raw = flat();
         raw["headers"] = headers.clone();
-        cases.push((raw, format!("{settings_path}.headers")));
+        cases.push((raw, format!("{settings_path}.{path}")));
         let mut raw = legacy();
         raw["headers"] = headers;
-        cases.push((raw, format!("{settings_path}.headers")));
+        cases.push((raw, format!("{settings_path}.{path}")));
     }
+    let many: serde_json::Map<String, Value> = (0..65)
+        .map(|index| (format!("X-{index}"), json!("x")))
+        .collect();
+    let mut raw = flat();
+    raw["headers"] = Value::Object(many);
+    cases.push((raw, format!("{settings_path}.headers")));
     for (raw, path) in cases {
         rejects_at(&profile(raw), &path);
     }
 }
 
 #[test]
-fn stream_settings_allow_raw_with_none_or_http11_tls_only() {
+fn stream_settings_accept_every_transport_and_its_security() {
     let with_stream = |stream: Value| {
         let mut raw = profile(flat());
         raw["outbounds"][0]["streamSettings"] = stream;
         raw
     };
+    let stream_of = |stream: Value| {
+        let parsed = parse_xray_json(&with_stream(stream).to_string()).expect("HTTP stream parses");
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        parsed.config.outbounds[0].stream.clone()
+    };
     for stream in [
-        json!({}),
         json!({"network":"raw"}),
         json!({"network":"tcp","security":"none"}),
-        json!({"network":"tcp","security":"tls","tlsSettings":{"serverName":"proxy.example"}}),
         json!({"security":"tls","tlsSettings":{"serverName":"proxy.example","alpn":["http/1.1"]}}),
         json!({"security":"tls","tlsSettings":{"serverName":"proxy.example","fingerprint":"chrome"}}),
+        // TLS offers what Xray-core offers; the proxy's pick decides the
+        // tunnel's HTTP version.
+        json!({"security":"tls","tlsSettings":{"serverName":"proxy.example","alpn":["h2"]}}),
+        json!({"security":"tls","tlsSettings":{"serverName":"proxy.example","alpn":["h2","http/1.1"]}}),
+        json!({"security":"tls","tlsSettings":{"serverName":"proxy.example","alpn":["http/1.1","http/1.1"]}}),
     ] {
         settings(&with_stream(stream));
     }
-    let parsed = parse_xray_json(
-        &with_stream(json!({"security":"tls","tlsSettings":{"serverName":"proxy.example"}}))
-            .to_string(),
-    )
-    .unwrap();
-    assert!(matches!(
-        parsed.config.outbounds[0].stream.security,
-        StreamSecurity::Tls(_)
-    ));
-    for (stream, path) in [
-        (json!({"network":"ws"}), "network"),
-        (json!({"network":"grpc"}), "network"),
-        (json!({"network":"httpupgrade"}), "network"),
-        (json!({"network":"xhttp"}), "network"),
+    let tls = json!({"serverName":"proxy.example"});
+    let reality = json!({"serverName":"proxy.example","fingerprint":"chrome",
+        "publicKey":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","shortId":"02030405"});
+    // Xray-core puts no transport or security restriction on its HTTP client.
+    for (stream, transport, security) in [
+        (json!({}), "raw", "none"),
         (
-            json!({"network":"raw","security":"reality","realitySettings":{
-                "serverName":"proxy.example","fingerprint":"chrome",
-                "publicKey":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE","shortId":"02030405"}}),
+            json!({"network":"tcp","security":"tls","tlsSettings":tls}),
+            "raw",
+            "tls",
+        ),
+        (
+            json!({"network":"raw","security":"reality","realitySettings":reality}),
+            "raw",
+            "reality",
+        ),
+        (
+            json!({"network":"ws","wsSettings":{"path":"/proxy"}}),
+            "ws",
+            "none",
+        ),
+        (
+            json!({"network":"ws","security":"tls","tlsSettings":tls}),
+            "ws",
+            "tls",
+        ),
+        (
+            json!({"network":"httpupgrade","security":"tls","tlsSettings":tls}),
+            "httpupgrade",
+            "tls",
+        ),
+        (
+            json!({"network":"grpc","grpcSettings":{"serviceName":"proxy"}}),
+            "grpc",
+            "none",
+        ),
+        (
+            json!({"network":"grpc","security":"reality","realitySettings":reality}),
+            "grpc",
+            "reality",
+        ),
+        (
+            json!({"network":"xhttp","xhttpSettings":{"path":"/proxy"}}),
+            "xhttp",
+            "none",
+        ),
+        (
+            json!({"network":"xhttp","security":"reality","realitySettings":reality}),
+            "xhttp",
+            "reality",
+        ),
+    ] {
+        let parsed = stream_of(stream.clone());
+        let parsed_transport = match parsed.transport {
+            StreamTransport::Raw => "raw",
+            StreamTransport::WebSocket(_) => "ws",
+            StreamTransport::HttpUpgrade(_) => "httpupgrade",
+            StreamTransport::Grpc(_) => "grpc",
+            StreamTransport::Xhttp(_) => "xhttp",
+            StreamTransport::Hysteria(_) => "hysteria",
+        };
+        let parsed_security = match parsed.security {
+            StreamSecurity::None => "none",
+            StreamSecurity::Tls(_) => "tls",
+            StreamSecurity::Reality(_) => "reality",
+        };
+        assert_eq!(
+            (parsed_transport, parsed_security),
+            (transport, security),
+            "{stream}"
+        );
+    }
+    // A plaintext XHTTP download leg to a public server is accepted, as a
+    // plaintext public HTTP proxy is.
+    stream_of(
+        json!({"network":"xhttp","xhttpSettings":{"path":"/up","downloadSettings":{
+        "address":"198.51.100.20","port":443,"network":"xhttp","xhttpSettings":{"path":"/down"}}}}),
+    );
+    // Only what every outbound refuses stays refused: REALITY over WebSocket
+    // as in Xray-core, and the Hysteria transport outside its own outbound.
+    for (stream, path) in [
+        (
+            json!({"network":"ws","security":"reality","realitySettings":reality}),
             "security",
         ),
         (
-            json!({"security":"tls","tlsSettings":{"serverName":"proxy.example","alpn":["h2"]}}),
-            "tlsSettings.alpn",
-        ),
-        (
-            json!({"security":"tls","tlsSettings":{"serverName":"proxy.example","alpn":["h2","http/1.1"]}}),
-            "tlsSettings.alpn",
-        ),
-        (
-            json!({"security":"tls","tlsSettings":{"serverName":"proxy.example","alpn":["http/1.1","http/1.1"]}}),
-            "tlsSettings.alpn",
+            json!({"network":"hysteria","hysteriaSettings":{"version":2,"auth":"synthetic"}}),
+            "network",
         ),
     ] {
         rejects_at(

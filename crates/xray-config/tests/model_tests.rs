@@ -247,6 +247,8 @@ fn dns_qtype_and_routing_port_ranges_enforce_ordered_bounds() {
 #[test]
 fn routing_network_and_port_selectors_fail_closed_without_target_metadata() {
     let rule = RoutingRule {
+        attributes: None,
+        protocols: None,
         origin: Default::default(),
         inbound_tags: Vec::new(),
         networks: Some(vec![Network::Udp]),
@@ -300,6 +302,8 @@ fn normalized_model_uses_xray_dns_query_strategy_default() {
 fn normalized_model_can_represent_inbound_tag_routing_rule() {
     let routing = RoutingConfig {
         rules: vec![RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: vec!["socks-in".to_owned()],
             networks: None,
@@ -321,6 +325,8 @@ fn normalized_model_can_represent_inbound_tag_routing_rule() {
 fn normalized_model_can_represent_domain_routing_rule() {
     let routing = RoutingConfig {
         rules: vec![RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: Vec::new(),
             networks: None,
@@ -355,6 +361,8 @@ fn normalized_model_can_represent_domain_routing_rule() {
 fn normalized_model_can_represent_ip_routing_rule() {
     let routing = RoutingConfig {
         rules: vec![RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: Vec::new(),
             networks: None,
@@ -383,6 +391,8 @@ fn normalized_model_can_represent_ip_routing_rule() {
 fn normalized_model_applies_inverse_ip_matchers_as_a_conjunction() {
     let routing = RoutingConfig {
         rules: vec![RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: Vec::new(),
             networks: None,

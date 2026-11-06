@@ -135,6 +135,37 @@
       }
     },
     {
+      "name": "http-accounts",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "http-in",
+            "protocol": "http",
+            "listen": "127.0.0.1",
+            "port": 1081,
+            "settings": {
+              "accounts": [
+                {
+                  "user": "synthetic-user",
+                  "pass": "synthetic-pass"
+                }
+              ]
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "protocol": "freedom",
+            "tag": "direct"
+          }
+        ]
+      },
+      "objects": {
+        "HTTP_ACCOUNT": "/inbounds/0/settings/accounts/0"
+      }
+    },
+    {
       "name": "dns-policy",
       "config": {
         "dns": {
@@ -1060,13 +1091,41 @@
     },
     {
       "name": "socks-account-empty-pass",
+      "accepted": true,
+      "base": "socks-password",
+      "set": {
+        "/inbounds/0/settings/accounts/0": {
+          "user": "synthetic-user",
+          "pass": ""
+        }
+      }
+    },
+    {
+      "name": "socks-users-alias",
+      "accepted": true,
+      "base": "socks-password",
+      "set": {
+        "/inbounds/0/settings": {
+          "auth": "password",
+          "accounts": null,
+          "users": [
+            {
+              "user": "synthetic-user",
+              "pass": "synthetic-pass"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "socks-account-pass-too-long",
       "accepted": false,
       "errorPath": "$.inbounds[0].settings.accounts[0]",
       "base": "socks-password",
       "set": {
         "/inbounds/0/settings/accounts/0": {
           "user": "synthetic-user",
-          "pass": ""
+          "pass": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
         }
       }
     },
@@ -1305,6 +1364,68 @@
       "base": "dns-policy",
       "set": {
         "/outbounds/1/settings/rules/0/qtype": 65
+      }
+    },
+    {
+      "name": "dns-client-ip-accepted",
+      "accepted": true,
+      "base": "dns-policy",
+      "set": {
+        "/dns/clientIp": "203.0.113.77",
+        "/dns/servers/0/clientIp": "2001:db8::1"
+      }
+    },
+    {
+      "name": "dns-client-ip-domain",
+      "accepted": false,
+      "errorPath": "$.dns.clientIp",
+      "base": "dns-policy",
+      "set": {
+        "/dns/clientIp": "example.com"
+      }
+    },
+    {
+      "name": "dns-server-client-ip-domain",
+      "accepted": false,
+      "errorPath": "$.dns.servers[0].clientIp",
+      "base": "dns-policy",
+      "set": {
+        "/dns/servers/0/clientIp": "example.com"
+      }
+    },
+    {
+      "name": "dns-parallel-query-accepted",
+      "accepted": true,
+      "base": "dns-policy",
+      "set": {
+        "/dns/enableParallelQuery": true
+      }
+    },
+    {
+      "name": "dns-parallel-query-not-boolean",
+      "accepted": false,
+      "errorPath": "$.dns.enableParallelQuery",
+      "base": "dns-policy",
+      "set": {
+        "/dns/enableParallelQuery": "yes"
+      }
+    },
+    {
+      "name": "dns-use-system-accepted",
+      "accepted": true,
+      "base": "dns-policy",
+      "set": {
+        "/dns/queryStrategy": "UseSystem",
+        "/dns/servers/0/queryStrategy": "use_sys"
+      }
+    },
+    {
+      "name": "dns-query-strategy-unknown",
+      "accepted": false,
+      "errorPath": "$.dns.queryStrategy",
+      "base": "dns-policy",
+      "set": {
+        "/dns/queryStrategy": "UseFastest"
       }
     },
     {
@@ -2054,6 +2175,84 @@
       }
     },
     {
+      "name": "loopback-routing",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "direct",
+            "protocol": "freedom"
+          },
+          {
+            "tag": "again",
+            "protocol": "loopback",
+            "settings": {
+              "inboundTag": "loopback-in",
+              "sniffing": {
+                "enabled": false
+              }
+            }
+          }
+        ],
+        "routing": {
+          "rules": [
+            {
+              "type": "field",
+              "inboundTag": [
+                "socks-in"
+              ],
+              "outboundTag": "again"
+            },
+            {
+              "type": "field",
+              "inboundTag": [
+                "loopback-in"
+              ],
+              "outboundTag": "direct"
+            }
+          ]
+        }
+      },
+      "objects": {
+        "LOOPBACK_SETTINGS": "/outbounds/1/settings"
+      }
+    },
+    {
+      "name": "loopback-sniffing-enabled",
+      "accepted": false,
+      "errorPath": "$.outbounds[1].settings.sniffing",
+      "base": "loopback-routing",
+      "set": {
+        "/outbounds/1/settings/sniffing": {
+          "enabled": true,
+          "destOverride": [
+            "tls"
+          ]
+        }
+      }
+    },
+    {
+      "name": "loopback-inbound-tag-number",
+      "accepted": false,
+      "errorPath": "$.outbounds[1].settings.inboundTag",
+      "base": "loopback-routing",
+      "set": {
+        "/outbounds/1/settings/inboundTag": 1
+      }
+    },
+    {
       "name": "blackhole-unknown-response",
       "accepted": false,
       "errorPath": "$.outbounds[1].settings.response.type",
@@ -2272,9 +2471,8 @@
       }
     },
     {
-      "name": "socks-outbound-non-raw-network",
-      "accepted": false,
-      "errorPath": "$.outbounds[0].streamSettings.network",
+      "name": "socks-outbound-websocket",
+      "accepted": true,
       "base": "socks-outbound-flat",
       "set": {
         "/outbounds/0/streamSettings/network": "ws"
@@ -2282,8 +2480,7 @@
     },
     {
       "name": "socks-outbound-reality",
-      "accepted": false,
-      "errorPath": "$.outbounds[0].streamSettings.security",
+      "accepted": true,
       "base": "socks-outbound-legacy",
       "set": {
         "/outbounds/0/streamSettings": {
@@ -2294,6 +2491,23 @@
             "fingerprint": "chrome",
             "publicKey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
             "shortId": "02030405"
+          }
+        }
+      }
+    },
+    {
+      "name": "socks-outbound-websocket-tls",
+      "accepted": true,
+      "base": "socks-outbound-legacy",
+      "set": {
+        "/outbounds/0/streamSettings": {
+          "network": "ws",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "server.example"
+          },
+          "wsSettings": {
+            "path": "/socks"
           }
         }
       }
@@ -2487,12 +2701,24 @@
     },
     {
       "name": "http-outbound-custom-headers",
-      "accepted": false,
-      "errorPath": "$.outbounds[0].settings.headers",
+      "accepted": true,
       "base": "http-outbound-flat",
       "set": {
         "/outbounds/0/settings/headers": {
-          "User-Agent": "synthetic"
+          "User-Agent": "synthetic",
+          "X-Target": "{{.Target}}",
+          "X-Source": "{{ .Source.Address }}"
+        }
+      }
+    },
+    {
+      "name": "http-outbound-header-template-function",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].settings.headers.X-Target",
+      "base": "http-outbound-flat",
+      "set": {
+        "/outbounds/0/settings/headers": {
+          "X-Target": "{{printf \"%s\" .Target}}"
         }
       }
     },
@@ -2530,6 +2756,15 @@
       }
     },
     {
+      "name": "reality-spider-x-relative",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.realitySettings.spiderX",
+      "base": "reality-compatible-unknown",
+      "set": {
+        "/outbounds/0/streamSettings/realitySettings/spiderX": "crawl?p=1"
+      }
+    },
+    {
       "name": "vless-vision-xudp-mux",
       "accepted": true,
       "base": "reality-compatible-unknown",
@@ -2556,9 +2791,8 @@
       }
     },
     {
-      "name": "http-outbound-non-raw-network",
-      "accepted": false,
-      "errorPath": "$.outbounds[0].streamSettings.network",
+      "name": "http-outbound-websocket",
+      "accepted": true,
       "base": "http-outbound-flat",
       "set": {
         "/outbounds/0/streamSettings/network": "ws"
@@ -2566,8 +2800,7 @@
     },
     {
       "name": "http-outbound-h2-alpn",
-      "accepted": false,
-      "errorPath": "$.outbounds[0].streamSettings.tlsSettings.alpn",
+      "accepted": true,
       "base": "http-outbound-flat",
       "set": {
         "/outbounds/0/streamSettings/tlsSettings/alpn": [
@@ -2578,8 +2811,7 @@
     },
     {
       "name": "http-outbound-reality",
-      "accepted": false,
-      "errorPath": "$.outbounds[0].streamSettings.security",
+      "accepted": true,
       "base": "http-outbound-legacy",
       "set": {
         "/outbounds/0/streamSettings": {
@@ -2590,6 +2822,23 @@
             "fingerprint": "chrome",
             "publicKey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
             "shortId": "02030405"
+          }
+        }
+      }
+    },
+    {
+      "name": "http-outbound-grpc-tls",
+      "accepted": true,
+      "base": "http-outbound-legacy",
+      "set": {
+        "/outbounds/0/streamSettings": {
+          "network": "grpc",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "server.example"
+          },
+          "grpcSettings": {
+            "serviceName": "proxy"
           }
         }
       }
@@ -2803,7 +3052,7 @@
       "set": {
         "/outbounds/0/streamSettings/finalmask/udp/0/settings/mode": "intervalRemote"
       },
-      "accepted": false
+      "accepted": true
     },
     {
       "name": "udp-hop-remote-ip",
@@ -2813,7 +3062,16 @@
           "192.0.2.1"
         ]
       },
-      "accepted": false
+      "accepted": true
+    },
+    {
+      "name": "udp-hop-untrimmed-mode",
+      "base": "udp-hop-mask-261021",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/0/settings/mode": "intervalLocal, intervalRemote"
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[0].settings.mode"
     },
     {
       "name": "udp-hop-zero-interval-bound",
@@ -3145,6 +3403,68 @@
       "warningPath": "$.outbounds[0].settings.ipsBlocked"
     },
     {
+      "name": "freedom-noises",
+      "base": "freedom-domain-strategy",
+      "set": {
+        "/outbounds/0/settings": {
+          "noises": [
+            {
+              "type": "rand",
+              "packet": "16-32",
+              "delay": "10-20",
+              "applyTo": "ipv4"
+            },
+            {
+              "type": "str",
+              "packet": "synthetic-noise"
+            },
+            {
+              "type": "hex",
+              "packet": "00ff"
+            },
+            {
+              "type": "base64",
+              "packet": "AAEC"
+            }
+          ]
+        }
+      },
+      "accepted": true,
+      "warningPath": "$.outbounds[0].settings.noises",
+      "objects": {
+        "FREEDOM_NOISE": "/outbounds/0/settings/noises/0"
+      }
+    },
+    {
+      "name": "freedom-noise-removed",
+      "base": "freedom-domain-strategy",
+      "set": {
+        "/outbounds/0/settings": {
+          "noise": {
+            "packet": "synthetic-noise"
+          }
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].settings.noise"
+    },
+    {
+      "name": "freedom-noises-rand-from-zero",
+      "base": "freedom-domain-strategy",
+      "set": {
+        "/outbounds/0/settings": {
+          "noises": [
+            {
+              "type": "rand",
+              "packet": "0-16"
+            }
+          ]
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].settings.noises[0].packet"
+    },
+    {
       "name": "routing-xray-string-lists",
       "config": {
         "inbounds": [
@@ -3427,6 +3747,195 @@
       },
       "accepted": false,
       "errorPath": "$.routing.rules[0].sourcePort"
+    },
+    {
+      "name": "routing-protocol",
+      "base": "routing-xray-string-lists",
+      "set": {
+        "/routing/rules/0": {
+          "protocol": [
+            "bittorrent",
+            "http"
+          ],
+          "outboundTag": "block"
+        }
+      },
+      "accepted": true
+    },
+    {
+      "name": "routing-protocol-not-a-list",
+      "base": "routing-xray-string-lists",
+      "set": {
+        "/routing/rules/0": {
+          "protocol": {
+            "name": "tls"
+          },
+          "outboundTag": "block"
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.routing.rules[0].protocol"
+    },
+    {
+      "name": "routing-attrs",
+      "base": "routing-xray-string-lists",
+      "set": {
+        "/routing/rules/0": {
+          "attrs": {
+            ":method": "GET",
+            "User-Agent": "^curl/"
+          },
+          "outboundTag": "block"
+        }
+      },
+      "accepted": true
+    },
+    {
+      "name": "routing-attrs-pattern-not-a-string",
+      "base": "routing-xray-string-lists",
+      "set": {
+        "/routing/rules/0": {
+          "attrs": {
+            ":path": [
+              "/admin"
+            ]
+          },
+          "outboundTag": "block"
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.routing.rules[0].attrs.:path"
+    },
+    {
+      "name": "routing-attrs-pattern-does-not-compile",
+      "base": "routing-xray-string-lists",
+      "set": {
+        "/routing/rules/0": {
+          "attrs": {
+            "user-agent": "("
+          },
+          "outboundTag": "block"
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.routing.rules[0].attrs.user-agent"
+    },
+    {
+      "name": "http-accounts-users",
+      "base": "http-accounts",
+      "set": {
+        "/inbounds/0/settings": {
+          "users": [
+            {
+              "user": "synthetic-user",
+              "pass": "synthetic-pass"
+            }
+          ]
+        }
+      },
+      "accepted": true
+    },
+    {
+      "name": "http-accounts-not-an-object",
+      "base": "http-accounts",
+      "set": {
+        "/inbounds/0/settings": {
+          "accounts": [
+            null
+          ]
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.inbounds[0].settings.accounts[0]"
+    },
+    {
+      "name": "http-accounts-user-not-a-string",
+      "base": "http-accounts",
+      "set": {
+        "/inbounds/0/settings": {
+          "accounts": [
+            {
+              "user": 5,
+              "pass": "x"
+            }
+          ]
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.inbounds[0].settings.accounts[0].user"
+    },
+    {
+      "name": "dns-hosts-rcode-accepted",
+      "config": {
+        "dns": {
+          "servers": [
+            "192.0.2.53"
+          ],
+          "hosts": {
+            "domain:ads.example.com": "#3",
+            "empty.example.com": "#0",
+            "refused.example.com": "#5"
+          }
+        },
+        "outbounds": [
+          {
+            "tag": "direct",
+            "protocol": "freedom"
+          }
+        ]
+      },
+      "accepted": true
+    },
+    {
+      "name": "dns-hosts-rcode-out-of-header-range",
+      "base": "dns-hosts-rcode-accepted",
+      "set": {
+        "/dns/hosts/refused.example.com": "#16"
+      },
+      "accepted": false,
+      "errorPath": "$.dns.hosts.refused.example.com"
+    },
+    {
+      "name": "remnawave-labels-shadowsocks",
+      "base": "shadowsocks-legacy",
+      "set": {
+        "/remarks": "Example host",
+        "/meta": {
+          "serverDescription": "Synthetic description"
+        },
+        "/outbounds/0/settings/servers/0/uot": false,
+        "/outbounds/0/settings/servers/0/UoTVersion": 2,
+        "/outbounds/0/streamSettings/tlsSettings/enableSessionResumption": false
+      },
+      "accepted": true
+    },
+    {
+      "name": "shadowsocks-uot-ignored",
+      "base": "shadowsocks-legacy",
+      "set": {
+        "/outbounds/0/settings/servers/0/uot": true,
+        "/outbounds/0/settings/servers/0/UoTVersion": 1
+      },
+      "accepted": true,
+      "warningPath": "$.outbounds[0].settings.servers[0].uot"
+    },
+    {
+      "name": "remarks-not-string",
+      "base": "shadowsocks-legacy",
+      "set": {
+        "/remarks": 42
+      },
+      "accepted": false,
+      "errorPath": "$.remarks"
+    },
+    {
+      "name": "tls-session-resumption-not-boolean",
+      "base": "shadowsocks-legacy",
+      "set": {
+        "/outbounds/0/streamSettings/tlsSettings/enableSessionResumption": "false"
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.tlsSettings.enableSessionResumption"
     }
   ]
 }

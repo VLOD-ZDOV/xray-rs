@@ -19,10 +19,11 @@ use super::{OutboundFactory, OutboundNodeId};
 use crate::connection::wait_for_connection_close;
 use crate::CoreError;
 
-/// Xray-core v26.7.28 `proxy/blackhole/config.go` `http403response`, byte for
-/// byte. It is a Go raw string, so lines end in LF and an extra LF follows the
-/// blank line.
-pub(crate) const XRAY_HTTP_403_RESPONSE: &[u8] = b"HTTP/1.1 403 Forbidden\nConnection: close\nCache-Control: max-age=3600, public\nContent-Length: 0\n\n\n";
+/// Xray-core v26.10.31's blackhole `http` reply, byte for byte: Go's
+/// `http.Response.Write` of a 403 with `Connection: close` and
+/// `Cache-Control: max-age=3600, public`, which sorts the headers, adds
+/// `Content-Length: 0` and ends lines with CRLF.
+pub(crate) const XRAY_HTTP_403_RESPONSE: &[u8] = b"HTTP/1.1 403 Forbidden\r\nCache-Control: max-age=3600, public\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 /// Xray keeps a link open for one second after writing a response so that the
 /// client can read it. xray-rust half-closes right after the response and
@@ -212,9 +213,9 @@ mod tests {
     fn http_response_is_xray_core_403_byte_for_byte() {
         assert_eq!(
             XRAY_HTTP_403_RESPONSE,
-            b"HTTP/1.1 403 Forbidden\nConnection: close\nCache-Control: max-age=3600, public\nContent-Length: 0\n\n\n"
+            b"HTTP/1.1 403 Forbidden\r\nCache-Control: max-age=3600, public\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
         );
-        assert_eq!(XRAY_HTTP_403_RESPONSE.len(), 97);
+        assert_eq!(XRAY_HTTP_403_RESPONSE.len(), 101);
         assert_eq!(
             BlackholeOutbound::new(&BlackholeResponse::Http).response_bytes(),
             XRAY_HTTP_403_RESPONSE
@@ -264,6 +265,7 @@ mod tests {
             .select_tcp_session_outbound_with_tag_and_resolver(
                 &xray_config::RouteContext::default(),
                 &target([203, 0, 113, 5], 80, RoutingNetwork::Tcp),
+                &target([203, 0, 113, 5], 80, RoutingNetwork::Tcp),
                 true,
                 &resolver,
             )
@@ -283,6 +285,7 @@ mod tests {
         let selected = router
             .select_udp_session_outbound_with_tag_and_resolver(
                 &xray_config::RouteContext::default(),
+                &target([203, 0, 113, 5], 443, RoutingNetwork::Udp),
                 &target([203, 0, 113, 5], 443, RoutingNetwork::Udp),
                 true,
                 &resolver,
@@ -396,6 +399,7 @@ mod tests {
             .select_tcp_session_outbound_with_tag_and_resolver(
                 &xray_config::RouteContext::default(),
                 &target([192, 0, 2, 10], 80, RoutingNetwork::Tcp),
+                &target([192, 0, 2, 10], 80, RoutingNetwork::Tcp),
                 true,
                 &resolver,
             )
@@ -411,6 +415,7 @@ mod tests {
             .select_udp_session_outbound_with_tag_and_resolver(
                 &xray_config::RouteContext::default(),
                 &target([198, 51, 100, 7], 443, RoutingNetwork::Udp),
+                &target([198, 51, 100, 7], 443, RoutingNetwork::Udp),
                 true,
                 &resolver,
             )
@@ -425,6 +430,7 @@ mod tests {
         let selected = router
             .select_tcp_session_outbound_with_tag_and_resolver(
                 &xray_config::RouteContext::default(),
+                &target([198, 51, 100, 7], 443, RoutingNetwork::Tcp),
                 &target([198, 51, 100, 7], 443, RoutingNetwork::Tcp),
                 true,
                 &resolver,
@@ -486,6 +492,7 @@ mod tests {
             .select_tcp_session_outbound_with_tag_and_resolver(
                 &xray_config::RouteContext::default(),
                 &target([203, 0, 113, 5], 443, RoutingNetwork::Tcp),
+                &target([203, 0, 113, 5], 443, RoutingNetwork::Tcp),
                 true,
                 &resolver,
             )
@@ -500,6 +507,7 @@ mod tests {
         let selected = router
             .select_udp_session_outbound_with_tag_and_resolver(
                 &xray_config::RouteContext::default(),
+                &target([203, 0, 113, 5], 443, RoutingNetwork::Udp),
                 &target([203, 0, 113, 5], 443, RoutingNetwork::Udp),
                 true,
                 &resolver,

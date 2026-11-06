@@ -36,6 +36,10 @@
       "semantics": "Dynamic header names with string/null values and carrier-specific Host rules."
     },
     {
+      "context": "$.outbounds[].settings.headers (http)",
+      "semantics": "Dynamic header names with string/null Go template values; see HTTP_OUTBOUND."
+    },
+    {
       "context": "xhttpSettings.downloadSettings; splithttpSettings.downloadSettings; effective extra.downloadSettings",
       "extends": "STREAM",
       "fields": [
@@ -540,6 +544,15 @@
       "notes": "random, roundRobin, leastPing and leastLoad only; settings are interpreted according to the selected strategy."
     },
     {
+      "context": "$.outbounds[].settings (loopback)",
+      "fields": [
+        "inboundTag",
+        "sniffing"
+      ],
+      "id": "LOOPBACK_SETTINGS",
+      "notes": "Absent or null settings, or a null inboundTag, mean the empty tag. The handler never dials: it routes the connection again as if it came from an inbound with that tag, keeping its source, local address and user but no sniffed protocol or attrs, by the address the connection goes to and without routing's DNS lookups. Up to 8 loopbacks in a row; a longer chain fails the connection, where Xray-core recurses until it crashes. sniffing reads as an inbound's; enabling it is refused for now."
+    },
+    {
       "context": "$.outbounds[].settings (blackhole)",
       "fields": [
         "response"
@@ -568,10 +581,12 @@
         "serveStale",
         "serveExpiredTTL",
         "disableFallback",
-        "disableFallbackIfMatch"
+        "disableFallbackIfMatch",
+        "clientIp",
+        "enableParallelQuery"
       ],
       "id": "DNS",
-      "notes": "At most eight servers. Managed selection, cache/fallback policy and IPv4 fake IP only. hosts keys are domain rules as Xray-core reads them, plain text being the whole name. Hosts and server URL semantics require the executable validator."
+      "notes": "At most eight servers. clientIp is an IP address every server without its own sends as the EDNS client subnet (/24 for IPv4, /96 for IPv6), as Xray-core sends it. enableParallelQuery asks every selected server at once; adjacent servers with the same policy race as a group, groups settling in order. Managed selection, cache/fallback policy and IPv4 fake IP only. hosts keys are domain rules as Xray-core reads them, plain text being the whole name; a \"#N\" value answers with DNS RCODE N from 0 to 15. Hosts and server URL semantics require the executable validator."
     },
     {
       "context": "$.outbounds[].settings (dns)",
@@ -615,10 +630,11 @@
         "timeoutMs",
         "skipFallback",
         "queryStrategy",
-        "finalQuery"
+        "finalQuery",
+        "clientIp"
       ],
       "id": "DNS_SERVER",
-      "notes": "expectedIPs is an alias of expectIPs. domains takes an array or a comma-separated string of domain rules as Xray-core reads them, plain text being a substring. URL, address/port, query-family and domain/IP-filter combinations are checked by the parser."
+      "notes": "expectedIPs is an alias of expectIPs. clientIp replaces dns.clientIp for this server. domains takes an array or a comma-separated string of domain rules as Xray-core reads them, plain text being a substring. URL, address/port, query-family and domain/IP-filter combinations are checked by the parser."
     },
     {
       "context": "$.dns.fakeIp",
@@ -690,10 +706,23 @@
         "userLevel",
         "proxyProtocol",
         "finalRules",
-        "ipsBlocked"
+        "ipsBlocked",
+        "noises",
+        "noise"
       ],
       "id": "FREEDOM_SETTINGS",
-      "notes": "domainStrategy, or targetStrategy when nonempty, is deprecated and migrates to sockopt.domainStrategy, as in Xray-core. redirect is host:port as Go's SplitHostPort reads it; it replaces the destination address unless the host is empty, 0.0.0.0 or ::, and the port unless it is 0. userLevel selects the policy level of freedom's idle timer. proxyProtocol 1 or 2 writes that PROXY protocol header first; other values are ignored. finalRules are checked in order against each address freedom connects or sends to, and are ignored when freedom dials through dialerProxy. ipsBlocked is removed and ignored with a warning. Only the bounded tlshello fragment option is supported; noise and other freedom settings fail closed."
+      "notes": "domainStrategy, or targetStrategy when nonempty, is deprecated and migrates to sockopt.domainStrategy, as in Xray-core. redirect is host:port as Go's SplitHostPort reads it; it replaces the destination address unless the host is empty, 0.0.0.0 or ::, and the port unless it is 0. userLevel selects the policy level of freedom's idle timer. proxyProtocol 1 or 2 writes that PROXY protocol header first; other values are ignored. finalRules are checked in order against each address freedom connects or sends to, and are ignored when freedom dials through dialerProxy. ipsBlocked is removed and ignored with a warning. noises, deprecated as in Xray-core, sends up to 16 datagrams before each UDP flow's first; the removed noise object is refused. Only the bounded tlshello fragment option is supported; other freedom settings fail closed."
+    },
+    {
+      "context": "$.outbounds[].settings.noises[] (freedom)",
+      "fields": [
+        "type",
+        "packet",
+        "delay",
+        "applyTo"
+      ],
+      "id": "FREEDOM_NOISE",
+      "notes": "type is rand, str, hex or base64, case-sensitively. packet is trimmed, and gives at most 4096 bytes: a length or range of random bytes for rand; the text itself for str; hex digits; or base64 in either alphabet, padding optional. delay is milliseconds, a number or range up to 1000. applyTo is ip (or all, or empty), ipv4 or ipv6, ignoring case."
     },
     {
       "context": "$.outbounds[].settings.finalRules[] (freedom)",
@@ -778,16 +807,26 @@
       "notes": "acceptProxyProtocol is ignored on the client. headers must not contain Host. REALITY is unsupported."
     },
     {
+      "context": "$.inbounds[].settings.accounts[] (http)",
+      "fields": [
+        "user",
+        "pass"
+      ],
+      "id": "HTTP_ACCOUNT",
+      "notes": "Proxy-Authorization: Basic credentials, as Xray-core reads them: strings of any length, absent or null reading as empty; a later account replaces an earlier one with the same user. Credentials are redacted."
+    },
+    {
       "context": "$.inbounds[].settings (http)",
       "fields": [
         "timeout",
         "accounts",
+        "users",
         "allowTransparent",
         "userLevel",
         "allowUnauthenticatedLan"
       ],
       "id": "HTTP_SETTINGS",
-      "notes": "accounts must be empty; allowTransparent cannot be true. timeout is accepted for compatibility."
+      "notes": "accounts (or users, read only when accounts is absent or null) lists at most 64 accounts, of which a request must name one; an empty list needs none. allowTransparent cannot be true. timeout is accepted for compatibility."
     },
     {
       "context": "$.outbounds[].settings (http)",
@@ -802,7 +841,7 @@
         "servers"
       ],
       "id": "HTTP_OUTBOUND",
-      "notes": "One flattened server or exactly one servers entry; mixing forms is rejected, while headers belongs to both. Credentials are absent (no authentication) or a user of 1..1024 bytes without `:` plus an optional pass of at most 1024 bytes, neither with control characters (RFC 7617 Basic); a lone pass is rejected and credentials are redacted. Level 0..255; email is type-checked and ignored. headers is accepted only as null or an empty object. HTTP/1.1 CONNECT only, status 200 required, over raw/tcp with none or TLS whose ALPN is empty or http/1.1; no Mux or UDP. Without TLS the credentials travel in cleartext."
+      "notes": "One flattened server or exactly one servers entry; mixing forms is rejected, while headers belongs to both. Credentials are absent (no authentication) or a user of 1..1024 bytes without `:` plus an optional pass of at most 1024 bytes, neither with control characters (RFC 7617 Basic); a lone pass is rejected and credentials are redacted. Level 0..255; email is type-checked and ignored. headers are set on each CONNECT after the credentials, so a Proxy-Authorization among them replaces theirs; a name is canonicalized, a null value is empty, and each value is a Go template that may name {{.Source}} and {{.Target}} and their .Address, .Port, .Network and .NetAddr. Other template actions, invalid names, control characters other than tabs and line breaks, more than 64 headers and values over 8 KiB are refused. CONNECT over raw/tcp with none or TLS, status 200 required: HTTP/2 when the proxy's TLS picks h2, HTTP/1.1 otherwise; TLS offers the ALPN Xray-core offers; no Mux or UDP. Without TLS the credentials travel in cleartext."
     },
     {
       "context": "$.outbounds[].settings.servers[0] (http)",
@@ -913,7 +952,7 @@
         "xudpProxyUDP443"
       ],
       "id": "MUX",
-      "notes": "Enabled Mux supports VLESS, Trojan, Shadowsocks (2022 and AEAD) and VMess. TCP concurrency 0 defaults to 8; negative disables TCP. XHTTP and VLESS Vision require negative TCP concurrency because the pinned server accepts only UDP children there. XUDP concurrency 0 shares TCP, negative uses native UDP. Positive concurrency is capped at 64. UDP/443: reject (default), allow, skip. Each pool has four parents and 128 lifetime children per parent."
+      "notes": "Enabled Mux supports VLESS, Trojan, Shadowsocks (2022 and AEAD) and VMess. TCP concurrency 0 defaults to 8; negative disables TCP. XHTTP and VLESS Vision require negative TCP concurrency because the pinned server accepts only UDP children there. XUDP concurrency 0 shares TCP, negative uses native UDP. Positive concurrency is capped at 64. UDP/443: reject (default), allow, skip. Each pool opens children on four parents with 128 lifetime children each; exhausted parents finish their children, up to 16 parents in all."
     },
     {
       "context": "$.observatory",
@@ -1037,10 +1076,12 @@
         "routing",
         "observatory",
         "dns",
-        "policy"
+        "policy",
+        "remarks",
+        "meta"
       ],
       "id": "ROOT",
-      "notes": "log is accepted and ignored. Missing/non-array inbounds and outbounds currently normalize to empty lists. Non-object JSON roots also normalize to an empty model. Parse success alone does not establish runtime usability."
+      "notes": "log is accepted and ignored. remarks (a string) and meta (an object) are subscription labels, such as Remnawave's, which Xray-core does not read; they are type-checked and ignored. Missing/non-array inbounds and outbounds currently normalize to empty lists. Non-object JSON roots also normalize to an empty model. Parse success alone does not establish runtime usability."
     },
     {
       "context": "$.routing",
@@ -1068,13 +1109,15 @@
         "localIP",
         "localPort",
         "user",
+        "protocol",
+        "attrs",
         "localOS",
         "outboundTag",
         "balancerTag",
         "ruleTag"
       ],
       "id": "ROUTING_RULE",
-      "notes": "Read as Xray-core v26.10.31 reads it. type is not read. A nonempty outboundTag wins over balancerTag. inboundTag, domain, domains, ip and localOS take an array or a comma-separated string; domains replaces domain when both are given. network names other than tcp and udp match nothing, and any port given sets a condition, so 0, \"\" or a reversed range matches no port. A rule with no condition is refused. sourceIP (or source), sourcePort, localIP and localPort match the peer and the address the connection arrived on; user matches a SOCKS account by name or regexp:. Domain/geodata, port selectors and aggregate budgets are validated. localOS matches the running platform as Go's runtime.GOOS names it: darwin on macOS, ios on Apple mobile platforms, android, linux, windows."
+      "notes": "Read as Xray-core v26.10.31 reads it. type is not read. A nonempty outboundTag wins over balancerTag. inboundTag, domain, domains, ip and localOS take an array or a comma-separated string; domains replaces domain when both are given. network names other than tcp and udp match nothing, and any port given sets a condition, so 0, \"\" or a reversed range matches no port. A rule with no condition is refused. sourceIP (or source), sourcePort, localIP and localPort match the peer and the address the connection arrived on; user matches a SOCKS account by name or regexp:. protocol matches a prefix of the sniffed protocol: http1, tls, quic, bittorrent or fakedns. attrs maps lowercased attribute names, such as an HTTP request's :method, :path and headers, to regular expressions their values must match; a pattern that does not compile is refused. Domain/geodata, port selectors and aggregate budgets are validated. localOS matches the running platform as Go's runtime.GOOS names it: darwin on macOS, ios on Apple mobile platforms, android, linux, windows."
     },
     {
       "context": "$.inbounds[].sniffing",
@@ -1107,20 +1150,21 @@
         "pass"
       ],
       "id": "SOCKS_ACCOUNT",
-      "notes": "RFC 1929 credentials; user and pass are required strings of 1..255 UTF-8 bytes. Credentials are redacted."
+      "notes": "RFC 1929 credentials; user and pass are strings of at most 255 UTF-8 bytes, absent or null reading as empty, as in Xray-core. A later account replaces an earlier one of the same user. Credentials are redacted."
     },
     {
       "context": "$.inbounds[].settings (socks)",
       "fields": [
         "auth",
         "accounts",
+        "users",
         "udp",
         "ip",
         "userLevel",
         "allowUnauthenticatedLan"
       ],
       "id": "SOCKS_SETTINGS",
-      "notes": "auth is noauth (default) or password. password requires 1..64 accounts and makes the inbound offer only RFC 1929 username/password; accounts must be empty or absent with noauth. udp false refuses UDP ASSOCIATE with REP 0x07 as Xray-core does; an absent udp keeps it enabled, unlike Xray-core. ip is ignored; userLevel is parsed."
+      "notes": "auth is noauth (default) or password; other values are refused, where Xray-core reads them as noauth. users is Xray-core's other name for accounts, which replaces it unless null. password requires 1..64 accounts and makes the inbound offer only RFC 1929 username/password; accounts must be empty or absent with noauth. udp false refuses UDP ASSOCIATE with REP 0x07 as Xray-core does; an absent or null udp keeps it enabled, unlike Xray-core. ip is ignored; userLevel is parsed."
     },
     {
       "context": "$.outbounds[].settings (socks)",
@@ -1187,10 +1231,11 @@
         "fingerprint",
         "alpn",
         "pinnedPeerCertSha256",
-        "verifyPeerCertByName"
+        "verifyPeerCertByName",
+        "enableSessionResumption"
       ],
       "id": "TLS",
-      "notes": "allowInsecure=true is rejected. fromMitm is unsupported. Fingerprints, certificate pins and name constraints use parser validation."
+      "notes": "allowInsecure=true is rejected. fromMitm is unsupported. Fingerprints, certificate pins and name constraints use parser validation. enableSessionResumption is a boolean with no effect on a uTLS-shaped handshake, which never resumes here or in Xray-core; with fingerprint unsafe, and on QUIC, rustls resumes sessions whatever its value."
     },
     {
       "context": "$.outbounds[].settings (wireguard)",
@@ -1256,7 +1301,7 @@
         "remotePorts"
       ],
       "id": "UDP_HOP_MASK",
-      "notes": "Hysteria only, first UDP mask: mode intervalLocal,intervalRemote, nonempty remotePorts and empty remoteIPs. Default interval 30 seconds, minimum 5. Independent modes, perConnRemote and remote IP hopping are rejected."
+      "notes": "Hysteria or XHTTP with exact h3 ALPN, first UDP mask: mode is any comma-separated mix of intervalLocal, intervalRemote and perConnRemote; remotePorts and remoteIPs (IPs or prefixes, drawn only within the server's family). Default interval 30 seconds, minimum 5. A remote hop also takes a fresh local socket and always changes the port."
     },
     {
       "context": "$.outbounds[].settings (shadowsocks)",
@@ -1267,10 +1312,12 @@
         "level",
         "email",
         "method",
+        "uot",
+        "UoTVersion",
         "servers"
       ],
       "id": "SHADOWSOCKS",
-      "notes": "One flattened server or exactly one servers entry; mixing forms is rejected. Methods are case-insensitive. SS2022: three blake3 methods; base64 PSKs, at most 8192 encoded bytes and 8 AES identity keys. ChaCha requires one key. Oversized keys retain legacy normalization; v26.10.21 requires exact-length keys, so portable profiles must use exact lengths. AEAD: aes-128-gcm, aes-256-gcm, chacha20-poly1305 and xchacha20-poly1305 with Xray aliases (aead_*, chacha20-ietf-poly1305, xchacha20-ietf-poly1305); nonempty password via EVP_BytesToKey. none/plain and stream ciphers are rejected, as in v26.10.21."
+      "notes": "One flattened server or exactly one servers entry; mixing forms is rejected. uot and UoTVersion are sing-box UDP-over-TCP options that Xray-core does not read; they are type-checked and ignored, and uot true warns that UDP stays native. Methods are case-insensitive. SS2022: three blake3 methods; base64 PSKs, at most 8192 encoded bytes and 8 AES identity keys. ChaCha requires one key. Oversized keys retain legacy normalization; v26.10.21 requires exact-length keys, so portable profiles must use exact lengths. AEAD: aes-128-gcm, aes-256-gcm, chacha20-poly1305 and xchacha20-poly1305 with Xray aliases (aead_*, chacha20-ietf-poly1305, xchacha20-ietf-poly1305); nonempty password via EVP_BytesToKey. none/plain and stream ciphers are rejected, as in v26.10.21."
     },
     {
       "context": "$.outbounds[].settings.servers[0] (shadowsocks)",
@@ -1280,10 +1327,12 @@
         "password",
         "level",
         "email",
-        "method"
+        "method",
+        "uot",
+        "UoTVersion"
       ],
       "id": "SHADOWSOCKS_SERVER",
-      "notes": "Nonempty address, nonzero port, level 0..255. Email is type-checked and ignored. TCP uses streamSettings; UDP is native encrypted datagrams of at most 8192 bytes, matching the pinned peer."
+      "notes": "Nonempty address, nonzero port, level 0..255. Email, uot and UoTVersion are type-checked and ignored. TCP uses streamSettings; UDP is native encrypted datagrams of at most 8192 bytes, matching the pinned peer."
     },
     {
       "context": "$.outbounds[].settings (vmess)",

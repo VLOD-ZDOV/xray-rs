@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::runtime::Handle;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{sleep, timeout, Instant};
-use xray_config::{DnsHostTarget, DnsQueryStrategy as ConfigDnsQueryStrategy, DomainHostIndex};
+use xray_config::{DnsHostTarget, DomainHostIndex};
 use xray_routing::{Target, TargetAddr};
 use xray_transport::{
     BoxedTransportStream, DnsLookup, DnsQueryStrategy, DnsResolver, TransportDialer, TransportError,
@@ -905,15 +905,15 @@ impl DnsOutboundRuntime {
             return Some(HijackResolution::NoData);
         }
 
-        let query_strategy = mapper
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .query_strategy();
-        if matches!(
-            (parsed.qtype(), query_strategy),
-            (DNS_TYPE_A, ConfigDnsQueryStrategy::UseIpv6)
-                | (DNS_TYPE_AAAA, ConfigDnsQueryStrategy::UseIpv4)
-        ) {
+        let answers = |ipv6| {
+            mapper
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .answers(ipv6)
+        };
+        if (parsed.qtype() == DNS_TYPE_A && !answers(false))
+            || (parsed.qtype() == DNS_TYPE_AAAA && !answers(true))
+        {
             return Some(HijackResolution::NoData);
         }
 
@@ -925,6 +925,7 @@ impl DnsOutboundRuntime {
                 Some(DnsHostTarget::Ips(addresses)) => {
                     return Some(static_host_hijack_resolution(parsed.qtype(), addresses));
                 }
+                Some(DnsHostTarget::Rcode(rcode)) => return Some(HijackResolution::Rcode(rcode)),
                 Some(DnsHostTarget::Domain(alias)) => alias,
                 None => parsed.domain().to_owned(),
             };
@@ -1162,6 +1163,7 @@ enum HijackResolution {
     NameError,
     NoData,
     ServerFailure,
+    Rcode(u8),
 }
 
 async fn resolve_hijack(
@@ -1184,6 +1186,7 @@ async fn resolve_hijack(
         {
             Ok(lookup) => hijack_lookup(parsed.qtype(), lookup),
             Err(TransportError::DnsNameError(_, _)) => HijackResolution::NameError,
+            Err(TransportError::DnsRcode(_, _, rcode)) => HijackResolution::Rcode(rcode),
             Err(TransportError::DnsNoData(_, _) | TransportError::NoResolvedAddress(_, _)) => {
                 HijackResolution::NoData
             }
@@ -1230,6 +1233,7 @@ fn build_hijack_response(
         HijackResolution::NameError => (Vec::new(), 0, DNS_RCODE_NXDOMAIN),
         HijackResolution::NoData => (Vec::new(), 0, DNS_RCODE_NOERROR),
         HijackResolution::ServerFailure => (Vec::new(), 0, DNS_RCODE_SERVFAIL),
+        HijackResolution::Rcode(rcode) => (Vec::new(), 0, u16::from(rcode & 0x0f)),
     };
     let answer_size = match parsed.qtype() {
         DNS_TYPE_A => 16usize,
@@ -1340,7 +1344,7 @@ mod tests {
         DnsOutboundSettings, DomainMatcher, IpCidr, Network, TargetAddr as ConfigTargetAddr,
     };
     use xray_routing::{Network as RoutingNetwork, TargetAddr};
-    use xray_transport::{SystemDnsResolver, TransportDialer};
+    use xray_transport::{ConfiguredDnsResolver, SystemDnsResolver, TransportDialer};
 
     use super::*;
 
@@ -1413,7 +1417,7 @@ mod tests {
             ttl: 60,
         };
         let mapper = Arc::new(Mutex::new(
-            FakeIpMapper::from_config(&config, ConfigDnsQueryStrategy::UseIp, &[]).unwrap(),
+            FakeIpMapper::from_config(&config, xray_config::DnsQueryStrategy::UseIp, &[]).unwrap(),
         ));
         let mut runtime = test_runtime();
         runtime.fake_ip_mapper = Some(Arc::clone(&mapper));
@@ -1445,8 +1449,15 @@ mod tests {
             443,
             RoutingNetwork::Tcp,
         );
+        // The mapper draws its address anywhere in the pool, so the unmapped
+        // one is whichever of two candidates it did not hand out.
+        let unmapped_ip = [2, 3]
+            .map(|last| Ipv4Addr::new(198, 18, 0, last))
+            .into_iter()
+            .find(|ip| *ip != mapped_ip)
+            .unwrap();
         let in_pool_unmapped = Target::new(
-            TargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 2))),
+            TargetAddr::Ip(IpAddr::V4(unmapped_ip)),
             443,
             RoutingNetwork::Tcp,
         );
@@ -1512,6 +1523,44 @@ mod tests {
         );
     }
 
+    /// Routes IPv6 alone, as a `UseSystem` probe may report.
+    #[derive(Debug)]
+    struct Ipv6Only;
+
+    impl xray_transport::RouteProbe for Ipv6Only {
+        fn families(&self) -> xray_transport::RouteFamilies {
+            xray_transport::RouteFamilies {
+                ipv4: false,
+                ipv6: true,
+            }
+        }
+    }
+
+    /// With `UseSystem` and no IPv4 route, a hijacked `A` query is answered
+    /// empty and allocates no fake IP, as Xray-core's `checkSystem` leaves it.
+    #[tokio::test]
+    async fn fake_ip_hijack_answers_no_a_record_without_an_ipv4_route() {
+        let (runtime, mapper) = test_runtime_with_fake_ip();
+        {
+            let mut guard = mapper.lock().unwrap();
+            let config = DnsFakeIpConfig {
+                enabled: true,
+                ipv4_pool: IpCidr::new(IpAddr::V4(Ipv4Addr::new(198, 18, 0, 0)), 29).unwrap(),
+                pool_size: 1,
+                ttl: 60,
+            };
+            *guard = FakeIpMapper::from_config(&config, xray_config::DnsQueryStrategy::UseIp, &[])
+                .unwrap()
+                .with_route_probe(Arc::new(Ipv6Only));
+        }
+
+        let response = hijack_reply(&runtime, query(0x2301, "unrouted.example")).await;
+
+        assert_eq!(response[3] & 0x0f, 0, "NOERROR");
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 0);
+        assert_eq!(mapper.lock().unwrap().mapping_count(), 0);
+    }
+
     #[tokio::test]
     async fn static_hosts_precede_fake_ip_hijack_without_allocating_a_mapping() {
         let (mut runtime, mapper) = test_runtime_with_fake_ip();
@@ -1550,6 +1599,86 @@ mod tests {
             &response[question_end + 12..question_end + 16],
             &static_ip.octets()
         );
+        assert_eq!(mapper.lock().unwrap().mapping_count(), 0);
+    }
+
+    async fn hijack_reply(runtime: &DnsOutboundRuntime, request: Bytes) -> Bytes {
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.execute_message(
+                &hijack_outbound(),
+                &udp_dns_target(),
+                request,
+                DnsClientTransport::Udp {
+                    path_payload_cap: 1_232,
+                },
+            ),
+        )
+        .await
+        .expect("static hosts Hijack must not wait");
+        let DnsMessageOutcome::Reply(response) = outcome else {
+            panic!("static hosts Hijack must reply");
+        };
+        response
+    }
+
+    fn rcode_hosts() -> Arc<DomainHostIndex<DnsHostTarget>> {
+        Arc::new(DomainHostIndex::from_iter([
+            (
+                DomainMatcher::Full("ads.example.com".to_owned()),
+                DnsHostTarget::Rcode(3),
+            ),
+            (
+                DomainMatcher::Full("refused.test".to_owned()),
+                DnsHostTarget::Rcode(5),
+            ),
+            (
+                DomainMatcher::Full("empty.test".to_owned()),
+                DnsHostTarget::Rcode(0),
+            ),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn static_rcode_hosts_answer_a_and_aaaa_hijack_with_that_rcode() {
+        let hosts = rcode_hosts();
+        let resolver: Arc<dyn DnsResolver> = Arc::new(ConfiguredDnsResolver::new(
+            Arc::clone(&hosts),
+            Vec::new(),
+            Arc::new(SystemDnsResolver),
+        ));
+        let mut runtime = DnsOutboundRuntime::new(
+            resolver,
+            Arc::new(SystemDnsResolver),
+            Arc::new(TransportDialer::system().expect("build test DNS dialer")),
+            Vec::new(),
+            8,
+        );
+        runtime.static_hosts = hosts;
+
+        for (domain, rcode) in [
+            ("ads.example.com", 3),
+            ("refused.test", 5),
+            ("empty.test", 0),
+        ] {
+            for qtype in [DNS_TYPE_A, DNS_TYPE_AAAA] {
+                let request = query_with_flags_and_type(0x2210, domain, 0x0100, qtype);
+                let response = hijack_reply(&runtime, request).await;
+                assert_eq!(response[3] & 0x0f, rcode, "{domain} {qtype}");
+                assert_eq!(u16::from_be_bytes([response[6], response[7]]), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn static_rcode_host_precedes_fake_ip_without_allocating_a_mapping() {
+        let (mut runtime, mapper) = test_runtime_with_fake_ip();
+        runtime.static_hosts = rcode_hosts();
+
+        let response = hijack_reply(&runtime, query(0x2211, "ads.example.com")).await;
+
+        assert_eq!(response[3] & 0x0f, DNS_RCODE_NXDOMAIN as u8);
+        assert_eq!(u16::from_be_bytes([response[6], response[7]]), 0);
         assert_eq!(mapper.lock().unwrap().mapping_count(), 0);
     }
 

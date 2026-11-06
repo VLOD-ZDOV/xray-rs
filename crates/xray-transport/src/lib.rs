@@ -39,6 +39,8 @@ pub mod reality;
 pub mod reality_connector;
 pub mod reality_runtime;
 mod reality_rustls;
+mod reality_spider;
+mod route_probe;
 pub mod stream;
 mod tls;
 mod utls_profiles;
@@ -51,7 +53,7 @@ pub use dns::{
     select_name_server_indices, CachingDnsResolver, CompiledNameServerPolicies,
     ConfiguredDnsResolver, DnsLookup, DnsQueryDispatch, DnsQueryMetadata, DnsQueryStrategy,
     DnsQueryTransport, DnsQueryTransportKind, DnsResolver, NameServer, NameServerPolicy,
-    NameServerTransport, SystemDnsResolver,
+    NameServerTransport, SystemDnsResolver, SystemRouteDnsResolver,
 };
 pub use happy_eyeballs::{connect_tcp_dual_stack, connect_tcp_happy_eyeballs, HappyEyeballsConfig};
 pub use memory_class::{memory_class, set_memory_class, MemoryClass};
@@ -60,7 +62,11 @@ pub use reality_connector::{RealityTlsSession, RealityTlsSessionProvider};
 pub use reality_runtime::{
     RealityHandshakeContextProvider, RealityRuntimeEngine, SystemRealityHandshakeContextProvider,
 };
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use reality_rustls::extract_server_hello_for_fuzzing;
 pub use reality_rustls::RustlsRealityTlsSessionProvider;
+pub use route_probe::{RouteFamilies, RouteProbe, SystemRouteProbe};
 pub use tls::{plain_tls_client_hello_bytes, TlsConnector};
 pub use utls_profiles::draw_modern_fingerprint;
 
@@ -142,6 +148,10 @@ pub enum TransportError {
     DnsNameError(String, u16),
     #[error("dns server returned no A or AAAA records for {0}:{1}")]
     DnsNoData(String, u16),
+    /// A DNS answer with an RCODE other than NOERROR or NXDOMAIN, such as a
+    /// `dns.hosts` `"#N"` target.
+    #[error("dns answered {0}:{1} with rcode {2}")]
+    DnsRcode(String, u16, u8),
     #[error("dns lookup returned no addresses for {0}:{1}")]
     NoResolvedAddress(String, u16),
     #[error("tcp connect failed: {0}")]
@@ -180,6 +190,8 @@ pub enum TransportError {
     Grpc(String),
     #[error("xhttp transport error: {0}")]
     Xhttp(String),
+    #[error(transparent)]
+    Http2Connect(#[from] stream::Http2ConnectError),
     #[error("reality handshake failed: {0}")]
     Reality(#[from] reality::RealityError),
     #[error("REALITY live TLS completion is not implemented")]
@@ -204,6 +216,14 @@ pub trait TransportStream: AsyncRead + AsyncWrite + Send + Unpin {
     /// into Vision direct mode, so any record-boundary read alignment kept
     /// for a lossless direct-mode unwrap can be dropped. Default: no-op.
     fn release_record_alignment(&mut self) {}
+
+    /// The application protocol that this stream's own TLS handshake
+    /// negotiated (ALPN). Only the raw transport's TLS reports one, the
+    /// session Xray-core's HTTP outbound reads it from; any other stream,
+    /// including TLS under an HTTP-based transport, reports `None`.
+    fn negotiated_alpn(&self) -> Option<&[u8]> {
+        None
+    }
 
     /// Consuming capability for independently owned protocol directions.
     fn take_parallel_halves(&mut self) -> Option<(ParallelRead, ParallelWrite)> {

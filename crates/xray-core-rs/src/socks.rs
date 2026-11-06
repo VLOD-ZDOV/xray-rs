@@ -17,10 +17,11 @@ use xray_config::{
     CoreConfig, DomainStrategy, InboundSniffingConfig, RouteContext, SocksInboundSettings,
 };
 use xray_proxy::inbound::{
-    encode_socks5_udp_datagram, negotiate_socks5, parse_http_connect_request, parse_socks4_connect,
-    parse_socks5_request_message, parse_socks5_udp_datagram, write_socks5_command_not_supported,
-    write_socks5_failure, write_socks5_success, write_socks5_success_with_bind, SocksCommand,
-    SocksInboundAuth, SocksUser, SOCKS4_GRANTED, SOCKS4_REJECTED, SOCKS4_VERSION,
+    encode_socks5_udp_datagram, negotiate_socks5, parse_socks4_connect, parse_socks5_udp_datagram,
+    read_socks5_command, read_socks5_target, write_socks5_command_not_supported,
+    write_socks5_failure, write_socks5_success, write_socks5_success_with_bind,
+    HttpInboundAccounts, InboundUser, SocksCommand, SocksInboundAuth, SocksParseError,
+    SOCKS4_GRANTED, SOCKS4_REJECTED, SOCKS4_VERSION,
 };
 use xray_proxy::vless::{
     encode_xudp_keep_packet, encode_xudp_new_packet, read_udp_packet, read_xudp_packet,
@@ -40,7 +41,7 @@ use crate::{
     open_vless_udp_stream_with_resolver_and_dialer,
     policy::{
         accept_error_wants_backoff, copy_bidirectional_with_idle_timeout_and_traffic,
-        effective_policy_for_level, AcceptBackoff, EffectivePolicy,
+        effective_policy_for_level, AcceptBackoff, EffectivePolicy, RelayTimeouts,
     },
     runtime_log::{monotonic_millis, LogThrottle},
     udp_ingress::{sniff_udp_flow, UdpIngress},
@@ -117,7 +118,7 @@ struct SocksUdpFlowContext {
     local_addr: Option<SocketAddr>,
     /// The user the control connection logged in as, which Xray-core gives
     /// routing for the association's flows too.
-    user: Option<SocksUser>,
+    user: Option<InboundUser>,
     inbound_tag: Option<String>,
     config: Arc<CoreConfig>,
     outbound_router: Arc<OutboundRouter>,
@@ -379,7 +380,9 @@ async fn handle_socks_connection(
             return;
         }
     }
-    let Some(user) = tokio::time::timeout(policy.handshake, negotiate_socks5(&mut inbound, auth))
+    // Xray-core gives the whole handshake one deadline.
+    let deadline = tokio::time::Instant::now() + policy.handshake;
+    let Some(user) = tokio::time::timeout_at(deadline, negotiate_socks5(&mut inbound, auth))
         .await
         .ok()
         .and_then(Result::ok)
@@ -387,22 +390,34 @@ async fn handle_socks_connection(
         return;
     };
 
-    let request =
-        match tokio::time::timeout(policy.handshake, parse_socks5_request_message(&mut inbound))
-            .await
-        {
-            Ok(Ok(request)) => request,
+    // Xray-core refuses a command it does not serve, and UDP while `"udp"`
+    // is false, before reading the address. A request it cannot read is
+    // closed without a reply.
+    let command = match tokio::time::timeout_at(deadline, read_socks5_command(&mut inbound)).await {
+        Ok(Ok(SocksCommand::UdpAssociate)) if !settings.udp => None,
+        Ok(Ok(command)) => Some(command),
+        Ok(Err(SocksParseError::UnsupportedCommand(_))) => None,
+        _ => return,
+    };
+    let Some(command) = command else {
+        let _ = write_socks5_command_not_supported(&mut inbound).await;
+        crate::http::drain_arrived(&inbound);
+        return;
+    };
+    let target =
+        match tokio::time::timeout_at(deadline, read_socks5_target(&mut inbound, command)).await {
+            Ok(Ok(target)) => target,
             _ => {
-                let _ = write_socks5_failure(&mut inbound).await;
+                crate::http::drain_arrived(&inbound);
                 return;
             }
         };
 
-    match request.command {
+    match command {
         SocksCommand::Connect => {
             handle_socks_connect::<true>(
                 inbound,
-                request.target,
+                target,
                 user,
                 inbound_tag,
                 config,
@@ -417,15 +432,8 @@ async fn handle_socks_connection(
             .await;
         }
         SocksCommand::UdpAssociate => {
-            // Like Xray-core, `"udp": false` refuses before a relay socket or
-            // client lock exists; returning closes the control connection.
-            if !settings.udp {
-                let _ = write_socks5_command_not_supported(&mut inbound).await;
-                return;
-            }
             let client_lock = if auth.requires_password() {
-                let Some(lock) =
-                    SocksUdpClientLock::for_request(&request.target, inbound.peer_addr().ok())
+                let Some(lock) = SocksUdpClientLock::for_request(&target, inbound.peer_addr().ok())
                 else {
                     let _ = write_socks5_failure(&mut inbound).await;
                     return;
@@ -507,15 +515,14 @@ async fn handle_socks4_connection(
     .await;
 }
 
-/// HTTP `CONNECT` on a SOCKS port. Xray's SOCKS inbound passes it to an HTTP
-/// server that requires the SOCKS accounts as Basic credentials; the tunnel
-/// then routes and sniffs as a SOCKS connection would.
+/// HTTP on a SOCKS port. Xray's SOCKS inbound hands it to an HTTP server that
+/// requires the SOCKS accounts as Basic credentials.
 #[expect(
     clippy::too_many_arguments,
     reason = "connection tasks receive shared runtime dependencies explicitly"
 )]
 async fn handle_socks_http_connection(
-    mut inbound: TcpStream,
+    inbound: TcpStream,
     auth: &SocksInboundAuth,
     inbound_tag: Option<String>,
     config: Arc<CoreConfig>,
@@ -527,37 +534,9 @@ async fn handle_socks_http_connection(
     runtime_logger: RuntimeLogger,
     connection_registry: Arc<ConnectionRegistry>,
 ) {
-    let request = match tokio::time::timeout(
-        policy.handshake,
-        parse_http_connect_request(&mut inbound),
-    )
-    .await
-    {
-        Ok(Ok(request)) => request,
-        _ => {
-            let _ = inbound.write_all(crate::http::HTTP_BAD_REQUEST).await;
-            return;
-        }
-    };
-    let Some(user) =
-        auth.http_basic_user(request.proxy_authorization.as_deref().map(Vec::as_slice))
-    else {
-        let _ = inbound
-            .write_all(crate::http::HTTP_PROXY_AUTH_REQUIRED)
-            .await;
-        return;
-    };
-    if inbound
-        .write_all(crate::http::HTTP_CONNECT_ESTABLISHED)
-        .await
-        .is_err()
-    {
-        return;
-    }
-    handle_socks_connect::<false>(
+    crate::http::serve_http_proxy_connection(
         inbound,
-        request.target,
-        user,
+        &HttpInboundAccounts::from(auth),
         inbound_tag,
         config,
         outbound_router,
@@ -575,10 +554,10 @@ async fn handle_socks_http_connection(
     clippy::too_many_arguments,
     reason = "connection tasks receive shared runtime dependencies explicitly"
 )]
-async fn handle_socks_connect<const SOCKS_REPLY: bool>(
+pub(crate) async fn handle_socks_connect<const SOCKS_REPLY: bool>(
     mut inbound: TcpStream,
     target: Target,
-    user: Option<SocksUser>,
+    user: Option<InboundUser>,
     inbound_tag: Option<String>,
     config: Arc<CoreConfig>,
     outbound_router: Arc<OutboundRouter>,
@@ -597,40 +576,64 @@ async fn handle_socks_connect<const SOCKS_REPLY: bool>(
     let sniffing_config = sniffing.as_ref();
     let restored_target = dns_resolvers.outbound.restore_client_target(&target);
     let provenance = restored_target.provenance;
-    let sniff_tcp = should_sniff_socks_tcp(sniffing_config, provenance);
+    let sniffed_routing = outbound_router.sniffed_routing();
+    let sniff_tcp = should_sniff_socks_tcp(sniffing_config, provenance, sniffed_routing.tcp());
     let effective_target = restored_target.target;
     let mut route_target = effective_target.clone();
     let mut dial_target = effective_target;
     let mut initial_payload = Bytes::new();
     let mut sniffed_protocol = None;
+    let mut protocol = None;
+    let mut attributes = None;
 
     if sniff_tcp {
         if SOCKS_REPLY && write_socks5_success(&mut inbound).await.is_err() {
             return;
         }
         if let Some(config) = sniffing_config {
-            let (payload, sniffed) =
-                read_socks_tcp_sniff_payload(&mut inbound, config, &dial_target).await;
+            let (payload, sniffed) = read_socks_tcp_sniff_payload(
+                &mut inbound,
+                config,
+                &dial_target,
+                sniffed_routing.attributes,
+            )
+            .await;
             initial_payload = payload;
-            if let Some(sniffed) = sniffed {
-                let sniffed = apply_fake_ip_sniffed_dial_precedence(provenance, sniffed);
-                sniffed_protocol = Some(sniffed.protocol);
-                route_target = sniffed.route_target;
-                dial_target = sniffed.dial_target;
+            attributes = sniffed.attributes;
+            if let Some(sniffed) = sniffed.sniffed {
+                protocol = Some(sniffed.protocol);
+                // A mapped fake IP keeps the domain the fake DNS gave it.
+                if let Some(sniffed) = sniffed
+                    .target
+                    .filter(|_| fake_ip_allows_content_sniffing(provenance))
+                {
+                    let sniffed = apply_fake_ip_sniffed_dial_precedence(provenance, sniffed);
+                    sniffed_protocol = Some(sniffed.protocol);
+                    route_target = sniffed.route_target;
+                    dial_target = sniffed.dial_target;
+                }
             }
         }
     }
+    let protocol = crate::sniffing::routing_protocol(
+        protocol,
+        provenance == FakeIpTargetProvenance::Mapped,
+        sniffing_config,
+    );
 
     let route = RouteContext {
         inbound_tag: inbound_tag.as_deref(),
         source: inbound.peer_addr().ok(),
         local: inbound.local_addr().ok(),
-        user: user.as_ref().map(SocksUser::as_str),
+        user: user.as_ref().map(InboundUser::as_str),
+        protocol: protocol.map(crate::sniffing::SniffedProtocol::name),
+        attributes: attributes.as_ref(),
     };
     let selected = match outbound_router
         .select_tcp_session_outbound_with_tag_and_resolver(
             &route,
             &route_target,
+            &dial_target,
             true,
             dns_resolvers.destination.as_ref(),
         )
@@ -730,77 +733,11 @@ async fn handle_socks_connect<const SOCKS_REPLY: bool>(
         }
     };
 
-    let (open_timeout, tunnel_idle, relay_buffer_size) = match outbound.primary() {
-        // Freedom's own timer runs at its level beside the inbound's, so the
-        // shorter idle timeout wins, as in Xray-core.
-        TcpOutbound::Freedom(freedom) => (
-            policy.handshake,
-            policy
-                .conn_idle
-                .min(effective_policy_for_level(&config, Some(freedom.level())).conn_idle),
-            policy.relay_buffer_size(),
-        ),
-        TcpOutbound::Vless(vless) => {
-            let outbound_policy = effective_policy_for_level(&config, Some(vless.user().level));
-            (
-                outbound_policy.handshake,
-                policy.conn_idle.min(outbound_policy.conn_idle),
-                outbound_policy.relay_buffer_size(),
-            )
-        }
-        TcpOutbound::Trojan(outbound) => {
-            let outbound_policy = effective_policy_for_level(&config, Some(outbound.level()));
-            (
-                outbound_policy.handshake,
-                policy.conn_idle.min(outbound_policy.conn_idle),
-                outbound_policy.relay_buffer_size(),
-            )
-        }
-        TcpOutbound::Socks(outbound) => {
-            let outbound_policy = effective_policy_for_level(&config, Some(outbound.level()));
-            (
-                outbound_policy.handshake,
-                policy.conn_idle.min(outbound_policy.conn_idle),
-                outbound_policy.relay_buffer_size(),
-            )
-        }
-        TcpOutbound::Http(outbound) => {
-            let outbound_policy = effective_policy_for_level(&config, Some(outbound.level()));
-            (
-                outbound_policy.handshake,
-                policy.conn_idle.min(outbound_policy.conn_idle),
-                outbound_policy.relay_buffer_size(),
-            )
-        }
-        TcpOutbound::Vmess(outbound) => {
-            let outbound_policy = effective_policy_for_level(&config, Some(outbound.level()));
-            (
-                outbound_policy.handshake,
-                policy.conn_idle.min(outbound_policy.conn_idle),
-                outbound_policy.relay_buffer_size(),
-            )
-        }
-        TcpOutbound::Shadowsocks2022(outbound) => {
-            let outbound_policy = effective_policy_for_level(&config, Some(outbound.level()));
-            (
-                outbound_policy.handshake,
-                policy.conn_idle.min(outbound_policy.conn_idle),
-                outbound_policy.relay_buffer_size(),
-            )
-        }
-        TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
-            let outbound_policy = effective_policy_for_level(&config, Some(0));
-            (
-                outbound_policy.handshake,
-                policy.conn_idle.min(outbound_policy.conn_idle),
-                outbound_policy.relay_buffer_size(),
-            )
-        }
-        TcpOutbound::Chained { .. } => unreachable!("primary outbound is never a chain wrapper"),
-    };
+    let (open_timeout, relay_timeouts, relay_buffer_size) =
+        tcp_relay_policy(&config, &policy, &outbound);
     let outbound_label = crate::debug_log::tcp_outbound_label(&outbound);
     let client = outbound
-        .writes_proxy_protocol()
+        .names_the_client()
         .then(|| inbound.peer_addr().ok().map(InboundSource::tcp))
         .flatten();
     let opened = tokio::select! {
@@ -878,7 +815,7 @@ async fn handle_socks_connect<const SOCKS_REPLY: bool>(
                 outbound_router.factory().parallel_vmess_budget(),
                 inbound.into_split(),
                 halves,
-                tunnel_idle,
+                relay_timeouts,
                 relay_buffer_size,
                 connection_traffic,
                 wait_for_connection_close(&mut connection_close),
@@ -893,7 +830,7 @@ async fn handle_socks_connect<const SOCKS_REPLY: bool>(
         result = copy_bidirectional_with_idle_timeout_and_traffic(
             &mut inbound,
             &mut outbound_stream,
-            tunnel_idle,
+            relay_timeouts,
             relay_buffer_size,
             connection_traffic.as_ref(),
         ) => Some(result),
@@ -903,11 +840,88 @@ async fn handle_socks_connect<const SOCKS_REPLY: bool>(
     connection.finish();
 }
 
+/// The open timeout, idle timeout and relay buffer for a TCP outbound: its
+/// own level's handshake and buffer, and the shorter of its idle timeout and
+/// the inbound's, as Xray-core's two timers make it.
+pub(crate) fn tcp_relay_policy(
+    config: &CoreConfig,
+    policy: &EffectivePolicy,
+    outbound: &TcpOutbound,
+) -> (Duration, RelayTimeouts, usize) {
+    match outbound.primary() {
+        // Freedom's own timer runs at its level beside the inbound's, so the
+        // shorter timeout wins in each phase, as in Xray-core.
+        TcpOutbound::Freedom(freedom) => (
+            policy.handshake,
+            policy.relay_timeouts(effective_policy_for_level(config, Some(freedom.level()))),
+            policy.relay_buffer_size(),
+        ),
+        TcpOutbound::Vless(vless) => {
+            let outbound_policy = effective_policy_for_level(config, Some(vless.user().level));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Trojan(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Socks(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Http(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Vmess(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Shadowsocks2022(outbound) => {
+            let outbound_policy = effective_policy_for_level(config, Some(outbound.level()));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
+            let outbound_policy = effective_policy_for_level(config, Some(0));
+            (
+                outbound_policy.handshake,
+                policy.relay_timeouts(outbound_policy),
+                outbound_policy.relay_buffer_size(),
+            )
+        }
+        TcpOutbound::Chained { .. } => unreachable!("primary outbound is never a chain wrapper"),
+    }
+}
+
 async fn read_socks_tcp_sniff_payload(
     inbound: &mut TcpStream,
     config: &InboundSniffingConfig,
     target: &Target,
-) -> (Bytes, Option<crate::sniffing::SniffedTarget>) {
+    record_attributes: bool,
+) -> (Bytes, crate::sniffing::TcpSniffed) {
     let deadline = tokio::time::Instant::now() + SOCKS_TCP_SNIFF_TIMEOUT;
     let mut buffer = Vec::with_capacity(SOCKS_TCP_SNIFF_BUFFER_SIZE);
 
@@ -925,12 +939,25 @@ async fn read_socks_tcp_sniff_payload(
         };
         buffer.extend_from_slice(&chunk[..len]);
 
-        if let Some(sniffed) = crate::sniffing::sniff_tcp_initial_payload(config, target, &buffer) {
-            return (Bytes::copy_from_slice(&buffer), Some(sniffed));
+        if let crate::sniffing::TcpSniff::Done(sniffed) = crate::sniffing::sniff_tcp_initial_payload(
+            config,
+            target,
+            &buffer,
+            false,
+            record_attributes,
+        ) {
+            return (Bytes::copy_from_slice(&buffer), sniffed);
         }
     }
 
-    let sniffed = crate::sniffing::sniff_tcp_initial_payload(config, target, &buffer);
+    let sniffed = crate::sniffing::sniff_tcp_initial_payload(
+        config,
+        target,
+        &buffer,
+        true,
+        record_attributes,
+    )
+    .done();
     (Bytes::copy_from_slice(&buffer), sniffed)
 }
 
@@ -941,7 +968,7 @@ async fn read_socks_tcp_sniff_payload(
 async fn handle_socks_udp_associate(
     mut control: TcpStream,
     client_lock: Option<SocksUdpClientLock>,
-    user: Option<SocksUser>,
+    user: Option<InboundUser>,
     inbound_tag: Option<String>,
     config: Arc<CoreConfig>,
     outbound_router: Arc<OutboundRouter>,
@@ -1022,6 +1049,10 @@ async fn handle_socks_udp_associate(
                 let Ok(datagram) = parse_socks5_udp_datagram(&buffer[..len]) else {
                     continue;
                 };
+                // Xray-core drops a datagram without a payload.
+                if datagram.payload.is_empty() {
+                    continue;
+                }
                 let flow_key = (client_addr, datagram.target.clone());
                 activity_sequence = activity_sequence.wrapping_add(1);
 
@@ -1269,16 +1300,21 @@ async fn bridge_socks_udp_flow(
     let route_target = sniffed_target.route_target;
     let dial_target = sniffed_target.dial_target;
     let route = RouteContext {
+        attributes: None,
         inbound_tag: context.inbound_tag.as_deref(),
         source: Some(context.client_addr),
         local: context.local_addr,
-        user: context.user.as_ref().map(SocksUser::as_str),
+        user: context.user.as_ref().map(InboundUser::as_str),
+        protocol: sniffed_target
+            .protocol
+            .map(crate::sniffing::SniffedProtocol::name),
     };
     let selected = match context
         .outbound_router
         .select_udp_session_outbound_with_tag_and_resolver(
             &route,
             &route_target,
+            &dial_target,
             true,
             context.dns_resolvers.destination.as_ref(),
         )
@@ -1600,6 +1636,8 @@ struct SocksUdpSniffedTarget {
     route_target: Target,
     dial_target: Target,
     sniffed_protocol: Option<xray_config::SniffingDestination>,
+    /// The protocol routing sees.
+    protocol: Option<crate::sniffing::SniffedProtocol>,
 }
 
 impl SocksUdpSniffedTarget {
@@ -1608,19 +1646,24 @@ impl SocksUdpSniffedTarget {
             route_target: target.clone(),
             dial_target: target.clone(),
             sniffed_protocol: None,
+            protocol: None,
         }
     }
 
     fn from_sniffed(
         target: &Target,
         provenance: FakeIpTargetProvenance,
-        sniffed: Option<crate::sniffing::SniffedTarget>,
+        sniffed: Option<crate::sniffing::Sniffed>,
     ) -> Self {
-        if !fake_ip_allows_content_sniffing(provenance) {
-            return Self::original(target);
-        }
-        let Some(sniffed) = sniffed else {
-            return Self::original(target);
+        let protocol = sniffed.as_ref().map(|sniffed| sniffed.protocol);
+        let Some(sniffed) = sniffed
+            .and_then(|sniffed| sniffed.target)
+            .filter(|_| fake_ip_allows_content_sniffing(provenance))
+        else {
+            return Self {
+                protocol,
+                ..Self::original(target)
+            };
         };
         let sniffed = apply_fake_ip_sniffed_dial_precedence(provenance, sniffed);
         let sniffed_protocol = Some(sniffed.protocol);
@@ -1628,22 +1671,26 @@ impl SocksUdpSniffedTarget {
             route_target: sniffed.route_target,
             dial_target: sniffed.dial_target,
             sniffed_protocol,
+            protocol,
         }
     }
 }
 
-fn fake_ip_allows_content_sniffing(provenance: FakeIpTargetProvenance) -> bool {
+pub(crate) fn fake_ip_allows_content_sniffing(provenance: FakeIpTargetProvenance) -> bool {
     provenance != FakeIpTargetProvenance::Mapped
 }
 
+/// A mapped fake IP is sniffed only for what routing reads, when it asks.
 fn should_sniff_socks_tcp(
     config: Option<&InboundSniffingConfig>,
     provenance: FakeIpTargetProvenance,
+    routes_by_sniffing: bool,
 ) -> bool {
-    fake_ip_allows_content_sniffing(provenance) && crate::sniffing::should_sniff_tcp(config)
+    (fake_ip_allows_content_sniffing(provenance) || routes_by_sniffing)
+        && crate::sniffing::should_sniff_tcp(config, routes_by_sniffing)
 }
 
-fn apply_fake_ip_sniffed_dial_precedence(
+pub(crate) fn apply_fake_ip_sniffed_dial_precedence(
     provenance: FakeIpTargetProvenance,
     mut sniffed: crate::sniffing::SniffedTarget,
 ) -> crate::sniffing::SniffedTarget {
@@ -1661,28 +1708,23 @@ async fn sniff_socks_udp_target(
     from_client: mpsc::Receiver<Bytes>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> (SocksUdpSniffedTarget, UdpIngress) {
-    if !fake_ip_allows_content_sniffing(provenance) {
-        return (
-            SocksUdpSniffedTarget::from_sniffed(target, provenance, None),
-            from_client.into(),
-        );
-    }
-    let Some(config) = context
+    let routes_by_protocol = context.outbound_router.sniffed_routing().protocol;
+    let config = context
         .sniffing
         .as_ref()
-        .filter(|config| crate::sniffing::should_sniff_udp(Some(config)))
-    else {
-        return (SocksUdpSniffedTarget::original(target), from_client.into());
+        .filter(|_| fake_ip_allows_content_sniffing(provenance) || routes_by_protocol)
+        .filter(|config| crate::sniffing::should_sniff_udp(Some(config), routes_by_protocol));
+    let (sniffed, from_client) = match config {
+        Some(config) => sniff_udp_flow(config, target, first_payload, from_client, shutdown).await,
+        None => (None, from_client.into()),
     };
-    let (sniffed, from_client) =
-        sniff_udp_flow(config, target, first_payload, from_client, shutdown).await;
-    let Some(sniffed) = sniffed else {
-        return (SocksUdpSniffedTarget::original(target), from_client);
-    };
-    (
-        SocksUdpSniffedTarget::from_sniffed(target, provenance, Some(sniffed)),
-        from_client,
-    )
+    let mut sniffed = SocksUdpSniffedTarget::from_sniffed(target, provenance, sniffed);
+    sniffed.protocol = crate::sniffing::routing_protocol(
+        sniffed.protocol,
+        provenance == FakeIpTargetProvenance::Mapped,
+        context.sniffing.as_ref(),
+    );
+    (sniffed, from_client)
 }
 
 #[expect(
@@ -1765,6 +1807,16 @@ async fn bridge_socks_udp_freedom_flow(
             return;
         }
     }
+    // Xray-core's noise writer goes after the header, before the payload.
+    let noise_sent = tokio::select! {
+        biased;
+        () = wait_for_connection_close(&mut connection_close) => return,
+        result = freedom.send_udp_noises(&remote_socket, target_addr) => result,
+    };
+    let Ok(noise_len) = noise_sent else {
+        return;
+    };
+    traffic.record_uplink(noise_len);
     let first_payload_len = first_payload.len();
     let first_sent = tokio::select! {
         biased;
@@ -2137,10 +2189,18 @@ mod tests {
         assert!(!should_sniff_socks_tcp(
             Some(&http_sniffing_config(false)),
             FakeIpTargetProvenance::Mapped,
+            false,
         ));
         assert!(should_sniff_socks_tcp(
             Some(&http_sniffing_config(false)),
             FakeIpTargetProvenance::Outside,
+            false,
+        ));
+        // Routing by protocol sniffs a mapped fake IP for its protocol.
+        assert!(should_sniff_socks_tcp(
+            Some(&http_sniffing_config(false)),
+            FakeIpTargetProvenance::Mapped,
+            true,
         ));
     }
 
@@ -2162,12 +2222,20 @@ mod tests {
         let result = SocksUdpSniffedTarget::from_sniffed(
             &mapped,
             FakeIpTargetProvenance::Mapped,
-            Some(sniffed_target(&mapped, "sniffed-b.example")),
+            Some(crate::sniffing::Sniffed {
+                protocol: crate::sniffing::SniffedProtocol::Quic,
+                target: Some(sniffed_target(&mapped, "sniffed-b.example")),
+            }),
         );
 
         assert_eq!(result.route_target, mapped);
         assert_eq!(result.dial_target, mapped);
         assert_eq!(result.sniffed_protocol, None);
+        // The protocol still reaches routing.
+        assert_eq!(
+            result.protocol,
+            Some(crate::sniffing::SniffedProtocol::Quic)
+        );
     }
 
     #[test]
@@ -2187,7 +2255,10 @@ mod tests {
         let udp = SocksUdpSniffedTarget::from_sniffed(
             &raw_udp,
             FakeIpTargetProvenance::InPoolUnmapped,
-            Some(sniffed_target(&raw_udp, "sniffed.example")),
+            Some(crate::sniffing::Sniffed {
+                protocol: crate::sniffing::SniffedProtocol::Quic,
+                target: Some(sniffed_target(&raw_udp, "sniffed.example")),
+            }),
         );
         assert_eq!(udp.dial_target, udp.route_target);
     }

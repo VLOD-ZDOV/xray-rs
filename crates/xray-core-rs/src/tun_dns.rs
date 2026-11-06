@@ -598,6 +598,7 @@ enum DnsHijackResolution {
     NameError,
     NoData,
     ServerFailure,
+    Rcode(u8),
 }
 
 fn dns_hijack_question(message: &[u8]) -> Option<DnsQuestion> {
@@ -661,6 +662,7 @@ fn dns_hijack_resolution(
             }
         }
         Err(TransportError::DnsNameError(_, _)) => DnsHijackResolution::NameError,
+        Err(TransportError::DnsRcode(_, _, rcode)) => DnsHijackResolution::Rcode(rcode),
         Err(TransportError::DnsNoData(_, _) | TransportError::NoResolvedAddress(_, _)) => {
             DnsHijackResolution::NoData
         }
@@ -683,6 +685,7 @@ fn build_dns_hijack_response(
         DnsHijackResolution::NameError => (Vec::new(), 0, DNS_RCODE_NXDOMAIN),
         DnsHijackResolution::NoData => (Vec::new(), 0, DNS_RCODE_NOERROR),
         DnsHijackResolution::ServerFailure => (Vec::new(), 0, DNS_RCODE_SERVFAIL),
+        DnsHijackResolution::Rcode(rcode) => (Vec::new(), 0, u16::from(rcode & 0x0f)),
     };
     let answer_size: usize = match question.qtype {
         DNS_TYPE_A => 16,
@@ -4058,6 +4061,15 @@ pub(super) async fn resolve_freedom_dns_upstreams(
                         .collect::<Result<Vec<_>, _>>()
                         .and_then(ensure_freedom_dns_upstreams);
                 }
+                Some(xray_config::DnsHostTarget::Rcode(rcode)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!(
+                            "DNS upstream hostname is answered with rcode {rcode} by dns.hosts"
+                        ),
+                    )
+                    .into());
+                }
                 Some(xray_config::DnsHostTarget::Domain(alias)) => alias,
                 None => domain.clone(),
             };
@@ -5030,7 +5042,7 @@ mod tests {
     }
 
     #[test]
-    fn dns_hijack_response_maps_nxdomain_nodata_and_servfail() {
+    fn dns_hijack_response_maps_nxdomain_nodata_servfail_and_hosts_rcode() {
         let query = dns_aaaa_query(0x4007, "errors.example");
         let question = dns_hijack_question(&query).unwrap();
         let cases = [
@@ -5048,6 +5060,14 @@ mod tests {
             (
                 Err(TransportError::NeedsDns(question.domain.clone())),
                 DNS_RCODE_SERVFAIL,
+            ),
+            (
+                Err(TransportError::DnsRcode(
+                    question.domain.clone(),
+                    DNS_PORT,
+                    5,
+                )),
+                DNS_RCODE_REFUSED,
             ),
         ];
 
@@ -6154,7 +6174,7 @@ mod tests {
         };
         FakeIpMapper::from_config(
             &config,
-            ConfigDnsQueryStrategy::UseIp,
+            xray_config::DnsQueryStrategy::UseIp,
             &[TUN_DNS_ANCHOR, TUN_CLIENT_IPV4],
         )
         .unwrap()
@@ -6369,7 +6389,10 @@ mod tests {
                     timeout_ms: 0,
                     skip_fallback: true,
                     query_strategy: xray_config::DnsQueryStrategy::UseIpv6,
+                    check_system_routes: false,
                     final_query: true,
+                    client_ip: None,
+                    policy_key: xray_config::DEFAULT_DNS_POLICY_KEY.to_owned(),
                 })),
                 DnsServerConfig::Ip(first),
                 DnsServerConfig::Ip(first),

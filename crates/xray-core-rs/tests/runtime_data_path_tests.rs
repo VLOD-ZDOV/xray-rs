@@ -76,14 +76,28 @@ mod tun_admission;
 
 #[path = "runtime_data_path_tests/blackhole.rs"]
 mod blackhole;
+#[path = "runtime_data_path_tests/dns_use_system.rs"]
+mod dns_use_system;
 #[path = "runtime_data_path_tests/freedom_domain_strategy.rs"]
 mod freedom_domain_strategy;
+#[path = "runtime_data_path_tests/freedom_noises.rs"]
+mod freedom_noises;
 #[path = "runtime_data_path_tests/freedom_settings.rs"]
 mod freedom_settings;
+#[path = "runtime_data_path_tests/http_inbound.rs"]
+mod http_inbound;
+#[path = "runtime_data_path_tests/loopback_outbound.rs"]
+mod loopback_outbound;
+#[path = "runtime_data_path_tests/routing_attributes.rs"]
+mod routing_attributes;
 #[path = "runtime_data_path_tests/routing_origin.rs"]
 mod routing_origin;
+#[path = "runtime_data_path_tests/routing_protocol.rs"]
+mod routing_protocol;
 #[path = "runtime_data_path_tests/socks_inbound_udp.rs"]
 mod socks_inbound_udp;
+#[path = "runtime_data_path_tests/socks_inbound_wire.rs"]
+mod socks_inbound_wire;
 #[path = "runtime_data_path_tests/socks_outbound.rs"]
 mod socks_outbound;
 
@@ -209,7 +223,10 @@ fn tagged_dns_server_with_transport(
         timeout_ms: 0,
         skip_fallback: false,
         query_strategy: DnsQueryStrategy::UseIp,
+        check_system_routes: false,
         final_query: false,
+        client_ip: None,
+        policy_key: xray_config::DEFAULT_DNS_POLICY_KEY.to_owned(),
     }))
 }
 
@@ -459,6 +476,17 @@ fn runtime_socks_config_with_level_0_policy(policy: PolicyLevelConfig) -> CoreCo
     config
 }
 
+/// Fake IP allocation starts at a random point of the pool, so a test can
+/// only expect an address inside the 198.18.0.0/15 pool its config sets.
+fn assert_in_fake_ip_pool(ip: Ipv4Addr) {
+    const POOL_HOST_BITS: u32 = 32 - 15;
+    assert_eq!(
+        u32::from(ip) >> POOL_HOST_BITS,
+        u32::from(Ipv4Addr::new(198, 18, 0, 0)) >> POOL_HOST_BITS,
+        "{ip} is outside the 198.18.0.0/15 fake IP pool"
+    );
+}
+
 fn runtime_tun_config_with_freedom_outbound() -> CoreConfig {
     CoreConfig {
         inbounds: vec![InboundConfig {
@@ -486,6 +514,8 @@ fn runtime_tun_config_with_dns_outbound(
     let mut config = runtime_tun_config_with_freedom_outbound();
     config.outbounds.insert(0, dns_outbound(settings));
     config.routing.rules = vec![RoutingRule {
+        attributes: None,
+        protocols: None,
         origin: Default::default(),
         inbound_tags: vec!["tun-in".to_owned()],
         networks: Some(networks),
@@ -518,6 +548,8 @@ fn runtime_listener_config_with_dns_outbound(
         default_outbound_tag: Some("direct".to_owned()),
         routing: RoutingConfig {
             rules: vec![RoutingRule {
+                attributes: None,
+                protocols: None,
                 origin: Default::default(),
                 inbound_tags: vec![inbound_tag.to_owned()],
                 networks: Some(networks),
@@ -557,6 +589,8 @@ fn runtime_tun_config_with_routed_freedom_outbound(unused_proxy_port: u16) -> Co
         default_outbound_tag: Some("proxy".to_owned()),
         routing: RoutingConfig {
             rules: vec![RoutingRule {
+                attributes: None,
+                protocols: None,
                 origin: Default::default(),
                 inbound_tags: vec!["tun-in".to_owned()],
                 networks: None,
@@ -684,6 +718,8 @@ fn runtime_tun_dns_proxy_config_routing_second_upstream_to_freedom(
     config.outbounds.push(freedom_outbound());
     let prefix = if second.is_ipv4() { 32 } else { 128 };
     config.routing.rules = vec![RoutingRule {
+        attributes: None,
+        protocols: None,
         origin: Default::default(),
         inbound_tags: vec!["dns-route".to_owned()],
         networks: None,
@@ -886,6 +922,8 @@ fn runtime_config_with_routed_freedom_outbound(unused_proxy_port: u16) -> CoreCo
         default_outbound_tag: Some("proxy".to_owned()),
         routing: RoutingConfig {
             rules: vec![RoutingRule {
+                attributes: None,
+                protocols: None,
                 origin: Default::default(),
                 inbound_tags: vec!["socks-in".to_owned()],
                 networks: None,
@@ -925,6 +963,8 @@ fn runtime_config_with_domain_routed_freedom_outbound(unused_proxy_port: u16) ->
         default_outbound_tag: Some("proxy".to_owned()),
         routing: RoutingConfig {
             rules: vec![RoutingRule {
+                attributes: None,
+                protocols: None,
                 origin: Default::default(),
                 inbound_tags: Vec::new(),
                 networks: None,
@@ -996,6 +1036,8 @@ fn runtime_config_with_ip_routed_freedom_outbound(unused_proxy_port: u16) -> Cor
         default_outbound_tag: Some("proxy".to_owned()),
         routing: RoutingConfig {
             rules: vec![RoutingRule {
+                attributes: None,
+                protocols: None,
                 origin: Default::default(),
                 inbound_tags: Vec::new(),
                 networks: None,
@@ -1041,6 +1083,8 @@ fn runtime_config_with_ip_if_non_match_routed_freedom_outbound(
         default_outbound_tag: Some("proxy".to_owned()),
         routing: RoutingConfig {
             rules: vec![RoutingRule {
+                attributes: None,
+                protocols: None,
                 origin: Default::default(),
                 inbound_tags: Vec::new(),
                 networks: None,
@@ -1089,7 +1133,7 @@ fn runtime_http_config_with_vless_server(vless_addr: SocketAddr) -> CoreConfig {
     CoreConfig {
         inbounds: vec![InboundConfig {
             tag: Some("http-in".to_owned()),
-            protocol: InboundProtocol::Http,
+            protocol: InboundProtocol::Http(Default::default()),
             listen: "127.0.0.1".to_owned(),
             port: 0,
             allow_unauthenticated_lan: false,
@@ -2063,7 +2107,7 @@ async fn http_tcp_connection_is_visible_and_host_close_cancels_the_relay() {
     timeout(Duration::from_secs(2), async {
         let (echo_addr, echo_handle) = spawn_echo_server().await;
         let mut config = runtime_config_with_freedom_outbound();
-        config.inbounds[0].protocol = InboundProtocol::Http;
+        config.inbounds[0].protocol = InboundProtocol::Http(Default::default());
         config.inbounds[0].tag = Some("http-in".to_owned());
         let mut core = Core::new(config).unwrap();
         core.start().await.unwrap();
@@ -2072,6 +2116,9 @@ async fn http_tcp_connection_is_visible_and_host_close_cancels_the_relay() {
             .await
             .unwrap();
         http_connect(&mut client, echo_addr).await;
+        // As in Xray-core, the 200 comes before routing, so the tunnel is
+        // open once bytes come back through it.
+        assert_echoes(&mut client, b"open").await;
         let snapshot = core.connection_snapshot();
         assert_eq!(snapshot.connections.len(), 1);
         assert_eq!(snapshot.connections[0].state, ConnectionState::Active);
@@ -3149,6 +3196,26 @@ async fn tun_dns_hijack_udp_uses_a_only_matched_policy_and_cache() {
 }
 
 #[tokio::test]
+async fn tun_dns_hijack_races_servers_by_policy_group_in_parallel() {
+    timeout(
+        Duration::from_secs(4),
+        run_tun_dns_hijack_parallel_query_scenario(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn tun_dns_hijack_sends_each_servers_client_subnet() {
+    timeout(
+        Duration::from_secs(2),
+        run_tun_dns_hijack_client_subnet_scenario(),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn tun_dns_proxy_udp_adapts_to_local_tcp_upstream_without_routing() {
     timeout(
         Duration::from_secs(2),
@@ -4046,7 +4113,7 @@ async fn run_socks_inbound_mixed_scenario() {
         &format!("CONNECT {echo_addr} HTTP/1.1\r\nHost: {echo_addr}\r\n\r\n"),
     )
     .await;
-    assert_eq!(head, "HTTP/1.1 200 Connection Established\r\n\r\n");
+    assert_eq!(head, "HTTP/1.1 200 Connection established\r\n\r\n");
     assert_echoes(&mut client, b"hello http on socks").await;
     drop(client);
     timeout(Duration::from_secs(1), echo_handle)
@@ -4054,12 +4121,9 @@ async fn run_socks_inbound_mixed_scenario() {
         .unwrap()
         .unwrap();
 
-    // Plain HTTP forwarding stays unsupported, as on the HTTP inbound.
-    let (_, head) = http_proxy_head(
-        socks_addr,
-        "GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\n\r\n",
-    )
-    .await;
+    // A request that names no host gets Xray-core's 400.
+    let (_, head) =
+        http_proxy_head(socks_addr, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n").await;
     assert!(head.starts_with("HTTP/1.1 400 Bad Request\r\n"), "{head}");
     core.stop().await.unwrap();
 }
@@ -4102,7 +4166,7 @@ async fn run_password_socks_inbound_mixed_scenario() {
         ),
     )
     .await;
-    assert_eq!(head, "HTTP/1.1 200 Connection Established\r\n\r\n");
+    assert_eq!(head, "HTTP/1.1 200 Connection established\r\n\r\n");
     assert_echoes(&mut client, b"hello basic auth").await;
     drop(client);
     core.stop().await.unwrap();
@@ -4122,9 +4186,10 @@ async fn run_socks_password_freedom_echo_scenario() {
     let socks_addr = core.inbound_addr(Some("socks-in")).unwrap();
 
     let mut rejected = TcpStream::connect(socks_addr).await.unwrap();
+    // Xray-core refuses a login with status 0xFF.
     assert_eq!(
         socks5_password_login(&mut rejected, b"synthetic-user", b"wrong-pass").await,
-        1
+        0xff
     );
     let mut byte = [0; 1];
     assert_eq!(rejected.read(&mut byte).await.unwrap(), 0);
@@ -4290,7 +4355,16 @@ async fn run_socks_policy_conn_idle_timeout_scenario() {
 
 async fn run_socks_policy_vless_user_level_conn_idle_scenario() {
     let (echo_addr, echo_handle) = spawn_echo_server().await;
-    let (vless_addr, vless_handle) = spawn_fake_vless_server().await;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let vless_addr = listener.local_addr().unwrap();
+    // The tunnel idles out before any payload, so, as in Xray-core, the held
+    // VLESS header is never sent.
+    let vless_handle = tokio::spawn(async move {
+        let (mut inbound, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        inbound.read_to_end(&mut received).await.unwrap();
+        assert!(received.is_empty());
+    });
     let mut config = runtime_socks_config_with_vless_server_user_level(vless_addr, 8);
     config.policy = PolicyConfig {
         levels: BTreeMap::from([(
@@ -4323,10 +4397,7 @@ async fn run_socks_policy_vless_user_level_conn_idle_scenario() {
         .await
         .unwrap()
         .unwrap();
-    timeout(Duration::from_secs(1), echo_handle)
-        .await
-        .unwrap()
-        .unwrap();
+    echo_handle.abort();
 }
 
 async fn run_socks_udp_freedom_echo_scenario() {
@@ -5441,7 +5512,7 @@ async fn run_tun_fake_dns_udp_domain_routing_scenario() {
     let fake_ip = ipv4_udp_payload(&dns_reply)
         .and_then(dns_response_answer_ipv4)
         .unwrap();
-    assert_eq!(fake_ip, Ipv4Addr::new(198, 18, 0, 3));
+    assert_in_fake_ip_pool(fake_ip);
 
     let request = ipv4_udp_packet(
         client_addr,
@@ -5492,6 +5563,8 @@ async fn run_tun_fake_dns_static_only_udp_freedom_scenario() {
     config.default_outbound_tag = Some("proxy".to_owned());
     config.routing.rules = vec![
         RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: vec!["dns-route".to_owned()],
             networks: None,
@@ -5502,6 +5575,8 @@ async fn run_tun_fake_dns_static_only_udp_freedom_scenario() {
             local_os: Vec::new(),
         },
         RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: Vec::new(),
             networks: None,
@@ -6494,7 +6569,7 @@ async fn run_http_dns_outbound_direct_udp_scenario() {
         ..DnsOutboundSettings::default()
     };
     let config = runtime_listener_config_with_dns_outbound(
-        InboundProtocol::Http,
+        InboundProtocol::Http(Default::default()),
         "http-in",
         settings,
         vec![Network::Tcp],
@@ -6581,7 +6656,7 @@ async fn run_core_wide_fake_dns_socks_to_http_scenario() {
     );
     config.inbounds.push(InboundConfig {
         tag: Some("http-in".to_owned()),
-        protocol: InboundProtocol::Http,
+        protocol: InboundProtocol::Http(Default::default()),
         listen: "127.0.0.1".to_owned(),
         port: 0,
         allow_unauthenticated_lan: false,
@@ -6589,6 +6664,8 @@ async fn run_core_wide_fake_dns_socks_to_http_scenario() {
         user_level: None,
     });
     config.routing.rules.push(RoutingRule {
+        attributes: None,
+        protocols: None,
         origin: Default::default(),
         inbound_tags: vec!["http-in".to_owned()],
         networks: Some(vec![Network::Tcp]),
@@ -6599,6 +6676,8 @@ async fn run_core_wide_fake_dns_socks_to_http_scenario() {
         local_os: Vec::new(),
     });
     config.routing.rules.push(RoutingRule {
+        attributes: None,
+        protocols: None,
         origin: Default::default(),
         inbound_tags: vec!["socks-in".to_owned()],
         networks: Some(vec![Network::Udp]),
@@ -6711,6 +6790,8 @@ async fn run_tun_dns_outbound_fake_ip_domain_scenario(strategy: RoutingDomainStr
     let mut config = runtime_tun_config_with_freedom_outbound();
     config.outbounds.insert(0, dns_outbound(settings));
     config.routing.rules = vec![RoutingRule {
+        attributes: None,
+        protocols: None,
         origin: Default::default(),
         inbound_tags: vec!["tun-in".to_owned()],
         networks: Some(vec![Network::Udp]),
@@ -6789,6 +6870,8 @@ async fn run_tun_dns_outbound_tcp_fake_ip_domain_scenario(strategy: RoutingDomai
     let mut config = runtime_tun_config_with_freedom_outbound();
     config.outbounds.insert(0, dns_outbound(settings));
     config.routing.rules = vec![RoutingRule {
+        attributes: None,
+        protocols: None,
         origin: Default::default(),
         inbound_tags: vec!["tun-in".to_owned()],
         networks: Some(vec![Network::Tcp]),
@@ -6906,7 +6989,10 @@ async fn run_tun_dns_hijack_udp_matched_policy_scenario() {
             timeout_ms: 0,
             skip_fallback: false,
             query_strategy: DnsQueryStrategy::UseIp,
+            check_system_routes: false,
             final_query: false,
+            client_ip: None,
+            policy_key: xray_config::DEFAULT_DNS_POLICY_KEY.to_owned(),
         })),
     ];
     let mut core = Core::new(config).unwrap();
@@ -6946,6 +7032,174 @@ async fn run_tun_dns_hijack_udp_matched_policy_scenario() {
     core.stop().await.unwrap();
     default.stop().await;
     matched.stop().await;
+}
+
+/// With `enableParallelQuery`, servers sharing a policy key race and the
+/// quicker answer wins, while a server whose key differs settles first as an
+/// earlier group, however slow.
+async fn run_tun_dns_hijack_parallel_query_scenario() {
+    let slow_answer = Ipv4Addr::new(192, 0, 2, 30);
+    let fast_answer = Ipv4Addr::new(192, 0, 2, 31);
+    for (slow_key, expected) in [
+        (xray_config::DEFAULT_DNS_POLICY_KEY, fast_answer),
+        (
+            "client=none|skip=0|qs=|tag=first|domains=[]|expected=[]|expect=[]|unexpected=[]|",
+            slow_answer,
+        ),
+    ] {
+        let slow =
+            spawn_observed_udp_dns_a_server_with_delay(slow_answer, Duration::from_millis(400))
+                .await;
+        let fast = spawn_observed_udp_dns_a_server(fast_answer).await;
+        let mut config = runtime_tun_config_with_freedom_outbound();
+        config.dns.enable_parallel_query = true;
+        config.dns.servers = vec![
+            DnsServerConfig::Policy(Box::new(DnsNameServerConfig {
+                endpoint: DnsServerEndpoint::Ip(slow.addr()),
+                transport: xray_config::DnsServerTransport::Classic,
+                https_path: None,
+                domains: Default::default(),
+                expected_ips: Default::default(),
+                unexpected_ips: Default::default(),
+                tag: String::new(),
+                timeout_ms: 0,
+                skip_fallback: false,
+                query_strategy: DnsQueryStrategy::UseIp,
+                check_system_routes: false,
+                final_query: false,
+                client_ip: None,
+                policy_key: slow_key.to_owned(),
+            })),
+            DnsServerConfig::Ip(fast.addr()),
+        ];
+        let mut core = Core::new(config).unwrap();
+        core.start().await.unwrap();
+
+        let client_addr = Ipv4Addr::new(10, 10, 0, 2);
+        let anchor = Ipv4Addr::new(198, 18, 0, 1);
+        let transaction_id = 0x2261;
+        let query = build_dns_a_query(transaction_id, "parallel.example");
+        core.tun()
+            .push_inbound(Bytes::from(ipv4_udp_packet(
+                client_addr,
+                53_061,
+                anchor,
+                53,
+                &query,
+            )))
+            .await
+            .unwrap();
+        poll_tun_outbound_until(core.tun(), |packet| {
+            ipv4_udp_payload(packet).is_some_and(|payload| {
+                payload.get(0..2) == Some(&transaction_id.to_be_bytes())
+                    && dns_response_answer_ipv4(payload) == Some(expected)
+            })
+        })
+        .await;
+        // Both were asked, at once.
+        assert_eq!(slow.probe().snapshot().len(), 1);
+        assert_eq!(fast.probe().snapshot().len(), 1);
+
+        core.stop().await.unwrap();
+        slow.stop().await;
+        fast.stop().await;
+    }
+}
+
+/// `dns.clientIp` goes to every server without its own, and a server's own
+/// replaces it, as the EDNS client subnet of each query.
+async fn run_tun_dns_hijack_client_subnet_scenario() {
+    let default = spawn_observed_udp_dns_a_server(Ipv4Addr::new(192, 0, 2, 20)).await;
+    let own = spawn_observed_udp_dns_a_server(Ipv4Addr::new(192, 0, 2, 21)).await;
+    let (default_probe, own_probe) = (default.probe(), own.probe());
+    let matched = "own-subnet.example";
+    let mut config = runtime_tun_config_with_freedom_outbound();
+    config.dns.client_ip = Some(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77)));
+    config.dns.servers = vec![
+        DnsServerConfig::Policy(Box::new(DnsNameServerConfig {
+            endpoint: DnsServerEndpoint::Ip(own.addr()),
+            transport: xray_config::DnsServerTransport::Classic,
+            https_path: None,
+            domains: compile_dns_domain_matchers(&[DomainMatcher::Full(matched.to_owned())])
+                .unwrap(),
+            expected_ips: Default::default(),
+            unexpected_ips: Default::default(),
+            tag: String::new(),
+            timeout_ms: 0,
+            skip_fallback: true,
+            query_strategy: DnsQueryStrategy::UseIp,
+            check_system_routes: false,
+            final_query: false,
+            client_ip: Some("2001:db8::1".parse().unwrap()),
+            policy_key: xray_config::DEFAULT_DNS_POLICY_KEY.to_owned(),
+        })),
+        DnsServerConfig::Ip(default.addr()),
+    ];
+    let mut core = Core::new(config).unwrap();
+    core.start().await.unwrap();
+
+    let client_addr = Ipv4Addr::new(10, 10, 0, 2);
+    let anchor = Ipv4Addr::new(198, 18, 0, 1);
+    for (transaction_id, client_port, domain, answer) in [
+        (0x2251, 53_051, matched, Ipv4Addr::new(192, 0, 2, 21)),
+        (
+            0x2252,
+            53_052,
+            "other-subnet.example",
+            Ipv4Addr::new(192, 0, 2, 20),
+        ),
+    ] {
+        let query = build_dns_a_query(transaction_id, domain);
+        core.tun()
+            .push_inbound(Bytes::from(ipv4_udp_packet(
+                client_addr,
+                client_port,
+                anchor,
+                53,
+                &query,
+            )))
+            .await
+            .unwrap();
+        poll_tun_outbound_until(core.tun(), |packet| {
+            ipv4_udp_payload(packet).is_some_and(|payload| {
+                payload.get(0..2) == Some(&transaction_id.to_be_bytes())
+                    && dns_response_answer_ipv4(payload) == Some(answer)
+            })
+        })
+        .await;
+    }
+
+    // Root name, OPT, a 1350-byte payload size, Xray-core's TTL with the DO
+    // bit, and the client subnet cut to /96 or /24.
+    let own_record = [
+        &[
+            0, 0, 41, 5, 70, 0xE0, 0, 0x80, 0, 0, 20, 0, 8, 0, 16, 0, 2, 96, 0,
+        ][..],
+        &[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0],
+    ]
+    .concat();
+    let global_record = [
+        0, 0, 41, 5, 70, 0xE0, 0, 0x80, 0, 0, 11, 0, 8, 0, 7, 0, 1, 24, 0, 203, 0, 113,
+    ];
+    for (probe, record) in [
+        (own_probe, own_record.as_slice()),
+        (default_probe, &global_record[..]),
+    ] {
+        let queries = probe.snapshot();
+        assert_eq!(queries.len(), 1);
+        let query = &queries[0];
+        let question = dns_query_question(query);
+        assert_eq!(
+            &query[10..12],
+            &1_u16.to_be_bytes(),
+            "one additional record"
+        );
+        assert_eq!(&query[question.len()..], record);
+    }
+
+    core.stop().await.unwrap();
+    default.stop().await;
+    own.stop().await;
 }
 
 async fn run_tun_dns_proxy_udp_scenario() {
@@ -7889,6 +8143,8 @@ async fn run_tun_dns_proxy_udp_static_ip_skip_routing_scenario(strategy: Routing
     ));
     config.routing.domain_strategy = RoutingDomainStrategy::IpIfNonMatch;
     config.routing.rules = vec![RoutingRule {
+        attributes: None,
+        protocols: None,
         origin: Default::default(),
         inbound_tags: vec!["dns-route".to_owned()],
         networks: None,
@@ -7961,6 +8217,8 @@ async fn run_tun_dns_proxy_udp_dynamic_ip_skip_routing_scenario(strategy: Routin
     ));
     config.routing.domain_strategy = RoutingDomainStrategy::IpIfNonMatch;
     config.routing.rules = vec![RoutingRule {
+        attributes: None,
+        protocols: None,
         origin: Default::default(),
         inbound_tags: vec!["dns-route".to_owned()],
         networks: None,
@@ -8297,7 +8555,10 @@ async fn run_tun_dns_hijack_tcp_mixed_pipeline_scenario() {
             timeout_ms: 0,
             skip_fallback: false,
             query_strategy: DnsQueryStrategy::UseIp,
+            check_system_routes: false,
             final_query: false,
+            client_ip: None,
+            policy_key: xray_config::DEFAULT_DNS_POLICY_KEY.to_owned(),
         })),
         DnsServerConfig::Ip(raw_server.addr()),
     ];
@@ -8729,6 +8990,8 @@ async fn run_tun_dns_proxy_tcp_partial_response_failover_scenario() {
         tagged_dns_server(DnsServerEndpoint::Ip(fallback.addr()), "dns-vless"),
     ];
     config.routing.rules = vec![RoutingRule {
+        attributes: None,
+        protocols: None,
         origin: Default::default(),
         inbound_tags: vec!["dns-vless".to_owned()],
         networks: None,
@@ -9169,15 +9432,12 @@ async fn run_tun_fake_dns_tcp_scenario(dns_destination: Ipv4Addr) {
     .await;
     let responses = complete_dns_tcp_messages(&received).unwrap();
     assert_eq!(&responses[0][0..2], &0x2301_u16.to_be_bytes());
-    assert_eq!(
-        dns_response_answer_ipv4(&responses[0]),
-        Some(Ipv4Addr::new(198, 18, 0, 3))
-    );
+    let first = dns_response_answer_ipv4(&responses[0]).expect("first fake IP");
+    assert_in_fake_ip_pool(first);
     assert_eq!(&responses[1][0..2], &0x2302_u16.to_be_bytes());
-    assert_eq!(
-        dns_response_answer_ipv4(&responses[1]),
-        Some(Ipv4Addr::new(198, 18, 0, 4))
-    );
+    let second = dns_response_answer_ipv4(&responses[1]).expect("second fake IP");
+    assert_in_fake_ip_pool(second);
+    assert_ne!(first, second, "each name gets its own fake IP");
     assert!(client.is_open());
 
     core.stop().await.unwrap();
@@ -9214,6 +9474,8 @@ async fn run_tun_fake_dns_udp_resolved_ip_routed_freedom_scenario(strategy: Rout
     config.routing.rules.insert(
         0,
         RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: vec!["dns-route".to_owned()],
             networks: None,
@@ -9267,7 +9529,7 @@ async fn run_tun_fake_dns_udp_resolved_ip_routed_freedom_scenario(strategy: Rout
     let fake_ip = ipv4_udp_payload(&dns_reply)
         .and_then(dns_response_answer_ipv4)
         .unwrap();
-    assert_eq!(fake_ip, Ipv4Addr::new(198, 18, 0, 3));
+    assert_in_fake_ip_pool(fake_ip);
 
     let request = ipv4_udp_packet(
         client_addr,
@@ -9907,7 +10169,7 @@ async fn run_http_to_resolved_ip_routed_freedom_echo_scenario(strategy: RoutingD
     };
     let (dns_server, dns_handle) = spawn_udp_dns_a_responder(echo_ip).await;
     let mut config = runtime_config_with_ip_if_non_match_routed_freedom_outbound(
-        InboundProtocol::Http,
+        InboundProtocol::Http(Default::default()),
         "http-in",
         allocate_unused_loopback_port(),
     );
@@ -10042,6 +10304,8 @@ async fn run_domain_target_preservation_scenario(strategy: RoutingDomainStrategy
             DnsHostTarget::Ip("203.0.113.7".parse().unwrap()),
         )]);
         config.routing.rules = vec![RoutingRule {
+            attributes: None,
+            protocols: None,
             origin: Default::default(),
             inbound_tags: Vec::new(),
             networks: None,
@@ -10061,14 +10325,15 @@ async fn run_domain_target_preservation_scenario(strategy: RoutingDomainStrategy
 
     let mut client = TcpStream::connect(socks_addr).await.unwrap();
     socks5_connect_domain(&mut client, "example.com", 443).await;
-
-    drop(client);
-    core.stop().await.unwrap();
-
+    // The VLESS header waits for the first payload, as in Xray-core.
+    client.write_all(b"x").await.unwrap();
     timeout(Duration::from_secs(1), vless_handle)
         .await
         .unwrap()
         .unwrap();
+
+    drop(client);
+    core.stop().await.unwrap();
 }
 
 struct TunTcpClient {
@@ -11662,7 +11927,15 @@ async fn spawn_udp_tcp_dns_a_responder(answer: Ipv4Addr) -> (SocketAddr, JoinHan
     (addr, handle)
 }
 
+/// The query up to the end of its question: a responder answers that, so an
+/// OPT record in the query never lands in front of the answer.
+fn dns_query_question(query: &[u8]) -> &[u8] {
+    let end = dns_test_wire_name_end(query, 12).map_or(query.len(), |end| end + 4);
+    &query[..end.min(query.len())]
+}
+
 fn build_dns_a_response_for_query(query: &[u8], answer: Ipv4Addr) -> Vec<u8> {
+    let query = dns_query_question(query);
     let mut response = Vec::with_capacity(query.len() + 16);
     response.extend_from_slice(&query[..2]);
     response.extend_from_slice(&0x8180_u16.to_be_bytes());
@@ -11699,6 +11972,7 @@ fn build_dns_aaaa_response_for_query(query: &[u8], answer: Ipv6Addr) -> Vec<u8> 
 }
 
 fn build_dns_nodata_response_for_query(query: &[u8]) -> Vec<u8> {
+    let query = dns_query_question(query);
     let mut response = Vec::with_capacity(query.len());
     response.extend_from_slice(&query[..2]);
     response.extend_from_slice(&0x8180_u16.to_be_bytes());
@@ -12353,7 +12627,7 @@ async fn http_connect_authority(client: &mut TcpStream, authority: &str) {
     let response = read_http_response_head(client).await;
     let response = std::str::from_utf8(&response).unwrap();
     assert!(
-        response.starts_with("HTTP/1.1 200 Connection Established\r\n"),
+        response.starts_with("HTTP/1.1 200 Connection established\r\n"),
         "unexpected HTTP CONNECT response: {response:?}"
     );
 }

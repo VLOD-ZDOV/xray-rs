@@ -159,6 +159,22 @@ fn rejects_apple_importer_tls_allow_insecure_fail_closed() {
 }
 
 #[test]
+fn rejects_reality_spider_x_without_leading_slash_like_xray_core() {
+    let raw = include_str!("../../../tests/fixtures/configs/vless_xhttp_reality_importer.json");
+    for spider_x in ["spider", "?p=1", " /spider"] {
+        let raw = raw.replace(r#""/spider""#, &format!("{spider_x:?}"));
+        assert!(raw.contains(&format!("{spider_x:?}")));
+        assert_parse_error_path(
+            &raw,
+            "$.outbounds[0].streamSettings.realitySettings.spiderX",
+        );
+    }
+    // Xray-core reads an empty spiderX as `/`.
+    let empty = raw.replace(r#""/spider""#, r#""""#);
+    parse_xray_json(&empty).expect("empty spiderX should parse");
+}
+
+#[test]
 fn parses_apple_importer_vless_xhttp_reality_fields_and_extra() {
     let raw = include_str!("../../../tests/fixtures/configs/vless_xhttp_reality_importer.json");
     let parsed = parse_xray_json(raw).expect("Apple XHTTP+REALITY config should parse");
@@ -994,10 +1010,6 @@ fn rejects_socks_password_account_limits() {
     };
     for (accounts, path) in [
         (accounts(65), "$.inbounds[0].settings.accounts"),
-        (
-            r#"{ "user": "synthetic-user" }"#.to_owned(),
-            "$.inbounds[0].settings.accounts[0]",
-        ),
         (
             format!(
                 r#"{{ "user": "synthetic-user", "pass": "{}" }}"#,
@@ -2685,7 +2697,10 @@ fn parses_tcp_dns_string_shorthand_as_default_policy() {
             timeout_ms: 0,
             skip_fallback: false,
             query_strategy: DnsQueryStrategy::UseIp,
+            check_system_routes: false,
             final_query: false,
+            client_ip: None,
+            policy_key: xray_config::DEFAULT_DNS_POLICY_KEY.to_owned(),
         }))]
     );
 }
@@ -3150,7 +3165,10 @@ fn parses_xray_dns_server_objects_and_fallback_policy() {
             timeout_ms: 0,
             skip_fallback: false,
             query_strategy: DnsQueryStrategy::UseIp,
+            check_system_routes: false,
             final_query: false,
+            client_ip: None,
+            policy_key: second.policy_key.clone(),
         }
     );
     assert!(second.domains.matches("my-corp-zone.example"));
@@ -3766,8 +3784,10 @@ fn parses_xray_dns_query_strategy_aliases() {
     }
 }
 
+/// `UseSystem` is Xray-core's `UseIP` narrowed per lookup to the families
+/// the system routes, globally or for one server.
 #[test]
-fn rejects_dns_use_system_until_route_capability_is_available() {
+fn dns_use_system_is_use_ip_that_checks_the_system_routes() {
     for strategy in [
         "UseSys",
         "UseSystem",
@@ -3777,16 +3797,43 @@ fn rejects_dns_use_system_until_route_capability_is_available() {
         "use-system",
     ] {
         let raw = raw_with_dns_query_strategy(&format!(r#""{strategy}""#));
-        let error = parse_xray_json(&raw).unwrap_err();
-
-        assert_eq!(
-            error.diagnostics[0].path.as_deref(),
-            Some("$.dns.queryStrategy")
-        );
-        assert!(error.diagnostics[0]
-            .message
-            .contains("requires platform route capability"));
+        let parsed = parse_xray_json(&raw).expect("UseSystem should parse");
+        assert_eq!(parsed.config.dns.query_strategy, DnsQueryStrategy::UseIp);
+        assert!(parsed.config.dns.check_system_routes, "{strategy}");
     }
+    let raw = raw_with_dns_query_strategy(r#""UseIPv4""#);
+    assert!(
+        !parse_xray_json(&raw)
+            .unwrap()
+            .config
+            .dns
+            .check_system_routes
+    );
+
+    let raw = r#"{
+        "dns": {"queryStrategy": "UseIPv4", "servers": [
+            {"address": "192.0.2.53", "queryStrategy": "UseSystem"},
+            {"address": "192.0.2.54", "queryStrategy": "UseIP"},
+            "192.0.2.55"
+        ]},
+        "outbounds": [{"tag": "direct", "protocol": "freedom"}]
+    }"#;
+    let parsed = parse_xray_json(raw).expect("a server's UseSystem should parse");
+    let servers = &parsed.config.dns.servers;
+    assert!(!parsed.config.dns.check_system_routes);
+    assert_eq!(
+        servers
+            .iter()
+            .map(|server| (server.query_strategy(), server.check_system_routes()))
+            .collect::<Vec<_>>(),
+        [
+            (DnsQueryStrategy::UseIp, true),
+            (DnsQueryStrategy::UseIp, false),
+            (DnsQueryStrategy::UseIp, false),
+        ]
+    );
+    // Xray-core's policy id reads the spelling as written.
+    assert!(servers[0].policy_key().contains("|qs=usesystem|"));
 }
 
 #[test]
@@ -5701,6 +5748,10 @@ fn finalmask_quic_params_full_v26_surface_is_normalized() {
             udp_hop: QuicUdpHopSettings {
                 ports: vec![443, 1000, 1001, 1002, 443],
                 interval: QuicIntervalRange { from: 10, to: 30 },
+                // The legacy spelling hops both, as the mask's two modes do.
+                local: true,
+                remote: true,
+                ..QuicUdpHopSettings::default()
             },
             init_stream_receive_window: 16_384,
             max_stream_receive_window: 32_768,
@@ -7327,4 +7378,121 @@ fn mixed_is_xrays_alias_of_the_socks_inbound() {
             udp: false,
         })
     );
+}
+
+/// The accounts a SOCKS inbound with these settings admits, as
+/// `(user, pass)` pairs.
+fn socks_accounts(settings: &str) -> Vec<(String, String)> {
+    let parsed = parse_xray_json(&raw_with_socks_settings(settings))
+        .unwrap_or_else(|error| panic!("{settings}: {:?}", error.diagnostics));
+    let InboundProtocol::Socks(socks) = &parsed.config.inbounds[0].protocol else {
+        panic!("expected a socks inbound");
+    };
+    let SocksInboundAuth::Password(accounts) = &socks.auth else {
+        return Vec::new();
+    };
+    accounts
+        .iter()
+        .map(|account| {
+            (
+                String::from_utf8(account.user().to_vec()).unwrap(),
+                String::from_utf8(account.pass().to_vec()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(user, pass)| ((*user).to_owned(), (*pass).to_owned()))
+        .collect()
+}
+
+#[test]
+fn socks_accounts_read_as_xray_core_reads_them() {
+    // `users` is Xray-core's other name, replaced by a non-null `accounts`.
+    assert_eq!(
+        socks_accounts(r#""auth": "password", "users": [{"user": "a", "pass": "1"}]"#),
+        pairs(&[("a", "1")])
+    );
+    assert_eq!(
+        socks_accounts(
+            r#""auth": "password", "accounts": null, "users": [{"user": "a", "pass": "1"}]"#
+        ),
+        pairs(&[("a", "1")])
+    );
+    assert_eq!(
+        socks_accounts(
+            r#""auth": "password", "accounts": [{"user": "b", "pass": "2"}],
+                "users": [{"user": "a", "pass": "1"}, null]"#
+        ),
+        pairs(&[("b", "2")])
+    );
+    // A later account of the same name wins, as in Xray-core's map.
+    assert_eq!(
+        socks_accounts(
+            r#""auth": "password", "accounts": [{"user": "a", "pass": "1"},
+                {"user": "b", "pass": "2"}, {"user": "a", "pass": "3"}]"#
+        ),
+        pairs(&[("a", "3"), ("b", "2")])
+    );
+    // Absent or null credentials read as empty.
+    assert_eq!(
+        socks_accounts(r#""auth": "password", "accounts": [{"user": "a"}, {"pass": null}]"#),
+        pairs(&[("a", ""), ("", "")])
+    );
+    // An absent or null `auth` is noauth, as are null settings.
+    for settings in [r#""auth": null"#, r#""auth": """#, ""] {
+        assert_eq!(socks_accounts(settings), pairs(&[]), "{settings}");
+    }
+    let parsed = parse_xray_json(&raw_with_inbound_extra(r#""settings": null"#)).unwrap();
+    let InboundProtocol::Socks(socks) = &parsed.config.inbounds[0].protocol else {
+        panic!("expected a socks inbound");
+    };
+    assert_eq!(socks.auth, SocksInboundAuth::NoAuth);
+    assert!(socks.udp);
+    // A null `udp` keeps UDP enabled, as an absent one does.
+    let parsed = parse_xray_json(&raw_with_socks_settings(r#""udp": null"#)).unwrap();
+    let InboundProtocol::Socks(socks) = &parsed.config.inbounds[0].protocol else {
+        panic!("expected a socks inbound");
+    };
+    assert!(socks.udp);
+}
+
+#[test]
+fn socks_accounts_reject_what_the_parser_refuses() {
+    let base = "$.inbounds[0].settings";
+    for (settings, path) in [
+        // As with `accounts`, `users` under noauth would be ignored.
+        (
+            r#""auth": "noauth", "users": [{"user": "a", "pass": "1"}]"#,
+            format!("{base}.users"),
+        ),
+        (
+            r#""auth": "password", "users": []"#,
+            format!("{base}.users"),
+        ),
+        (
+            r#""auth": "password", "users": null"#,
+            format!("{base}.accounts"),
+        ),
+        (
+            r#""auth": "password", "users": "a""#,
+            format!("{base}.users"),
+        ),
+        // Xray-core panics on a null entry in the list it uses.
+        (
+            r#""auth": "password", "users": [null]"#,
+            format!("{base}.users[0]"),
+        ),
+        (
+            r#""auth": "password", "accounts": [{"user": 1, "pass": "1"}]"#,
+            format!("{base}.accounts[0].user"),
+        ),
+        (r#""auth": "Password""#, format!("{base}.auth")),
+        (r#""udp": "yes""#, format!("{base}.udp")),
+    ] {
+        assert_parse_error_path(&raw_with_socks_settings(settings), &path);
+    }
 }

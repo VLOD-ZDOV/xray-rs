@@ -1,6 +1,9 @@
 //! DNS selection, static hosts, fake IP and DNS outbound configuration.
 use super::*;
 
+/// DNS RCODE values that fit the 4-bit header field without an EDNS OPT record.
+const MAX_DNS_HOST_RCODE: u8 = 15;
+
 fn is_special_dns_server(address: &str) -> bool {
     address.eq_ignore_ascii_case("localhost") || address.eq_ignore_ascii_case("fakedns")
 }
@@ -262,6 +265,20 @@ pub(super) fn parse_dns_tcp_server_port(port: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+/// A field read as Go reads Xray-core's `StringList`, for the policy key only:
+/// an array of strings, `null` entries empty; one string split at commas; or
+/// nothing. The field's own parser reports what it refuses.
+fn go_string_list(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(text)) => text.split(',').map(str::to_owned).collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| item.as_str().unwrap_or_default().to_owned())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub(super) fn dns_stream_server_policy(
     transport: DnsServerTransport,
     endpoint: DnsServerEndpoint,
@@ -278,7 +295,10 @@ pub(super) fn dns_stream_server_policy(
         timeout_ms: 0,
         skip_fallback: false,
         query_strategy: DnsQueryStrategy::UseIp,
+        check_system_routes: false,
         final_query: false,
+        client_ip: None,
+        policy_key: crate::DEFAULT_DNS_POLICY_KEY.to_owned(),
     }))
 }
 
@@ -327,7 +347,7 @@ impl Parser<'_> {
         }
 
         self.reject_unknown_fields(dns, dns_path, &surface::DNS);
-        let query_strategy = self.parse_dns_query_strategy(dns);
+        let (query_strategy, check_system_routes) = self.parse_dns_query_strategy(dns);
         let disable_cache = self
             .optional_bool_at(dns, "disableCache", "$.dns.disableCache".to_owned())
             .unwrap_or(false);
@@ -366,6 +386,7 @@ impl Parser<'_> {
                 .unwrap_or_default()
                 .to_owned(),
             query_strategy,
+            check_system_routes,
             disable_cache,
             serve_stale,
             serve_expired_ttl,
@@ -379,47 +400,80 @@ impl Parser<'_> {
                     "$.dns.disableFallbackIfMatch".to_owned(),
                 )
                 .unwrap_or(false),
+            client_ip: self.parse_dns_client_ip(dns.get("clientIp"), "$.dns.clientIp"),
+            // Go reads a JSON null into a bool as false.
+            enable_parallel_query: match dns.get("enableParallelQuery") {
+                None | Some(Value::Null) => false,
+                Some(_) => self
+                    .optional_bool_at(
+                        dns,
+                        "enableParallelQuery",
+                        "$.dns.enableParallelQuery".to_owned(),
+                    )
+                    .unwrap_or(false),
+            },
         }
     }
 
-    pub(super) fn parse_dns_query_strategy(&mut self, dns: &Value) -> DnsQueryStrategy {
+    /// Xray-core's `clientIp`: an IP address, read as Xray-core reads an
+    /// address, that servers send as the EDNS client subnet. `null` or absent
+    /// is none, and a domain fails, as in Xray-core.
+    fn parse_dns_client_ip(&mut self, raw: Option<&Value>, path: &str) -> Option<IpAddr> {
+        match raw? {
+            Value::Null => None,
+            Value::String(text) => match parse_xray_ip_address(text) {
+                Some(ip) => Some(ip.to_canonical()),
+                None => {
+                    self.error(path, format!("dns clientIp `{text}` is not an IP address"));
+                    None
+                }
+            },
+            _ => {
+                self.error(path, "dns clientIp must be a string");
+                None
+            }
+        }
+    }
+
+    /// The global `queryStrategy`, and whether it is `UseSystem`.
+    pub(super) fn parse_dns_query_strategy(&mut self, dns: &Value) -> (DnsQueryStrategy, bool) {
         self.parse_dns_query_strategy_at(dns.get("queryStrategy"), "$.dns.queryStrategy")
     }
 
+    /// A `queryStrategy` and whether it is `UseSystem`, which Xray-core reads
+    /// as `UseIP` narrowed per lookup to the families the system has a route
+    /// for.
     pub(super) fn parse_dns_query_strategy_at(
         &mut self,
         raw_strategy: Option<&Value>,
         path: &str,
-    ) -> DnsQueryStrategy {
+    ) -> (DnsQueryStrategy, bool) {
         let Some(raw_strategy) = raw_strategy else {
-            return DnsQueryStrategy::default();
+            return (DnsQueryStrategy::default(), false);
         };
         let Some(strategy) = raw_strategy.as_str() else {
             self.error(path, "dns queryStrategy must be a string");
-            return DnsQueryStrategy::default();
+            return (DnsQueryStrategy::default(), false);
         };
 
+        let strategy_for = |strategy| (strategy, false);
         match strategy.to_ascii_lowercase().as_str() {
-            "useip" | "use_ip" | "use-ip" => DnsQueryStrategy::UseIp,
+            "useip" | "use_ip" | "use-ip" => strategy_for(DnsQueryStrategy::UseIp),
             "useip4" | "useipv4" | "use_ip4" | "use_ipv4" | "use_ip_v4" | "use-ip4"
-            | "use-ipv4" | "use-ip-v4" => DnsQueryStrategy::UseIpv4,
+            | "use-ipv4" | "use-ip-v4" => strategy_for(DnsQueryStrategy::UseIpv4),
             "useip6" | "useipv6" | "use_ip6" | "use_ipv6" | "use_ip_v6" | "use-ip6"
-            | "use-ipv6" | "use-ip-v6" => DnsQueryStrategy::UseIpv6,
+            | "use-ipv6" | "use-ip-v6" => strategy_for(DnsQueryStrategy::UseIpv6),
             "usesys" | "usesystem" | "use_sys" | "use_system" | "use-sys" | "use-system" => {
-                self.error(
-                    path,
-                    "dns queryStrategy `UseSystem` requires platform route capability and is not supported",
-                );
-                DnsQueryStrategy::default()
+                (DnsQueryStrategy::UseIp, true)
             }
             _ => {
                 self.error(
                     path,
                     format!(
-                        "unsupported dns queryStrategy `{strategy}`; expected UseIP, UseIPv4, or UseIPv6"
+                        "unsupported dns queryStrategy `{strategy}`; expected UseIP, UseIPv4, UseIPv6, or UseSystem"
                     ),
                 );
-                DnsQueryStrategy::default()
+                (DnsQueryStrategy::default(), false)
             }
         }
     }
@@ -525,7 +579,7 @@ impl Parser<'_> {
             return None;
         }
         let query_strategy_path = format!("{path}.queryStrategy");
-        let query_strategy =
+        let (query_strategy, check_system_routes) =
             self.parse_dns_query_strategy_at(server.get("queryStrategy"), &query_strategy_path);
         if !dns_query_strategies_overlap(global_query_strategy, query_strategy) {
             self.error(
@@ -535,6 +589,16 @@ impl Parser<'_> {
             return None;
         }
 
+        let tag = self
+            .nullable_string_at(server, "tag", format!("{path}.tag"))
+            .unwrap_or_default()
+            .to_owned();
+        let skip_fallback = self
+            .optional_bool_at(server, "skipFallback", format!("{path}.skipFallback"))
+            .unwrap_or(false);
+        let client_ip =
+            self.parse_dns_client_ip(server.get("clientIp"), &format!("{path}.clientIp"));
+        let policy_key = Self::dns_policy_key(server, client_ip, skip_fallback, &tag);
         Some(DnsServerConfig::Policy(Box::new(DnsNameServerConfig {
             endpoint,
             transport,
@@ -542,19 +606,65 @@ impl Parser<'_> {
             domains,
             expected_ips,
             unexpected_ips,
-            tag: self
-                .nullable_string_at(server, "tag", format!("{path}.tag"))
-                .unwrap_or_default()
-                .to_owned(),
+            tag,
             timeout_ms,
-            skip_fallback: self
-                .optional_bool_at(server, "skipFallback", format!("{path}.skipFallback"))
-                .unwrap_or(false),
+            skip_fallback,
             query_strategy,
+            check_system_routes,
             final_query: self
                 .optional_bool_at(server, "finalQuery", format!("{path}.finalQuery"))
                 .unwrap_or(false),
+            client_ip,
+            policy_key,
         })))
+    }
+
+    /// The policy key Xray-core v26.10.31's config builder writes for an
+    /// object server: its own `clientIp`, `skipFallback`, `queryStrategy` and
+    /// `tag` (trimmed and lowercased), then its `domains`, `expectedIPs`,
+    /// `expectIPs` and `unexpectedIPs` as written, each trimmed, lowercased
+    /// and sorted.
+    fn dns_policy_key(
+        server: &Value,
+        client_ip: Option<IpAddr>,
+        skip_fallback: bool,
+        tag: &str,
+    ) -> String {
+        let normalize = |text: &str| text.trim().to_lowercase();
+        // Go's Address.String() puts an IPv6 address in brackets.
+        let mut key = match client_ip {
+            Some(IpAddr::V4(ip)) => format!("client={ip}|"),
+            Some(IpAddr::V6(ip)) => format!("client=[{ip}]|"),
+            None => "client=none|".to_owned(),
+        };
+        key.push_str(if skip_fallback { "skip=1|" } else { "skip=0|" });
+        let query_strategy = server
+            .get("queryStrategy")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        key.push_str(&format!(
+            "qs={}|tag={}|",
+            normalize(query_strategy),
+            normalize(tag)
+        ));
+        for (field, name) in [
+            ("domains", "domains"),
+            ("expectedIPs", "expected"),
+            ("expectIPs", "expect"),
+            ("unexpectedIPs", "unexpected"),
+        ] {
+            let mut values: Vec<String> = go_string_list(server.get(field))
+                .into_iter()
+                .map(|value| normalize(&value))
+                .collect();
+            if values.is_empty() {
+                key.push_str(&format!("{name}=[]|"));
+            } else {
+                values.sort();
+                key.push_str(&format!("{name}={}|", values.join(",")));
+            }
+        }
+        key
     }
 
     pub(super) fn parse_dns_server_ip_filters(
@@ -866,6 +976,9 @@ impl Parser<'_> {
         path: &str,
     ) -> Option<DnsHostTarget> {
         if let Some(target) = target.as_str() {
+            if let Some(rcode) = target.strip_prefix('#') {
+                return self.parse_dns_host_rcode(rcode, path);
+            }
             return Some(match target.parse::<IpAddr>() {
                 Ok(ip) => DnsHostTarget::Ip(ip),
                 Err(_) => DnsHostTarget::Domain(target.to_owned()),
@@ -899,6 +1012,22 @@ impl Parser<'_> {
         }
 
         Some(DnsHostTarget::Ips(ips))
+    }
+
+    /// Xray-core's `"#N"` hosts value (`app/dns/hosts.go`): answer with DNS
+    /// RCODE `N`. Go accepts any `strconv.Atoi` integer and ORs it into the
+    /// header flags; only the 4-bit RCODE range 0..=15 is accepted here.
+    fn parse_dns_host_rcode(&mut self, rcode: &str, path: &str) -> Option<DnsHostTarget> {
+        match rcode.parse::<i64>().map(u8::try_from) {
+            Ok(Ok(rcode)) if rcode <= MAX_DNS_HOST_RCODE => Some(DnsHostTarget::Rcode(rcode)),
+            _ => {
+                self.error(
+                    path,
+                    "dns host rcode target must be `#` followed by a DNS RCODE from 0 to 15",
+                );
+                None
+            }
+        }
     }
 
     pub(super) fn parse_dns_fake_ip(&mut self, dns: &Value) -> Option<DnsFakeIpConfig> {

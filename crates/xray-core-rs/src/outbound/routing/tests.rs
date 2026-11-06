@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::sync::{Notify, Semaphore};
 use xray_config::{parse_xray_json, CoreConfig};
-use xray_routing::{Network as RoutingNetwork, TargetAddr};
-use xray_transport::{CachingDnsResolver, DnsLookup, TransportError};
+use xray_routing::{
+    DnsHostTarget, DomainHostIndex, DomainMatcher, Network as RoutingNetwork, TargetAddr,
+};
+use xray_transport::{CachingDnsResolver, ConfiguredDnsResolver, DnsLookup, TransportError};
 
 use super::super::OutboundRouter;
 use super::*;
@@ -195,6 +197,30 @@ async fn ip_on_demand_empty_success_does_not_retry_or_skip_later_domain_rules() 
     let resolver = Resolver::new(vec![]);
     assert_eq!(selected_tag(&router, &target(), &resolver).await, "domain");
     assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn ip_on_demand_treats_static_rcode_host_as_no_addresses() {
+    let router = OutboundRouter::new(Arc::new(on_demand_config()));
+    for rcode in [0, 3, 5] {
+        let fallback = Arc::new(Resolver::new(vec!["203.0.113.7".parse().unwrap()]));
+        let resolver = ConfiguredDnsResolver::new(
+            DomainHostIndex::from_iter([(
+                DomainMatcher::Full("example.test".into()),
+                DnsHostTarget::Rcode(rcode),
+            )]),
+            Vec::new(),
+            fallback.clone(),
+        );
+        let selected = tokio::time::timeout(
+            Duration::from_secs(5),
+            selected_tag(&router, &target(), &resolver),
+        )
+        .await
+        .expect("static rcode routing lookup must not wait");
+        assert_eq!(selected, "domain", "#{rcode}");
+        assert_eq!(fallback.calls.load(Ordering::SeqCst), 0, "#{rcode}");
+    }
 }
 
 struct ActiveLookup<'a>(&'a AtomicUsize);
@@ -418,6 +444,8 @@ async fn ip_on_demand_checks_origin_conditions_in_xray_core_order() {
     };
     let elsewhere = Some("192.0.2.1:5000".parse().unwrap());
     let route = |source, user| xray_config::RouteContext {
+        attributes: None,
+        protocol: None,
         inbound_tag: Some("socks-in"),
         source,
         local: None,
@@ -437,4 +465,298 @@ async fn ip_on_demand_checks_origin_conditions_in_xray_core_order() {
         selected(route(inside, None)).await,
         ("second".to_owned(), 1)
     );
+}
+
+/// Under `IPOnDemand`, `protocol` holds as everywhere else, and is checked
+/// before the destination IP, so a flow it rules out looks nothing up.
+#[tokio::test]
+async fn ip_on_demand_checks_the_sniffed_protocol() {
+    let config = config(json!({"domainStrategy": "IPOnDemand", "rules": [
+        {"protocol": ["bittorrent"], "outboundTag": "second"},
+        {"protocol": ["tls"], "ip": ["203.0.113.7/32"], "outboundTag": "ip"},
+        {"domain": ["full:example.test"], "outboundTag": "domain"}
+    ]}));
+    let router = OutboundRouter::new(Arc::new(config));
+    let selected = |protocol: Option<&'static str>| {
+        let router = &router;
+        async move {
+            let resolver = Resolver::new(vec!["203.0.113.7".parse().unwrap()]);
+            let route = xray_config::RouteContext {
+                protocol,
+                ..xray_config::RouteContext::inbound(Some("socks-in"))
+            };
+            let node = router
+                .select_configured_node_with_resolver(&route, &target(), &resolver)
+                .await
+                .unwrap();
+            (
+                router.graph().node(node).unwrap().tag().unwrap().to_owned(),
+                resolver.calls.load(Ordering::SeqCst),
+            )
+        }
+    };
+    assert_eq!(selected(None).await, ("domain".to_owned(), 0));
+    assert_eq!(selected(Some("bittorrent")).await, ("second".to_owned(), 0));
+    assert_eq!(selected(Some("tls")).await, ("ip".to_owned(), 1));
+}
+
+/// Under `IPOnDemand`, `attrs` is checked before the destination IP too.
+#[tokio::test]
+async fn ip_on_demand_checks_attributes_before_the_lookup() {
+    let config = config(json!({"domainStrategy": "IPOnDemand", "rules": [
+        {"attrs": {"user-agent": "^curl/"}, "ip": ["203.0.113.7/32"], "outboundTag": "ip"},
+        {"attrs": {":method": "POST"}, "outboundTag": "second"},
+        {"domain": ["full:example.test"], "outboundTag": "domain"}
+    ]}));
+    let router = OutboundRouter::new(Arc::new(config));
+    let selected = |attributes: Option<xray_config::ContentAttributes>| {
+        let router = &router;
+        async move {
+            let resolver = Resolver::new(vec!["203.0.113.7".parse().unwrap()]);
+            let route = xray_config::RouteContext {
+                attributes: attributes.as_ref(),
+                ..xray_config::RouteContext::inbound(Some("socks-in"))
+            };
+            let node = router
+                .select_configured_node_with_resolver(&route, &target(), &resolver)
+                .await
+                .unwrap();
+            (
+                router.graph().node(node).unwrap().tag().unwrap().to_owned(),
+                resolver.calls.load(Ordering::SeqCst),
+            )
+        }
+    };
+    let request = |method: &str, agent: &str| {
+        let mut attributes = xray_config::ContentAttributes::default();
+        attributes.set(":method", method.to_owned());
+        attributes.set("user-agent", agent.to_owned());
+        Some(attributes)
+    };
+    assert_eq!(selected(None).await, ("domain".to_owned(), 0));
+    assert_eq!(
+        selected(request("POST", "wget/1.21")).await,
+        ("second".to_owned(), 0)
+    );
+    assert_eq!(
+        selected(request("GET", "curl/8.7")).await,
+        ("ip".to_owned(), 1)
+    );
+}
+
+/// Outbounds for loopback tests: `lb` routes again from `again`, and `spin`
+/// from `spin`.
+fn loopback_config(routing: Value) -> CoreConfig {
+    parse_xray_json(
+        &json!({
+            "inbounds": [],
+            "outbounds": [
+                {"tag": "default", "protocol": "freedom"},
+                {"tag": "lb", "protocol": "loopback", "settings": {"inboundTag": "again"}},
+                {"tag": "direct", "protocol": "freedom"},
+                {"tag": "second", "protocol": "freedom"},
+                {"tag": "spin", "protocol": "loopback", "settings": {"inboundTag": "spin"}},
+            ],
+            "routing": routing,
+        })
+        .to_string(),
+    )
+    .unwrap()
+    .config
+}
+
+fn ip_target() -> Target {
+    Target::new(
+        TargetAddr::Ip("203.0.113.7".parse().unwrap()),
+        443,
+        RoutingNetwork::Tcp,
+    )
+}
+
+/// The tag a session from `route` to `target`, going to `dial_target`, ends
+/// at, and how many lookups routing made.
+async fn loopback_selection(
+    router: &OutboundRouter,
+    route: &xray_config::RouteContext<'_>,
+    target: &Target,
+    dial_target: &Target,
+) -> (Result<String, CoreError>, usize) {
+    let resolver = Resolver::new(vec!["203.0.113.7".parse().unwrap()]);
+    let node = router
+        .select_session_node_with_resolver(route, target, dial_target, &resolver)
+        .await
+        .map(|node| router.graph().node(node).unwrap().tag().unwrap().to_owned());
+    (node, resolver.calls.load(Ordering::SeqCst))
+}
+
+#[tokio::test]
+async fn loopbacks_route_again_from_their_inbound_tag() {
+    let router = OutboundRouter::new(Arc::new(loopback_config(json!({"rules": [
+        {"inboundTag": ["socks-in"], "outboundTag": "lb"},
+        {"inboundTag": ["again"], "user": ["alice"], "outboundTag": "second"},
+        {"inboundTag": ["again"], "protocol": ["tls"], "outboundTag": "second"},
+        {"inboundTag": ["again"], "attrs": {":method": "GET"}, "outboundTag": "second"},
+        {"inboundTag": ["again"], "outboundTag": "direct"}
+    ]}))));
+    let socks = xray_config::RouteContext::inbound(Some("socks-in"));
+    assert_eq!(
+        loopback_selection(&router, &socks, &target(), &target())
+            .await
+            .0
+            .unwrap(),
+        "direct"
+    );
+    // The user stays, as Xray-core's loopback copies the inbound.
+    let alice = xray_config::RouteContext {
+        user: Some("alice"),
+        ..socks
+    };
+    assert_eq!(
+        loopback_selection(&router, &alice, &target(), &target())
+            .await
+            .0
+            .unwrap(),
+        "second"
+    );
+    // A sniffed protocol and attrs do not: the loopback starts a new
+    // content.
+    let mut get = xray_config::ContentAttributes::default();
+    get.set(":method", "GET".to_owned());
+    let sniffed = xray_config::RouteContext {
+        protocol: Some("tls"),
+        attributes: Some(&get),
+        ..socks
+    };
+    assert_eq!(
+        loopback_selection(&router, &sniffed, &target(), &target())
+            .await
+            .0
+            .unwrap(),
+        "direct"
+    );
+}
+
+#[test]
+fn a_loopback_cannot_join_a_transport_chain() {
+    for raw in [
+        r#"{"outbounds": [
+            {"tag": "direct", "protocol": "freedom", "proxySettings": {"tag": "lb", "transportLayer": true}},
+            {"tag": "lb", "protocol": "loopback"}
+        ]}"#,
+        r#"{"outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "lb", "protocol": "loopback", "proxySettings": {"tag": "direct", "transportLayer": true}}
+        ]}"#,
+    ] {
+        let parsed = parse_xray_json(raw).expect("chain shape parses");
+        let graph = super::super::OutboundGraph::new(Arc::new(parsed.config));
+        assert!(matches!(
+            graph.validate_proxy_chains(),
+            Err(super::super::OutboundProxyGraphError::UnsupportedNode { outbound, reason })
+                if outbound == "lb" && reason.contains("loopback")
+        ));
+    }
+}
+
+#[tokio::test]
+async fn loopbacks_route_the_dial_target_without_lookups() {
+    let router = OutboundRouter::new(Arc::new(loopback_config(json!({
+        "domainStrategy": "IPOnDemand",
+        "rules": [
+            {"inboundTag": ["socks-in"], "outboundTag": "lb"},
+            {"inboundTag": ["again"], "ip": ["203.0.113.7/32"], "outboundTag": "second"},
+            {"inboundTag": ["again"], "domain": ["full:example.test"], "outboundTag": "direct"}
+        ]
+    }))));
+    let socks = xray_config::RouteContext::inbound(Some("socks-in"));
+    // Routing again checks the address the session goes to.
+    let (selected, lookups) = loopback_selection(&router, &socks, &target(), &ip_target()).await;
+    assert_eq!((selected.unwrap(), lookups), ("second".to_owned(), 0));
+    // A domain is not looked up for the IP rule, as Xray-core's loopback
+    // skips DNS resolution.
+    let (selected, lookups) = loopback_selection(&router, &socks, &ip_target(), &target()).await;
+    assert_eq!((selected.unwrap(), lookups), ("direct".to_owned(), 0));
+}
+
+#[tokio::test]
+async fn a_default_loopback_routes_again_too() {
+    let router = OutboundRouter::new(Arc::new(
+        parse_xray_json(
+            &json!({
+                "inbounds": [],
+                "outbounds": [
+                    {"tag": "lb", "protocol": "loopback", "settings": {"inboundTag": "again"}},
+                    {"tag": "direct", "protocol": "freedom"},
+                ],
+                "routing": {"rules": [{"inboundTag": ["again"], "outboundTag": "direct"}]},
+            })
+            .to_string(),
+        )
+        .unwrap()
+        .config,
+    ));
+    let socks = xray_config::RouteContext::inbound(Some("socks-in"));
+    assert_eq!(
+        loopback_selection(&router, &socks, &target(), &target())
+            .await
+            .0
+            .unwrap(),
+        "direct"
+    );
+}
+
+#[tokio::test]
+async fn a_loopback_chain_ends_after_the_hop_limit() {
+    // `hN` loops back from `inN` to the next; the last goes to freedom.
+    let chain = |hops: usize| {
+        let mut outbounds = vec![json!({"tag": "direct", "protocol": "freedom"})];
+        let mut rules = vec![json!({"inboundTag": ["socks-in"], "outboundTag": "h1"})];
+        for hop in 1..=hops {
+            outbounds.push(json!({"tag": format!("h{hop}"), "protocol": "loopback",
+                "settings": {"inboundTag": format!("in{hop}")}}));
+            let next = if hop == hops {
+                "direct".to_owned()
+            } else {
+                format!("h{}", hop + 1)
+            };
+            rules.push(json!({"inboundTag": [format!("in{hop}")], "outboundTag": next}));
+        }
+        OutboundRouter::new(Arc::new(
+            parse_xray_json(
+                &json!({"inbounds": [], "outbounds": outbounds, "routing": {"rules": rules}})
+                    .to_string(),
+            )
+            .unwrap()
+            .config,
+        ))
+    };
+    let socks = xray_config::RouteContext::inbound(Some("socks-in"));
+    let router = chain(super::super::MAX_LOOPBACK_HOPS);
+    assert_eq!(
+        loopback_selection(&router, &socks, &target(), &target())
+            .await
+            .0
+            .unwrap(),
+        "direct"
+    );
+    let router = chain(super::super::MAX_LOOPBACK_HOPS + 1);
+    assert!(matches!(
+        loopback_selection(&router, &socks, &target(), &target())
+            .await
+            .0,
+        Err(CoreError::LoopbackChainTooLong(
+            super::super::MAX_LOOPBACK_HOPS
+        ))
+    ));
+
+    // A loopback that routes back to itself fails the same way.
+    let router = OutboundRouter::new(Arc::new(loopback_config(
+        json!({"rules": [{"outboundTag": "spin", "network": "tcp,udp"}]}),
+    )));
+    assert!(matches!(
+        loopback_selection(&router, &socks, &target(), &target())
+            .await
+            .0,
+        Err(CoreError::LoopbackChainTooLong(_))
+    ));
 }

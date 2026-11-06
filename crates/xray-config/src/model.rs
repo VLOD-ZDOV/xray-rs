@@ -138,6 +138,10 @@ pub struct DnsConfig {
     /// tag. UUID generation intentionally stays outside the config model.
     pub tag: String,
     pub query_strategy: DnsQueryStrategy,
+    /// `queryStrategy: "UseSystem"`, which leaves `query_strategy` at
+    /// [`DnsQueryStrategy::UseIp`] and narrows each lookup to the address
+    /// families the system has a route for, as Xray-core's `checkSystem` does.
+    pub check_system_routes: bool,
     /// Disables the core-owned destination DNS cache. Bootstrap/system caches
     /// remain platform-owned, matching Xray's `localhost` exception.
     pub disable_cache: bool,
@@ -147,6 +151,11 @@ pub struct DnsConfig {
     pub serve_expired_ttl: u32,
     pub disable_fallback: bool,
     pub disable_fallback_if_match: bool,
+    /// Xray-core's `clientIp`: the address sent as the EDNS client subnet by
+    /// every server without its own.
+    pub client_ip: Option<IpAddr>,
+    /// Xray-core's `enableParallelQuery`: query every selected server at once.
+    pub enable_parallel_query: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -178,6 +187,11 @@ pub enum DnsServerTransport {
 }
 
 pub const DEFAULT_DNS_SERVER_TIMEOUT_MS: u64 = 4_000;
+
+/// The policy key of a DNS server entry that sets none of the fields the key
+/// reads, as Xray-core's config builder writes it.
+pub const DEFAULT_DNS_POLICY_KEY: &str =
+    "client=none|skip=0|qs=|tag=|domains=[]|expected=[]|expect=[]|unexpected=[]|";
 pub const MAX_DNS_SERVE_EXPIRED_TTL_SECONDS: u32 = 24 * 60 * 60;
 /// Largest millisecond value safe across Xray-core's duration conversions.
 ///
@@ -209,7 +223,15 @@ pub struct DnsNameServerConfig {
     pub timeout_ms: u64,
     pub skip_fallback: bool,
     pub query_strategy: DnsQueryStrategy,
+    /// This server's `queryStrategy` is `UseSystem`; see
+    /// [`DnsConfig::check_system_routes`].
+    pub check_system_routes: bool,
     pub final_query: bool,
+    /// This server's own `clientIp`, which replaces `dns.clientIp`.
+    pub client_ip: Option<IpAddr>,
+    /// The policy key Xray-core's config builder derives from this entry's
+    /// raw fields; see [`DnsServerConfig::policy_key`].
+    pub policy_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -257,8 +279,34 @@ impl DnsServerConfig {
         }
     }
 
+    /// Whether this server's lookups are narrowed to the address families
+    /// the system has a route for (`queryStrategy: "UseSystem"`).
+    pub fn check_system_routes(&self) -> bool {
+        matches!(self, Self::Policy(server) if server.check_system_routes)
+    }
+
     pub fn final_query(&self) -> bool {
         matches!(self, Self::Policy(server) if server.final_query)
+    }
+
+    /// The key Xray-core v26.10.31's config builder gives this entry's
+    /// policy: its own `clientIp`, `skipFallback`, `queryStrategy` and `tag`,
+    /// and its domain and IP lists, as written. Adjacent servers with equal
+    /// keys race as one group under `enableParallelQuery`. A string entry has
+    /// the key of an object with none of those fields.
+    pub fn policy_key(&self) -> &str {
+        match self {
+            Self::Policy(server) => &server.policy_key,
+            Self::Ip(_) | Self::Domain { .. } => DEFAULT_DNS_POLICY_KEY,
+        }
+    }
+
+    /// This server's own `clientIp`; only object entries can carry one.
+    pub fn client_ip(&self) -> Option<IpAddr> {
+        match self {
+            Self::Policy(server) => server.client_ip,
+            Self::Ip(_) | Self::Domain { .. } => None,
+        }
     }
 
     pub fn timeout_ms(&self) -> u64 {
@@ -310,6 +358,12 @@ pub struct RoutingRule {
     pub local_os: Vec<String>,
     /// Conditions on where the connection comes from.
     pub origin: RoutingOrigin,
+    /// Sniffed protocols, matched as prefixes of the protocol Xray-core's
+    /// sniffers name, such as `http1`, `tls`, `quic` or `bittorrent`. Empty
+    /// names are dropped, so a list of only empty names matches nothing.
+    pub protocols: Option<Vec<String>>,
+    /// `attrs`: patterns the flow's attributes of the same names must match.
+    pub attributes: Option<RoutingAttributes>,
     pub target: RoutingRuleTarget,
 }
 
@@ -326,6 +380,11 @@ pub struct RouteContext<'a> {
     /// The authenticated user, which Xray-core names by email: for SOCKS and
     /// HTTP, the username.
     pub user: Option<&'a str>,
+    /// The protocol sniffing recognized, named as Xray-core's sniffers name
+    /// it.
+    pub protocol: Option<&'a str>,
+    /// What the flow carries for `attrs`, such as an HTTP request's headers.
+    pub attributes: Option<&'a ContentAttributes>,
 }
 
 impl<'a> RouteContext<'a> {
@@ -336,8 +395,110 @@ impl<'a> RouteContext<'a> {
             source: None,
             local: None,
             user: None,
+            protocol: None,
+            attributes: None,
         }
     }
+}
+
+/// The attributes Xray-core keeps on a flow for routing's `attrs`. Its HTTP
+/// sniffer records a request's method and target as `:method` and `:path`,
+/// and each header under its lowercased name. Names are lowercased here, as
+/// Xray-core's matcher reads them, and a later value replaces an earlier one.
+///
+/// Headers can carry credentials, so `Debug` shows only the names.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ContentAttributes {
+    entries: Vec<(String, String)>,
+}
+
+impl ContentAttributes {
+    pub fn set(&mut self, name: &str, value: String) {
+        let name = go_lowercase(name);
+        match self.entries.iter_mut().find(|(known, _)| *known == name) {
+            Some((_, known)) => *known = value,
+            None => self.entries.push((name.into_owned(), value)),
+        }
+    }
+
+    /// The value under `name`, which must already be lowercase.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(known, _)| known == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+impl fmt::Debug for ContentAttributes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_set()
+            .entries(self.entries.iter().map(|(name, _)| name))
+            .finish()
+    }
+}
+
+/// A rule's `attrs`: for each attribute name, a pattern its value must match
+/// anywhere, case-sensitively, as Go's `regexp.MatchString` does. Names are
+/// lowercased, as in Xray-core, so names that differ only in case keep one
+/// pattern.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RoutingAttributes {
+    patterns: Vec<(String, RegexMatcher)>,
+}
+
+impl RoutingAttributes {
+    pub fn insert(&mut self, name: &str, pattern: RegexMatcher) {
+        let name = go_lowercase(name);
+        match self.patterns.iter_mut().find(|(known, _)| *known == name) {
+            Some((_, known)) => *known = pattern,
+            None => self.patterns.push((name.into_owned(), pattern)),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.patterns.is_empty()
+    }
+
+    /// Whether every named attribute is present and matches. As in
+    /// Xray-core, a flow without attributes matches no `attrs`.
+    pub fn matches(&self, attributes: Option<&ContentAttributes>) -> bool {
+        attributes.is_some_and(|attributes| {
+            self.patterns.iter().all(|(name, pattern)| {
+                attributes
+                    .get(name)
+                    .is_some_and(|value| pattern.is_match(value))
+            })
+        })
+    }
+}
+
+/// Go's `strings.ToLower`, which maps each character on its own: unlike
+/// Rust's `str::to_lowercase`, it lowercases `İ` to a plain `i` and `Σ`
+/// always to `σ`.
+pub fn go_lowercase(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.is_ascii() {
+        return if text.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            text.to_ascii_lowercase().into()
+        } else {
+            text.into()
+        };
+    }
+    text.chars()
+        .flat_map(|character| {
+            let mut lower = character.to_lowercase();
+            // Only `İ` lowercases to more than one character in Rust.
+            let first = lower.next().unwrap_or(character);
+            let rest = (character != 'İ').then_some(lower).into_iter().flatten();
+            std::iter::once(first).chain(rest)
+        })
+        .collect::<String>()
+        .into()
 }
 
 /// A routing rule's conditions on where a connection comes from: `sourceIP`
@@ -483,8 +644,10 @@ impl RoutingRule {
         self.matches_local_os()
             && self.matches_inbound(route.inbound_tag)
             && self.matches_network(target_network)
+            && self.matches_protocol(route.protocol)
             && self.matches_port(target_port)
             && self.origin.matches_ports_and_user(route)
+            && self.matches_attributes(route.attributes)
             && self.matches_ip(target_ip)
             && self.origin.matches_ips(route)
             && self.matches_domain(target_domain)
@@ -525,6 +688,27 @@ impl RoutingRule {
         };
 
         target_network.is_some_and(|target| networks.contains(&target))
+    }
+
+    /// As in Xray-core, a flow without a sniffed protocol matches no
+    /// protocol rule.
+    pub fn matches_protocol(&self, protocol: Option<&str>) -> bool {
+        let Some(protocols) = &self.protocols else {
+            return true;
+        };
+        protocol
+            .filter(|protocol| !protocol.is_empty())
+            .is_some_and(|protocol| {
+                protocols
+                    .iter()
+                    .any(|prefix| protocol.starts_with(prefix.as_str()))
+            })
+    }
+
+    pub fn matches_attributes(&self, attributes: Option<&ContentAttributes>) -> bool {
+        self.attributes
+            .as_ref()
+            .is_none_or(|patterns| patterns.matches(attributes))
     }
 
     pub fn matches_port(&self, target_port: Option<u16>) -> bool {
@@ -569,6 +753,8 @@ impl RoutingRule {
             || self.domain_matchers.is_some()
             || self.ip_matchers.is_some()
             || !self.origin.is_empty()
+            || self.protocols.is_some()
+            || self.attributes.is_some()
     }
 }
 
@@ -714,8 +900,16 @@ pub enum SniffingDestination {
 pub enum InboundProtocol {
     Tproxy(TproxySettings),
     Socks(SocksInboundSettings),
-    Http,
+    Http(HttpInboundSettings),
     Tun,
+}
+
+/// HTTP inbound settings.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpInboundSettings {
+    /// The accounts `Proxy-Authorization: Basic` must name; none admits
+    /// every request.
+    pub accounts: xray_proxy::inbound::HttpInboundAccounts,
 }
 
 /// SOCKS5 inbound settings.
@@ -786,6 +980,38 @@ pub struct FreedomOutboundSettings {
     /// or sends to. Empty when freedom itself dials through `dialerProxy`,
     /// where Xray-core ignores them.
     pub final_rules: Vec<FreedomFinalRule>,
+    /// `noises`: datagrams sent before the first of each UDP flow.
+    pub noises: Vec<FreedomNoise>,
+}
+
+/// One of freedom's `noises`, which Xray-core sends, in order, before the
+/// first datagram of a UDP flow, to the address the flow goes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreedomNoise {
+    pub packet: FreedomNoisePacket,
+    /// Milliseconds to wait after the datagram, drawn as Xray-core's
+    /// `RandBetween` draws: from the lower bound up to, but not including,
+    /// the upper, or the lower when they are at most one apart. `(0, 0)`
+    /// waits not at all.
+    pub delay_ms: (u32, u32),
+    pub apply_to: FreedomNoiseFamily,
+}
+
+/// What a noise datagram holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreedomNoisePacket {
+    Bytes(Vec<u8>),
+    /// Random bytes, their count drawn between the two bounds as the delay
+    /// is.
+    Random(u32, u32),
+}
+
+/// The destinations a noise datagram goes to, by address family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FreedomNoiseFamily {
+    Ip,
+    Ipv4,
+    Ipv6,
 }
 
 /// The PROXY protocol version of freedom's `proxyProtocol`.
@@ -892,6 +1118,7 @@ pub enum OutboundProtocol {
     Hysteria,
     Wireguard,
     Blackhole,
+    Loopback,
     Socks,
     Http,
 }
@@ -907,6 +1134,7 @@ pub enum OutboundSettings {
     Hysteria(HysteriaOutboundSettings),
     Wireguard(WireguardOutboundSettings),
     Blackhole(BlackholeOutboundSettings),
+    Loopback(LoopbackOutboundSettings),
     Socks(SocksOutboundSettings),
     Http(HttpOutboundSettings),
 }
@@ -923,10 +1151,18 @@ impl OutboundSettings {
             Self::Hysteria(_) => OutboundProtocol::Hysteria,
             Self::Wireguard(_) => OutboundProtocol::Wireguard,
             Self::Blackhole(_) => OutboundProtocol::Blackhole,
+            Self::Loopback(_) => OutboundProtocol::Loopback,
             Self::Socks(_) => OutboundProtocol::Socks,
             Self::Http(_) => OutboundProtocol::Http,
         }
     }
+}
+
+/// Xray `loopback` outbound settings. The handler never dials: it routes the
+/// connection again, as if it came from an inbound tagged `inbound_tag`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoopbackOutboundSettings {
+    pub inbound_tag: String,
 }
 
 /// Xray `blackhole` outbound settings. The handler never dials: TCP sessions
@@ -1176,6 +1412,9 @@ pub struct HttpOutboundSettings {
     pub port: u16,
     pub account: Option<xray_proxy::outbound::HttpAccount>,
     pub level: u32,
+    /// `headers`, set on each `CONNECT` after the credentials, by canonical
+    /// name; their values are redacted from `Debug`.
+    pub headers: Vec<(String, xray_proxy::outbound::HttpHeaderTemplate)>,
 }
 
 /// Settings of the `shadowsocks` outbound for both method families:
@@ -1353,6 +1592,15 @@ pub struct QuicUdpHopSettings {
     /// Expanded in configured order; duplicates are intentionally preserved.
     pub ports: Vec<u16>,
     pub interval: QuicIntervalRange,
+    /// Xray's `intervalLocal`: a new local socket at every interval.
+    pub local: bool,
+    /// Xray's `intervalRemote`: a new remote address at every interval.
+    pub remote: bool,
+    /// Xray's `perConnRemote`: a random remote address once per connection.
+    pub remote_once: bool,
+    /// Xray's `remoteIPs`: a new remote address takes a random IP in one of
+    /// these; empty keeps the server's IP.
+    pub remote_ips: Vec<IpCidr>,
 }
 
 /// An ordered Xray `Int32Range` used for the UDP-hop interval.
