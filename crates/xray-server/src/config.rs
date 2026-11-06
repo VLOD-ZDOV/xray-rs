@@ -489,7 +489,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             log::warn(format!("skipping inbound {tag:?}: missing realitySettings"));
             return Ok(None);
         };
-        Some(parse_reality(settings)?)
+        match parse_reality(settings, &tag)? {
+            Some(r) => Some(r),
+            None => return Ok(None),
+        }
     } else {
         None
     };
@@ -874,7 +877,26 @@ fn parse_version_opt(v: &Value) -> Option<Result<[u8; 3], String>> {
     }
 }
 
-fn parse_reality(reality: &Value) -> Result<RealityInboundSettings, String> {
+fn parse_reality(reality: &Value, tag: &str) -> Result<Option<RealityInboundSettings>, String> {
+    if let Some(seed) = reality
+        .get("mldsa65Seed")
+        .or_else(|| reality.get("mldsa65_seed"))
+    {
+        if let Some(s) = seed.as_str() {
+            if !s.is_empty() {
+                log::warn(format!(
+                    "skipping inbound {tag:?}: realitySettings.mldsa65Seed is not supported"
+                ));
+                return Ok(None);
+            }
+        } else if !seed.is_null() {
+            log::warn(format!(
+                "skipping inbound {tag:?}: realitySettings.mldsa65Seed is not supported"
+            ));
+            return Ok(None);
+        }
+    }
+
     let dest = parse_dest(reality.get("dest"))?;
 
     let mut server_names = Vec::new();
@@ -942,7 +964,7 @@ fn parse_reality(reality: &Value) -> Result<RealityInboundSettings, String> {
         }
     }
 
-    Ok(RealityInboundSettings {
+    Ok(Some(RealityInboundSettings {
         dest,
         server_names,
         private_key,
@@ -953,7 +975,7 @@ fn parse_reality(reality: &Value) -> Result<RealityInboundSettings, String> {
         xver,
         show,
         alpn,
-    })
+    }))
 }
 
 fn parse_xhttp(x: &Value) -> Result<XhttpSettings, String> {
@@ -1851,6 +1873,53 @@ mod tests {
         assert_eq!(reality.xver, 1);
         assert!(reality.show);
         assert_eq!(reality.alpn, vec!["h2", "http/1.1"]);
+    }
+
+    #[test]
+    fn skips_reality_inbound_with_mldsa65_seed() {
+        let raw_with_seed = r#"{
+          "inbounds": [
+            {
+              "tag": "reality-mldsa",
+              "port": 443,
+              "protocol": "vless",
+              "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                  "dest": "www.yahoo.com:443",
+                  "serverNames": ["www.yahoo.com"],
+                  "privateKey": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10",
+                  "mldsa65Seed": "ai9ixjkLpABQyp5J15DrKgz1ik7vFAYprc46d8y512g"
+                }
+              }
+            }
+          ]
+        }"#;
+        let inbounds = parse(raw_with_seed).unwrap().inbounds;
+        assert_eq!(inbounds.len(), 0);
+
+        let raw_empty_seed = r#"{
+          "inbounds": [
+            {
+              "tag": "reality-empty-seed",
+              "port": 443,
+              "protocol": "vless",
+              "streamSettings": {
+                "network": "tcp",
+                "security": "reality",
+                "realitySettings": {
+                  "dest": "www.yahoo.com:443",
+                  "serverNames": ["www.yahoo.com"],
+                  "privateKey": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10",
+                  "mldsa65Seed": ""
+                }
+              }
+            }
+          ]
+        }"#;
+        let inbounds = parse(raw_empty_seed).unwrap().inbounds;
+        assert_eq!(inbounds.len(), 1);
     }
 
     #[test]
