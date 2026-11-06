@@ -14,6 +14,7 @@ static STATS: OnceLock<Stats> = OnceLock::new();
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
+    pub enabled: bool,
     pub user_uplink: bool,
     pub user_downlink: bool,
     pub user_online: bool,
@@ -37,6 +38,7 @@ impl Policy {
         let level = root.pointer("/policy/levels/0");
         let system = root.pointer("/policy/system");
         Self {
+            enabled: true,
             user_uplink: flag(level, "statsUserUplink"),
             user_downlink: flag(level, "statsUserDownlink"),
             user_online: flag(level, "statsUserOnline"),
@@ -87,8 +89,12 @@ impl Stats {
     }
 
     /// Counters for one proxied connection, honoring the policy flags.
-    pub fn traffic(&self, inbound: &str, email: &str, outbound: &str) -> Traffic {
+    pub fn traffic(&self, inbound: &str, email: &str, level: u32, outbound: &str) -> Traffic {
+        if !self.policy.enabled {
+            return Traffic::default();
+        }
         let p = self.policy;
+        let user_policy = crate::policy::for_level(level);
         let mut traffic = Traffic::default();
         let mut add = |enabled: bool, name: String, up: bool| {
             if enabled {
@@ -102,12 +108,12 @@ impl Stats {
         };
         if !email.is_empty() {
             add(
-                p.user_uplink,
+                user_policy.stats_user_uplink,
                 format!("user>>>{email}>>>traffic>>>uplink"),
                 true,
             );
             add(
-                p.user_downlink,
+                user_policy.stats_user_downlink,
                 format!("user>>>{email}>>>traffic>>>downlink"),
                 false,
             );
@@ -171,8 +177,12 @@ impl Stats {
     }
 
     /// Marks a live connection from `ip` for `email` until the guard drops.
-    pub fn connect(&'static self, email: &str, ip: IpAddr) -> Option<OnlineGuard> {
-        if !self.policy.user_online || email.is_empty() {
+    pub fn connect(&'static self, email: &str, level: u32, ip: IpAddr) -> Option<OnlineGuard> {
+        if !self.policy.enabled || email.is_empty() {
+            return None;
+        }
+        let user_policy = crate::policy::for_level(level);
+        if !user_policy.stats_user_online {
             return None;
         }
         let ip = match ip {
@@ -282,8 +292,9 @@ mod tests {
     fn counts_and_resets_like_xray() {
         let panel = json!({"stats": {}, "policy": {"levels": {"0": {"statsUserUplink": true, "statsUserDownlink": true}},
             "system": {"statsInboundUplink": true, "statsInboundDownlink": true, "statsOutboundUplink": false}}});
+        crate::policy::init(crate::policy::PolicyManager::from_config(&panel));
         let stats = leaked(Policy::from_config(&panel));
-        let t = stats.traffic("in-1", "alice", "direct");
+        let t = stats.traffic("in-1", "alice", 0, "direct");
         t.up(100);
         t.down(1000);
         let all = stats.query("", false);
@@ -315,12 +326,11 @@ mod tests {
 
     #[test]
     fn tracks_online_ips() {
-        let stats = leaked(Policy {
-            user_online: true,
-            ..Policy::default()
-        });
-        let a = stats.connect("bob", "1.2.3.4".parse().unwrap());
-        let b = stats.connect("bob", "::ffff:1.2.3.4".parse().unwrap());
+        let panel = json!({"stats": {}, "policy": {"levels": {"0": {"statsUserOnline": true}}}});
+        crate::policy::init(crate::policy::PolicyManager::from_config(&panel));
+        let stats = leaked(Policy::from_config(&panel));
+        let a = stats.connect("bob", 0, "1.2.3.4".parse().unwrap());
+        let b = stats.connect("bob", 0, "::ffff:1.2.3.4".parse().unwrap());
         assert_eq!(stats.online_users()[0].1.len(), 1);
         drop(a);
         assert_eq!(stats.online_users().len(), 1);

@@ -438,7 +438,7 @@ async fn handle_connection(
     };
 
     let peer_addr = connection.remote_address();
-    let _online = stats::get().connect(&user.email, peer_addr.ip());
+    let _online = stats::get().connect(&user.email, user.level, peer_addr.ip());
 
     let conn_for_tcp = connection.clone();
     let ctx_for_tcp = ctx.clone();
@@ -541,7 +541,7 @@ async fn handle_tcp_streams(
 
             eprintln!("[hysteria] connected outbound, relaying");
 
-            let traffic = stats::get().traffic(&ctx.tag, &user.email, &decision.tag);
+            let traffic = stats::get().traffic(&ctx.tag, &user.email, user.level, &decision.tag);
             let (mut out_r, mut out_w) = tokio::io::split(outbound_stream);
 
             let up = async {
@@ -670,7 +670,7 @@ async fn handle_udp_datagrams(
 
             let conn = connection.clone();
             let sessions_for_task = sessions.clone();
-            let traffic = stats::get().traffic(&ctx.tag, &user.email, &decision.tag);
+            let traffic = stats::get().traffic(&ctx.tag, &user.email, user.level, &decision.tag);
             let addr_for_down = address_str.clone();
 
             traffic.up(payload.len());

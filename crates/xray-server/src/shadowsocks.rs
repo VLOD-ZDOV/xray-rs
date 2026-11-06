@@ -19,7 +19,7 @@ use crate::log;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, Query};
 use crate::stats;
-use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest};
+use crate::vless::{read_first, Activity, Context, Host, RouteRequest};
 
 pub async fn serve_tcp<S>(stream: S, ctx: &Context, peer: SocketAddr) -> io::Result<()>
 where
@@ -92,11 +92,12 @@ where
         }
     };
 
-    let email = users
+    let (email, level) = users
         .get(user_idx)
-        .map(|u| u.email.as_str())
+        .map(|u| (u.email.as_str(), u.level))
         .unwrap_or_default();
-    let _online = stats::get().connect(email, peer.ip());
+    let user_policy = crate::policy::for_level(level);
+    let _online = stats::get().connect(email, level, peer.ip());
 
     if early.is_empty() && (ctx.router.needs_sniff() || ctx.sniffing.enabled()) {
         read_first(&mut client_r, &mut early).await;
@@ -121,7 +122,7 @@ where
     ctx.sniffing.override_host(&early, &mut host);
 
     let mut outbound_stream = outbound::connect(&ctx.router, &decision, &host, port).await?;
-    let traffic = stats::get().traffic(&ctx.tag, email, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, email, level, &decision.tag);
     if !early.is_empty() {
         outbound_stream.write_all(&early).await?;
         traffic.up(early.len());
@@ -130,10 +131,23 @@ where
     let (mut target_r, mut target_w) = tokio::io::split(outbound_stream);
 
     let activity = Activity::new();
-    relay(
-        copy(&mut client_r, &mut target_w, &activity, |n| traffic.up(n)),
-        copy(&mut target_r, &mut client_w, &activity, |n| traffic.down(n)),
+    crate::vless::relay_policy(
+        crate::vless::copy_buf(
+            &mut client_r,
+            &mut target_w,
+            &activity,
+            |n| traffic.up(n),
+            user_policy.buffer_size,
+        ),
+        crate::vless::copy_buf(
+            &mut target_r,
+            &mut client_w,
+            &activity,
+            |n| traffic.down(n),
+            user_policy.buffer_size,
+        ),
         &activity,
+        user_policy,
     )
     .await
 }
@@ -271,7 +285,8 @@ impl ShadowsocksUdpHandler {
             return Ok(());
         }
 
-        let _online = stats::get().connect(&init.user.email, init.peer.ip());
+        let user_policy = crate::policy::for_level(init.user.level);
+        let _online = stats::get().connect(&init.user.email, init.user.level, init.peer.ip());
 
         let (host, port) = target_to_host_port(&init.target);
         let route = RouteRequest {
@@ -291,7 +306,12 @@ impl ShadowsocksUdpHandler {
             return Ok(());
         }
         let cone = ConeUdp::open(self.ctx.router.clone(), &decision).await?;
-        let traffic = stats::get().traffic(&self.ctx.tag, &init.user.email, &decision.tag);
+        let traffic = stats::get().traffic(
+            &self.ctx.tag,
+            &init.user.email,
+            init.user.level,
+            &decision.tag,
+        );
         let activity = Activity::new();
         if let Ok(target) = cone.target(&host, port).await {
             cone.send_to(&init.payload, target).await?;
@@ -370,7 +390,7 @@ impl ShadowsocksUdpHandler {
                 }
             }
         };
-        relay(up, down, &activity).await
+        crate::vless::relay_policy(up, down, &activity, user_policy).await
     }
 
     async fn run_2017(self) {
@@ -457,7 +477,8 @@ impl ShadowsocksUdpHandler {
             ShadowsocksMethod::Aead2017(m) => m.clone(),
             _ => return Ok(()),
         };
-        let _online = stats::get().connect(&user.email, peer.ip());
+        let user_policy = crate::policy::for_level(user.level);
+        let _online = stats::get().connect(&user.email, user.level, peer.ip());
 
         let (host, port) = target_to_host_port(&initial_target);
         let route = RouteRequest {
@@ -477,7 +498,7 @@ impl ShadowsocksUdpHandler {
             return Ok(());
         }
         let cone = ConeUdp::open(self.ctx.router.clone(), &decision).await?;
-        let traffic = stats::get().traffic(&self.ctx.tag, &user.email, &decision.tag);
+        let traffic = stats::get().traffic(&self.ctx.tag, &user.email, user.level, &decision.tag);
         let activity = Activity::new();
         if let Ok(target) = cone.target(&host, port).await {
             cone.send_to(&initial_payload, target).await?;
@@ -539,7 +560,7 @@ impl ShadowsocksUdpHandler {
                 }
             }
         };
-        relay(up, down, &activity).await
+        crate::vless::relay_policy(up, down, &activity, user_policy).await
     }
 }
 

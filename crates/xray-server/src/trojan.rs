@@ -15,7 +15,7 @@ use crate::config::User;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, BlockAction};
 use crate::stats;
-use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest, CONN_IDLE};
+use crate::vless::{read_first, Activity, Context, Host, RouteRequest};
 
 const MAX_HEADER: usize = 56 + 2 + 1 + 1 + 255 + 2 + 2;
 
@@ -206,7 +206,8 @@ where
     };
 
     let mut early = buf.split_off(header_len);
-    let _online = stats::get().connect(&user.email, peer.ip());
+    let user_policy = crate::policy::for_level(user.level);
+    let _online = stats::get().connect(&user.email, user.level, peer.ip());
 
     let network = match request.command {
         Command::Tcp => Network::Tcp,
@@ -255,7 +256,7 @@ where
         return Ok(());
     }
 
-    let traffic = stats::get().traffic(&ctx.tag, &user.email, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, &user.email, user.level, &decision.tag);
 
     match request.command {
         Command::Tcp => {
@@ -265,10 +266,23 @@ where
             target_w.write_all(&early).await?;
             traffic.up(early.len());
             let activity = Activity::new();
-            relay(
-                copy(&mut uplink, &mut target_w, &activity, |n| traffic.up(n)),
-                copy(&mut target_r, &mut downlink, &activity, |n| traffic.down(n)),
+            crate::vless::relay_policy(
+                crate::vless::copy_buf(
+                    &mut uplink,
+                    &mut target_w,
+                    &activity,
+                    |n| traffic.up(n),
+                    user_policy.buffer_size,
+                ),
+                crate::vless::copy_buf(
+                    &mut target_r,
+                    &mut downlink,
+                    &activity,
+                    |n| traffic.down(n),
+                    user_policy.buffer_size,
+                ),
                 &activity,
+                user_policy,
             )
             .await
         }
@@ -305,7 +319,7 @@ where
                             }
                         }
                     }
-                    let n = timeout(CONN_IDLE, uplink.read(&mut temp))
+                    let n = timeout(user_policy.conn_idle, uplink.read(&mut temp))
                         .await
                         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
                     if n == 0 {
@@ -320,7 +334,7 @@ where
                 let mut buf = vec![0u8; 65535];
                 loop {
                     activity.touch();
-                    let (n, from) = timeout(CONN_IDLE, cone.recv_from(&mut buf))
+                    let (n, from) = timeout(user_policy.conn_idle, cone.recv_from(&mut buf))
                         .await
                         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
                     let target = Target::new(
@@ -346,7 +360,7 @@ where
                 Ok::<(), io::Error>(())
             };
 
-            relay(up, down, &activity).await
+            crate::vless::relay_policy(up, down, &activity, user_policy).await
         }
     }
 }
@@ -370,6 +384,7 @@ mod tests {
             id: [0; 16],
             hash: trojan_password_hash("secret"),
             email: "alice@example.com".into(),
+            level: 0,
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&user.hash);
@@ -396,6 +411,7 @@ mod tests {
             id: [0; 16],
             hash: trojan_password_hash("secret"),
             email: "bob@example.com".into(),
+            level: 0,
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&user.hash);
@@ -420,6 +436,7 @@ mod tests {
             id: [0; 16],
             hash: trojan_password_hash("secret"),
             email: "bob@example.com".into(),
+            level: 0,
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&[b'a'; 56]);

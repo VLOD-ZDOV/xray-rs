@@ -23,7 +23,7 @@ The server crate and every workspace crate it is built from (`xray-config`,
 | Sniffing | `destOverride` `http`, `tls`, `quic`; `routeOnly`, `metadataOnly`, `domainsExcluded` |
 | Outbound | `freedom`, `blackhole`, `wireguard` (Cloudflare WARP), `socks`, `vless` (raw, WS, gRPC), `vmess`, `trojan`, `shadowsocks`, `http`, `dns`, `loopback`; balancers (`random`, `roundRobin`) |
 | Routing | `domain`, `geosite`, `ip`, `geoip`, `port`, `network`, `inboundTag`, `user`, `source`, `sourcePort`, `localPort`, `localIP`, `protocol`, `attrs`, `vlessRoute`, `balancerTag`; `domainStrategy` AsIs, IPIfNonMatch, IPOnDemand |
-| DNS and policy | built-in `dns` section (servers, `hosts`, `queryStrategy`); `policy` level 0 timeouts and `bufferSize` |
+| DNS and policy | built-in `dns` section (servers, `hosts`, `queryStrategy`); `policy` levels (timeouts, `bufferSize`, per-user stats and online tracking) |
 | 3x-ui | `-c`, `run -test -c`, `-version`; gRPC `StatsService`, `HandlerService` (users for VLESS, VMess, Trojan and Shadowsocks, `AddInbound`, `RemoveInbound`, `AddOutbound`, `RemoveOutbound`), `RoutingService`, `LoggerService`; the `log` section (`loglevel`, `access`, `error`, `maskAddress`, `dnsLog`) |
 
 Tested against the official Xray-core 26.10.31 as client, outbound peer,
@@ -59,7 +59,7 @@ to run noise.
 
 - Skipped with a warning: WireGuard inbound, XHTTP over HTTP/3, mKCP, fallbacks selected
   by `name` or `alpn`.
-- `policy` levels other than 0, `reverse`, `metrics`, observatory and the
+- `reverse`, `metrics`, observatory and the
   `leastPing` / `leastLoad` balancer strategies.
 
 ## Build

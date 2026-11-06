@@ -45,7 +45,7 @@ where
         .as_ref()
         .map(|u| u.as_str().to_owned())
         .unwrap_or_default();
-    let _online = stats::get().connect(&email, peer.ip());
+    let _online = stats::get().connect(&email, 0, peer.ip());
 
     let req = timeout(
         crate::policy::get().handshake,
@@ -129,7 +129,7 @@ async fn relay_udp(
         return Ok(());
     }
     let cone = ConeUdp::open(ctx.router.clone(), &decision).await?;
-    let traffic = stats::get().traffic(&ctx.tag, email, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, email, 0, &decision.tag);
     let activity = Activity::new();
     if let Ok(target) = cone.target(&host, port).await {
         cone.send_to(&first.payload, target).await?;
@@ -232,7 +232,7 @@ where
     }
     ctx.sniffing.override_host(&early, &mut host);
     let target = outbound::connect(&ctx.router, &decision, &host, port).await?;
-    let traffic = stats::get().traffic(&ctx.tag, email, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, email, 0, &decision.tag);
     let (mut target_r, mut target_w) = tokio::io::split(target);
     if !early.is_empty() {
         target_w.write_all(&early).await?;
@@ -276,7 +276,7 @@ where
         .as_ref()
         .map(|u| u.as_str().to_owned())
         .unwrap_or_default();
-    let _online = stats::get().connect(&email, peer.ip());
+    let _online = stats::get().connect(&email, 0, peer.ip());
 
     if let Some(target) = head.connect_target() {
         let target = target.map_err(|e| {

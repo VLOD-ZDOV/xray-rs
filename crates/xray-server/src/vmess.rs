@@ -13,7 +13,7 @@ use xray_routing::TargetAddr;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, BlockAction};
 use crate::stats;
-use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest, CONN_IDLE};
+use crate::vless::{read_first, Activity, Context, Host, RouteRequest};
 
 pub async fn serve<R, W>(
     mut uplink: R,
@@ -50,7 +50,15 @@ where
     };
 
     let user_email = server_users[hs.user_index].email.clone();
-    let _online = stats::get().connect(&user_email, peer.ip());
+    let user_level = ctx
+        .users
+        .read()
+        .unwrap()
+        .get(hs.user_index)
+        .map(|u| u.level)
+        .unwrap_or(0);
+    let user_policy = crate::policy::for_level(user_level);
+    let _online = stats::get().connect(&user_email, user_level, peer.ip());
 
     let host = match &hs.target.addr {
         TargetAddr::Ip(ip) => Host::Ip(*ip),
@@ -105,7 +113,7 @@ where
         return Ok(());
     }
 
-    let traffic = stats::get().traffic(&ctx.tag, &user_email, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, &user_email, user_level, &decision.tag);
 
     match network {
         Network::Tcp => {
@@ -119,10 +127,23 @@ where
             }
 
             let activity = Activity::new();
-            relay(
-                copy(&mut server_r, &mut target_w, &activity, |n| traffic.up(n)),
-                copy(&mut target_r, &mut server_w, &activity, |n| traffic.down(n)),
+            crate::vless::relay_policy(
+                crate::vless::copy_buf(
+                    &mut server_r,
+                    &mut target_w,
+                    &activity,
+                    |n| traffic.up(n),
+                    user_policy.buffer_size,
+                ),
+                crate::vless::copy_buf(
+                    &mut target_r,
+                    &mut server_w,
+                    &activity,
+                    |n| traffic.down(n),
+                    user_policy.buffer_size,
+                ),
                 &activity,
+                user_policy,
             )
             .await
         }
@@ -135,7 +156,7 @@ where
                 let mut packet = vec![0u8; 65535];
                 loop {
                     activity.touch();
-                    let n = timeout(CONN_IDLE, server_r.read(&mut packet))
+                    let n = timeout(user_policy.conn_idle, server_r.read(&mut packet))
                         .await
                         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
                     if n == 0 {
@@ -151,7 +172,7 @@ where
                 let mut buf = vec![0u8; 65535];
                 loop {
                     activity.touch();
-                    let (n, _from) = timeout(CONN_IDLE, cone.recv_from(&mut buf))
+                    let (n, _from) = timeout(user_policy.conn_idle, cone.recv_from(&mut buf))
                         .await
                         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
                     server_w.write_all(&buf[..n]).await?;
@@ -160,7 +181,7 @@ where
                 }
             };
 
-            relay(up, down, &activity).await
+            crate::vless::relay_policy(up, down, &activity, user_policy).await
         }
     }
 }

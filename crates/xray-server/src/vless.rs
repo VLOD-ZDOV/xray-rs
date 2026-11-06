@@ -342,6 +342,7 @@ impl Context {
         {
             return Err(format!("User {email} already exists."));
         }
+        let level = ss_user.level;
         ss_users.push(ss_user);
         let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
         if !users.iter().any(|u| u.email.eq_ignore_ascii_case(&email)) {
@@ -349,6 +350,7 @@ impl Context {
                 id: crate::config::user_id(&email),
                 hash: [0u8; 56],
                 email,
+                level,
             });
         }
         Ok(())
@@ -390,6 +392,7 @@ impl Context {
                 id: crate::config::user_id(&user.email),
                 hash: [0u8; 56],
                 email: user.email,
+                level: user.level,
             });
         }
         Ok(())
@@ -526,7 +529,8 @@ where
     };
     let mut early = buf.split_off(header_len);
 
-    let _online = stats::get().connect(&user.email, peer.ip());
+    let user_policy = crate::policy::for_level(user.level);
+    let _online = stats::get().connect(&user.email, user.level, peer.ip());
     if request.command == Command::Mux {
         stream.write_all(&[request.version, 0]).await?;
         stream.flush().await?;
@@ -535,6 +539,7 @@ where
             tag: ctx.tag.clone(),
             port: ctx.port,
             email: user.email.clone(),
+            level: user.level,
             router: ctx.router.clone(),
             sniffing: ctx.sniffing.clone(),
         };
@@ -587,7 +592,7 @@ where
         }
         return Ok(());
     }
-    let traffic = stats::get().traffic(&ctx.tag, &user.email, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, &user.email, user.level, &decision.tag);
 
     match request.command {
         Command::Tcp => {
@@ -613,10 +618,23 @@ where
                 let (mut target_r, mut target_w) = tokio::io::split(target);
 
                 let activity = Activity::new();
-                relay(
-                    copy(&mut client_r, &mut target_w, &activity, |n| traffic.up(n)),
-                    copy(&mut target_r, &mut client_w, &activity, |n| traffic.down(n)),
+                relay_policy(
+                    copy_buf(
+                        &mut client_r,
+                        &mut target_w,
+                        &activity,
+                        |n| traffic.up(n),
+                        user_policy.buffer_size,
+                    ),
+                    copy_buf(
+                        &mut target_r,
+                        &mut client_w,
+                        &activity,
+                        |n| traffic.down(n),
+                        user_policy.buffer_size,
+                    ),
                     &activity,
+                    user_policy,
                 )
                 .await
             } else {
@@ -630,10 +648,23 @@ where
 
                 let (mut uplink, mut downlink) = tokio::io::split(stream);
                 let activity = Activity::new();
-                relay(
-                    copy(&mut uplink, &mut target_w, &activity, |n| traffic.up(n)),
-                    copy(&mut target_r, &mut downlink, &activity, |n| traffic.down(n)),
+                relay_policy(
+                    copy_buf(
+                        &mut uplink,
+                        &mut target_w,
+                        &activity,
+                        |n| traffic.up(n),
+                        user_policy.buffer_size,
+                    ),
+                    copy_buf(
+                        &mut target_r,
+                        &mut downlink,
+                        &activity,
+                        |n| traffic.down(n),
+                        user_policy.buffer_size,
+                    ),
                     &activity,
+                    user_policy,
                 )
                 .await
             }
@@ -650,10 +681,11 @@ where
                 pos: 0,
                 inner: &mut uplink,
             };
-            relay(
+            relay_policy(
                 udp_up(reader, &link, &activity, &traffic),
                 udp_down(&link, &mut downlink, &activity, &traffic),
                 &activity,
+                user_policy,
             )
             .await
         }
@@ -836,7 +868,15 @@ pub(crate) async fn relay(
     down: impl std::future::Future<Output = io::Result<()>>,
     activity: &Activity,
 ) -> io::Result<()> {
-    let policy = crate::policy::get();
+    relay_policy(up, down, activity, crate::policy::get()).await
+}
+
+pub(crate) async fn relay_policy(
+    up: impl std::future::Future<Output = io::Result<()>>,
+    down: impl std::future::Future<Output = io::Result<()>>,
+    activity: &Activity,
+    policy: crate::policy::PolicySettings,
+) -> io::Result<()> {
     tokio::pin!(up, down);
     tokio::select! {
         result = &mut up => {
@@ -874,8 +914,28 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let buf_size = crate::policy::get().buffer_size;
-    let mut buf = vec![0u8; buf_size];
+    copy_buf(
+        reader,
+        writer,
+        activity,
+        count,
+        crate::policy::get().buffer_size,
+    )
+    .await
+}
+
+pub(crate) async fn copy_buf<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    activity: &Activity,
+    count: impl Fn(usize),
+    buf_size: usize,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; buf_size.max(512)];
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
@@ -1240,6 +1300,7 @@ mod tests {
             id: [7; 16],
             hash: [0; 56],
             email: "u".into(),
+            level: 0,
         }]
     }
 
@@ -1436,7 +1497,7 @@ mod tests {
             vless_encryption: None,
         };
 
-        crate::policy::init(crate::policy::PolicySettings {
+        crate::policy::init_single(crate::policy::PolicySettings {
             handshake: Duration::from_millis(50),
             ..Default::default()
         });
@@ -1447,6 +1508,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
 
-        crate::policy::init(crate::policy::PolicySettings::default());
+        crate::policy::init_single(crate::policy::PolicySettings::default());
     }
 }

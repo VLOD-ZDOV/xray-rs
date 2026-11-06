@@ -61,7 +61,7 @@ where
     ctx.sniffing.override_host(&early, &mut route_host);
 
     let target_stream = outbound::connect(&ctx.router, &decision, &route_host, port).await?;
-    let traffic = stats::get().traffic(&ctx.tag, "", &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, "", 0, &decision.tag);
     let (mut client_r, mut client_w) = tokio::io::split(stream);
     let (mut target_r, mut target_w) = tokio::io::split(target_stream);
 
@@ -175,7 +175,7 @@ impl DokodemoUdpHandler {
             return Ok(());
         }
         let cone = ConeUdp::open(self.ctx.router.clone(), &decision).await?;
-        let traffic = stats::get().traffic(&self.ctx.tag, "", &decision.tag);
+        let traffic = stats::get().traffic(&self.ctx.tag, "", 0, &decision.tag);
         let activity = Activity::new();
         if let Ok(target) = cone.target(&host, port).await {
             cone.send_to(&initial_payload, target).await?;

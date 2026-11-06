@@ -158,6 +158,7 @@ pub struct Info {
     pub tag: String,
     pub port: u16,
     pub email: String,
+    pub level: u32,
     pub router: Arc<Router>,
     pub sniffing: Sniffing,
 }
@@ -239,7 +240,8 @@ where
                     }
                     let data = frame.data.as_deref().unwrap_or_default();
                     info.sniffing.override_host(data, &mut host);
-                    let traffic = stats::get().traffic(&info.tag, &info.email, &decision.tag);
+                    let traffic =
+                        stats::get().traffic(&info.tag, &info.email, info.level, &decision.tag);
                     let dial = Dial {
                         router: info.router.clone(),
                         decision,

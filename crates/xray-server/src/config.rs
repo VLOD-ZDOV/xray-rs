@@ -23,7 +23,7 @@ pub struct Config {
     pub inbounds: Vec<Inbound>,
     pub router: Router,
     pub dns: Option<xray_config::DnsConfig>,
-    pub policy: policy::PolicySettings,
+    pub policy: policy::PolicyManager,
     pub fakedns: Option<crate::fakedns::FakeDnsMulti>,
 }
 
@@ -67,6 +67,7 @@ pub enum ShadowsocksMethod {
 pub struct ShadowsocksUser {
     pub method: ShadowsocksMethod,
     pub email: String,
+    pub level: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +133,7 @@ pub struct User {
     pub id: [u8; 16],
     pub hash: [u8; 56],
     pub email: String,
+    pub level: u32,
 }
 
 /// Like Xray, a non-UUID id maps to UUIDv5 in the nil namespace.
@@ -285,7 +287,7 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         }
         None => None,
     };
-    let policy = policy::PolicySettings::from_config(&root);
+    let policy = policy::PolicyManager::from_config(&root);
     let fakedns = parse_fakedns(&root, dns.as_ref(), &inbounds)?;
     Ok(Config {
         log,
@@ -409,10 +411,12 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         } else {
             id_str
         };
+        let level = client.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
         users.push(User {
             id: user_id(key),
             hash: crate::trojan::trojan_password_hash(key),
             email: str_field(client, "email").to_owned(),
+            level,
         });
     }
 
@@ -455,9 +459,11 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                         return Ok(None);
                     }
                 };
+                let level = settings.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
                 shadowsocks_users.push(ShadowsocksUser {
                     method: ShadowsocksMethod::Ss2022(Arc::new(m)),
                     email: str_field(settings, "email").to_owned(),
+                    level,
                 });
             } else {
                 for entry in clients {
@@ -480,9 +486,11 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                             return Ok(None);
                         }
                     };
+                    let level = entry.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
                     shadowsocks_users.push(ShadowsocksUser {
                         method: ShadowsocksMethod::Ss2022(Arc::new(m)),
                         email: str_field(entry, "email").to_owned(),
+                        level,
                     });
                 }
             }
@@ -507,9 +515,11 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                         return Ok(None);
                     }
                 };
+                let level = entry.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
                 shadowsocks_users.push(ShadowsocksUser {
                     method: ShadowsocksMethod::Aead2017(Arc::new(m)),
                     email: str_field(entry, "email").to_owned(),
+                    level,
                 });
             }
         }
@@ -2337,6 +2347,9 @@ mod tests {
         assert_eq!(dns.servers.len(), 2);
         assert_eq!(dns.query_strategy, xray_config::DnsQueryStrategy::UseIpv4);
         assert!(!dns.hosts.is_empty());
-        assert_eq!(config.policy.conn_idle, std::time::Duration::from_secs(120));
+        assert_eq!(
+            config.policy.for_level(0).conn_idle,
+            std::time::Duration::from_secs(120)
+        );
     }
 }

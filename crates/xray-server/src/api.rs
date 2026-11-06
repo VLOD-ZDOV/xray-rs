@@ -1273,6 +1273,7 @@ async fn handle_handler(
                                         id: user_id(&acc.id),
                                         hash: crate::trojan::trojan_password_hash(&acc.id),
                                         email,
+                                        level: u.level,
                                     });
                                 }
                             }
@@ -1282,6 +1283,7 @@ async fn handle_handler(
                                         id: user_id(&acc.password),
                                         hash: crate::trojan::trojan_password_hash(&acc.password),
                                         email,
+                                        level: u.level,
                                     });
                                 }
                             }
@@ -1307,6 +1309,7 @@ async fn handle_handler(
                                             method: crate::config::ShadowsocksMethod::Aead2017(
                                                 Arc::new(m),
                                             ),
+                                            level: u.level,
                                         });
                                         ss_method = Some(m_name.to_owned());
                                         ss_pass = Some(acc.password);
@@ -1426,6 +1429,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 id: user_id(&account.id),
                 hash: crate::trojan::trojan_password_hash(&account.id),
                 email: user.email,
+                level: user.level,
             })
         }
         TROJAN_ACCOUNT => {
@@ -1434,6 +1438,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 id: user_id(&account.password),
                 hash: crate::trojan::trojan_password_hash(&account.password),
                 email: user.email,
+                level: user.level,
             })
         }
         VMESS_ACCOUNT => {
@@ -1442,6 +1447,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 id: user_id(&account.id),
                 hash: crate::trojan::trojan_password_hash(&account.id),
                 email: user.email,
+                level: user.level,
             })
         }
         SHADOWSOCKS_ACCOUNT => {
@@ -1468,6 +1474,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 crate::config::ShadowsocksUser {
                     method: crate::config::ShadowsocksMethod::Aead2017(Arc::new(m)),
                     email: user.email,
+                    level: user.level,
                 },
             )
         }
@@ -1498,6 +1505,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 crate::config::ShadowsocksUser {
                     method: crate::config::ShadowsocksMethod::Ss2022(Arc::new(m)),
                     email: user.email,
+                    level: user.level,
                 },
             )
         }
@@ -1520,7 +1528,7 @@ fn protocol_user(user: InboundUser) -> ProtocolUser {
         ..Default::default()
     };
     ProtocolUser {
-        level: 0,
+        level: user.level,
         email: user.email,
         account: Some(TypedMessage {
             r#type: VLESS_ACCOUNT.into(),
