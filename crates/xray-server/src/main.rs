@@ -8,6 +8,7 @@ mod dns_outbound;
 mod dokodemo;
 mod fakedns;
 mod fallback;
+mod finalmask;
 mod grpc;
 mod http_obfs;
 mod http_outbound;

@@ -378,6 +378,10 @@ impl ServerConnector {
             }));
         }
 
+        if let Some(tcp_fragment) = crate::finalmask::parse_finalmask_tcp_fragment(stream)? {
+            dialer = dialer.with_tcp_fragment(tcp_fragment);
+        }
+
         Ok(Self {
             tag: tag.to_owned(),
             protocol: protocol.to_owned(),

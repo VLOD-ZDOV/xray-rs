@@ -13,12 +13,18 @@ use xray_transport::stream::{
 
 /// `authority` is the fallback host: the TLS or REALITY server name, else the server address.
 pub fn transport(stream: &Value, authority: &str) -> Result<TransportLayer, String> {
+    let mut synth_stream = json!({
+        "network": "xhttp",
+        "xhttpSettings": stream.get("xhttpSettings").or_else(|| stream.get("splithttpSettings")),
+    });
+    if let Some(fm) = stream.get("finalmask") {
+        synth_stream["finalmask"] = fm.clone();
+    }
     let synth = json!({"outbounds": [{
         "protocol": "vless",
         "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
             "users": [{"id": "00000000-0000-0000-0000-000000000000", "encryption": "none"}]}]},
-        "streamSettings": {"network": "xhttp", "xhttpSettings": stream.get("xhttpSettings")
-            .or_else(|| stream.get("splithttpSettings"))},
+        "streamSettings": synth_stream,
     }]});
     let parsed = xray_config::parse_xray_json(&synth.to_string()).map_err(|e| {
         let messages: Vec<String> = e.diagnostics.iter().map(|d| format!("{d:?}")).collect();

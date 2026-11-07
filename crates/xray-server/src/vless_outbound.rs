@@ -358,6 +358,10 @@ impl VlessOutbound {
             ));
         }
 
+        if let Some(tcp_fragment) = crate::finalmask::parse_finalmask_tcp_fragment(stream)? {
+            dialer = dialer.with_tcp_fragment(tcp_fragment);
+        }
+
         let packet_encoding = settings
             .get("packetEncoding")
             .or_else(|| outbound.get("packetEncoding"))

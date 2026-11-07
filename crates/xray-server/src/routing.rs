@@ -217,8 +217,31 @@ pub fn parse_fragment(v: &Value) -> Result<FreedomFragmentSetting, String> {
     };
 
     let tcp_fragment = if matches!(packets, FreedomFragmentPackets::TlsHello) {
-        let lengths = vec![(len_min as u32)..=(len_max as u32)];
-        let delays = vec![(int_min as u32)..=(int_max as u32)];
+        let lengths: Vec<std::ops::RangeInclusive<u32>> = if let Some(arr) = v
+            .get("lengths")
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+        {
+            arr.iter()
+                .filter_map(|item| parse_u64_range(item).ok())
+                .map(|(min, max)| (min as u32)..=(max as u32))
+                .collect()
+        } else {
+            vec![(len_min as u32)..=(len_max as u32)]
+        };
+        let delays: Vec<std::ops::RangeInclusive<u32>> = if let Some(arr) = v
+            .get("delays")
+            .or_else(|| v.get("intervals"))
+            .and_then(Value::as_array)
+            .filter(|a| !a.is_empty())
+        {
+            arr.iter()
+                .filter_map(|item| parse_u64_range(item).ok())
+                .map(|(min, max)| (min as u32)..=(max as u32))
+                .collect()
+        } else {
+            vec![(int_min as u32)..=(int_max as u32)]
+        };
         let split = if max_split.1 > 0 {
             (max_split.0 as u32)..=(max_split.1 as u32)
         } else {
@@ -1119,12 +1142,16 @@ impl Router {
                     } else {
                         None
                     };
+                    let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
                     let fragment = if let Some(f) = settings.get("fragment") {
                         Some(parse_fragment(f)?)
                     } else {
-                        None
+                        crate::finalmask::parse_freedom_fragment_from_finalmask(stream)?
                     };
-                    let noises = parse_freedom_noises(settings)?;
+                    let mut noises = parse_freedom_noises(settings)?;
+                    if noises.is_empty() {
+                        noises = crate::finalmask::parse_finalmask_udp_noises(stream)?;
+                    }
                     let send_through = parse_send_through(outbound.get("sendThrough"))?;
                     let dialer_proxy = parse_dialer_proxy(outbound, &tag)?;
                     let sockopt = crate::config::parse_sockopt(
@@ -1221,12 +1248,7 @@ impl Router {
                     "outbound {tag:?}: sockopt is only applied to freedom outbounds yet, ignored"
                 ));
             }
-            let finalmask = outbound.pointer("/streamSettings/finalmask");
-            if finalmask.is_some_and(|m| m.as_object().is_some_and(|m| !m.is_empty())) {
-                log::warn(format!(
-                    "outbound {tag:?}: streamSettings.finalmask is not supported yet for outbounds, ignored"
-                ));
-            }
+            crate::finalmask::validate_and_log_finalmask(outbound, &tag)?;
             if let Some(proxy_tag) = parse_dialer_proxy(outbound, &tag)? {
                 dialer_proxies.push((tag.clone(), proxy_tag));
             }
