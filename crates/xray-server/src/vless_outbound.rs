@@ -24,7 +24,7 @@ use xray_proxy::vless::{
 use xray_routing::{Target, TargetAddr};
 use xray_transport::stream::{
     resolve_user_agent, Authority, GrpcConfig, GrpcTransport, HttpUpgradeConfig, TransportLayer,
-    WebSocketConfig,
+    WebSocketConfig, XhttpConnectTarget,
 };
 use xray_transport::{
     BoxedTransportStream, ConnectorConfig, RealityClientConfig, TlsClientConfig, TransportDialer,
@@ -111,6 +111,7 @@ pub struct VlessOutbound {
     pub transport: TransportLayer,
     pub mux_settings: Option<crate::mux::MuxSettings>,
     pub mux_pool: Option<Arc<crate::mux::MuxClientPool>>,
+    pub download: Option<Arc<crate::xhttp_outbound::XhttpDownloadTarget>>,
 }
 
 impl fmt::Debug for VlessOutbound {
@@ -215,6 +216,7 @@ impl VlessOutbound {
             },
         };
 
+        let mut download = None;
         let transport = match network {
             "" | "tcp" | "raw" => TransportLayer::Raw,
             "ws" | "websocket" => {
@@ -328,7 +330,10 @@ impl VlessOutbound {
                 }))
             }
             "xhttp" | "splithttp" => {
-                crate::xhttp_outbound::transport(stream, &host_fallback).map_err(|e| err(&e))?
+                let (tl, dl) = crate::xhttp_outbound::transport(stream, &host_fallback)
+                    .map_err(|e| err(&e))?;
+                download = dl;
+                tl
             }
             other => {
                 return Err(err(&format!(
@@ -379,6 +384,7 @@ impl VlessOutbound {
             transport,
             mux_settings,
             mux_pool,
+            download,
         })
     }
 
@@ -423,23 +429,58 @@ impl VlessOutbound {
         );
 
         let dialer = self.dialer.read().unwrap().clone();
-        let carrier = timeout(
-            CONNECT_TIMEOUT,
-            dialer.connect_stream(&self.connector, &self.transport, &target, &candidates, None),
-        )
+        let carrier = timeout(CONNECT_TIMEOUT, async {
+            if let (Some(down), TransportLayer::Xhttp(up)) = (&self.download, &self.transport) {
+                let down_candidates = resolve_all(&down.server.0, down.server.1).await?;
+                if down_candidates.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "failed to resolve download server address {:?}",
+                            down.server.0
+                        ),
+                    ));
+                }
+                let down_target = Target::new(
+                    match &down.server.0 {
+                        Host::Ip(ip) => TargetAddr::Ip(*ip),
+                        Host::Domain(d) => TargetAddr::Domain(d.clone()),
+                    },
+                    down.server.1,
+                    xray_routing::Network::Tcp,
+                );
+                up.open_split_stream(
+                    &dialer,
+                    XhttpConnectTarget {
+                        connector: &self.connector,
+                        target: &target,
+                        candidates: &candidates,
+                        happy_eyeballs: None,
+                    },
+                    &down.transport,
+                    XhttpConnectTarget {
+                        connector: &down.connector,
+                        target: &down_target,
+                        candidates: &down_candidates,
+                        happy_eyeballs: None,
+                    },
+                )
+                .await
+                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))
+            } else {
+                dialer
+                    .connect_stream(&self.connector, &self.transport, &target, &candidates, None)
+                    .await
+                    .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))
+            }
+        })
         .await
         .map_err(|_| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("connect to vless outbound {:?} timed out", self.tag),
             )
-        })?
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::ConnectionRefused,
-                format!("connect to vless outbound {:?} failed: {e}", self.tag),
-            )
-        })?;
+        })??;
 
         let req_target = Target::new(
             match host {
