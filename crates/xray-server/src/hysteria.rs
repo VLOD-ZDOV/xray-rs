@@ -422,8 +422,7 @@ async fn serve_masq<S>(
             ..
         }) => {
             let status = if *masq_string_status_code != 0 {
-                http::StatusCode::from_u16(*masq_string_status_code)
-                    .unwrap_or(http::StatusCode::OK)
+                http::StatusCode::from_u16(*masq_string_status_code).unwrap_or(http::StatusCode::OK)
             } else {
                 http::StatusCode::OK
             };
@@ -434,7 +433,9 @@ async fn serve_masq<S>(
             if let Ok(resp) = builder.body(()) {
                 if response.send_response(resp).await.is_ok() {
                     if let Some(s) = masq_string {
-                        let _ = response.send_data(Bytes::copy_from_slice(s.as_bytes())).await;
+                        let _ = response
+                            .send_data(Bytes::copy_from_slice(s.as_bytes()))
+                            .await;
                     }
                 }
             }

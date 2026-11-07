@@ -422,10 +422,7 @@ async fn connect_direct(
                 )
                 .await?;
                 if let Some(ref fragment) = settings.fragment {
-                    return Ok(Box::new(FragmentWriterStream::new(
-                        boxed,
-                        fragment.clone(),
-                    )));
+                    return Ok(Box::new(FragmentWriterStream::new(boxed, fragment.clone())));
                 }
                 return Ok(boxed);
             }

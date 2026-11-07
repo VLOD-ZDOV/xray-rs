@@ -1116,7 +1116,8 @@ impl ReversePortal {
         host: &Host,
         port: u16,
     ) -> io::Result<Box<dyn crate::outbound::Stream>> {
-        self.open_sub_session(host, port, xray_routing::Network::Tcp).await
+        self.open_sub_session(host, port, xray_routing::Network::Tcp)
+            .await
     }
 
     async fn open_sub_session(
@@ -1135,7 +1136,10 @@ impl ReversePortal {
             .find(|p| p.active_count.load(Ordering::Relaxed) < p.concurrency)
             .cloned()
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotConnected, "no reverse connection available")
+                io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "no reverse connection available",
+                )
             })?;
 
         let session_id = loop {

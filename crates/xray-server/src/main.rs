@@ -46,11 +46,11 @@ mod xhttp;
 mod xhttp_outbound;
 
 use crate::routing::Router;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::collections::HashMap;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
@@ -64,7 +64,9 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
-use config::{CertConfig, CertUsage, Config, Inbound, InboundProtocol, InboundTransport, TlsSettings};
+use config::{
+    CertConfig, CertUsage, Config, Inbound, InboundProtocol, InboundTransport, TlsSettings,
+};
 
 // 3x-ui reads the second word of `-version` output as the core version.
 pub(crate) const COMPAT_VERSION: &str = "26.10.31";
@@ -1161,9 +1163,13 @@ impl ManagedCa {
         let der = CertificateDer::from(self.ca_cert_der.clone());
         let issuer = rcgen::Issuer::from_ca_cert_der(&der, ca_key).ok()?;
         let mut params = rcgen::CertificateParams::new(vec![sni.to_string()]).ok()?;
-        params.distinguished_name.push(rcgen::DnType::CommonName, sni);
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, sni);
         params.use_authority_key_identifier_extension = true;
-        params.key_usages.push(rcgen::KeyUsagePurpose::DigitalSignature);
+        params
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::DigitalSignature);
         params
             .extended_key_usages
             .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
@@ -1210,7 +1216,11 @@ impl rustls::server::ResolvesServerCert for SniCheckingResolver {
         if let Some(ref sni) = sni {
             for m in &self.encipherment_certs {
                 if let Ok(cert) = m.read() {
-                    if cert.allowed_names.iter().any(|allowed| match_sni(allowed, sni)) {
+                    if cert
+                        .allowed_names
+                        .iter()
+                        .any(|allowed| match_sni(allowed, sni))
+                    {
                         return Some(cert.certified_key.clone());
                     }
                 }
@@ -1364,10 +1374,16 @@ pub(crate) fn build_rustls_server_config(
     };
 
     if let Some(ref ech_keys) = settings.ech_server_keys {
-        log::info(format!("TLS ECH server keys configured (len {})", ech_keys.len()));
+        log::info(format!(
+            "TLS ECH server keys configured (len {})",
+            ech_keys.len()
+        ));
     }
     if let Some(ref ech_list) = settings.ech_config_list {
-        log::info(format!("TLS ECH config list configured (len {})", ech_list.len()));
+        log::info(format!(
+            "TLS ECH config list configured (len {})",
+            ech_list.len()
+        ));
     }
 
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
@@ -1442,8 +1458,12 @@ mod tests {
         // 1. Generate CA certificate
         let mut ca_params = rcgen::CertificateParams::new(vec!["Test CA".to_string()]).unwrap();
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
-        ca_params.key_usages.push(rcgen::KeyUsagePurpose::DigitalSignature);
+        ca_params
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::KeyCertSign);
+        ca_params
+            .key_usages
+            .push(rcgen::KeyUsagePurpose::DigitalSignature);
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let ca_cert = ca_params.self_signed(&ca_key).unwrap();
         let ca_cert_pem = ca_cert.pem().into_bytes();

@@ -414,7 +414,13 @@ fn validate_geodata(geo: &Value) -> Result<(), String> {
             let fields: Vec<&str> = cron.split_whitespace().collect();
             let is_predefined = matches!(
                 cron,
-                "@yearly" | "@annually" | "@monthly" | "@weekly" | "@daily" | "@midnight" | "@hourly"
+                "@yearly"
+                    | "@annually"
+                    | "@monthly"
+                    | "@weekly"
+                    | "@daily"
+                    | "@midnight"
+                    | "@hourly"
             );
             if !is_predefined && fields.len() != 5 {
                 return Err("failed to build geodata configuration: invalid geodata cron".into());
@@ -435,7 +441,10 @@ fn validate_geodata(geo: &Value) -> Result<(), String> {
         }
         if cron.is_some_and(|c| !c.is_empty()) {
             if assets.len() > 100 {
-                return Err("failed to build geodata configuration: geodata supports at most 100 assets".into());
+                return Err(
+                    "failed to build geodata configuration: geodata supports at most 100 assets"
+                        .into(),
+                );
             }
             for asset in assets {
                 let file = str_field(asset, "file");
@@ -649,10 +658,14 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             let settings = item.get("settings").unwrap_or(&Value::Null);
             let secret_key = str_field(settings, "secretKey");
             if secret_key.is_empty() {
-                return Err("invalid WireGuard secret key: %winfra/conf: key must not be empty".into());
+                return Err(
+                    "invalid WireGuard secret key: %winfra/conf: key must not be empty".into(),
+                );
             }
             if parse_wireguard_key(secret_key).is_err() {
-                return Err("invalid WireGuard secret key: %winfra/conf: failed to deserialize key".into());
+                return Err(
+                    "invalid WireGuard secret key: %winfra/conf: failed to deserialize key".into(),
+                );
             }
             if let Some(reserved) = settings.get("reserved").and_then(Value::as_array) {
                 if !reserved.is_empty() && reserved.len() != 3 {
@@ -667,7 +680,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                     }
                 }
             }
-            log::warn(format!("skipping inbound {tag:?}: WireGuard inbound is not supported yet"));
+            log::warn(format!(
+                "skipping inbound {tag:?}: WireGuard inbound is not supported yet"
+            ));
             return Ok(None);
         }
         "masque" => {
@@ -675,7 +690,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             if str_field(settings, "address").is_empty() {
                 return Err("MASQUE: \"address\" is not set".into());
             }
-            log::warn(format!("skipping inbound {tag:?}: MASQUE inbound is not supported yet"));
+            log::warn(format!(
+                "skipping inbound {tag:?}: MASQUE inbound is not supported yet"
+            ));
             return Ok(None);
         }
         other => {
@@ -699,7 +716,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         let settings = item.get("settings").unwrap_or(&Value::Null);
         let decryption = str_field(settings, "decryption");
         if decryption == "none" {
-            return Err("the xdrive transport needs VLESS \"decryption\", run \"xray vlessenc\" to get one".into());
+            return Err(
+                "the xdrive transport needs VLESS \"decryption\", run \"xray vlessenc\" to get one"
+                    .into(),
+            );
         }
         if let Some(clients) = settings.get("clients").and_then(Value::as_array) {
             for client in clients {
@@ -769,7 +789,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 return Err("CwndMultiplier must be at least 1".into());
             }
         }
-        log::warn(format!("skipping inbound {tag:?}: mKCP transport is not supported yet"));
+        log::warn(format!(
+            "skipping inbound {tag:?}: mKCP transport is not supported yet"
+        ));
         return Ok(None);
     }
     if is_hysteria {
@@ -871,7 +893,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                         return Err(r#"VLESS users: "tag" can't be empty for "reverse""#.into());
                     }
                     if rev.get("sniffing").is_some_and(|s| !s.is_null()) {
-                        return Err(r#"VLESS users: inbound's "reverse" can't have "sniffing""#.into());
+                        return Err(
+                            r#"VLESS users: inbound's "reverse" can't have "sniffing""#.into()
+                        );
                     }
                     Some(tag.to_string())
                 } else {
@@ -1332,11 +1356,12 @@ fn parse_hysteria_masq(
 
     let masq_file = masq.get("dir").and_then(Value::as_str).map(String::from);
     let masq_url = masq.get("url").and_then(Value::as_str).map(String::from);
-    let masq_string = masq.get("content").and_then(Value::as_str).map(String::from);
-    let masq_string_status_code = masq
-        .get("statusCode")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as u16;
+    let masq_string = masq
+        .get("content")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let masq_string_status_code =
+        masq.get("statusCode").and_then(Value::as_u64).unwrap_or(0) as u16;
     let mut masq_string_headers = HashMap::new();
     if let Some(headers) = masq.get("headers").and_then(Value::as_object) {
         for (k, v) in headers {
@@ -1439,14 +1464,8 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
             .get("prioritizeIPv6")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let interleave = he
-            .get("interleave")
-            .and_then(Value::as_u64)
-            .unwrap_or(1) as u32;
-        let try_delay_ms = he
-            .get("tryDelayMs")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as u32;
+        let interleave = he.get("interleave").and_then(Value::as_u64).unwrap_or(1) as u32;
+        let try_delay_ms = he.get("tryDelayMs").and_then(Value::as_u64).unwrap_or(0) as u32;
         let max_concurrent_try = he
             .get("maxConcurrentTry")
             .and_then(Value::as_u64)
@@ -1528,7 +1547,11 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
 }
 
 fn parse_tls(tls: &Value) -> Result<TlsSettings, String> {
-    if tls.get("allowInsecure").and_then(Value::as_bool).unwrap_or(false) {
+    if tls
+        .get("allowInsecure")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
         return Err("The feature \"allowInsecure\" has been removed and migrated to \"pinnedPeerCertSha256\"(pcs) and \"verifyPeerCertByName\"(vcn). Please update your config(s) according to release note and documentation.".into());
     }
     let cert_array = array(tls, "certificates");
@@ -1548,7 +1571,10 @@ fn parse_tls(tls: &Value) -> Result<TlsSettings, String> {
             "issue" => CertUsage::Issue,
             _ => CertUsage::Encipherment,
         };
-        let ocsp_stapling = cert.get("ocspStapling").and_then(Value::as_u64).unwrap_or(0);
+        let ocsp_stapling = cert
+            .get("ocspStapling")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         let one_time_loading = cert
             .get("oneTimeLoading")
             .and_then(Value::as_bool)
@@ -3214,8 +3240,14 @@ mod tests {
           "inbounds": []
         }"#;
         let config = parse(raw).unwrap();
-        assert_eq!(config.env.get("XRAY_TEST_VAR_1"), Some(&"hello".to_string()));
-        assert_eq!(config.env.get("XRAY_TEST_VAR_2"), Some(&"world".to_string()));
+        assert_eq!(
+            config.env.get("XRAY_TEST_VAR_1"),
+            Some(&"hello".to_string())
+        );
+        assert_eq!(
+            config.env.get("XRAY_TEST_VAR_2"),
+            Some(&"world".to_string())
+        );
         assert_eq!(get_env("XRAY_TEST_VAR_1"), Some("hello".to_string()));
     }
 }

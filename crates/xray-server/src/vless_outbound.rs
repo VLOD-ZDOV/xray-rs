@@ -447,7 +447,11 @@ impl VlessOutbound {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             loop {
                 let connect_res = outbound
-                    .open_raw_stream(&Host::Domain("v1.rvs.cool".into()), 0, VlessCommand::Reverse)
+                    .open_raw_stream(
+                        &Host::Domain("v1.rvs.cool".into()),
+                        0,
+                        VlessCommand::Reverse,
+                    )
                     .await;
                 match connect_res {
                     Ok(stream) => {
@@ -498,9 +502,10 @@ impl VlessOutbound {
         let (server_host, server_port) = match &self.server.0 {
             Host::Domain(d) => {
                 if let Some(strategy) = self.sockopt.as_ref().map(|s| s.address_port_strategy) {
-                    let (h, p) = crate::sockopt::resolve_address_port_strategy(d, self.server.1, strategy)
-                        .await
-                        .unwrap_or_else(|_| (d.clone(), self.server.1));
+                    let (h, p) =
+                        crate::sockopt::resolve_address_port_strategy(d, self.server.1, strategy)
+                            .await
+                            .unwrap_or_else(|_| (d.clone(), self.server.1));
                     if let Ok(ip) = h.parse::<std::net::IpAddr>() {
                         (Host::Ip(ip), p)
                     } else {
@@ -678,11 +683,8 @@ impl VlessOutbound {
             Some("xtls-rprx-vision" | "xtls-rprx-vision-udp443")
         );
         if is_vision {
-            let vision_stream = VisionStream::new(
-                response_stream,
-                *self.user_id.as_bytes(),
-                self.testseed,
-            );
+            let vision_stream =
+                VisionStream::new(response_stream, *self.user_id.as_bytes(), self.testseed);
             Ok(Box::new(vision_stream))
         } else {
             Ok(Box::new(response_stream))

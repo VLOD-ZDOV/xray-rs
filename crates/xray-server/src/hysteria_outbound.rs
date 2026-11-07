@@ -94,11 +94,7 @@ impl HysteriaOutbound {
                 let resolved = resolve(&Host::Domain(self.address.clone()), self.port)
                     .await
                     .map_err(|e| io::Error::other(format!("Hysteria resolve failed: {e}")))?;
-                let cfg = HysteriaConfig::new(
-                    resolved,
-                    self.tls_config.clone(),
-                    self.auth.clone(),
-                );
+                let cfg = HysteriaConfig::new(resolved, self.tls_config.clone(), self.auth.clone());
                 let tls_connector = TlsConnector::system()
                     .map_err(|e| io::Error::other(format!("Hysteria TLS init failed: {e}")))?;
                 let c = HysteriaClient::connect(cfg, &tls_connector)

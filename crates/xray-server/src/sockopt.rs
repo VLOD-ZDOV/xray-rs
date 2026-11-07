@@ -382,9 +382,8 @@ pub async fn connect_happy_eyeballs(
         }
     }
 
-    Err(last_err.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "no addresses to connect")
-    }))
+    Err(last_err
+        .unwrap_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no addresses to connect")))
 }
 
 use crate::config::AddressPortStrategy;
@@ -526,13 +525,18 @@ async fn exchange_dns_query(qname: &str, qtype: u16) -> io::Result<Vec<u8>> {
         if socket.send(&query).await.is_err() {
             continue;
         }
-        if let Ok(Ok(len)) = tokio::time::timeout(Duration::from_millis(1500), socket.recv(&mut buf)).await {
+        if let Ok(Ok(len)) =
+            tokio::time::timeout(Duration::from_millis(1500), socket.recv(&mut buf)).await
+        {
             if len >= 12 && buf[0] == 0x12 && buf[1] == 0x34 {
                 return Ok(buf[..len].to_vec());
             }
         }
     }
-    Err(io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))
+    Err(io::Error::new(
+        io::ErrorKind::TimedOut,
+        "DNS query timed out",
+    ))
 }
 
 async fn query_dns_srv(qname: &str) -> io::Result<(String, u16)> {
@@ -607,7 +611,10 @@ fn read_dns_name(buf: &[u8], mut offset: usize) -> Option<String> {
 
 fn parse_srv_response(buf: &[u8]) -> io::Result<(String, u16)> {
     if buf.len() < 12 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "short dns response"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short dns response",
+        ));
     }
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
     let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
@@ -621,7 +628,10 @@ fn parse_srv_response(buf: &[u8]) -> io::Result<(String, u16)> {
         offset = skip_dns_name(buf, offset)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid answer name"))?;
         if offset + 10 > buf.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "short answer record"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "short answer record",
+            ));
         }
         let rtype = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
         let rdlen = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
@@ -633,12 +643,18 @@ fn parse_srv_response(buf: &[u8]) -> io::Result<(String, u16)> {
         }
         offset += rdlen;
     }
-    Err(io::Error::new(io::ErrorKind::NotFound, "no SRV record found in response"))
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "no SRV record found in response",
+    ))
 }
 
 fn parse_txt_response(buf: &[u8]) -> io::Result<Vec<String>> {
     if buf.len() < 12 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "short dns response"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "short dns response",
+        ));
     }
     let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
     let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
@@ -653,7 +669,10 @@ fn parse_txt_response(buf: &[u8]) -> io::Result<Vec<String>> {
         offset = skip_dns_name(buf, offset)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid answer name"))?;
         if offset + 10 > buf.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "short answer record"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "short answer record",
+            ));
         }
         let rtype = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
         let rdlen = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
@@ -677,7 +696,10 @@ fn parse_txt_response(buf: &[u8]) -> io::Result<Vec<String>> {
         offset += rdlen;
     }
     if results.is_empty() {
-        Err(io::Error::new(io::ErrorKind::NotFound, "no TXT record found in response"))
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no TXT record found in response",
+        ))
     } else {
         Ok(results)
     }

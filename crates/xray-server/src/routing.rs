@@ -1331,27 +1331,45 @@ impl Router {
                     return Err("the xdrive transport can only be used by VLESS".into());
                 }
                 let settings = outbound.get("settings").unwrap_or(&Value::Null);
-                if let Some(vnext) = settings.get("vnext").and_then(Value::as_array).and_then(|v| v.first()) {
-                    if let Some(users) = vnext.get("users").and_then(Value::as_array).and_then(|u| u.first()) {
+                if let Some(vnext) = settings
+                    .get("vnext")
+                    .and_then(Value::as_array)
+                    .and_then(|v| v.first())
+                {
+                    if let Some(users) = vnext
+                        .get("users")
+                        .and_then(Value::as_array)
+                        .and_then(|u| u.first())
+                    {
                         if !str_field(users, "flow").is_empty() {
-                            return Err("the xdrive transport doesn't support VLESS \"flow\"".into());
+                            return Err(
+                                "the xdrive transport doesn't support VLESS \"flow\"".into()
+                            );
                         }
                         if str_field(users, "encryption") == "none" {
                             return Err("the xdrive transport needs VLESS \"encryption\", run \"xray vlessenc\" to get one".into());
                         }
                         if let Some(testpre) = users.get("testpre").and_then(Value::as_i64) {
                             if testpre != 0 {
-                                return Err("the xdrive transport doesn't support VLESS \"testpre\"".into());
+                                return Err(
+                                    "the xdrive transport doesn't support VLESS \"testpre\"".into(),
+                                );
                             }
                         }
                         let has_reverse = users.get("reverse").is_some_and(|r| !r.is_null());
                         if !has_reverse {
                             let mux = outbound.get("mux").unwrap_or(&Value::Null);
-                            let mux_enabled = mux.get("enabled").and_then(Value::as_bool).unwrap_or(false);
-                            let concurrency = mux.get("concurrency").and_then(Value::as_i64).unwrap_or(0);
-                            let xudp_concurrency = mux.get("xudpConcurrency").and_then(Value::as_i64).unwrap_or(0);
+                            let mux_enabled =
+                                mux.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                            let concurrency =
+                                mux.get("concurrency").and_then(Value::as_i64).unwrap_or(0);
+                            let xudp_concurrency = mux
+                                .get("xudpConcurrency")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0);
                             let xudp_skip = str_field(mux, "xudpProxyUDP443") == "skip";
-                            if !mux_enabled || concurrency < 0 || xudp_concurrency < 0 || xudp_skip {
+                            if !mux_enabled || concurrency < 0 || xudp_concurrency < 0 || xudp_skip
+                            {
                                 return Err("the xdrive transport needs \"mux\" enabled, with no negative \"concurrency\" or \"xudpConcurrency\" and no \"xudpProxyUDP443\":\"skip\"".into());
                             }
                         }
@@ -1416,7 +1434,10 @@ impl Router {
                     .map(Arc::new);
                     if let Some(ref so) = sockopt {
                         if so.address_port_strategy != crate::config::AddressPortStrategy::None {
-                            return Err("freedom outbound does not support \"sockopt.addressPortStrategy\"".into());
+                            return Err(
+                                "freedom outbound does not support \"sockopt.addressPortStrategy\""
+                                    .into(),
+                            );
                         }
                     }
                     let freedom_settings = FreedomSettings {
@@ -1484,7 +1505,9 @@ impl Router {
                     if str_field(settings, "address").is_empty() {
                         return Err("MASQUE: \"address\" is not set".into());
                     }
-                    log::warn(format!("skipping outbound {tag:?}: MASQUE outbound is not supported yet"));
+                    log::warn(format!(
+                        "skipping outbound {tag:?}: MASQUE outbound is not supported yet"
+                    ));
                     Action::Block(BlockAction::Drop)
                 }
                 "hysteria" | "hysteria2" => {
@@ -1497,7 +1520,9 @@ impl Router {
                     if !matches!(network, "hysteria" | "hysteria2") {
                         return Err("not hysteria transport".into());
                     }
-                    Action::Hysteria(Arc::new(crate::hysteria_outbound::HysteriaOutbound::parse(&tag, outbound)?))
+                    Action::Hysteria(Arc::new(crate::hysteria_outbound::HysteriaOutbound::parse(
+                        &tag, outbound,
+                    )?))
                 }
                 "loopback" => {
                     let settings = outbound.get("settings").unwrap_or(&Value::Null);
@@ -1989,8 +2014,7 @@ pub fn parse_single_rule(raw: &Value, asset_dirs: &[PathBuf]) -> Result<Rule, St
     }) {
         let url = wh.get("url").and_then(Value::as_str).unwrap_or("");
         if !url.is_empty() {
-            let deduplication =
-                wh.get("deduplication").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let deduplication = wh.get("deduplication").and_then(Value::as_u64).unwrap_or(0) as u32;
             let mut headers = HashMap::new();
             if let Some(h) = wh.get("headers").and_then(Value::as_object) {
                 for (k, v) in h {

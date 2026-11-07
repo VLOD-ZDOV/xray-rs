@@ -1474,7 +1474,12 @@ async fn handle_handler(
                             VLESS_ACCOUNT | VMESS_ACCOUNT => {
                                 if let Ok(acc) = VlessAccount::decode(account.value) {
                                     let testseed = if acc.testseed.len() >= 4 {
-                                        [acc.testseed[0], acc.testseed[1], acc.testseed[2], acc.testseed[3]]
+                                        [
+                                            acc.testseed[0],
+                                            acc.testseed[1],
+                                            acc.testseed[2],
+                                            acc.testseed[3],
+                                        ]
                                     } else {
                                         xray_proxy::vless::DEFAULT_VISION_SEED
                                     };
@@ -1650,7 +1655,12 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 ));
             }
             let testseed = if account.testseed.len() >= 4 {
-                [account.testseed[0], account.testseed[1], account.testseed[2], account.testseed[3]]
+                [
+                    account.testseed[0],
+                    account.testseed[1],
+                    account.testseed[2],
+                    account.testseed[3],
+                ]
             } else {
                 xray_proxy::vless::DEFAULT_VISION_SEED
             };

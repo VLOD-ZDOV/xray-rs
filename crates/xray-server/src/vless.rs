@@ -601,11 +601,8 @@ where
             // Mux under Vision (XUDP from a Vision client) keeps the padding but
             // never switches to direct copy.
             write_vision_response(&mut stream, request.version).await?;
-            let client = VisionStream::new(
-                PrefixedStreamIo::new(stream, early),
-                user.id,
-                user.testseed,
-            );
+            let client =
+                VisionStream::new(PrefixedStreamIo::new(stream, early), user.id, user.testseed);
             let (mut r, mut w) = tokio::io::split(client);
             return mux::serve(&mut r, &mut w, &info).await;
         }
