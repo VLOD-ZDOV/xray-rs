@@ -1378,22 +1378,7 @@ impl Router {
             }
 
             if matches!(network, "kcp" | "mkcp") {
-                let kcp_settings = stream.get("kcpSettings").unwrap_or(&Value::Null);
-                if let Some(mtu) = kcp_settings.get("mtu").and_then(Value::as_u64) {
-                    if mtu < 21 {
-                        return Err("MTU must be at least 21".into());
-                    }
-                }
-                if let Some(tti) = kcp_settings.get("tti").and_then(Value::as_u64) {
-                    if !(10..=1000).contains(&tti) {
-                        return Err("TTI must be between 10 and 1000".into());
-                    }
-                }
-                if let Some(cwnd) = kcp_settings.get("cwndMultiplier").and_then(Value::as_u64) {
-                    if cwnd < 1 {
-                        return Err("CwndMultiplier must be at least 1".into());
-                    }
-                }
+                let _ = crate::config::parse_kcp(stream)?;
             }
 
             let action = match protocol {

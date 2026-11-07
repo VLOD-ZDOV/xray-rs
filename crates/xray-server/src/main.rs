@@ -16,6 +16,7 @@ mod httpupgrade;
 mod hysteria;
 mod hysteria_outbound;
 mod inbound_proxy;
+pub mod kcp;
 mod log;
 mod metrics;
 mod mux;
@@ -265,6 +266,96 @@ async fn run(
     Ok(())
 }
 
+pub(crate) fn select_inbound_handler(
+    inbound: &Inbound,
+    ctx: Arc<vless::Context>,
+    trusted_xff: &[String],
+) -> Result<InboundHandler, String> {
+    match (inbound.protocol, inbound.transport.clone()) {
+        (InboundProtocol::Vless, InboundTransport::Tcp | InboundTransport::Kcp(_)) => {
+            Ok(InboundHandler::VlessTcp(ctx))
+        }
+        (InboundProtocol::Vless, InboundTransport::Websocket(settings)) => {
+            Ok(InboundHandler::VlessWs(ctx, settings, trusted_xff.to_vec()))
+        }
+        (InboundProtocol::Vless, InboundTransport::HttpUpgrade(settings)) => Ok(
+            InboundHandler::VlessHttpUpgrade(ctx, settings, trusted_xff.to_vec()),
+        ),
+        (InboundProtocol::Vless, InboundTransport::Grpc(settings)) => {
+            let mut gh = grpc::Handler::new(settings, grpc::GrpcProtocol::Vless(ctx));
+            gh.with_trusted_x_forwarded_for(trusted_xff.to_vec());
+            Ok(InboundHandler::VlessGrpc(gh))
+        }
+        (InboundProtocol::Trojan, InboundTransport::Tcp | InboundTransport::Kcp(_)) => {
+            Ok(InboundHandler::TrojanTcp(ctx))
+        }
+        (InboundProtocol::Trojan, InboundTransport::Websocket(settings)) => Ok(
+            InboundHandler::TrojanWs(ctx, settings, trusted_xff.to_vec()),
+        ),
+        (InboundProtocol::Trojan, InboundTransport::HttpUpgrade(settings)) => Ok(
+            InboundHandler::TrojanHttpUpgrade(ctx, settings, trusted_xff.to_vec()),
+        ),
+        (InboundProtocol::Trojan, InboundTransport::Grpc(settings)) => {
+            let mut gh = grpc::Handler::new(settings, grpc::GrpcProtocol::Trojan(ctx));
+            gh.with_trusted_x_forwarded_for(trusted_xff.to_vec());
+            Ok(InboundHandler::TrojanGrpc(gh))
+        }
+        (InboundProtocol::Vmess, InboundTransport::Tcp | InboundTransport::Kcp(_)) => {
+            Ok(InboundHandler::VmessTcp(ctx))
+        }
+        (InboundProtocol::Vmess, InboundTransport::Websocket(settings)) => {
+            Ok(InboundHandler::VmessWs(ctx, settings, trusted_xff.to_vec()))
+        }
+        (InboundProtocol::Vmess, InboundTransport::HttpUpgrade(settings)) => Ok(
+            InboundHandler::VmessHttpUpgrade(ctx, settings, trusted_xff.to_vec()),
+        ),
+        (InboundProtocol::Socks, InboundTransport::Tcp | InboundTransport::Kcp(_)) => Ok(
+            InboundHandler::Socks(ctx, inbound.socks_auth.clone(), inbound.udp),
+        ),
+        (InboundProtocol::Http, InboundTransport::Tcp | InboundTransport::Kcp(_)) => {
+            Ok(InboundHandler::Http(ctx, inbound.socks_auth.clone()))
+        }
+        (InboundProtocol::Shadowsocks, InboundTransport::Tcp | InboundTransport::Kcp(_)) => {
+            Ok(InboundHandler::Shadowsocks(ctx))
+        }
+        (InboundProtocol::Dokodemo, InboundTransport::Tcp | InboundTransport::Kcp(_)) => {
+            let settings = inbound
+                .dokodemo
+                .clone()
+                .unwrap_or(config::DokodemoSettings {
+                    address: None,
+                    port: None,
+                    follow_redirect: false,
+                });
+            Ok(InboundHandler::Dokodemo(ctx, Arc::new(settings)))
+        }
+        (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
+            let mut xh = xhttp::Handler::new(*settings, ctx);
+            xh.with_trusted_x_forwarded_for(trusted_xff.to_vec());
+            Ok(InboundHandler::VlessXhttp(xh))
+        }
+        (other, InboundTransport::Xhttp(_)) => Err(format!(
+            "inbound {}: {:?} over XHTTP is not supported",
+            inbound.tag, other
+        )),
+        (other, InboundTransport::Websocket(_)) => Err(format!(
+            "inbound {}: {:?} over WebSocket is not supported",
+            inbound.tag, other
+        )),
+        (other, InboundTransport::HttpUpgrade(_)) => Err(format!(
+            "inbound {}: {:?} over HTTPUpgrade is not supported",
+            inbound.tag, other
+        )),
+        (other, InboundTransport::Grpc(_)) => Err(format!(
+            "inbound {}: {:?} over gRPC is not supported",
+            inbound.tag, other
+        )),
+        (InboundProtocol::Hysteria, _) | (_, InboundTransport::Hysteria) => {
+            unreachable!("hysteria is handled above")
+        }
+    }
+}
+
 pub(crate) async fn start_inbound(
     inbound: &Inbound,
     acceptor: Option<TlsAcceptor>,
@@ -314,6 +405,14 @@ pub(crate) async fn start_inbound(
         return Ok((ctx, Some(abort), None));
     }
 
+    if matches!(inbound.transport, InboundTransport::Kcp(_)) {
+        let InboundTransport::Kcp(settings) = &inbound.transport else {
+            unreachable!()
+        };
+        let abort = kcp::start(inbound, ctx.clone(), settings.clone(), acceptor, router).await?;
+        return Ok((ctx, Some(abort), None));
+    }
+
     let listener = bind(inbound).await?;
     log::info(format!(
         "listening {} on {}",
@@ -332,91 +431,7 @@ pub(crate) async fn start_inbound(
         .map(|s| s.trusted_x_forwarded_for.clone())
         .unwrap_or_default();
 
-    let handler = match (inbound.protocol, inbound.transport.clone()) {
-        (InboundProtocol::Vless, InboundTransport::Tcp) => InboundHandler::VlessTcp(ctx.clone()),
-        (InboundProtocol::Vless, InboundTransport::Websocket(settings)) => {
-            InboundHandler::VlessWs(ctx.clone(), settings, trusted_xff)
-        }
-        (InboundProtocol::Vless, InboundTransport::HttpUpgrade(settings)) => {
-            InboundHandler::VlessHttpUpgrade(ctx.clone(), settings, trusted_xff)
-        }
-        (InboundProtocol::Vless, InboundTransport::Grpc(settings)) => {
-            let mut gh = grpc::Handler::new(settings, grpc::GrpcProtocol::Vless(ctx.clone()));
-            gh.with_trusted_x_forwarded_for(trusted_xff);
-            InboundHandler::VlessGrpc(gh)
-        }
-        (InboundProtocol::Trojan, InboundTransport::Tcp) => InboundHandler::TrojanTcp(ctx.clone()),
-        (InboundProtocol::Trojan, InboundTransport::Websocket(settings)) => {
-            InboundHandler::TrojanWs(ctx.clone(), settings, trusted_xff)
-        }
-        (InboundProtocol::Trojan, InboundTransport::HttpUpgrade(settings)) => {
-            InboundHandler::TrojanHttpUpgrade(ctx.clone(), settings, trusted_xff)
-        }
-        (InboundProtocol::Trojan, InboundTransport::Grpc(settings)) => {
-            let mut gh = grpc::Handler::new(settings, grpc::GrpcProtocol::Trojan(ctx.clone()));
-            gh.with_trusted_x_forwarded_for(trusted_xff);
-            InboundHandler::TrojanGrpc(gh)
-        }
-        (InboundProtocol::Vmess, InboundTransport::Tcp) => InboundHandler::VmessTcp(ctx.clone()),
-        (InboundProtocol::Vmess, InboundTransport::Websocket(settings)) => {
-            InboundHandler::VmessWs(ctx.clone(), settings, trusted_xff)
-        }
-        (InboundProtocol::Vmess, InboundTransport::HttpUpgrade(settings)) => {
-            InboundHandler::VmessHttpUpgrade(ctx.clone(), settings, trusted_xff)
-        }
-        (InboundProtocol::Socks, InboundTransport::Tcp) => {
-            InboundHandler::Socks(ctx.clone(), inbound.socks_auth.clone(), inbound.udp)
-        }
-        (InboundProtocol::Http, InboundTransport::Tcp) => {
-            InboundHandler::Http(ctx.clone(), inbound.socks_auth.clone())
-        }
-        (InboundProtocol::Shadowsocks, InboundTransport::Tcp) => {
-            InboundHandler::Shadowsocks(ctx.clone())
-        }
-        (InboundProtocol::Dokodemo, InboundTransport::Tcp) => {
-            let settings = inbound
-                .dokodemo
-                .clone()
-                .unwrap_or(config::DokodemoSettings {
-                    address: None,
-                    port: None,
-                    follow_redirect: false,
-                });
-            InboundHandler::Dokodemo(ctx.clone(), Arc::new(settings))
-        }
-        (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
-            let mut xh = xhttp::Handler::new(*settings, ctx.clone());
-            xh.with_trusted_x_forwarded_for(trusted_xff);
-            InboundHandler::VlessXhttp(xh)
-        }
-        (other, InboundTransport::Xhttp(_)) => {
-            return Err(format!(
-                "inbound {}: {:?} over XHTTP is not supported",
-                inbound.tag, other
-            ));
-        }
-        (other, InboundTransport::Websocket(_)) => {
-            return Err(format!(
-                "inbound {}: {:?} over WebSocket is not supported",
-                inbound.tag, other
-            ));
-        }
-        (other, InboundTransport::HttpUpgrade(_)) => {
-            return Err(format!(
-                "inbound {}: {:?} over HTTPUpgrade is not supported",
-                inbound.tag, other
-            ));
-        }
-        (other, InboundTransport::Grpc(_)) => {
-            return Err(format!(
-                "inbound {}: {:?} over gRPC is not supported",
-                inbound.tag, other
-            ));
-        }
-        (InboundProtocol::Hysteria, _) | (_, InboundTransport::Hysteria) => {
-            unreachable!("hysteria is handled above")
-        }
-    };
+    let handler = select_inbound_handler(inbound, ctx.clone(), &trusted_xff)?;
     let reality = if let Some(reality_settings) = &inbound.reality {
         let is_grpc = matches!(inbound.transport, InboundTransport::Grpc(_));
         let is_xhttp = matches!(inbound.transport, InboundTransport::Xhttp(_));
@@ -566,11 +581,96 @@ fn bracket(host: &str) -> String {
     }
 }
 
+pub enum InboundIo {
+    Tcp(TcpStream),
+    Duplex(tokio::io::DuplexStream),
+}
+
+impl AsyncRead for InboundIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Duplex(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for InboundIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Duplex(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_flush(cx),
+            Self::Duplex(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Duplex(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+impl xray_proxy::vless::VisionStreamIo for InboundIo {
+    fn release_record_alignment(&mut self) {}
+
+    fn poll_read_direct(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        output: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        AsyncRead::poll_read(self, cx, output)
+    }
+
+    fn poll_write_direct(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        input: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        AsyncWrite::poll_write(self, cx, input)
+    }
+
+    fn poll_flush_direct(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        AsyncWrite::poll_flush(self, cx)
+    }
+
+    fn poll_shutdown_direct(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        AsyncWrite::poll_shutdown(self, cx)
+    }
+}
+
 pub enum InboundStream {
-    Plain(httpupgrade::PrefixedStream<TcpStream>),
-    Tls(penetrating_tls::ServerPenetratingTlsStream<httpupgrade::PrefixedStream<TcpStream>>),
-    Reality(reality::Tls13Stream<httpupgrade::PrefixedStream<TcpStream>>),
-    HttpObfs(http_obfs::PrefixedStream<httpupgrade::PrefixedStream<TcpStream>>),
+    Plain(httpupgrade::PrefixedStream<InboundIo>),
+    Tls(penetrating_tls::ServerPenetratingTlsStream<httpupgrade::PrefixedStream<InboundIo>>),
+    Reality(reality::Tls13Stream<httpupgrade::PrefixedStream<InboundIo>>),
+    HttpObfs(http_obfs::PrefixedStream<httpupgrade::PrefixedStream<InboundIo>>),
 }
 
 impl InboundStream {
@@ -760,7 +860,7 @@ async fn accept_loop(
                 Vec::new()
             };
 
-            let stream = httpupgrade::PrefixedStream::new(stream, leftover);
+            let stream = httpupgrade::PrefixedStream::new(InboundIo::Tcp(stream), leftover);
             if let Some(reality) = reality {
                 match reality.handle(stream, peer).await {
                     Ok(Some(tls_stream)) => {

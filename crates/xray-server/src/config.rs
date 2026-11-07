@@ -52,6 +52,7 @@ pub enum InboundTransport {
     Grpc(crate::grpc::GrpcSettings),
     Xhttp(Box<XhttpSettings>),
     Hysteria,
+    Kcp(Arc<crate::kcp::KcpSettings>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -771,35 +772,22 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let is_httpupgrade = network == "httpupgrade";
     let is_grpc = matches!(network, "grpc" | "gun");
     let is_xhttp = matches!(network, "xhttp" | "splithttp");
+    let is_kcp = matches!(network, "kcp" | "mkcp");
     let supported_security = matches!(security, "" | "none" | "tls" | "reality");
-    if matches!(network, "kcp" | "mkcp") {
-        let kcp_settings = stream.get("kcpSettings").unwrap_or(&Value::Null);
-        if let Some(mtu) = kcp_settings.get("mtu").and_then(Value::as_u64) {
-            if mtu < 21 {
-                return Err("MTU must be at least 21".into());
-            }
-        }
-        if let Some(tti) = kcp_settings.get("tti").and_then(Value::as_u64) {
-            if !(10..=1000).contains(&tti) {
-                return Err("TTI must be between 10 and 1000".into());
-            }
-        }
-        if let Some(cwnd) = kcp_settings.get("cwndMultiplier").and_then(Value::as_u64) {
-            if cwnd < 1 {
-                return Err("CwndMultiplier must be at least 1".into());
-            }
-        }
-        log::warn(format!(
-            "skipping inbound {tag:?}: mKCP transport is not supported yet"
-        ));
-        return Ok(None);
-    }
+
+    let kcp_settings = if is_kcp {
+        Some(Arc::new(parse_kcp(stream)?))
+    } else {
+        None
+    };
+
     if is_hysteria {
         if security != "tls" {
             log::warn(format!("skipping inbound {tag:?}: Hysteria requires TLS"));
             return Ok(None);
         }
-    } else if (!is_tcp && !is_ws && !is_httpupgrade && !is_grpc && !is_xhttp) || !supported_security
+    } else if (!is_tcp && !is_ws && !is_httpupgrade && !is_grpc && !is_xhttp && !is_kcp)
+        || !supported_security
     {
         log::warn(format!(
             "skipping inbound {tag:?}: {:?}/{}/{} is not supported yet",
@@ -1052,6 +1040,8 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     };
     let transport = if is_hysteria {
         InboundTransport::Hysteria
+    } else if let Some(kcp) = kcp_settings {
+        InboundTransport::Kcp(kcp)
     } else if is_tcp {
         InboundTransport::Tcp
     } else if is_ws {
@@ -2044,6 +2034,85 @@ fn parse_reality(reality: &Value, _tag: &str) -> Result<Option<RealityInboundSet
         alpn,
         mldsa65_seed,
     }))
+}
+
+pub fn parse_kcp(stream: &Value) -> Result<crate::kcp::KcpSettings, String> {
+    let k = stream.get("kcpSettings").unwrap_or(&Value::Null);
+    let mut settings = crate::kcp::KcpSettings::default();
+
+    if let Some(mtu) = k.get("mtu").and_then(Value::as_u64) {
+        settings.mtu = mtu as u32;
+    }
+    if let Some(tti) = k.get("tti").and_then(Value::as_u64) {
+        settings.tti = tti as u32;
+    }
+    if let Some(up) = k.get("uplinkCapacity").and_then(Value::as_u64) {
+        settings.uplink_capacity = up as u32;
+    }
+    if let Some(down) = k.get("downlinkCapacity").and_then(Value::as_u64) {
+        settings.downlink_capacity = down as u32;
+    }
+    if let Some(c) = k.get("congestion").and_then(Value::as_bool) {
+        settings.congestion = c;
+        if c && k.get("cwndMultiplier").is_none() {
+            settings.cwnd_multiplier = 20;
+        }
+    }
+    if let Some(cwnd) = k.get("cwndMultiplier").and_then(Value::as_u64) {
+        settings.cwnd_multiplier = cwnd as u32;
+    }
+    if let Some(r) = k.get("readBufferSize").and_then(Value::as_u64) {
+        settings.read_buffer_size = r as u32;
+    }
+    if let Some(w) = k.get("writeBufferSize").and_then(Value::as_u64) {
+        settings.write_buffer_size = w as u32;
+    }
+    if let Some(m) = k.get("maxSendingWindow").and_then(Value::as_u64) {
+        settings.max_sending_window = m as u32;
+    }
+
+    if let Some(h) = k.get("header") {
+        let h_type = h.get("type").and_then(Value::as_str).unwrap_or("");
+        if let Some(ht) = crate::kcp::KcpHeaderType::parse(h_type) {
+            settings.header_type = ht;
+        }
+        if let Some(domain) = h.get("domain").and_then(Value::as_str) {
+            settings.header_domain = domain.to_string();
+        }
+    }
+    if let Some(seed) = k.get("seed").and_then(Value::as_str) {
+        if !seed.is_empty() {
+            settings.seed = Some(seed.to_string());
+        }
+    }
+
+    // Also check finalmask.udp for mkcp-legacy if not set in kcpSettings
+    if let Some(udp_masks) = stream
+        .get("finalmask")
+        .and_then(|f| f.get("udp"))
+        .and_then(Value::as_array)
+    {
+        for mask in udp_masks {
+            if mask.get("type").and_then(Value::as_str) == Some("mkcp-legacy") {
+                let s = mask.get("settings").unwrap_or(&Value::Null);
+                let h = s.get("header").and_then(Value::as_str).unwrap_or("");
+                let val = s.get("value").and_then(Value::as_str).unwrap_or("");
+                if !h.is_empty() {
+                    if let Some(ht) = crate::kcp::KcpHeaderType::parse(h) {
+                        settings.header_type = ht;
+                    }
+                    if settings.header_type == crate::kcp::KcpHeaderType::Dns && !val.is_empty() {
+                        settings.header_domain = val.to_string();
+                    }
+                } else if !val.is_empty() {
+                    settings.seed = Some(val.to_string());
+                }
+            }
+        }
+    }
+
+    settings.validate()?;
+    Ok(settings)
 }
 
 fn parse_xhttp(x: &Value) -> Result<XhttpSettings, String> {

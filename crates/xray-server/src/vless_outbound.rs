@@ -117,6 +117,7 @@ pub struct VlessOutbound {
     pub send_through: Option<crate::routing::SendThrough>,
     pub reverse: Option<String>,
     pub testseed: [u32; 4],
+    pub kcp: Option<Arc<crate::kcp::KcpSettings>>,
 }
 
 impl fmt::Debug for VlessOutbound {
@@ -254,8 +255,13 @@ impl VlessOutbound {
         };
 
         let mut download = None;
+        let kcp = if matches!(network, "kcp" | "mkcp") {
+            Some(Arc::new(crate::config::parse_kcp(stream)?))
+        } else {
+            None
+        };
         let transport = match network {
-            "" | "tcp" | "raw" => TransportLayer::Raw,
+            "" | "tcp" | "raw" | "kcp" | "mkcp" => TransportLayer::Raw,
             "ws" | "websocket" => {
                 let ws = stream.get("wsSettings").unwrap_or(&Value::Null);
                 let path = ws
@@ -434,6 +440,7 @@ impl VlessOutbound {
             send_through,
             reverse,
             testseed,
+            kcp,
         })
     }
 
@@ -591,6 +598,26 @@ impl VlessOutbound {
                 )
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))
+            } else if let Some(kcp_settings) = &self.kcp {
+                let candidate = candidates[0];
+                let protector = crate::outbound_transport::OutboundProtector::new(
+                    self.sockopt.clone(),
+                    self.send_through.clone(),
+                    None,
+                );
+                let duplex = crate::kcp::dial(candidate, kcp_settings, Some(&protector)).await?;
+                let base: BoxedTransportStream =
+                    Box::new(crate::outbound_transport::TransportStreamWrapper(duplex));
+                match &self.connector {
+                    ConnectorConfig::Tls(tls_cfg) => dialer
+                        .tls_connector()
+                        .connect_stream(base, tls_cfg)
+                        .await
+                        .map_err(|e| {
+                            io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string())
+                        }),
+                    _ => Ok(base),
+                }
             } else {
                 dialer
                     .connect_stream(
