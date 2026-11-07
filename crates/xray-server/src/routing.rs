@@ -1180,10 +1180,14 @@ impl Router {
                     };
                     Action::Block(block_action)
                 }
-                "wireguard" => Action::Wireguard(Arc::new(WgOutbound::parse(
-                    &tag,
-                    outbound.get("settings").unwrap_or(&Value::Null),
-                )?)),
+                "wireguard" => {
+                    let wg = Arc::new(WgOutbound::parse(
+                        &tag,
+                        outbound.get("settings").unwrap_or(&Value::Null),
+                    )?);
+                    wg.clone().warm_up();
+                    Action::Wireguard(wg)
+                }
                 "socks" => Action::Socks(Arc::new(SocksOutbound::parse(&tag, outbound)?)),
                 "vless" => Action::Vless(Arc::new(VlessOutbound::parse(&tag, outbound)?)),
                 "vmess" => Action::Vmess(Arc::new(VmessOutbound::parse(&tag, outbound)?)),

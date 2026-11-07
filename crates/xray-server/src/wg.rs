@@ -5,6 +5,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::Value;
@@ -166,6 +167,18 @@ impl WgOutbound {
                 .collect(),
             addresses: self.addresses.clone(),
             mtu: self.mtu,
+        }
+    }
+
+    /// Brings the tunnel up at startup, as Xray does, so the first user connection does not race
+    /// the handshake. Skipped outside a runtime (config test).
+    pub fn warm_up(self: Arc<Self>) {
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(e) = self.client().await {
+                    log::warn(format!("wireguard outbound {:?}: {e}", self.tag));
+                }
+            });
         }
     }
 
