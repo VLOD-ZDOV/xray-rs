@@ -1217,6 +1217,12 @@ impl Router {
                     "outbound {tag:?}: sockopt is only applied to freedom outbounds yet, ignored"
                 ));
             }
+            let finalmask = outbound.pointer("/streamSettings/finalmask");
+            if finalmask.is_some_and(|m| m.as_object().is_some_and(|m| !m.is_empty())) {
+                log::warn(format!(
+                    "outbound {tag:?}: streamSettings.finalmask is not supported yet for outbounds, ignored"
+                ));
+            }
             if let Some(proxy_tag) = parse_dialer_proxy(outbound, &tag)? {
                 dialer_proxies.push((tag.clone(), proxy_tag));
             }
