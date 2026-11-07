@@ -202,6 +202,15 @@ pub fn parse_finalmask_udp_noises(stream: &Value) -> Result<Vec<FreedomNoiseSett
 
 /// Validates `finalmask.quicParams` against official Xray bounds.
 pub fn validate_finalmask_quic_params(stream: &Value, tag: &str) -> Result<(), String> {
+    validate_quic_params_inner(stream, "outbound", tag)
+}
+
+/// Validates inbound `quicParams` against official Xray bounds.
+pub fn validate_inbound_quic_params(stream: &Value, tag: &str) -> Result<(), String> {
+    validate_quic_params_inner(stream, "inbound", tag)
+}
+
+fn validate_quic_params_inner(stream: &Value, kind: &str, tag: &str) -> Result<(), String> {
     let quic = match stream
         .pointer("/finalmask/quicParams")
         .or_else(|| stream.get("quicParams"))
@@ -210,14 +219,14 @@ pub fn validate_finalmask_quic_params(stream: &Value, tag: &str) -> Result<(), S
         _ => return Ok(()),
     };
     let Some(obj) = quic.as_object() else {
-        return Err(format!("outbound {tag:?}: quicParams must be an object"));
+        return Err(format!("{kind} {tag:?}: quicParams must be an object"));
     };
 
     if let Some(congestion) = obj.get("congestion").and_then(Value::as_str) {
         let c = congestion.to_ascii_lowercase();
         if !matches!(c.as_str(), "" | "bbr" | "reno" | "brutal" | "force-brutal") {
             return Err(format!(
-                "outbound {tag:?}: unknown congestion control: {congestion}, valid values: reno, bbr, brutal, force-brutal"
+                "{kind} {tag:?}: unknown congestion control: {congestion}, valid values: reno, bbr, brutal, force-brutal"
             ));
         }
     }
@@ -225,7 +234,7 @@ pub fn validate_finalmask_quic_params(stream: &Value, tag: &str) -> Result<(), S
     if let Some(bbr_profile) = obj.get("bbrProfile").and_then(Value::as_str) {
         let p = bbr_profile.to_ascii_lowercase();
         if !matches!(p.as_str(), "" | "conservative" | "standard" | "aggressive") {
-            return Err(format!("outbound {tag:?}: unknown bbr profile"));
+            return Err(format!("{kind} {tag:?}: unknown bbr profile"));
         }
     }
 
@@ -240,7 +249,7 @@ pub fn validate_finalmask_quic_params(stream: &Value, tag: &str) -> Result<(), S
             };
             if bps > 0 && bps < 65536 {
                 return Err(format!(
-                    "outbound {tag:?}: {field_name} must be at least 65536 bytes per second"
+                    "{kind} {tag:?}: {field_name} must be at least 65536 bytes per second"
                 ));
             }
             return Ok(Some(bps));
@@ -257,7 +266,7 @@ pub fn validate_finalmask_quic_params(stream: &Value, tag: &str) -> Result<(), S
         .and_then(Value::as_str)
     {
         if congestion.eq_ignore_ascii_case("force-brutal") && brutal_up == 0 {
-            return Err(format!("outbound {tag:?}: force-brutal requires up"));
+            return Err(format!("{kind} {tag:?}: force-brutal requires up"));
         }
     }
 
@@ -269,7 +278,7 @@ pub fn validate_finalmask_quic_params(stream: &Value, tag: &str) -> Result<(), S
         {
             if w > 0 && w < 16384 {
                 return Err(format!(
-                    "outbound {tag:?}: {field_name} must be at least 16384"
+                    "{kind} {tag:?}: {field_name} must be at least 16384"
                 ));
             }
         }
@@ -287,7 +296,7 @@ pub fn validate_finalmask_quic_params(stream: &Value, tag: &str) -> Result<(), S
     {
         if timeout != 0 && !(4..=120).contains(&timeout) {
             return Err(format!(
-                "outbound {tag:?}: MaxIdleTimeout must be between 4 and 120"
+                "{kind} {tag:?}: MaxIdleTimeout must be between 4 and 120"
             ));
         }
     }
@@ -299,7 +308,7 @@ pub fn validate_finalmask_quic_params(stream: &Value, tag: &str) -> Result<(), S
     {
         if keepalive != 0 && !(2..=60).contains(&keepalive) {
             return Err(format!(
-                "outbound {tag:?}: KeepAlivePeriod must be between 2 and 60"
+                "{kind} {tag:?}: KeepAlivePeriod must be between 2 and 60"
             ));
         }
     }
@@ -311,7 +320,7 @@ pub fn validate_finalmask_quic_params(stream: &Value, tag: &str) -> Result<(), S
     {
         if streams != 0 && streams < 8 {
             return Err(format!(
-                "outbound {tag:?}: MaxIncomingStreams must be at least 8"
+                "{kind} {tag:?}: MaxIncomingStreams must be at least 8"
             ));
         }
     }

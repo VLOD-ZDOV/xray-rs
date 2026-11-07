@@ -280,6 +280,17 @@ pub(crate) async fn start_inbound(
         return Ok((ctx, Some(abort), None));
     }
 
+    let is_xhttp_h3 = matches!(inbound.transport, InboundTransport::Xhttp(_))
+        && inbound.tls.as_ref().map(|t| t.alpn.as_slice()) == Some(&[String::from("h3")]);
+
+    if is_xhttp_h3 {
+        let InboundTransport::Xhttp(settings) = &inbound.transport else {
+            unreachable!()
+        };
+        let abort = xhttp::start_h3(inbound, ctx.clone(), (**settings).clone()).await?;
+        return Ok((ctx, Some(abort), None));
+    }
+
     let listener = bind(inbound).await?;
     log::info(format!(
         "listening {} on {}",
@@ -1105,6 +1116,10 @@ fn tls_acceptor(
     is_xhttp: bool,
     is_grpc: bool,
 ) -> Result<TlsAcceptor, String> {
+    if is_xhttp && settings.alpn.as_slice() == ["h3"] {
+        let config = build_rustls_server_config(settings, vec![b"h3".to_vec()], true)?;
+        return Ok(TlsAcceptor::from(Arc::new(config)));
+    }
     let alpn: Vec<Vec<u8>> = settings
         .alpn
         .iter()

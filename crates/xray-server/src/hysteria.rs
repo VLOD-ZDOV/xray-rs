@@ -78,7 +78,7 @@ fn decode(password: &str, buffer: &mut [u8], meta: &mut udp::RecvMeta) {
     meta.stride -= SALT_LEN;
 }
 
-struct ServerCarrierSocket {
+pub(crate) struct ServerCarrierSocket {
     inner: Arc<dyn AsyncUdpSocket>,
     password: Arc<Zeroizing<String>>,
     gecko: Option<GeckoPacketSize>,
@@ -90,7 +90,7 @@ struct ServerCarrierSocket {
 }
 
 impl ServerCarrierSocket {
-    fn new(
+    pub(crate) fn new(
         inner: Arc<dyn AsyncUdpSocket>,
         password: Arc<Zeroizing<String>>,
         gecko: Option<GeckoPacketSize>,

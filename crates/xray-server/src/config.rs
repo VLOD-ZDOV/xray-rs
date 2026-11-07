@@ -155,6 +155,7 @@ pub struct Inbound {
     pub has_udphop: bool,
     pub vless_encryption: Option<Arc<xray_vless_encryption::Server>>,
     pub sockopt: Option<SockoptSettings>,
+    pub quic_params: Option<xray_config::QuicParamsSettings>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -878,6 +879,48 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         }
     }
 
+    let quic_params = if stream.pointer("/finalmask/quicParams").is_some()
+        || stream.get("quicParams").is_some()
+    {
+        crate::finalmask::validate_inbound_quic_params(stream, &tag)?;
+        let mut qp_val = stream
+            .pointer("/finalmask/quicParams")
+            .or_else(|| stream.get("quicParams"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = qp_val.as_object_mut() {
+            obj.insert("disableChromeParrot".to_string(), serde_json::json!(true));
+        }
+        let synth_stream = serde_json::json!({
+            "network": "xhttp",
+            "xhttpSettings": { "path": "/" },
+            "security": "tls",
+            "tlsSettings": { "serverName": "a", "alpn": ["h3"] },
+            "finalmask": {
+                "quicParams": qp_val
+            }
+        });
+        let synth = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [{
+                "protocol": "freedom",
+                "streamSettings": synth_stream
+            }]
+        });
+        let parsed = xray_config::parse_xray_json(&synth.to_string()).map_err(|e| {
+            let messages: Vec<String> = e.diagnostics.iter().map(|d| d.message.clone()).collect();
+            format!("inbound {tag:?}: {}", messages.join("; "))
+        })?;
+        parsed
+            .config
+            .outbounds
+            .into_iter()
+            .next()
+            .and_then(|o| o.stream.quic_params)
+    } else {
+        None
+    };
+
     Ok(Some(Inbound {
         tag,
         listen,
@@ -904,6 +947,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         has_udphop,
         vless_encryption,
         sockopt: sockopt_settings,
+        quic_params,
     }))
 }
 
