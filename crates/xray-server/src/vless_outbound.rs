@@ -115,6 +115,7 @@ pub struct VlessOutbound {
     pub sockopt: Option<Arc<crate::config::SockoptSettings>>,
     pub send_through: Option<crate::routing::SendThrough>,
     pub reverse: Option<String>,
+    pub testseed: [u32; 4],
 }
 
 impl fmt::Debug for VlessOutbound {
@@ -212,6 +213,10 @@ impl VlessOutbound {
             .map(str::trim)
             .filter(|f| !f.is_empty())
             .map(str::to_owned);
+        let testseed = crate::config::parse_testseed(
+            user.get("testseed").or_else(|| settings.get("testseed")),
+            DEFAULT_VISION_SEED,
+        );
 
         let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
         let network = stream
@@ -427,6 +432,7 @@ impl VlessOutbound {
             sockopt,
             send_through,
             reverse,
+            testseed,
         })
     }
 
@@ -633,7 +639,7 @@ impl VlessOutbound {
             let vision_stream = VisionStream::new(
                 response_stream,
                 *self.user_id.as_bytes(),
-                DEFAULT_VISION_SEED,
+                self.testseed,
             );
             Ok(Box::new(vision_stream))
         } else {

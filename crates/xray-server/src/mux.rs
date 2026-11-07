@@ -42,6 +42,7 @@ pub struct Frame {
     pub option: u8,
     pub target: Option<(u8, Host, u16)>,
     pub data: Option<Vec<u8>>,
+    pub global_id: Option<[u8; 8]>,
 }
 
 pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Frame> {
@@ -55,15 +56,26 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Fram
     let (status, option) = (meta[2], meta[3]);
 
     let mut target = None;
+    let mut global_id = None;
     // A Keep frame may carry a per-packet UDP address; the flag byte must be checked first.
     if status == STATUS_NEW || (status == STATUS_KEEP && meta.len() > 4 && meta[4] == NETWORK_UDP) {
         let network = meta[4];
         if network != NETWORK_TCP && network != NETWORK_UDP {
             return Err(invalid("unknown mux network"));
         }
-        let (host, port, _) =
+        let (host, port, used) =
             parse_port_addr(&meta[5..]).ok_or_else(|| invalid("bad mux address"))?;
         target = Some((network, host, port));
+        if status == STATUS_NEW && (option & OPTION_DATA != 0) && network == NETWORK_UDP {
+            let rem = &meta[5 + used..];
+            if rem.len() >= 8 {
+                let mut gid = [0u8; 8];
+                gid.copy_from_slice(&rem[..8]);
+                if gid != [0u8; 8] {
+                    global_id = Some(gid);
+                }
+            }
+        }
     }
 
     let data = if option & OPTION_DATA != 0 {
@@ -80,6 +92,7 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Fram
         option,
         target,
         data,
+        global_id,
     })
 }
 
@@ -168,15 +181,47 @@ struct Packet {
     dest: Option<(Host, u16)>,
 }
 
+type DownlinkSender = Arc<std::sync::RwLock<Option<(u16, mpsc::Sender<Bytes>)>>>;
+
+struct XudpSessionState {
+    downlink: DownlinkSender,
+    uplink: mpsc::Sender<Packet>,
+    expire_at: Arc<std::sync::atomic::AtomicU64>,
+}
+
+static XUDP_MANAGER: std::sync::LazyLock<
+    std::sync::RwLock<HashMap<[u8; 8], Arc<XudpSessionState>>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+fn detach_xudp(gid: [u8; 8]) {
+    let mgr = XUDP_MANAGER.read().unwrap();
+    if let Some(state) = mgr.get(&gid) {
+        *state.downlink.write().unwrap() = None;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        state
+            .expire_at
+            .store(now + 60, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 struct Session {
     input: mpsc::Sender<Packet>,
     udp: bool,
-    task: JoinHandle<()>,
+    global_id: Option<[u8; 8]>,
+    task: Option<JoinHandle<()>>,
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+        if let Some(gid) = self.global_id {
+            detach_xudp(gid);
+        }
     }
 }
 
@@ -252,6 +297,88 @@ where
                         decision,
                         traffic,
                     };
+                    if let (true, Some(gid)) = (udp, frame.global_id) {
+                        let existing = {
+                            let mut mgr = XUDP_MANAGER.write().unwrap();
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            mgr.retain(|_, s| {
+                                let exp = s.expire_at.load(std::sync::atomic::Ordering::Relaxed);
+                                exp == 0 || now < exp
+                            });
+                            if let Some(s) = mgr.get(&gid) {
+                                *s.downlink.write().unwrap() = Some((frame.id, out_tx.clone()));
+                                s.expire_at.store(0, std::sync::atomic::Ordering::Relaxed);
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some(state) = existing {
+                            let session = Session {
+                                input: state.uplink.clone(),
+                                udp: true,
+                                global_id: Some(gid),
+                                task: None,
+                            };
+                            if let Some(data) = frame.data {
+                                forward(
+                                    &session,
+                                    Packet {
+                                        data: data.into(),
+                                        dest: None,
+                                    },
+                                )
+                                .await;
+                            }
+                            sessions.insert(frame.id, session);
+                            continue;
+                        }
+
+                        let (tx, rx) = mpsc::channel(64);
+                        let downlink =
+                            Arc::new(std::sync::RwLock::new(Some((frame.id, out_tx.clone()))));
+                        let expire_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                        let state = Arc::new(XudpSessionState {
+                            downlink: downlink.clone(),
+                            uplink: tx.clone(),
+                            expire_at: expire_at.clone(),
+                        });
+                        {
+                            let mut mgr = XUDP_MANAGER.write().unwrap();
+                            mgr.insert(gid, state);
+                        }
+                        tokio::spawn(xudp_worker(
+                            gid,
+                            (host, port),
+                            rx,
+                            downlink,
+                            expire_at,
+                            dial,
+                        ));
+                        let session = Session {
+                            input: tx,
+                            udp: true,
+                            global_id: Some(gid),
+                            task: None,
+                        };
+                        if let Some(data) = frame.data {
+                            forward(
+                                &session,
+                                Packet {
+                                    data: data.into(),
+                                    dest: None,
+                                },
+                            )
+                            .await;
+                        }
+                        sessions.insert(frame.id, session);
+                        continue;
+                    }
+
                     let (tx, rx) = mpsc::channel(64);
                     let out = out_tx.clone();
                     let id = frame.id;
@@ -263,7 +390,8 @@ where
                     let session = Session {
                         input: tx,
                         udp,
-                        task,
+                        global_id: None,
+                        task: Some(task),
                     };
                     if let Some(data) = frame.data {
                         forward(
@@ -378,6 +506,96 @@ async fn tcp_session(
         log::debug(format!("mux tcp session {id} ended: {e}"));
     }
     let _ = out.send(end_frame(id, result.is_err())).await;
+}
+
+async fn xudp_worker(
+    gid: [u8; 8],
+    target: (Host, u16),
+    mut input: mpsc::Receiver<Packet>,
+    downlink: DownlinkSender,
+    expire_at: Arc<std::sync::atomic::AtomicU64>,
+    dial: Dial,
+) {
+    let result: io::Result<()> = async {
+        let cone = ConeUdp::open(dial.router.clone(), &dial.decision).await?;
+        let mut resolved: HashMap<(String, u16), SocketAddr> = HashMap::new();
+        let up = async {
+            while let Some(packet) = input.recv().await {
+                let (host, port) = packet
+                    .dest
+                    .as_ref()
+                    .map_or((&target.0, target.1), |(h, p)| (h, *p));
+                let key = (host_label(host), port);
+                let addr = match resolved.get(&key) {
+                    Some(addr) => *addr,
+                    None => match cone.target(host, port).await {
+                        Ok(addr) => *resolved.entry(key).or_insert(addr),
+                        Err(e) => {
+                            log::debug(format!("mux xudp {gid:?}: {e}"));
+                            continue;
+                        }
+                    },
+                };
+                match cone.send_to(&packet.data, addr).await {
+                    Ok(()) => dial.traffic.up(packet.data.len()),
+                    Err(e) => log::debug(format!("mux xudp {gid:?} send to {addr}: {e}")),
+                }
+            }
+            Ok::<(), io::Error>(())
+        };
+        let down = async {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let exp = expire_at.load(std::sync::atomic::Ordering::Relaxed);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                if exp != 0 && now >= exp {
+                    return Ok::<(), io::Error>(());
+                }
+
+                let recv_res =
+                    timeout(std::time::Duration::from_secs(5), cone.recv_from(&mut buf)).await;
+                let (n, from) = match recv_res {
+                    Ok(Ok(pair)) => pair,
+                    Ok(Err(e)) => return Err(e),
+                    Err(_) => {
+                        let exp = expire_at.load(std::sync::atomic::Ordering::Relaxed);
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        if exp != 0 && now >= exp {
+                            return Ok(());
+                        }
+                        continue;
+                    }
+                };
+                dial.traffic.down(n);
+
+                let current_downlink = downlink.read().unwrap().clone();
+                if let Some((id, ref out)) = current_downlink {
+                    let frame =
+                        encode_frame(id, STATUS_KEEP, OPTION_DATA, Some(from), Some(&buf[..n]));
+                    if out.send(frame).await.is_err() {
+                        *downlink.write().unwrap() = None;
+                        expire_at.store(now + 60, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            result = up => result,
+            result = down => result,
+        }
+    }
+    .await;
+    if let Err(e) = &result {
+        log::debug(format!("mux xudp worker {gid:?} ended: {e}"));
+    }
+    let mut mgr = XUDP_MANAGER.write().unwrap();
+    mgr.remove(&gid);
 }
 
 /// Full-cone UDP: one socket per session, any destination, replies tagged

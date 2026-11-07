@@ -7,6 +7,7 @@
 //! source, sourcePort, protocol) are matched here.
 
 use std::collections::HashMap;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,7 +30,7 @@ use crate::vmess_outbound::VmessOutbound;
 use crate::wg::WgOutbound;
 
 const STUB_TAG: &str = "rule";
-const SERVER_FIELDS: [&str; 8] = [
+const SERVER_FIELDS: [&str; 10] = [
     "user",
     "source",
     "sourcePort",
@@ -38,6 +39,8 @@ const SERVER_FIELDS: [&str; 8] = [
     "attrs",
     "vlessRoute",
     "localIP",
+    "process",
+    "webhook",
 ];
 const IGNORED_FIELDS: [&str; 2] = ["ruleTag", "domainMatcher"];
 
@@ -1077,6 +1080,173 @@ pub struct Query<'a> {
     pub attributes: Option<&'a HashMap<String, String>>,
     pub local_ip: Option<IpAddr>,
     pub vless_route: Option<u32>,
+    pub process_info: Option<&'a std::sync::OnceLock<Option<crate::process::ProcessInfo>>>,
+}
+
+impl<'a> Query<'a> {
+    pub fn get_process_info(&self) -> Option<crate::process::ProcessInfo> {
+        match self.process_info {
+            Some(cell) => cell
+                .get_or_init(|| crate::process::find_local_process(self.network, self.source))
+                .clone(),
+            None => crate::process::find_local_process(self.network, self.source),
+        }
+    }
+}
+
+pub struct WebhookNotifier {
+    pub url: String,
+    pub socket_path: Option<String>,
+    pub headers: HashMap<String, String>,
+    pub deduplication: u32,
+    seen: std::sync::Mutex<HashMap<String, std::time::Instant>>,
+}
+
+impl WebhookNotifier {
+    pub fn new(url_str: String, headers: HashMap<String, String>, deduplication: u32) -> Self {
+        let (url, socket_path) = split_http_unix_url(&url_str);
+        Self {
+            url,
+            socket_path,
+            headers,
+            deduplication,
+            seen: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    pub fn fire(&self, query: &Query<'_>, outbound_tag: &str) {
+        let email = query.user;
+        if self.is_duplicate(email) {
+            return;
+        }
+
+        let network_str = match query.network {
+            Network::Tcp => "tcp",
+            Network::Udp => "udp",
+        };
+        let dest = if let Some(d) = query.domain {
+            format!("{d}:{}", query.port)
+        } else if let Some(ip) = query.ip {
+            format!("{ip}:{}", query.port)
+        } else {
+            format!("{}:{}", query.port, query.port)
+        };
+        let orig_target = format!("{network_str}:{dest}");
+        let inbound_local = query
+            .local_ip
+            .map(|ip| format!("{ip}:{}", query.inbound_port));
+
+        let event = json!({
+            "email": if email.is_empty() { Value::Null } else { json!(email) },
+            "level": 0,
+            "protocol": query.protocol.unwrap_or(""),
+            "network": network_str,
+            "source": query.source.to_string(),
+            "destination": dest,
+            "originalTarget": orig_target,
+            "routeTarget": Value::Null,
+            "inboundTag": query.inbound,
+            "inboundName": "socks",
+            "inboundLocal": inbound_local,
+            "outboundTag": outbound_tag,
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0),
+        });
+
+        let body = serde_json::to_vec(&event).unwrap_or_default();
+        let url = self.url.clone();
+        let socket_path = self.socket_path.clone();
+        let headers = self.headers.clone();
+
+        tokio::spawn(async move {
+            let _ = post_webhook(&url, socket_path.as_deref(), &headers, &body).await;
+        });
+    }
+
+    fn is_duplicate(&self, email: &str) -> bool {
+        if self.deduplication == 0 || email.is_empty() {
+            return false;
+        }
+        let ttl = std::time::Duration::from_secs(self.deduplication as u64);
+        let now = std::time::Instant::now();
+        let mut seen = self.seen.lock().unwrap();
+        seen.retain(|_, time| now.duration_since(*time) < ttl);
+        if let Some(last) = seen.get(email) {
+            if now.duration_since(*last) < ttl {
+                return true;
+            }
+        }
+        seen.insert(email.to_string(), now);
+        false
+    }
+}
+
+fn split_http_unix_url(raw: &str) -> (String, Option<String>) {
+    if raw.is_empty() || (!raw.starts_with('/') && !raw.starts_with('@')) {
+        return (raw.to_string(), None);
+    }
+    if let Some(idx) = raw.find(":/") {
+        (
+            format!("http://localhost{}", &raw[idx + 1..]),
+            Some(raw[..idx].to_string()),
+        )
+    } else {
+        ("http://localhost/".to_string(), Some(raw.to_string()))
+    }
+}
+
+async fn post_webhook(
+    url_str: &str,
+    socket_path: Option<&str>,
+    headers: &HashMap<String, String>,
+    body: &[u8],
+) -> io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let clean_url = url_str.strip_prefix("http://").unwrap_or(url_str);
+        let (host_port, path) = match clean_url.find('/') {
+            Some(idx) => (&clean_url[..idx], &clean_url[idx..]),
+            None => (clean_url, "/"),
+        };
+        let (host, port) = match host_port.find(':') {
+            Some(idx) => (
+                &host_port[..idx],
+                host_port[idx + 1..].parse::<u16>().unwrap_or(80),
+            ),
+            None => (host_port, 80),
+        };
+
+        let mut req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+            body.len()
+        );
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+
+        if let Some(sock) = socket_path {
+            let mut stream = tokio::net::UnixStream::connect(sock).await?;
+            stream.write_all(req.as_bytes()).await?;
+            stream.write_all(body).await?;
+            stream.flush().await?;
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+        } else {
+            let mut stream = tokio::net::TcpStream::connect((host, port)).await?;
+            stream.write_all(req.as_bytes()).await?;
+            stream.write_all(body).await?;
+            stream.flush().await?;
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf).await;
+        }
+        Ok::<(), io::Error>(())
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "webhook timeout"))?
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1111,6 +1281,8 @@ pub struct Rule {
     pub attrs: HashMap<String, String>,
     pub vless_routes: Vec<(u32, u32)>,
     pub local_ip: Option<RoutingRule>,
+    pub process: Option<crate::process::ProcessMatcher>,
+    pub webhook: Option<Arc<WebhookNotifier>>,
 }
 
 pub enum UserMatcher {
@@ -1536,6 +1708,7 @@ impl Router {
                 attributes: query.attributes,
                 local_ip: query.local_ip,
                 vless_route: query.vless_route,
+                process_info: query.process_info,
             };
             let decision = self.route_once(&q, resolved).await;
             match decision.action {
@@ -1568,10 +1741,13 @@ impl Router {
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.first_match(&rules, query, query.ip.or(resolved))
-                .cloned()
         };
-        if let Some(target) = matched {
-            return self.resolve_target(&target).await;
+        if let Some((target, webhook)) = matched {
+            let decision = self.resolve_target(&target).await;
+            if let Some(wh) = webhook {
+                wh.fire(query, &decision.tag);
+            }
+            return decision;
         }
         if self.strategy == RoutingDomainStrategy::IpIfNonMatch && query.domain.is_some() {
             let ip = match resolved {
@@ -1584,10 +1760,14 @@ impl Router {
                         .rules
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    self.first_match(&rules, query, Some(ip)).cloned()
+                    self.first_match(&rules, query, Some(ip))
                 };
-                if let Some(target) = matched {
-                    return self.resolve_target(&target).await;
+                if let Some((target, webhook)) = matched {
+                    let decision = self.resolve_target(&target).await;
+                    if let Some(wh) = webhook {
+                        wh.fire(query, &decision.tag);
+                    }
+                    return decision;
                 }
             }
         }
@@ -1608,11 +1788,11 @@ impl Router {
         rules: &'a [Rule],
         query: &Query<'_>,
         ip: Option<IpAddr>,
-    ) -> Option<&'a RuleTarget> {
+    ) -> Option<(RuleTarget, Option<Arc<WebhookNotifier>>)> {
         rules
             .iter()
             .find(|rule| rule.matches(query, ip))
-            .map(|rule| &rule.target)
+            .map(|rule| (rule.target.clone(), rule.webhook.clone()))
     }
 
     async fn resolve_target(&self, target: &RuleTarget) -> Decision {
@@ -1696,6 +1876,54 @@ pub fn parse_single_rule(raw: &Value, asset_dirs: &[PathBuf]) -> Result<Rule, St
     let local_ip = rule.remove("localIP");
     let source = rule.remove("source").or_else(|| rule.remove("sourceIP"));
     let source_port = rule.remove("sourcePort");
+    let process_list = match rule.remove("process") {
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let process = if !process_list.is_empty() {
+        Some(crate::process::ProcessMatcher::new(&process_list))
+    } else {
+        None
+    };
+    let webhook = if let Some(wh) = rule.remove("webhook").and_then(|v| match v {
+        Value::Object(map) => Some(map),
+        _ => None,
+    }) {
+        let url = wh.get("url").and_then(Value::as_str).unwrap_or("");
+        if !url.is_empty() {
+            let deduplication =
+                wh.get("deduplication").and_then(Value::as_u64).unwrap_or(0) as u32;
+            let mut headers = HashMap::new();
+            if let Some(h) = wh.get("headers").and_then(Value::as_object) {
+                for (k, v) in h {
+                    if let Some(vs) = v.as_str() {
+                        headers.insert(k.clone(), vs.to_string());
+                    }
+                }
+            }
+            Some(Arc::new(WebhookNotifier::new(
+                url.to_string(),
+                headers,
+                deduplication,
+            )))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     for key in IGNORED_FIELDS {
         rule.remove(key);
     }
@@ -1760,6 +1988,8 @@ pub fn parse_single_rule(raw: &Value, asset_dirs: &[PathBuf]) -> Result<Rule, St
         attrs,
         vless_routes,
         local_ip: helper_local_ip.map(|i| parsed_rules[i].clone()),
+        process,
+        webhook,
     })
 }
 
@@ -1882,6 +2112,11 @@ impl Rule {
                 .local_ip
                 .as_ref()
                 .is_none_or(|lip_rule| q.local_ip.is_some_and(|ip| lip_rule.matches_ip(Some(&ip))))
+            && self.process.as_ref().is_none_or(|matcher| {
+                let info = q.get_process_info();
+                info.as_ref()
+                    .is_some_and(|p| matcher.matches(p.pid, &p.name, &p.abs_path))
+            })
     }
 }
 
@@ -2119,6 +2354,7 @@ mod tests {
             attributes: None,
             local_ip: None,
             vless_route: None,
+            process_info: None,
         }
     }
 

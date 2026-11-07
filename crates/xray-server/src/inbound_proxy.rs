@@ -236,6 +236,7 @@ async fn relay_udp(
                 attributes: None,
                 local_ip: None,
                 vless_route: None,
+                process_info: None,
             };
             if ctx.router.route(&query).await.tag != decision.tag {
                 log::debug(format!(

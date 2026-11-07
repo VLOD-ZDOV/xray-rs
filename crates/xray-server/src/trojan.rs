@@ -388,6 +388,7 @@ mod tests {
             level: 0,
             flow: String::new(),
             reverse: None,
+            testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&user.hash);
@@ -417,6 +418,7 @@ mod tests {
             level: 0,
             flow: String::new(),
             reverse: None,
+            testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&user.hash);
@@ -444,6 +446,7 @@ mod tests {
             level: 0,
             flow: String::new(),
             reverse: None,
+            testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&[b'a'; 56]);

@@ -359,6 +359,7 @@ impl ShadowsocksUdpHandler {
                     attributes: None,
                     local_ip: None,
                     vless_route: None,
+                    process_info: None,
                 };
                 if self.ctx.router.route(&query).await.tag != decision.tag {
                     continue;
@@ -532,6 +533,7 @@ impl ShadowsocksUdpHandler {
                     attributes: None,
                     local_ip: None,
                     vless_route: None,
+                    process_info: None,
                 };
                 if self.ctx.router.route(&query).await.tag != decision.tag {
                     continue;

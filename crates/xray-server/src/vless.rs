@@ -370,6 +370,7 @@ impl Context {
                 level,
                 flow: String::new(),
                 reverse: None,
+                testseed: DEFAULT_VISION_SEED,
             });
         }
         Ok(())
@@ -414,6 +415,7 @@ impl Context {
                 level: user.level,
                 flow: String::new(),
                 reverse: None,
+                testseed: DEFAULT_VISION_SEED,
             });
         }
         Ok(())
@@ -602,7 +604,7 @@ where
             let client = VisionStream::new(
                 PrefixedStreamIo::new(stream, early),
                 user.id,
-                DEFAULT_VISION_SEED,
+                user.testseed,
             );
             let (mut r, mut w) = tokio::io::split(client);
             return mux::serve(&mut r, &mut w, &info).await;
@@ -666,7 +668,7 @@ where
                 write_vision_response(&mut stream, request.version).await?;
 
                 let client_stream = PrefixedStreamIo::new(stream, early);
-                let vision_client = VisionStream::new(client_stream, user.id, DEFAULT_VISION_SEED);
+                let vision_client = VisionStream::new(client_stream, user.id, user.testseed);
                 let (mut client_r, mut client_w) = tokio::io::split(vision_client);
 
                 let target =
@@ -789,6 +791,7 @@ impl RouteRequest<'_> {
         } else {
             None
         };
+        let proc_cell = std::sync::OnceLock::new();
         let query = Query {
             inbound: self.ctx_tag,
             inbound_port: self.inbound_port,
@@ -802,6 +805,7 @@ impl RouteRequest<'_> {
             attributes: None,
             local_ip: None,
             vless_route: None,
+            process_info: Some(&proc_cell),
         };
         let decision = router.route(&query).await;
         let network = if self.network == Network::Tcp {
@@ -1412,6 +1416,7 @@ mod tests {
             level: 0,
             flow: String::new(),
             reverse: None,
+            testseed: DEFAULT_VISION_SEED,
         }]
     }
 

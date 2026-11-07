@@ -189,6 +189,8 @@ pub struct VlessAccount {
     pub flow: String,
     #[prost(string, tag = "3")]
     pub encryption: String,
+    #[prost(uint32, repeated, tag = "9")]
+    pub testseed: Vec<u32>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1070,6 +1072,7 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                     attributes: Some(&rc.attributes),
                     local_ip,
                     vless_route,
+                    process_info: None,
                 };
                 let decision = router.route(&query).await;
                 rc.outbound_tag = decision.tag;
@@ -1470,6 +1473,11 @@ async fn handle_handler(
                         match account.r#type.as_str() {
                             VLESS_ACCOUNT | VMESS_ACCOUNT => {
                                 if let Ok(acc) = VlessAccount::decode(account.value) {
+                                    let testseed = if acc.testseed.len() >= 4 {
+                                        [acc.testseed[0], acc.testseed[1], acc.testseed[2], acc.testseed[3]]
+                                    } else {
+                                        xray_proxy::vless::DEFAULT_VISION_SEED
+                                    };
                                     parsed_users.push(InboundUser {
                                         id: user_id(&acc.id),
                                         hash: crate::trojan::trojan_password_hash(&acc.id),
@@ -1477,6 +1485,7 @@ async fn handle_handler(
                                         level: u.level,
                                         flow: acc.flow,
                                         reverse: None,
+                                        testseed,
                                     });
                                 }
                             }
@@ -1489,6 +1498,7 @@ async fn handle_handler(
                                         level: u.level,
                                         flow: String::new(),
                                         reverse: None,
+                                        testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
                                     });
                                 }
                             }
@@ -1638,6 +1648,11 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                     account.flow
                 ));
             }
+            let testseed = if account.testseed.len() >= 4 {
+                [account.testseed[0], account.testseed[1], account.testseed[2], account.testseed[3]]
+            } else {
+                xray_proxy::vless::DEFAULT_VISION_SEED
+            };
             ctx.add_user(InboundUser {
                 id: user_id(&account.id),
                 hash: crate::trojan::trojan_password_hash(&account.id),
@@ -1645,6 +1660,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 level: user.level,
                 flow: account.flow,
                 reverse: None,
+                testseed,
             })
         }
         TROJAN_ACCOUNT => {
@@ -1656,6 +1672,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 level: user.level,
                 flow: String::new(),
                 reverse: None,
+                testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
             })
         }
         VMESS_ACCOUNT => {
@@ -1667,6 +1684,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 level: user.level,
                 flow: String::new(),
                 reverse: None,
+                testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
             })
         }
         SHADOWSOCKS_ACCOUNT => {

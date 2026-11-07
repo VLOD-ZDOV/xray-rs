@@ -77,6 +77,7 @@ pub async fn connect(
                 attributes: None,
                 local_ip: None,
                 vless_route: None,
+                process_info: None,
             };
             let next = router.route(&query).await;
             Box::pin(connect(router, &next, host, port)).await
@@ -504,6 +505,7 @@ impl UdpLink {
                     attributes: None,
                     local_ip: None,
                     vless_route: None,
+                    process_info: None,
                 };
                 let next = router.route(&query).await;
                 Box::pin(Self::open(router, &next, host, port)).await
@@ -629,6 +631,7 @@ impl ConeUdp {
                     attributes: None,
                     local_ip: None,
                     vless_route: None,
+                    process_info: None,
                 };
                 let next = router.route(&query).await;
                 Box::pin(Self::open(router, &next)).await

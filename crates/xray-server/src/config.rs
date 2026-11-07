@@ -168,6 +168,28 @@ pub struct User {
     /// VLESS: `xtls-rprx-vision` or empty.
     pub flow: String,
     pub reverse: Option<String>,
+    pub testseed: [u32; 4],
+}
+
+pub fn parse_testseed(val: Option<&Value>, fallback: [u32; 4]) -> [u32; 4] {
+    if let Some(Value::Array(arr)) = val {
+        if arr.len() >= 4 {
+            let mut res = [0u32; 4];
+            let mut valid = true;
+            for (i, item) in arr.iter().take(4).enumerate() {
+                if let Some(n) = item.as_u64() {
+                    res[i] = n as u32;
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                return res;
+            }
+        }
+    }
+    fallback
 }
 
 pub const VISION_FLOW: &str = "xtls-rprx-vision";
@@ -555,7 +577,12 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             r#"VLESS "settings.flow" doesn't support "{default_flow}" in this version"#
         ));
     }
+    let default_testseed = parse_testseed(
+        settings.get("testseed"),
+        xray_proxy::vless::DEFAULT_VISION_SEED,
+    );
     for client in array(settings, "clients") {
+        let testseed = parse_testseed(client.get("testseed"), default_testseed);
         let flow = match (protocol, str_field(client, "flow")) {
             (InboundProtocol::Vless, "") => default_flow,
             (InboundProtocol::Vless, VISION_FLOW) => VISION_FLOW,
@@ -601,6 +628,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             level,
             flow: flow.to_owned(),
             reverse,
+            testseed,
         });
     }
 
