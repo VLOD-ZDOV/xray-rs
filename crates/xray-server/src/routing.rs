@@ -1353,6 +1353,11 @@ impl Router {
                         &format!("outbound {tag:?}"),
                     )?
                     .map(Arc::new);
+                    if let Some(ref so) = sockopt {
+                        if so.address_port_strategy != crate::config::AddressPortStrategy::None {
+                            return Err("freedom outbound does not support \"sockopt.addressPortStrategy\"".into());
+                        }
+                    }
                     let freedom_settings = FreedomSettings {
                         strategy: domain_strategy,
                         redirect,
@@ -2525,6 +2530,23 @@ mod tests {
             &[]
         )
         .is_err());
+        let err = match Router::build(
+            &json!({"outbounds": [{
+                "tag": "bad",
+                "protocol": "freedom",
+                "streamSettings": {
+                    "sockopt": {"addressPortStrategy": "srvPortOnly"}
+                }
+            }]}),
+            &[],
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected freedom to reject addressPortStrategy"),
+        };
+        assert_eq!(
+            err,
+            "freedom outbound does not support \"sockopt.addressPortStrategy\""
+        );
     }
 
     #[test]

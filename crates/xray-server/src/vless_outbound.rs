@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use rustls::pki_types::pem::PemObject;
@@ -494,22 +495,57 @@ impl VlessOutbound {
         port: u16,
         command: VlessCommand,
     ) -> io::Result<VlessResponseStream<VisionTransportStream>> {
-        let candidates = resolve_all(&self.server.0, self.server.1).await?;
+        let (server_host, server_port) = match &self.server.0 {
+            Host::Domain(d) => {
+                if let Some(strategy) = self.sockopt.as_ref().map(|s| s.address_port_strategy) {
+                    let (h, p) = crate::sockopt::resolve_address_port_strategy(d, self.server.1, strategy)
+                        .await
+                        .unwrap_or_else(|_| (d.clone(), self.server.1));
+                    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+                        (Host::Ip(ip), p)
+                    } else {
+                        (Host::Domain(h), p)
+                    }
+                } else {
+                    (self.server.0.clone(), self.server.1)
+                }
+            }
+            Host::Ip(_) => (self.server.0.clone(), self.server.1),
+        };
+        let candidates = resolve_all(&server_host, server_port).await?;
         if candidates.is_empty() {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("failed to resolve server address {:?}", self.server.0),
+                format!("failed to resolve server address {:?}", server_host),
             ));
         }
 
         let target = Target::new(
-            match &self.server.0 {
+            match &server_host {
                 Host::Ip(ip) => TargetAddr::Ip(*ip),
                 Host::Domain(d) => TargetAddr::Domain(d.clone()),
             },
-            self.server.1,
+            server_port,
             xray_routing::Network::Tcp,
         );
+
+        let happy_eyeballs = self
+            .sockopt
+            .as_ref()
+            .and_then(|s| s.happy_eyeballs.as_ref())
+            .and_then(|he| {
+                if he.try_delay_ms == 0 {
+                    return None;
+                }
+                let max_concurrent = std::num::NonZeroUsize::new(he.max_concurrent_try as usize)
+                    .unwrap_or(std::num::NonZeroUsize::MIN);
+                Some(xray_transport::HappyEyeballsConfig {
+                    prioritize_ipv6: he.prioritize_ipv6,
+                    interleave: he.interleave as usize,
+                    try_delay: Duration::from_millis(he.try_delay_ms as u64),
+                    max_concurrent,
+                })
+            });
 
         let dialer = self.dialer.read().unwrap().clone();
         let carrier = timeout(CONNECT_TIMEOUT, async {
@@ -538,21 +574,27 @@ impl VlessOutbound {
                         connector: &self.connector,
                         target: &target,
                         candidates: &candidates,
-                        happy_eyeballs: None,
+                        happy_eyeballs: happy_eyeballs.as_ref(),
                     },
                     &down.transport,
                     XhttpConnectTarget {
                         connector: &down.connector,
                         target: &down_target,
                         candidates: &down_candidates,
-                        happy_eyeballs: None,
+                        happy_eyeballs: happy_eyeballs.as_ref(),
                     },
                 )
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))
             } else {
                 dialer
-                    .connect_stream(&self.connector, &self.transport, &target, &candidates, None)
+                    .connect_stream(
+                        &self.connector,
+                        &self.transport,
+                        &target,
+                        &candidates,
+                        happy_eyeballs.as_ref(),
+                    )
                     .await
                     .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))
             }

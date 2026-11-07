@@ -76,9 +76,6 @@ pub fn transport(
     if let Some(qp) = stream.get("quicParams") {
         synth_stream["quicParams"] = qp.clone();
     }
-    if let Some(so) = stream.get("sockopt") {
-        synth_stream["sockopt"] = so.clone();
-    }
 
     let synth = json!({"outbounds": [{
         "protocol": "vless",
@@ -592,6 +589,10 @@ mod tests {
         let stream = json!({
             "network": "xhttp",
             "security": "tls",
+            "sockopt": {
+                "penetrate": true,
+                "mark": 42
+            },
             "tlsSettings": {
                 "serverName": "example.com",
                 "alpn": ["h2"]

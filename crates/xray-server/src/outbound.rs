@@ -7,6 +7,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Bytes;
 use rand::Rng;
@@ -390,6 +391,45 @@ async fn connect_direct(
     let mut last_error = None;
     let mut addrs = resolve_all(host, port).await?;
     apply_strategy(host, &mut addrs, settings.strategy)?;
+    if let Some(sockopt) = settings.sockopt.as_deref() {
+        if let Some(ref he) = sockopt.happy_eyeballs {
+            if he.try_delay_ms > 0 && he.max_concurrent_try > 0 && addrs.len() >= 2 {
+                crate::sockopt::sort_ips_happy_eyeballs(
+                    &mut addrs,
+                    he.prioritize_ipv6,
+                    he.interleave,
+                );
+                // Filter candidate addresses through final rules if needed
+                let valid_addrs: Vec<SocketAddr> = addrs
+                    .into_iter()
+                    .filter(|&a| check_final(router, outbound, Network::Tcp, a).is_ok())
+                    .collect();
+                if valid_addrs.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "all candidate addresses blocked by freedom finalRules",
+                    ));
+                }
+                let timeout_duration = CONNECT_TIMEOUT;
+                let boxed = crate::sockopt::connect_happy_eyeballs(
+                    &valid_addrs,
+                    bind_ip,
+                    Some(sockopt),
+                    Duration::from_millis(he.try_delay_ms as u64),
+                    he.max_concurrent_try as usize,
+                    timeout_duration,
+                )
+                .await?;
+                if let Some(ref fragment) = settings.fragment {
+                    return Ok(Box::new(FragmentWriterStream::new(
+                        boxed,
+                        fragment.clone(),
+                    )));
+                }
+                return Ok(boxed);
+            }
+        }
+    }
     for addr in addrs {
         if let Err(e) = check_final(router, outbound, Network::Tcp, addr) {
             last_error = Some(e);

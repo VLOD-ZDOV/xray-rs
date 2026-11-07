@@ -88,6 +88,40 @@ pub struct SockoptSettings {
     pub mptcp: bool,
     pub interface: Option<String>,
     pub trusted_x_forwarded_for: Vec<String>,
+    pub penetrate: bool,
+    pub address_port_strategy: AddressPortStrategy,
+    pub happy_eyeballs: Option<HappyEyeballsSettings>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressPortStrategy {
+    #[default]
+    None,
+    SrvPortOnly,
+    SrvAddressOnly,
+    SrvPortAndAddress,
+    TxtPortOnly,
+    TxtAddressOnly,
+    TxtPortAndAddress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HappyEyeballsSettings {
+    pub prioritize_ipv6: bool,
+    pub interleave: u32,
+    pub try_delay_ms: u32,
+    pub max_concurrent_try: u32,
+}
+
+impl Default for HappyEyeballsSettings {
+    fn default() -> Self {
+        Self {
+            prioritize_ipv6: false,
+            interleave: 1,
+            try_delay_ms: 0,
+            max_concurrent_try: 4,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1104,19 +1138,55 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
     let Some(map) = sockopt.as_object() else {
         return Ok(None);
     };
-    for key in [
-        "tcpWindowClamp",
-        "customSockopt",
-        "penetrate",
-        "addressPortStrategy",
-        "happyEyeballs",
-    ] {
+    for key in ["tcpWindowClamp", "customSockopt"] {
         if map.get(key).is_some_and(|v| !v.is_null()) {
             log::warn(format!(
                 "{owner}: sockopt.{key} is not supported yet, ignored"
             ));
         }
     }
+    let penetrate = map
+        .get("penetrate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let address_port_strategy = match map.get("addressPortStrategy").and_then(Value::as_str) {
+        None | Some("") | Some("none") => AddressPortStrategy::None,
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "srvportonly" => AddressPortStrategy::SrvPortOnly,
+            "srvaddressonly" => AddressPortStrategy::SrvAddressOnly,
+            "srvportandaddress" => AddressPortStrategy::SrvPortAndAddress,
+            "txtportonly" => AddressPortStrategy::TxtPortOnly,
+            "txtaddressonly" => AddressPortStrategy::TxtAddressOnly,
+            "txtportandaddress" => AddressPortStrategy::TxtPortAndAddress,
+            _ => return Err(format!("unknown addressPortStrategy: {s}")),
+        },
+    };
+    let happy_eyeballs = if let Some(he) = map.get("happyEyeballs").and_then(Value::as_object) {
+        let prioritize_ipv6 = he
+            .get("prioritizeIPv6")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let interleave = he
+            .get("interleave")
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as u32;
+        let try_delay_ms = he
+            .get("tryDelayMs")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as u32;
+        let max_concurrent_try = he
+            .get("maxConcurrentTry")
+            .and_then(Value::as_u64)
+            .unwrap_or(4) as u32;
+        Some(HappyEyeballsSettings {
+            prioritize_ipv6,
+            interleave,
+            try_delay_ms,
+            max_concurrent_try,
+        })
+    } else {
+        None
+    };
     let trusted_x_forwarded_for = match map.get("trustedXForwardedFor") {
         Some(Value::Array(arr)) => arr
             .iter()
@@ -1160,6 +1230,9 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
             .filter(|s| !s.is_empty())
             .map(str::to_owned),
         trusted_x_forwarded_for,
+        penetrate,
+        address_port_strategy,
+        happy_eyeballs,
     };
     let unset = SockoptSettings {
         mark: 0,
@@ -1174,6 +1247,9 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
         mptcp: false,
         interface: None,
         trusted_x_forwarded_for: Vec::new(),
+        penetrate: false,
+        address_port_strategy: AddressPortStrategy::None,
+        happy_eyeballs: None,
     };
     Ok((settings != unset).then_some(settings))
 }
@@ -2801,6 +2877,30 @@ mod tests {
         assert_eq!(queue.tcp_fast_open, Some(64));
         assert_eq!(queue.tcp_user_timeout_ms, Some(10000));
         assert!(parse(serde_json::json!({"tcpFastOpen": "yes"})).is_err());
+
+        let full = parse(serde_json::json!({
+            "penetrate": true,
+            "addressPortStrategy": "srvPortAndAddress",
+            "happyEyeballs": {
+                "prioritizeIPv6": true,
+                "interleave": 2,
+                "tryDelayMs": 300,
+                "maxConcurrentTry": 6
+            }
+        }))
+        .unwrap()
+        .unwrap();
+        assert!(full.penetrate);
+        assert_eq!(
+            full.address_port_strategy,
+            AddressPortStrategy::SrvPortAndAddress
+        );
+        let he = full.happy_eyeballs.unwrap();
+        assert!(he.prioritize_ipv6);
+        assert_eq!(he.interleave, 2);
+        assert_eq!(he.try_delay_ms, 300);
+        assert_eq!(he.max_concurrent_try, 6);
+        assert!(parse(serde_json::json!({"addressPortStrategy": "invalid"})).is_err());
     }
 
     #[test]

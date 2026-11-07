@@ -255,6 +255,434 @@ fn apply_trusted_x_forwarded_for_value(
     remote_addr
 }
 
+/// Sorts socket addresses according to RFC 8305 / Xray Happy Eyeballs specification.
+pub fn sort_ips_happy_eyeballs(ips: &mut [SocketAddr], prioritize_ipv6: bool, interleave: u32) {
+    if ips.len() < 2 {
+        return;
+    }
+    let interleave = interleave.max(1) as usize;
+    let mut ip4 = Vec::new();
+    let mut ip6 = Vec::new();
+    for &addr in ips.iter() {
+        if addr.is_ipv4() {
+            ip4.push(addr);
+        } else {
+            ip6.push(addr);
+        }
+    }
+    if ip4.is_empty() || ip6.is_empty() {
+        return;
+    }
+    let mut sorted = Vec::with_capacity(ips.len());
+    let mut c4 = 0;
+    let mut c6 = 0;
+    let mut ip4_turn = !prioritize_ipv6;
+    while c4 < ip4.len() || c6 < ip6.len() {
+        if ip4_turn {
+            let take = (ip4.len() - c4).min(interleave);
+            sorted.extend_from_slice(&ip4[c4..c4 + take]);
+            c4 += take;
+            if c6 < ip6.len() {
+                ip4_turn = false;
+            }
+        } else {
+            let take = (ip6.len() - c6).min(interleave);
+            sorted.extend_from_slice(&ip6[c6..c6 + take]);
+            c6 += take;
+            if c4 < ip4.len() {
+                ip4_turn = true;
+            }
+        }
+    }
+    ips.copy_from_slice(&sorted);
+}
+
+/// Happy Eyeballs concurrent TCP race dialer (RFC 8305).
+pub async fn connect_happy_eyeballs(
+    addrs: &[SocketAddr],
+    bind_ip: Option<std::net::IpAddr>,
+    sockopt: Option<&SockoptSettings>,
+    try_delay: Duration,
+    max_concurrent: usize,
+    overall_timeout: Duration,
+) -> io::Result<Box<dyn crate::outbound::Stream>> {
+    use futures_util::stream::{FuturesUnordered, StreamExt};
+    use tokio::time::sleep;
+
+    let max_concurrent = max_concurrent.max(1);
+    let mut next_idx = 0;
+    let mut in_flight = FuturesUnordered::new();
+    let mut last_err = None;
+
+    let deadline = tokio::time::Instant::now() + overall_timeout;
+
+    let make_attempt = |addr: SocketAddr, idx: usize| {
+        let sockopt_clone = sockopt.cloned();
+        async move {
+            let socket = if addr.is_ipv4() {
+                tokio::net::TcpSocket::new_v4()
+            } else {
+                tokio::net::TcpSocket::new_v6()
+            };
+            let socket = match socket {
+                Ok(s) => s,
+                Err(e) => return (idx, addr, Err(e)),
+            };
+            if let Some(ip) = bind_ip {
+                if let Err(e) = socket.bind(SocketAddr::new(ip, 0)) {
+                    return (idx, addr, Err(e));
+                }
+            }
+            let res = connect(socket, addr, sockopt_clone.as_ref()).await;
+            (idx, addr, res)
+        }
+    };
+
+    if next_idx < addrs.len() {
+        in_flight.push(tokio::spawn(make_attempt(addrs[next_idx], next_idx)));
+        next_idx += 1;
+    }
+
+    let delay_sleep = sleep(try_delay);
+    tokio::pin!(delay_sleep);
+
+    while !in_flight.is_empty() || next_idx < addrs.len() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "happy eyeballs connect timed out",
+            ));
+        }
+
+        tokio::select! {
+            _ = &mut delay_sleep, if next_idx < addrs.len() && in_flight.len() < max_concurrent => {
+                in_flight.push(tokio::spawn(make_attempt(addrs[next_idx], next_idx)));
+                next_idx += 1;
+                delay_sleep.as_mut().reset(tokio::time::Instant::now() + try_delay);
+            }
+            Some(join_res) = in_flight.next() => {
+                match join_res {
+                    Ok((_idx, _addr, Ok(stream))) => {
+                        return Ok(stream);
+                    }
+                    Ok((_idx, _addr, Err(e))) => {
+                        last_err = Some(e);
+                        if next_idx < addrs.len() && in_flight.len() < max_concurrent {
+                            in_flight.push(tokio::spawn(make_attempt(addrs[next_idx], next_idx)));
+                            next_idx += 1;
+                            delay_sleep.as_mut().reset(tokio::time::Instant::now() + try_delay);
+                        }
+                    }
+                    Err(join_err) => {
+                        last_err = Some(io::Error::other(join_err.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "no addresses to connect")
+    }))
+}
+
+use crate::config::AddressPortStrategy;
+
+pub async fn resolve_address_port_strategy(
+    host: &str,
+    port: u16,
+    strategy: AddressPortStrategy,
+) -> Result<(String, u16), String> {
+    if strategy == AddressPortStrategy::None {
+        return Ok((host.to_string(), port));
+    }
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return Ok((host.to_string(), port));
+    }
+
+    match strategy {
+        AddressPortStrategy::None => Ok((host.to_string(), port)),
+        AddressPortStrategy::SrvPortOnly
+        | AddressPortStrategy::SrvAddressOnly
+        | AddressPortStrategy::SrvPortAndAddress => {
+            let (override_port, override_address) = match strategy {
+                AddressPortStrategy::SrvPortOnly => (true, false),
+                AddressPortStrategy::SrvAddressOnly => (false, true),
+                AddressPortStrategy::SrvPortAndAddress => (true, true),
+                _ => unreachable!(),
+            };
+            let parts: Vec<&str> = host.splitn(3, '.').collect();
+            if parts.len() != 3 {
+                return Err(format!("invalid address format {host}"));
+            }
+            let service = parts[0].strip_prefix('_').unwrap_or(parts[0]);
+            let proto = parts[1].strip_prefix('_').unwrap_or(parts[1]);
+            let domain = parts[2];
+            let qname = format!("_{service}._{proto}.{domain}");
+            let (target_addr, target_port) = query_dns_srv(&qname)
+                .await
+                .map_err(|e| format!("failed to lookup SRV record: {e}"))?;
+            let new_host = if override_address {
+                target_addr
+            } else {
+                host.to_string()
+            };
+            let new_port = if override_port { target_port } else { port };
+            Ok((new_host, new_port))
+        }
+        AddressPortStrategy::TxtPortOnly
+        | AddressPortStrategy::TxtAddressOnly
+        | AddressPortStrategy::TxtPortAndAddress => {
+            let (override_port, override_address) = match strategy {
+                AddressPortStrategy::TxtPortOnly => (true, false),
+                AddressPortStrategy::TxtAddressOnly => (false, true),
+                AddressPortStrategy::TxtPortAndAddress => (true, true),
+                _ => unreachable!(),
+            };
+            let txt_records = query_dns_txt(host)
+                .await
+                .map_err(|e| format!("failed to lookup TXT record: {e}"))?;
+            for txt in txt_records {
+                if let Some((addr, p)) = parse_txt_endpoint(&txt) {
+                    let new_host = if override_address {
+                        addr
+                    } else {
+                        host.to_string()
+                    };
+                    let new_port = if override_port { p } else { port };
+                    return Ok((new_host, new_port));
+                }
+            }
+            Ok((host.to_string(), port))
+        }
+    }
+}
+
+fn parse_txt_endpoint(txt: &str) -> Option<(String, u16)> {
+    let s = txt.trim();
+    if let Ok(addr) = s.parse::<SocketAddr>() {
+        return Some((addr.ip().to_string(), addr.port()));
+    }
+    if let Some((h, p)) = s.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            let h = h
+                .strip_prefix('[')
+                .and_then(|h| h.strip_suffix(']'))
+                .unwrap_or(h);
+            return Some((h.to_string(), port));
+        }
+    }
+    None
+}
+
+fn get_system_nameservers() -> Vec<SocketAddr> {
+    let mut servers = Vec::new();
+    if let Ok(content) = std::fs::read_to_string("/etc/resolv.conf") {
+        for line in content.lines() {
+            let line = line.trim();
+            if line.starts_with("nameserver ") || line.starts_with("nameserver\t") {
+                let ip_str = line["nameserver".len()..].trim();
+                if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
+                    servers.push(SocketAddr::new(ip, 53));
+                }
+            }
+        }
+    }
+    if servers.is_empty() {
+        servers.push(SocketAddr::from(([127, 0, 0, 1], 53)));
+        servers.push(SocketAddr::from(([127, 0, 0, 53], 53)));
+    }
+    servers
+}
+
+fn encode_dns_query(qname: &str, qtype: u16) -> Vec<u8> {
+    let mut query = Vec::with_capacity(64);
+    query.extend_from_slice(&[0x12, 0x34]); // Transaction ID
+    query.extend_from_slice(&[0x01, 0x00]); // Standard query, RD=1
+    query.extend_from_slice(&[0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // QD=1
+    for label in qname.split('.') {
+        if label.is_empty() {
+            continue;
+        }
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0x00);
+    query.extend_from_slice(&qtype.to_be_bytes());
+    query.extend_from_slice(&[0x00, 0x01]); // IN class
+    query
+}
+
+async fn exchange_dns_query(qname: &str, qtype: u16) -> io::Result<Vec<u8>> {
+    let query = encode_dns_query(qname, qtype);
+    let nameservers = get_system_nameservers();
+    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+    let mut buf = [0u8; 4096];
+    for ns in nameservers {
+        if socket.connect(ns).await.is_err() {
+            continue;
+        }
+        if socket.send(&query).await.is_err() {
+            continue;
+        }
+        if let Ok(Ok(len)) = tokio::time::timeout(Duration::from_millis(1500), socket.recv(&mut buf)).await {
+            if len >= 12 && buf[0] == 0x12 && buf[1] == 0x34 {
+                return Ok(buf[..len].to_vec());
+            }
+        }
+    }
+    Err(io::Error::new(io::ErrorKind::TimedOut, "DNS query timed out"))
+}
+
+async fn query_dns_srv(qname: &str) -> io::Result<(String, u16)> {
+    let resp = exchange_dns_query(qname, 33).await?;
+    parse_srv_response(&resp)
+}
+
+async fn query_dns_txt(qname: &str) -> io::Result<Vec<String>> {
+    let resp = exchange_dns_query(qname, 16).await?;
+    parse_txt_response(&resp)
+}
+
+fn skip_dns_name(buf: &[u8], mut offset: usize) -> Option<usize> {
+    while offset < buf.len() {
+        let b = buf[offset];
+        if b == 0 {
+            return Some(offset + 1);
+        } else if b & 0xc0 == 0xc0 {
+            return Some(offset + 2);
+        } else {
+            offset += 1 + (b as usize);
+        }
+    }
+    None
+}
+
+fn read_dns_name(buf: &[u8], mut offset: usize) -> Option<String> {
+    let mut labels = Vec::new();
+    let mut jumped = false;
+    let mut next_offset = offset;
+    let mut loops = 0;
+    while offset < buf.len() && loops < 50 {
+        loops += 1;
+        let b = buf[offset];
+        if b == 0 {
+            if !jumped {
+                next_offset = offset + 1;
+            }
+            break;
+        } else if b & 0xc0 == 0xc0 {
+            if offset + 1 >= buf.len() {
+                return None;
+            }
+            let ptr = (((b & 0x3f) as usize) << 8) | (buf[offset + 1] as usize);
+            if !jumped {
+                next_offset = offset + 2;
+                jumped = true;
+            }
+            offset = ptr;
+        } else {
+            let len = b as usize;
+            offset += 1;
+            if offset + len > buf.len() {
+                return None;
+            }
+            if let Ok(label) = std::str::from_utf8(&buf[offset..offset + len]) {
+                labels.push(label.to_string());
+            }
+            offset += len;
+            if !jumped {
+                next_offset = offset;
+            }
+        }
+    }
+    let _ = next_offset;
+    if labels.is_empty() {
+        None
+    } else {
+        Some(labels.join("."))
+    }
+}
+
+fn parse_srv_response(buf: &[u8]) -> io::Result<(String, u16)> {
+    if buf.len() < 12 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "short dns response"));
+    }
+    let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    let mut offset = 12;
+    for _ in 0..qdcount {
+        offset = skip_dns_name(buf, offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid question name"))?;
+        offset += 4; // QTYPE + QCLASS
+    }
+    for _ in 0..ancount {
+        offset = skip_dns_name(buf, offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid answer name"))?;
+        if offset + 10 > buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "short answer record"));
+        }
+        let rtype = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let rdlen = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
+        offset += 10;
+        if rtype == 33 && rdlen >= 6 && offset + rdlen <= buf.len() {
+            let port = u16::from_be_bytes([buf[offset + 4], buf[offset + 5]]);
+            let target = read_dns_name(buf, offset + 6).unwrap_or_default();
+            return Ok((target, port));
+        }
+        offset += rdlen;
+    }
+    Err(io::Error::new(io::ErrorKind::NotFound, "no SRV record found in response"))
+}
+
+fn parse_txt_response(buf: &[u8]) -> io::Result<Vec<String>> {
+    if buf.len() < 12 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "short dns response"));
+    }
+    let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    let mut offset = 12;
+    for _ in 0..qdcount {
+        offset = skip_dns_name(buf, offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid question name"))?;
+        offset += 4; // QTYPE + QCLASS
+    }
+    let mut results = Vec::new();
+    for _ in 0..ancount {
+        offset = skip_dns_name(buf, offset)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid answer name"))?;
+        if offset + 10 > buf.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "short answer record"));
+        }
+        let rtype = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let rdlen = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
+        offset += 10;
+        if rtype == 16 && offset + rdlen <= buf.len() {
+            let rdata = &buf[offset..offset + rdlen];
+            let mut roffset = 0;
+            while roffset < rdata.len() {
+                let slen = rdata[roffset] as usize;
+                roffset += 1;
+                if roffset + slen <= rdata.len() {
+                    if let Ok(s) = std::str::from_utf8(&rdata[roffset..roffset + slen]) {
+                        results.push(s.to_string());
+                    }
+                    roffset += slen;
+                } else {
+                    break;
+                }
+            }
+        }
+        offset += rdlen;
+    }
+    if results.is_empty() {
+        Err(io::Error::new(io::ErrorKind::NotFound, "no TXT record found in response"))
+    } else {
+        Ok(results)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +735,45 @@ mod tests {
             apply_trusted_x_forwarded_for_raw(raw, &trusted, remote),
             expected
         );
+    }
+
+    #[test]
+    fn test_sort_ips_happy_eyeballs() {
+        let v4_1: SocketAddr = "1.1.1.1:80".parse().unwrap();
+        let v4_2: SocketAddr = "2.2.2.2:80".parse().unwrap();
+        let v6_1: SocketAddr = "[2001:db8::1]:80".parse().unwrap();
+        let v6_2: SocketAddr = "[2001:db8::2]:80".parse().unwrap();
+
+        // 1. Prioritize IPv4, interleave 1
+        let mut list = vec![v4_1, v4_2, v6_1, v6_2];
+        sort_ips_happy_eyeballs(&mut list, false, 1);
+        assert_eq!(list, vec![v4_1, v6_1, v4_2, v6_2]);
+
+        // 2. Prioritize IPv6, interleave 1
+        let mut list = vec![v4_1, v4_2, v6_1, v6_2];
+        sort_ips_happy_eyeballs(&mut list, true, 1);
+        assert_eq!(list, vec![v6_1, v4_1, v6_2, v4_2]);
+
+        // 3. Prioritize IPv6, interleave 2
+        let mut list = vec![v4_1, v4_2, v6_1, v6_2];
+        sort_ips_happy_eyeballs(&mut list, true, 2);
+        assert_eq!(list, vec![v6_1, v6_2, v4_1, v4_2]);
+    }
+
+    #[test]
+    fn test_parse_txt_endpoint() {
+        assert_eq!(
+            parse_txt_endpoint("192.0.2.1:8443"),
+            Some(("192.0.2.1".to_string(), 8443))
+        );
+        assert_eq!(
+            parse_txt_endpoint("[2001:db8::1]:9443"),
+            Some(("2001:db8::1".to_string(), 9443))
+        );
+        assert_eq!(
+            parse_txt_endpoint("example.com:443"),
+            Some(("example.com".to_string(), 443))
+        );
+        assert_eq!(parse_txt_endpoint("invalid"), None);
     }
 }
