@@ -50,6 +50,7 @@ pub async fn connect(
             connect_direct(router, &decision.tag, settings, &target_host, target_port).await
         }
         Action::Wireguard(wg) => Ok(Box::new(wg.connect(host, port).await?)),
+        Action::Masque(masque) => Ok(Box::new(masque.connect(host, port).await?)),
         Action::Socks(socks) => Ok(Box::new(socks.connect(host, port).await?)),
         Action::Vless(vless) => Ok(vless.connect(host, port).await?),
         Action::Vmess(vmess) => Ok(vmess.connect(host, port).await?),
@@ -467,6 +468,7 @@ async fn connect_direct(
 pub enum UdpLink {
     Direct(UdpSocket),
     Wireguard(UdpSession),
+    Masque(UdpSession),
     Socks(SocksUdp, SocketAddr),
     Vless(VlessUdpLink),
     Vmess(VmessUdpLink),
@@ -514,6 +516,11 @@ impl UdpLink {
             Action::Wireguard(wg) => Ok(Self::Wireguard(
                 wg.open_udp(wg.udp_target(host, port).await?).await?,
             )),
+            Action::Masque(masque) => Ok(Self::Masque(
+                masque
+                    .open_udp(masque.udp_target(host, port).await?)
+                    .await?,
+            )),
             Action::Socks(socks) => Ok(Self::Socks(
                 socks.associate().await?,
                 resolve(host, port).await?,
@@ -555,7 +562,9 @@ impl UdpLink {
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
         match self {
             Self::Direct(socket) => socket.send(data).await.map(|_| ()),
-            Self::Wireguard(session) => session.send(data).await.map_err(to_io),
+            Self::Wireguard(session) | Self::Masque(session) => {
+                session.send(data).await.map_err(to_io)
+            }
             Self::Socks(udp, target) => udp.send_to(data, *target).await,
             Self::Vless(vless) => vless.send(data).await,
             Self::Vmess(vmess) => vmess.send(data).await,
@@ -568,7 +577,7 @@ impl UdpLink {
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Direct(socket) => socket.recv(buf).await,
-            Self::Wireguard(session) => {
+            Self::Wireguard(session) | Self::Masque(session) => {
                 let packet = session.recv().await.map_err(to_io)?;
                 let n = packet.len().min(buf.len());
                 buf[..n].copy_from_slice(&packet[..n]);
@@ -604,6 +613,12 @@ pub enum ConeUdp {
     },
     Wireguard {
         wg: Arc<WgOutbound>,
+        sessions: Mutex<HashMap<SocketAddr, WgFlow>>,
+        tx: mpsc::Sender<(SocketAddr, Bytes)>,
+        rx: Mutex<mpsc::Receiver<(SocketAddr, Bytes)>>,
+    },
+    Masque {
+        masque: Arc<crate::masque_outbound::MasqueOutbound>,
         sessions: Mutex<HashMap<SocketAddr, WgFlow>>,
         tx: mpsc::Sender<(SocketAddr, Bytes)>,
         rx: Mutex<mpsc::Receiver<(SocketAddr, Bytes)>>,
@@ -644,6 +659,15 @@ impl ConeUdp {
                 let (tx, rx) = mpsc::channel(256);
                 Ok(Self::Wireguard {
                     wg: wg.clone(),
+                    sessions: Mutex::new(HashMap::new()),
+                    tx,
+                    rx: Mutex::new(rx),
+                })
+            }
+            Action::Masque(masque) => {
+                let (tx, rx) = mpsc::channel(256);
+                Ok(Self::Masque {
+                    masque: masque.clone(),
                     sessions: Mutex::new(HashMap::new()),
                     tx,
                     rx: Mutex::new(rx),
@@ -698,6 +722,7 @@ impl ConeUdp {
                 Ok(addr)
             }
             Self::Wireguard { wg, .. } => wg.udp_target(host, port).await,
+            Self::Masque { masque, .. } => masque.udp_target(host, port).await,
             Self::Socks(_) => resolve(host, port).await,
             Self::Vless(vless) => vless.udp_target(host, port).await,
             Self::Vmess(vmess) => vmess.udp_target(host, port).await,
@@ -755,6 +780,34 @@ impl ConeUdp {
                 drop(sessions);
                 session.send(data).await.map_err(to_io)
             }
+            Self::Masque {
+                masque,
+                sessions,
+                tx,
+                ..
+            } => {
+                let mut sessions = sessions.lock().await;
+                if sessions
+                    .get(&addr)
+                    .is_none_or(|(_, task)| task.is_finished())
+                {
+                    let session = Arc::new(masque.open_udp(addr).await?);
+                    let (reader, tx) = (session.clone(), tx.clone());
+                    let task = tokio::spawn(async move {
+                        while let Ok(packet) = reader.recv().await {
+                            if tx.send((addr, packet)).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    if let Some((_, old)) = sessions.insert(addr, (session, task)) {
+                        old.abort();
+                    }
+                }
+                let session = sessions[&addr].0.clone();
+                drop(sessions);
+                session.send(data).await.map_err(to_io)
+            }
             Self::Socks(udp) => udp.send_to(data, addr).await,
             Self::Vless(vless) => vless.send_to(data, addr).await,
             Self::Vmess(vmess) => vmess.send_to(data, addr).await,
@@ -778,7 +831,7 @@ impl ConeUdp {
                 };
                 Ok((n, from))
             }
-            Self::Wireguard { rx, .. } => {
+            Self::Wireguard { rx, .. } | Self::Masque { rx, .. } => {
                 let (from, packet) = rx
                     .lock()
                     .await

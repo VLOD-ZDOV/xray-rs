@@ -1020,6 +1020,7 @@ pub enum Action {
     Http(Arc<HttpOutbound>),
     Dns(Arc<DnsOutbound>),
     Hysteria(Arc<crate::hysteria_outbound::HysteriaOutbound>),
+    Masque(Arc<crate::masque_outbound::MasqueOutbound>),
     Loopback(String),
     /// The `metrics` section's tag: connections reach its HTTP server.
     Metrics,
@@ -1040,6 +1041,7 @@ impl PartialEq for Action {
             (Self::Http(a), Self::Http(b)) => Arc::ptr_eq(a, b),
             (Self::Dns(a), Self::Dns(b)) => Arc::ptr_eq(a, b),
             (Self::Hysteria(a), Self::Hysteria(b)) => Arc::ptr_eq(a, b),
+            (Self::Masque(a), Self::Masque(b)) => Arc::ptr_eq(a, b),
             (Self::Reverse(a), Self::Reverse(b)) => Arc::ptr_eq(a, b),
             (Self::Loopback(a), Self::Loopback(b)) => a == b,
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
@@ -1485,16 +1487,9 @@ impl Router {
                 }
                 "http" => Action::Http(Arc::new(HttpOutbound::parse(&tag, outbound)?)),
                 "dns" => Action::Dns(Arc::new(DnsOutbound::parse(&tag, outbound)?)),
-                "masque" => {
-                    let settings = outbound.get("settings").unwrap_or(&Value::Null);
-                    if str_field(settings, "address").is_empty() {
-                        return Err("MASQUE: \"address\" is not set".into());
-                    }
-                    log::warn(format!(
-                        "skipping outbound {tag:?}: MASQUE outbound is not supported yet"
-                    ));
-                    Action::Block(BlockAction::Drop)
-                }
+                "masque" => Action::Masque(Arc::new(
+                    crate::masque_outbound::MasqueOutbound::parse(&tag, outbound)?,
+                )),
                 "hysteria" | "hysteria2" => {
                     let settings = outbound.get("settings").unwrap_or(&Value::Null);
                     if let Some(v) = settings.get("version") {

@@ -889,7 +889,9 @@ fn h3_response(builder: http::response::Builder, code: StatusCode) -> Response<(
         .unwrap_or_else(|_| h3_status(code))
 }
 
-fn build_quic_transport_config(config: &H3QuicConfig) -> Result<quinn::TransportConfig, String> {
+pub(crate) fn build_quic_transport_config(
+    config: &H3QuicConfig,
+) -> Result<quinn::TransportConfig, String> {
     let mut transport = quinn::TransportConfig::default();
 
     let idle_timeout = config

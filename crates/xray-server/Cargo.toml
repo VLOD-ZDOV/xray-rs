@@ -20,6 +20,7 @@ base64.workspace = true
 http.workspace = true
 http-body-util = "0.1"
 prost.workspace = true
+h2 = { workspace = true }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "http1", "http2"] }
 rand.workspace = true

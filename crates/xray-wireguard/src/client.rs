@@ -150,6 +150,64 @@ impl Client {
     ) -> Result<Self, Error> {
         Self::start_with_options(config, protector, Options::default()).await
     }
+    pub async fn start_raw(
+        addresses: Vec<IpAddr>,
+        mtu: u16,
+        to_tunnel: mpsc::Sender<gotatun::packet::Packet<gotatun::packet::Ip>>,
+        from_tunnel: mpsc::Receiver<gotatun::packet::Packet<gotatun::packet::Ip>>,
+    ) -> Result<Self, Error> {
+        let stop = Stop::new();
+        let wake = Arc::new(Notify::new());
+        let (commands, requests) = mpsc::channel(COMMAND_QUEUE);
+
+        let allowed_ips = vec![
+            "0.0.0.0/0"
+                .parse::<xray_proxy::wireguard::AllowedIp>()
+                .map_err(|_| Error::Configuration)?,
+            "::/0"
+                .parse::<xray_proxy::wireguard::AllowedIp>()
+                .map_err(|_| Error::Configuration)?,
+        ];
+        let dummy_peer = crate::PeerConfig {
+            public_key: xray_proxy::wireguard::KeyMaterial::parse(
+                "7WKPQ2Vz0dYScVNBB6IYSeuBo0v89DNfQ/aZJYjkFz0=",
+            )
+            .map_err(|_| Error::Configuration)?,
+            preshared_key: None,
+            endpoint: "127.0.0.1:1".parse().unwrap(),
+            allowed_ips,
+            keepalive: 0,
+        };
+        let config = Config {
+            secret_key: xray_proxy::wireguard::KeyMaterial::parse(
+                "SAQHLz+rEHl2naHY055FsmJXgQ/J1v8UEFdo0LHFi2c=",
+            )
+            .map_err(|_| Error::Configuration)?,
+            peers: vec![dummy_peer],
+            addresses,
+            mtu,
+        };
+
+        let stack = stack::Stack::new(&config, to_tunnel, from_tunnel, requests, wake.clone());
+        let (finished, done) = watch::channel(false);
+        let task_stop = stop.clone();
+        tokio::spawn(async move {
+            stack.run(task_stop).await;
+            let _ = finished.send(true);
+        });
+
+        Ok(Self(Arc::new(Owner {
+            config,
+            commands,
+            stop,
+            finished: done,
+            wake,
+            rebind: Arc::new(RebindRequest::default()),
+            tcp: Arc::new(Semaphore::new(TCP_LIMIT)),
+            udp: Arc::new(Semaphore::new(UDP_LIMIT)),
+            next: AtomicU64::new(1),
+        })))
+    }
     pub async fn start_with_options(
         config: Config,
         protector: Option<Arc<dyn SocketProtector>>,

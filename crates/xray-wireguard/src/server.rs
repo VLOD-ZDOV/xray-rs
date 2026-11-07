@@ -183,6 +183,51 @@ impl Server {
         self.udp_rx.lock().await.recv().await
     }
 
+    pub fn start_raw(
+        addresses: Vec<IpAddr>,
+        mtu: u16,
+        to_tunnel: mpsc::Sender<Packet<Ip>>,
+        from_tunnel: mpsc::Receiver<Packet<Ip>>,
+    ) -> Self {
+        let stop = Stop::new();
+        let wake = Arc::new(Notify::new());
+        let (tcp_tx, tcp_rx) = mpsc::channel(64);
+        let (udp_tx, udp_rx) = mpsc::channel(64);
+        let (udp_resp_tx, udp_resp_rx) = mpsc::channel(128);
+
+        let config = ServerConfig {
+            secret_key: KeyMaterial::parse("EGs4lTSJPmgELx6YiJAmPR2meWi6bY+e9rTdCipSj10=").unwrap(),
+            peers: vec![],
+            addresses,
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            mtu,
+            reserved: [0; 3],
+        };
+
+        let stack = ServerStack::new(
+            &config,
+            to_tunnel,
+            from_tunnel,
+            tcp_tx,
+            udp_tx,
+            udp_resp_tx,
+            udp_resp_rx,
+            stop.clone(),
+            wake.clone(),
+        );
+
+        let stack_stop = stop.clone();
+        tokio::spawn(async move {
+            stack.run(stack_stop).await;
+        });
+
+        Self {
+            stop,
+            tcp_rx: Arc::new(Mutex::new(tcp_rx)),
+            udp_rx: Arc::new(Mutex::new(udp_rx)),
+        }
+    }
+
     pub fn close(&self) {
         self.stop.close();
     }

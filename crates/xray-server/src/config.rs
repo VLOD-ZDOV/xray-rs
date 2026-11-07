@@ -66,6 +66,7 @@ pub enum InboundProtocol {
     Dokodemo,
     Hysteria,
     Wireguard,
+    Masque,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,6 +210,7 @@ pub struct Inbound {
     pub sockopt: Option<SockoptSettings>,
     pub quic_params: Option<xray_config::QuicParamsSettings>,
     pub wireguard: Option<Arc<xray_wireguard::ServerConfig>>,
+    pub masque: Option<Arc<crate::masque_inbound::MasqueServerConfig>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -673,17 +675,69 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 sockopt: sockopt_settings,
                 quic_params: None,
                 wireguard: Some(Arc::new(wg_cfg)),
+                masque: None,
             }));
         }
         "masque" => {
-            let settings = item.get("settings").unwrap_or(&Value::Null);
-            if str_field(settings, "address").is_empty() {
-                return Err("MASQUE: \"address\" is not set".into());
+            let masque_cfg = crate::masque_inbound::parse(&tag, item)?;
+            let port = parse_port(item.get("port")).unwrap_or(443);
+            let listen = match str_field(item, "listen") {
+                "" => String::new(),
+                addr if addr.starts_with('/') || addr.starts_with('@') => {
+                    return Err("unix socket listen is not supported".into());
+                }
+                addr => addr.to_owned(),
+            };
+            let stream = item.get("streamSettings").unwrap_or(&Value::Null);
+            let network = str_field(stream, "network");
+            if network != "masque" {
+                return Err("the masque transport can only be used by the masque inbound".into());
             }
-            log::warn(format!(
-                "skipping inbound {tag:?}: MASQUE inbound is not supported yet"
-            ));
-            return Ok(None);
+            let security = str_field(stream, "security");
+            if security != "tls" {
+                return Err("MASQUE requires \"security\": \"tls\"".into());
+            }
+            let tls_settings = parse_tls(stream.get("tlsSettings").unwrap_or(&Value::Null))?;
+            let sniffing = parse_sniffing(item.get("sniffing").unwrap_or(&Value::Null), &tag);
+            let sockopt_settings = parse_sockopt(
+                stream
+                    .get("sockopt")
+                    .or_else(|| item.get("sockopt"))
+                    .unwrap_or(&Value::Null),
+                &format!("inbound {tag:?}"),
+            )?;
+            let quic_params = parse_quic_params_from_stream(stream, &tag)?;
+            return Ok(Some(Inbound {
+                tag,
+                listen,
+                port,
+                protocol: InboundProtocol::Masque,
+                users: Vec::new(),
+                shadowsocks_users: Vec::new(),
+                shadowsocks_top_method: None,
+                shadowsocks_top_password: None,
+                fallbacks: Vec::new(),
+                socks_auth: xray_proxy::inbound::SocksInboundAuth::NoAuth,
+                udp: true,
+                sniffing,
+                dokodemo: None,
+                http_obfs: None,
+                tls: Some(tls_settings),
+                reality: None,
+                transport: InboundTransport::Tcp,
+                accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept::None,
+                hysteria_users: Vec::new(),
+                hysteria_salamander: None,
+                hysteria_gecko: None,
+                hysteria_udp_idle_timeout: None,
+                hysteria_masq: None,
+                has_udphop: false,
+                vless_encryption: None,
+                sockopt: sockopt_settings,
+                quic_params,
+                wireguard: None,
+                masque: Some(Arc::new(masque_cfg)),
+            }));
         }
         other => {
             log::warn(format!(
@@ -1228,47 +1282,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         }
     }
 
-    let quic_params = if stream.pointer("/finalmask/quicParams").is_some()
-        || stream.get("quicParams").is_some()
-    {
-        crate::finalmask::validate_inbound_quic_params(stream, &tag)?;
-        let mut qp_val = stream
-            .pointer("/finalmask/quicParams")
-            .or_else(|| stream.get("quicParams"))
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({}));
-        if let Some(obj) = qp_val.as_object_mut() {
-            obj.insert("disableChromeParrot".to_string(), serde_json::json!(true));
-        }
-        let synth_stream = serde_json::json!({
-            "network": "xhttp",
-            "xhttpSettings": { "path": "/" },
-            "security": "tls",
-            "tlsSettings": { "serverName": "a", "alpn": ["h3"] },
-            "finalmask": {
-                "quicParams": qp_val
-            }
-        });
-        let synth = serde_json::json!({
-            "inbounds": [],
-            "outbounds": [{
-                "protocol": "freedom",
-                "streamSettings": synth_stream
-            }]
-        });
-        let parsed = xray_config::parse_xray_json(&synth.to_string()).map_err(|e| {
-            let messages: Vec<String> = e.diagnostics.iter().map(|d| d.message.clone()).collect();
-            format!("inbound {tag:?}: {}", messages.join("; "))
-        })?;
-        parsed
-            .config
-            .outbounds
-            .into_iter()
-            .next()
-            .and_then(|o| o.stream.quic_params)
-    } else {
-        None
-    };
+    let quic_params = parse_quic_params_from_stream(stream, &tag)?;
 
     Ok(Some(Inbound {
         tag,
@@ -1299,7 +1313,53 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         sockopt: sockopt_settings,
         quic_params,
         wireguard: None,
+        masque: None,
     }))
+}
+
+fn parse_quic_params_from_stream(
+    stream: &Value,
+    tag: &str,
+) -> Result<Option<xray_config::QuicParamsSettings>, String> {
+    if stream.pointer("/finalmask/quicParams").is_some() || stream.get("quicParams").is_some() {
+        crate::finalmask::validate_inbound_quic_params(stream, tag)?;
+        let mut qp_val = stream
+            .pointer("/finalmask/quicParams")
+            .or_else(|| stream.get("quicParams"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = qp_val.as_object_mut() {
+            obj.insert("disableChromeParrot".to_string(), serde_json::json!(true));
+        }
+        let synth_stream = serde_json::json!({
+            "network": "xhttp",
+            "xhttpSettings": { "path": "/" },
+            "security": "tls",
+            "tlsSettings": { "serverName": "a", "alpn": ["h3"] },
+            "finalmask": {
+                "quicParams": qp_val
+            }
+        });
+        let synth = serde_json::json!({
+            "inbounds": [],
+            "outbounds": [{
+                "protocol": "freedom",
+                "streamSettings": synth_stream
+            }]
+        });
+        let parsed = xray_config::parse_xray_json(&synth.to_string()).map_err(|e| {
+            let messages: Vec<String> = e.diagnostics.iter().map(|d| d.message.clone()).collect();
+            format!("inbound {tag:?}: {}", messages.join("; "))
+        })?;
+        Ok(parsed
+            .config
+            .outbounds
+            .into_iter()
+            .next()
+            .and_then(|o| o.stream.quic_params))
+    } else {
+        Ok(None)
+    }
 }
 
 fn parse_hysteria_masq(

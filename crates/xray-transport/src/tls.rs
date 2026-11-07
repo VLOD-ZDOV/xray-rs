@@ -176,7 +176,7 @@ impl TlsConnector {
 
     /// Builds an unshaped TLS 1.3 configuration for one QUIC application
     /// protocol while preserving the connector's trust policy and cache.
-    pub(crate) fn quic_client_config_for(
+    pub fn quic_client_config_for(
         &self,
         config: &TlsClientConfig,
         alpn: &[u8],

@@ -18,6 +18,9 @@ mod hysteria_outbound;
 mod inbound_proxy;
 pub mod kcp;
 mod log;
+mod masque_capsule;
+mod masque_inbound;
+mod masque_outbound;
 mod metrics;
 mod mux;
 mod observatory;
@@ -357,6 +360,9 @@ pub(crate) fn select_inbound_handler(
         (InboundProtocol::Wireguard, _) => {
             unreachable!("wireguard is handled above")
         }
+        (InboundProtocol::Masque, _) => {
+            unreachable!("masque is handled above")
+        }
     }
 }
 
@@ -400,6 +406,11 @@ pub(crate) async fn start_inbound(
 
     if inbound.protocol == InboundProtocol::Wireguard {
         let abort = wg_inbound::start(inbound, ctx.clone(), router).await?;
+        return Ok((ctx, Some(abort), None));
+    }
+
+    if inbound.protocol == InboundProtocol::Masque {
+        let abort = masque_inbound::start(inbound, ctx.clone(), router).await?;
         return Ok((ctx, Some(abort), None));
     }
 
