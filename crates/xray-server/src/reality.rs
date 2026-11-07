@@ -773,7 +773,7 @@ impl RealityServer {
         dest: &mut Box<dyn Stream>,
     ) -> Result<DestHandshake, (Vec<u8>, &'static str)> {
         let mut s2c_saved = Vec::new();
-        let mut buf = [0u8; 8192];
+        let mut buf = vec![0u8; 8192];
         let mut handshake_lens = [0usize; 7];
 
         let timeout = crate::policy::get().handshake;

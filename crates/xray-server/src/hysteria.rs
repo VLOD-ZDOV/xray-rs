@@ -547,7 +547,7 @@ async fn handle_tcp_streams(
             let (mut out_r, mut out_w) = tokio::io::split(outbound_stream);
 
             let up = async {
-                let mut buf = [0u8; 16384];
+                let mut buf = vec![0u8; 16384];
                 loop {
                     match recv.read(&mut buf).await {
                         Ok(Some(n)) if n > 0 => {
@@ -563,7 +563,7 @@ async fn handle_tcp_streams(
             };
 
             let down = async {
-                let mut buf = [0u8; 16384];
+                let mut buf = vec![0u8; 16384];
                 loop {
                     match out_r.read(&mut buf).await {
                         Ok(n) if n > 0 => {

@@ -144,6 +144,8 @@ pub struct ShadowsocksUdpLink {
     target: Target,
     method: ShadowsocksMethod,
     session2022: Option<Arc<Mutex<UdpSession2022>>>,
+    // Kept out of the recv future: a 64 KiB array there would grow every connection's task.
+    wire_buf: Mutex<Vec<u8>>,
 }
 
 impl ShadowsocksUdpLink {
@@ -170,6 +172,7 @@ impl ShadowsocksUdpLink {
             target,
             method,
             session2022,
+            wire_buf: Mutex::new(vec![0u8; 65535]),
         })
     }
 
@@ -189,7 +192,7 @@ impl ShadowsocksUdpLink {
     }
 
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut wire_buf = [0u8; 65535];
+        let mut wire_buf = self.wire_buf.lock().await;
         loop {
             let n = self.socket.recv(&mut wire_buf).await?;
             if n == 0 {
@@ -250,7 +253,7 @@ impl ShadowsocksConeUdp {
         let tx_recv = tx.clone();
 
         let reader_task = tokio::spawn(async move {
-            let mut wire_buf = [0u8; 65535];
+            let mut wire_buf = vec![0u8; 65535];
             while let Ok(n) = socket_recv.recv(&mut wire_buf).await {
                 if n == 0 {
                     break;

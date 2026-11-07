@@ -142,7 +142,7 @@ impl TrojanUdpLink {
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         let mut read_buf = self.read_buf.lock().await;
         let mut reader = self.reader.lock().await;
-        let mut temp = [0u8; 8192];
+        let mut temp = vec![0u8; 8192];
         loop {
             if !read_buf.is_empty() {
                 match decode_udp_packet(&read_buf) {

@@ -293,7 +293,7 @@ where
 
             let up = async {
                 let mut in_buf = early;
-                let mut temp = [0u8; 8192];
+                let mut temp = vec![0u8; 8192];
                 loop {
                     activity.touch();
                     // Process any full Trojan UDP packets currently in in_buf
