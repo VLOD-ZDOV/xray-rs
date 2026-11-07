@@ -107,6 +107,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    for (k, v) in &config.env {
+        std::env::set_var(k, v);
+    }
     if let Err(e) = log::init(&config.log) {
         log::error(e);
         return ExitCode::FAILURE;
@@ -493,18 +496,48 @@ async fn bind(inbound: &Inbound) -> Result<TcpListener, String> {
         }
         return Err(last.unwrap_or_default());
     }
-    if !inbound.listen.is_empty() {
+    let candidates: Vec<SocketAddr> = if inbound.listen.is_empty() {
+        vec![
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)),
+            SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, port)),
+        ]
+    } else {
         let addr = format!("{}:{port}", bracket(&inbound.listen));
-        return TcpListener::bind(&addr)
-            .await
-            .map_err(|e| format!("failed to listen on {addr}: {e}"));
+        vec![addr
+            .parse()
+            .map_err(|_| format!("invalid listen address {addr}"))?]
+    };
+    let mut last = None;
+    for addr in candidates {
+        let sock = match socket2::Socket::new(
+            socket2::Domain::for_address(addr),
+            socket2::Type::STREAM,
+            None,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last = Some(format!("failed to create socket for {addr}: {e}"));
+                continue;
+            }
+        };
+        let _ = sock.set_reuse_address(true);
+        if addr.is_ipv6() {
+            let _ = sock.set_only_v6(false);
+        }
+        let _ = sock.set_nonblocking(true);
+        if let Err(e) = sock.bind(&addr.into()) {
+            last = Some(format!("failed to bind {addr}: {e}"));
+            continue;
+        }
+        if let Err(e) = sock.listen(1024) {
+            last = Some(format!("failed to listen on {addr}: {e}"));
+            continue;
+        }
+        let std_listener = std::net::TcpListener::from(sock);
+        return TcpListener::from_std(std_listener)
+            .map_err(|e| format!("failed to convert std socket: {e}"));
     }
-    match TcpListener::bind(("::", port)).await {
-        Ok(listener) => Ok(listener),
-        Err(_) => TcpListener::bind(("0.0.0.0", port))
-            .await
-            .map_err(|e| format!("failed to listen on port {port}: {e}")),
-    }
+    Err(last.unwrap_or_else(|| format!("failed to listen on port {port}")))
 }
 
 async fn bind_udp_addr(listen: &str, port: u16) -> Result<UdpSocket, String> {

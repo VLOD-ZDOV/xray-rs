@@ -43,7 +43,7 @@ pub fn init(settings: &Settings) -> Result<(), String> {
         "none" => NONE,
         other => return Err(format!("unknown log level {other:?}")),
     };
-    let debug_override = std::env::var_os("XRAY_SERVER_DEBUG").is_some();
+    let debug_override = crate::config::get_env("XRAY_SERVER_DEBUG").is_some();
     LEVEL.store(
         if debug_override { DEBUG } else { level },
         Ordering::Relaxed,
@@ -197,7 +197,7 @@ fn write_line(sink: &Sink, line: std::fmt::Arguments<'_>) {
 fn local_offset_seconds() -> i64 {
     static OFFSET: OnceLock<i64> = OnceLock::new();
     *OFFSET.get_or_init(|| {
-        if let Ok(tz) = std::env::var("TZ") {
+        if let Some(tz) = crate::config::get_env("TZ") {
             if let Some(off) = parse_tz_string(&tz) {
                 return off;
             }

@@ -1,6 +1,7 @@
 //! Subset of the Xray JSON config that this server understands. Unknown or
 //! unsupported entries are skipped with a warning so a full 3x-ui config loads.
 
+use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -28,6 +29,19 @@ pub struct Config {
     pub observatory: Option<Arc<crate::observatory::Observatory>>,
     pub metrics_listen: Option<SocketAddr>,
     pub api_tag: Option<String>,
+    pub env: HashMap<String, String>,
+}
+
+pub static ENV_TABLE: std::sync::LazyLock<std::sync::RwLock<HashMap<String, String>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+pub fn get_env(key: &str) -> Option<String> {
+    if let Ok(table) = ENV_TABLE.read() {
+        if let Some(val) = table.get(key) {
+            return Some(val.clone());
+        }
+    }
+    std::env::var(key).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -338,7 +352,7 @@ fn normalize_sections(root: &mut Value) {
             }
         }
     }
-    for section in ["transport", "env", "geodata"] {
+    for section in ["transport", "geodata"] {
         if map.get(section).is_some_and(|v| !v.is_null()) {
             log::warn(format!("config: {section:?} is not supported yet, ignored"));
         }
@@ -382,6 +396,22 @@ fn check_version(root: &Value) -> Result<(), String> {
 pub fn parse(raw: &str) -> Result<Config, String> {
     let mut root: Value = serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
     normalize_sections(&mut root);
+    let mut env_map = HashMap::new();
+    if let Some(env_obj) = root.get("env").and_then(Value::as_object) {
+        for (k, v) in env_obj {
+            let val = match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                _ => continue,
+            };
+            std::env::set_var(k, &val);
+            env_map.insert(k.clone(), val);
+        }
+    }
+    if let Ok(mut table) = ENV_TABLE.write() {
+        table.extend(env_map.clone());
+    }
     if root.get("reverse").is_some_and(|v| !v.is_null()) {
         return Err("The feature \"legacy reverse\" has been removed and migrated to \"VLESS Reverse Proxy\". Please update your config(s) according to release note and documentation.".into());
     }
@@ -470,6 +500,7 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         observatory,
         metrics_listen: crate::metrics::parse(&root)?.and_then(|m| m.listen),
         api_tag: api_tag.map(str::to_owned),
+        env: env_map,
     })
 }
 
@@ -1929,7 +1960,7 @@ fn parse_port(value: Option<&Value>) -> Option<u16> {
 
 /// Where geoip.dat/geosite.dat live; the parser also adds the binary's directory.
 fn asset_dirs() -> Vec<PathBuf> {
-    std::env::var_os("XRAY_LOCATION_ASSET")
+    get_env("XRAY_LOCATION_ASSET")
         .map(PathBuf::from)
         .into_iter()
         .collect()
@@ -2798,5 +2829,20 @@ mod tests {
             parse(too_old).err().unwrap(),
             "this config should be run on version 26.10.30 or lower"
         );
+    }
+
+    #[test]
+    fn parses_env_section() {
+        let raw = r#"{
+          "env": {
+            "XRAY_TEST_VAR_1": "hello",
+            "XRAY_TEST_VAR_2": "world"
+          },
+          "inbounds": []
+        }"#;
+        let config = parse(raw).unwrap();
+        assert_eq!(config.env.get("XRAY_TEST_VAR_1"), Some(&"hello".to_string()));
+        assert_eq!(config.env.get("XRAY_TEST_VAR_2"), Some(&"world".to_string()));
+        assert_eq!(get_env("XRAY_TEST_VAR_1"), Some("hello".to_string()));
     }
 }
