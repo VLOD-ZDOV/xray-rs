@@ -187,7 +187,7 @@ impl DokodemoUdpHandler {
             traffic.up(initial_payload.len());
         }
 
-        let up = async {
+        let up = Box::pin(async {
             while let Some(packet) = rx.recv().await {
                 activity.touch();
                 let query = Query {
@@ -219,8 +219,8 @@ impl DokodemoUdpHandler {
                 }
             }
             Ok(())
-        };
-        let down = async {
+        });
+        let down = Box::pin(async {
             let mut buf = vec![0u8; 65535];
             loop {
                 let (n, _from) = cone.recv_from(&mut buf).await?;
@@ -228,7 +228,7 @@ impl DokodemoUdpHandler {
                 let _ = self.socket.send_to(&buf[..n], peer).await;
                 traffic.down(n);
             }
-        };
+        });
         relay(up, down, &activity).await
     }
 }

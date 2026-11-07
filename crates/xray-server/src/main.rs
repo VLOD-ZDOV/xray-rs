@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(clippy::large_futures)]
 
 mod api;
 mod config;

@@ -208,7 +208,7 @@ async fn relay_udp(
         traffic.up(first.payload.len());
     }
 
-    let up = async {
+    let up = Box::pin(async {
         loop {
             let (n, from) = udp_relay.recv_from(&mut buf).await?;
             if from != client {
@@ -249,8 +249,8 @@ async fn relay_udp(
                 traffic.up(datagram.payload.len());
             }
         }
-    };
-    let down = async {
+    });
+    let down = Box::pin(async {
         let mut buf = vec![0u8; 65535];
         loop {
             let (n, from) = cone.recv_from(&mut buf).await?;
@@ -265,7 +265,7 @@ async fn relay_udp(
                 traffic.down(n);
             }
         }
-    };
+    });
     relay(up, down, &activity).await
 }
 
