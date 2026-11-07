@@ -851,6 +851,7 @@ mod tests {
             address: None,
             port: 53,
             network: Network::Udp,
+            sockopt: None,
         };
 
         // Standard DNS query for localhost A record: ID=0x1234, Flags=0x0100, QD=1, AN=0, NS=0, AR=0

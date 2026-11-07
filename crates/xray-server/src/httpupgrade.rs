@@ -98,7 +98,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> xray_proxy::vless::VisionStreamIo for Pr
 pub async fn accept<S>(
     mut stream: S,
     settings: &HttpUpgradeSettings,
-) -> io::Result<PrefixedStream<S>>
+    trusted_xff: &[String],
+    peer: std::net::SocketAddr,
+) -> io::Result<(PrefixedStream<S>, std::net::SocketAddr)>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
@@ -172,6 +174,7 @@ where
     let mut connection_ok = false;
     let mut upgrade_hdr = None;
     let mut host_hdr = None;
+    let mut header_pairs = Vec::new();
 
     for line in lines {
         let Some((key, val)) = line.split_once(':') else {
@@ -179,6 +182,7 @@ where
         };
         let key = key.trim();
         let val = val.trim();
+        header_pairs.push((key, val));
 
         if key.eq_ignore_ascii_case("connection") && val.to_ascii_lowercase().contains("upgrade") {
             connection_ok = true;
@@ -188,6 +192,8 @@ where
             host_hdr = Some(val.to_owned());
         }
     }
+
+    let peer = crate::sockopt::apply_trusted_x_forwarded_for_raw(header_pairs, trusted_xff, peer);
 
     if let Some(expected_host) = &settings.host {
         let h = host_hdr.unwrap_or_default();
@@ -229,7 +235,7 @@ where
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await?;
 
-    Ok(PrefixedStream::new(stream, leftover))
+    Ok((PrefixedStream::new(stream, leftover), peer))
 }
 
 fn normalize_path(p: &str) -> &str {

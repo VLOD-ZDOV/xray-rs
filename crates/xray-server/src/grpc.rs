@@ -42,11 +42,28 @@ pub enum GrpcProtocol {
 pub struct Handler {
     settings: GrpcSettings,
     protocol: GrpcProtocol,
+    trusted_x_forwarded_for: Vec<String>,
 }
 
 impl Handler {
     pub fn new(settings: GrpcSettings, protocol: GrpcProtocol) -> Arc<Self> {
-        Arc::new(Self { settings, protocol })
+        Arc::new(Self {
+            settings,
+            protocol,
+            trusted_x_forwarded_for: Vec::new(),
+        })
+    }
+
+    pub fn with_trusted_x_forwarded_for(self: &mut Arc<Self>, trusted: Vec<String>) {
+        if let Some(handler) = Arc::get_mut(self) {
+            handler.trusted_x_forwarded_for = trusted;
+        } else {
+            *self = Arc::new(Self {
+                settings: self.settings.clone(),
+                protocol: self.protocol.clone(),
+                trusted_x_forwarded_for: trusted,
+            });
+        }
     }
 
     pub async fn handle(
@@ -54,6 +71,11 @@ impl Handler {
         req: Request<Incoming>,
         peer: SocketAddr,
     ) -> Response<Body> {
+        let peer = crate::sockopt::apply_trusted_x_forwarded_for(
+            req.headers(),
+            &self.trusted_x_forwarded_for,
+            peer,
+        );
         if req.method() != Method::POST {
             log::debug(format!(
                 "grpc: non-POST method {:?} from {}",

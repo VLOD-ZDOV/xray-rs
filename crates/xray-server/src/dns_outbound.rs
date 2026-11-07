@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use xray_config::Network;
 
@@ -19,6 +18,7 @@ pub struct DnsOutbound {
     pub address: Option<Host>,
     pub port: u16,
     pub network: Network,
+    pub sockopt: Option<Arc<crate::config::SockoptSettings>>,
 }
 
 impl fmt::Debug for DnsOutbound {
@@ -32,7 +32,8 @@ impl fmt::Debug for DnsOutbound {
 }
 
 impl DnsOutbound {
-    pub fn parse(tag: &str, settings: &Value) -> Result<Self, String> {
+    pub fn parse(tag: &str, outbound: &Value) -> Result<Self, String> {
+        let settings = outbound.get("settings").unwrap_or(outbound);
         let address = settings
             .get("rewriteAddress")
             .or_else(|| settings.get("address"))
@@ -68,11 +69,20 @@ impl DnsOutbound {
             _ => Network::Udp,
         };
 
+        let sockopt = crate::config::parse_sockopt(
+            outbound
+                .pointer("/streamSettings/sockopt")
+                .unwrap_or(&Value::Null),
+            &format!("outbound {tag:?}"),
+        )?
+        .map(Arc::new);
+
         Ok(Self {
             tag: tag.to_owned(),
             address,
             port,
             network,
+            sockopt,
         })
     }
 
@@ -92,7 +102,7 @@ impl DnsOutbound {
             } else {
                 ([0u16; 8], 0).into()
             };
-            let socket = UdpSocket::bind(bind_addr).await?;
+            let socket = crate::sockopt::bind_udp(bind_addr, self.sockopt.as_deref())?;
             socket.connect(upstream_addr).await?;
             socket.send(query).await?;
             let mut buf = vec![0u8; 4096];
@@ -181,6 +191,7 @@ impl DnsOutbound {
             address: self.address.clone(),
             port: self.port,
             network: self.network,
+            sockopt: self.sockopt.clone(),
         });
 
         tokio::spawn(async move {

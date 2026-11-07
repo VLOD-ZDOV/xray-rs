@@ -1208,10 +1208,7 @@ impl Router {
                     Action::Block(block_action)
                 }
                 "wireguard" => {
-                    let wg = Arc::new(WgOutbound::parse(
-                        &tag,
-                        outbound.get("settings").unwrap_or(&Value::Null),
-                    )?);
+                    let wg = Arc::new(WgOutbound::parse(&tag, outbound)?);
                     wg.clone().warm_up();
                     Action::Wireguard(wg)
                 }
@@ -1223,10 +1220,7 @@ impl Router {
                     Action::Shadowsocks(Arc::new(ShadowsocksOutbound::parse(&tag, outbound)?))
                 }
                 "http" => Action::Http(Arc::new(HttpOutbound::parse(&tag, outbound)?)),
-                "dns" => Action::Dns(Arc::new(DnsOutbound::parse(
-                    &tag,
-                    outbound.get("settings").unwrap_or(&Value::Null),
-                )?)),
+                "dns" => Action::Dns(Arc::new(DnsOutbound::parse(&tag, outbound)?)),
                 "loopback" => {
                     let settings = outbound.get("settings").unwrap_or(&Value::Null);
                     let inbound_tag = str_field(settings, "inboundTag").to_owned();
@@ -1238,16 +1232,6 @@ impl Router {
                 }
             };
             default_tag.get_or_insert_with(|| tag.clone());
-            let sockopt = outbound
-                .pointer("/streamSettings/sockopt")
-                .unwrap_or(&Value::Null);
-            if !matches!(protocol, "freedom" | "direct")
-                && crate::config::parse_sockopt(sockopt, &format!("outbound {tag:?}"))?.is_some()
-            {
-                log::warn(format!(
-                    "outbound {tag:?}: sockopt is only applied to freedom outbounds yet, ignored"
-                ));
-            }
             crate::finalmask::validate_and_log_finalmask(outbound, &tag)?;
             if let Some(proxy_tag) = parse_dialer_proxy(outbound, &tag)? {
                 dialer_proxies.push((tag.clone(), proxy_tag));

@@ -92,6 +92,12 @@ impl TransportDialer {
 
     pub fn with_socket_protector(mut self, protector: Arc<dyn SocketProtector>) -> Self {
         self.tls = self.tls.with_socket_protector(Arc::clone(&protector));
+        if self.reality.is_some() {
+            let reality =
+                RealityRuntimeEngine::new(Arc::new(RustlsRealityTlsSessionProvider::new()))
+                    .with_socket_protector(Arc::clone(&protector));
+            self.reality = Some(Arc::new(reality));
+        }
         self.socket_protector = Some(protector);
         self
     }

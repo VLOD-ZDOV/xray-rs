@@ -175,16 +175,28 @@ fn main() -> ExitCode {
 #[derive(Clone)]
 enum InboundHandler {
     VlessTcp(Arc<vless::Context>),
-    VlessWs(Arc<vless::Context>, ws::WsSettings),
-    VlessHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
+    VlessWs(Arc<vless::Context>, ws::WsSettings, Vec<String>),
+    VlessHttpUpgrade(
+        Arc<vless::Context>,
+        httpupgrade::HttpUpgradeSettings,
+        Vec<String>,
+    ),
     VlessGrpc(Arc<grpc::Handler>),
     TrojanTcp(Arc<vless::Context>),
-    TrojanWs(Arc<vless::Context>, ws::WsSettings),
-    TrojanHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
+    TrojanWs(Arc<vless::Context>, ws::WsSettings, Vec<String>),
+    TrojanHttpUpgrade(
+        Arc<vless::Context>,
+        httpupgrade::HttpUpgradeSettings,
+        Vec<String>,
+    ),
     TrojanGrpc(Arc<grpc::Handler>),
     VmessTcp(Arc<vless::Context>),
-    VmessWs(Arc<vless::Context>, ws::WsSettings),
-    VmessHttpUpgrade(Arc<vless::Context>, httpupgrade::HttpUpgradeSettings),
+    VmessWs(Arc<vless::Context>, ws::WsSettings, Vec<String>),
+    VmessHttpUpgrade(
+        Arc<vless::Context>,
+        httpupgrade::HttpUpgradeSettings,
+        Vec<String>,
+    ),
     Socks(
         Arc<vless::Context>,
         xray_proxy::inbound::SocksInboundAuth,
@@ -303,34 +315,43 @@ pub(crate) async fn start_inbound(
     let ss_inbound_tag = inbound.tag.clone();
     let ss_listen = inbound.listen.clone();
     let ss_port = inbound.port;
+    let trusted_xff = inbound
+        .sockopt
+        .as_ref()
+        .map(|s| s.trusted_x_forwarded_for.clone())
+        .unwrap_or_default();
 
     let handler = match (inbound.protocol, inbound.transport.clone()) {
         (InboundProtocol::Vless, InboundTransport::Tcp) => InboundHandler::VlessTcp(ctx.clone()),
         (InboundProtocol::Vless, InboundTransport::Websocket(settings)) => {
-            InboundHandler::VlessWs(ctx.clone(), settings)
+            InboundHandler::VlessWs(ctx.clone(), settings, trusted_xff)
         }
         (InboundProtocol::Vless, InboundTransport::HttpUpgrade(settings)) => {
-            InboundHandler::VlessHttpUpgrade(ctx.clone(), settings)
+            InboundHandler::VlessHttpUpgrade(ctx.clone(), settings, trusted_xff)
         }
-        (InboundProtocol::Vless, InboundTransport::Grpc(settings)) => InboundHandler::VlessGrpc(
-            grpc::Handler::new(settings, grpc::GrpcProtocol::Vless(ctx.clone())),
-        ),
+        (InboundProtocol::Vless, InboundTransport::Grpc(settings)) => {
+            let mut gh = grpc::Handler::new(settings, grpc::GrpcProtocol::Vless(ctx.clone()));
+            gh.with_trusted_x_forwarded_for(trusted_xff);
+            InboundHandler::VlessGrpc(gh)
+        }
         (InboundProtocol::Trojan, InboundTransport::Tcp) => InboundHandler::TrojanTcp(ctx.clone()),
         (InboundProtocol::Trojan, InboundTransport::Websocket(settings)) => {
-            InboundHandler::TrojanWs(ctx.clone(), settings)
+            InboundHandler::TrojanWs(ctx.clone(), settings, trusted_xff)
         }
         (InboundProtocol::Trojan, InboundTransport::HttpUpgrade(settings)) => {
-            InboundHandler::TrojanHttpUpgrade(ctx.clone(), settings)
+            InboundHandler::TrojanHttpUpgrade(ctx.clone(), settings, trusted_xff)
         }
-        (InboundProtocol::Trojan, InboundTransport::Grpc(settings)) => InboundHandler::TrojanGrpc(
-            grpc::Handler::new(settings, grpc::GrpcProtocol::Trojan(ctx.clone())),
-        ),
+        (InboundProtocol::Trojan, InboundTransport::Grpc(settings)) => {
+            let mut gh = grpc::Handler::new(settings, grpc::GrpcProtocol::Trojan(ctx.clone()));
+            gh.with_trusted_x_forwarded_for(trusted_xff);
+            InboundHandler::TrojanGrpc(gh)
+        }
         (InboundProtocol::Vmess, InboundTransport::Tcp) => InboundHandler::VmessTcp(ctx.clone()),
         (InboundProtocol::Vmess, InboundTransport::Websocket(settings)) => {
-            InboundHandler::VmessWs(ctx.clone(), settings)
+            InboundHandler::VmessWs(ctx.clone(), settings, trusted_xff)
         }
         (InboundProtocol::Vmess, InboundTransport::HttpUpgrade(settings)) => {
-            InboundHandler::VmessHttpUpgrade(ctx.clone(), settings)
+            InboundHandler::VmessHttpUpgrade(ctx.clone(), settings, trusted_xff)
         }
         (InboundProtocol::Socks, InboundTransport::Tcp) => {
             InboundHandler::Socks(ctx.clone(), inbound.socks_auth.clone(), inbound.udp)
@@ -353,7 +374,9 @@ pub(crate) async fn start_inbound(
             InboundHandler::Dokodemo(ctx.clone(), Arc::new(settings))
         }
         (InboundProtocol::Vless, InboundTransport::Xhttp(settings)) => {
-            InboundHandler::VlessXhttp(xhttp::Handler::new(*settings, ctx.clone()))
+            let mut xh = xhttp::Handler::new(*settings, ctx.clone());
+            xh.with_trusted_x_forwarded_for(trusted_xff);
+            InboundHandler::VlessXhttp(xh)
         }
         (other, InboundTransport::Xhttp(_)) => {
             return Err(format!(
@@ -793,9 +816,9 @@ async fn dispatch(
                 log::info(format!("vless from {} rejected: {e}", log::mask(peer)));
             }
         }),
-        InboundHandler::VlessWs(ctx, ws_settings) => Box::pin(async move {
-            match ws::accept(stream, &ws_settings).await {
-                Ok(ws_stream) => {
+        InboundHandler::VlessWs(ctx, ws_settings, trusted_xff) => Box::pin(async move {
+            match ws::accept(stream, &ws_settings, &trusted_xff, peer).await {
+                Ok((ws_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(ws_stream);
                     if let Err(e) = vless::serve(uplink, downlink, &ctx, peer).await {
                         log::info(format!("vless-ws from {} rejected: {e}", log::mask(peer)));
@@ -806,9 +829,9 @@ async fn dispatch(
                 }
             }
         }),
-        InboundHandler::VlessHttpUpgrade(ctx, hu_settings) => Box::pin(async move {
-            match httpupgrade::accept(stream, &hu_settings).await {
-                Ok(prefixed_stream) => {
+        InboundHandler::VlessHttpUpgrade(ctx, hu_settings, trusted_xff) => Box::pin(async move {
+            match httpupgrade::accept(stream, &hu_settings, &trusted_xff, peer).await {
+                Ok((prefixed_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
                     if let Err(e) = vless::serve(uplink, downlink, &ctx, peer).await {
                         log::info(format!(
@@ -832,9 +855,9 @@ async fn dispatch(
                 log::info(format!("trojan from {} rejected: {e}", log::mask(peer)));
             }
         }),
-        InboundHandler::TrojanWs(ctx, ws_settings) => Box::pin(async move {
-            match ws::accept(stream, &ws_settings).await {
-                Ok(ws_stream) => {
+        InboundHandler::TrojanWs(ctx, ws_settings, trusted_xff) => Box::pin(async move {
+            match ws::accept(stream, &ws_settings, &trusted_xff, peer).await {
+                Ok((ws_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(ws_stream);
                     if let Err(e) =
                         trojan::serve(uplink, downlink, &ctx, peer, &Default::default()).await
@@ -847,9 +870,9 @@ async fn dispatch(
                 }
             }
         }),
-        InboundHandler::TrojanHttpUpgrade(ctx, hu_settings) => Box::pin(async move {
-            match httpupgrade::accept(stream, &hu_settings).await {
-                Ok(prefixed_stream) => {
+        InboundHandler::TrojanHttpUpgrade(ctx, hu_settings, trusted_xff) => Box::pin(async move {
+            match httpupgrade::accept(stream, &hu_settings, &trusted_xff, peer).await {
+                Ok((prefixed_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
                     if let Err(e) =
                         trojan::serve(uplink, downlink, &ctx, peer, &Default::default()).await
@@ -874,9 +897,9 @@ async fn dispatch(
                 log::info(format!("vmess from {} rejected: {e}", log::mask(peer)));
             }
         }),
-        InboundHandler::VmessWs(ctx, ws_settings) => Box::pin(async move {
-            match ws::accept(stream, &ws_settings).await {
-                Ok(ws_stream) => {
+        InboundHandler::VmessWs(ctx, ws_settings, trusted_xff) => Box::pin(async move {
+            match ws::accept(stream, &ws_settings, &trusted_xff, peer).await {
+                Ok((ws_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(ws_stream);
                     if let Err(e) = vmess::serve(uplink, downlink, &ctx, peer).await {
                         log::info(format!("vmess-ws from {} rejected: {e}", log::mask(peer)));
@@ -887,9 +910,9 @@ async fn dispatch(
                 }
             }
         }),
-        InboundHandler::VmessHttpUpgrade(ctx, hu_settings) => Box::pin(async move {
-            match httpupgrade::accept(stream, &hu_settings).await {
-                Ok(prefixed_stream) => {
+        InboundHandler::VmessHttpUpgrade(ctx, hu_settings, trusted_xff) => Box::pin(async move {
+            match httpupgrade::accept(stream, &hu_settings, &trusted_xff, peer).await {
+                Ok((prefixed_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
                     if let Err(e) = vmess::serve(uplink, downlink, &ctx, peer).await {
                         log::info(format!(

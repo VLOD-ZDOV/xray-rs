@@ -97,40 +97,67 @@ impl ResolvedTcpConnector for ChainedTcpConnector {
     }
 }
 
-pub struct SendThroughConnector {
-    pub send_through: crate::routing::SendThrough,
+pub struct OutboundProtector {
+    pub sockopt: Option<Arc<crate::config::SockoptSettings>>,
+    pub send_through: Option<crate::routing::SendThrough>,
+    pub inner: Option<Arc<dyn xray_transport::SocketProtector>>,
 }
 
-#[async_trait::async_trait]
-impl ResolvedTcpConnector for SendThroughConnector {
-    async fn connect_resolved(
-        &self,
-        original_target: &Target,
-        candidates: &[std::net::SocketAddr],
-        _happy_eyeballs: Option<&HappyEyeballsConfig>,
-    ) -> Result<BoxedTransportStream, TransportError> {
-        let Some(addr) = candidates.first().copied() else {
-            return Err(TransportError::NoResolvedAddress(
-                format!("{:?}", original_target.addr),
-                original_target.port,
-            ));
-        };
-        let bind_ip = self.send_through.resolve_ip().unwrap_or(if addr.is_ipv4() {
-            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-        } else {
-            IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
-        });
-        let socket = if bind_ip.is_ipv4() {
-            tokio::net::TcpSocket::new_v4().map_err(TransportError::Tcp)?
-        } else {
-            tokio::net::TcpSocket::new_v6().map_err(TransportError::Tcp)?
-        };
-        socket
-            .bind(std::net::SocketAddr::new(bind_ip, 0))
-            .map_err(TransportError::Tcp)?;
-        let stream = socket.connect(addr).await.map_err(TransportError::Tcp)?;
-        stream.set_nodelay(true).map_err(TransportError::Tcp)?;
-        Ok(Box::new(stream))
+impl OutboundProtector {
+    pub fn new(
+        sockopt: Option<Arc<crate::config::SockoptSettings>>,
+        send_through: Option<crate::routing::SendThrough>,
+        inner: Option<Arc<dyn xray_transport::SocketProtector>>,
+    ) -> Self {
+        Self {
+            sockopt,
+            send_through,
+            inner,
+        }
+    }
+}
+
+impl xray_transport::SocketProtector for OutboundProtector {
+    fn protect(&self, socket: xray_transport::SocketHandle) -> io::Result<()> {
+        if let Some(inner) = &self.inner {
+            inner.protect(socket)?;
+        }
+        Ok(())
+    }
+
+    fn apply_tcp_socket(&self, socket: &tokio::net::TcpSocket) -> io::Result<()> {
+        if let Some(st) = &self.send_through {
+            if let Some(ip) = st.resolve_ip() {
+                socket.bind(std::net::SocketAddr::new(ip, 0))?;
+            }
+        }
+        if let Some(sockopt) = &self.sockopt {
+            crate::sockopt::apply_dial(socket, sockopt);
+        }
+        if let Some(inner) = &self.inner {
+            inner.apply_tcp_socket(socket)?;
+        }
+        Ok(())
+    }
+
+    fn apply_std_udp_socket(&self, socket: &std::net::UdpSocket) -> io::Result<()> {
+        if let Some(sockopt) = &self.sockopt {
+            crate::sockopt::apply_dial_udp(socket, sockopt);
+        }
+        if let Some(inner) = &self.inner {
+            inner.apply_std_udp_socket(socket)?;
+        }
+        Ok(())
+    }
+
+    fn apply_udp_socket(&self, socket: &tokio::net::UdpSocket) -> io::Result<()> {
+        if let Some(sockopt) = &self.sockopt {
+            crate::sockopt::apply_dial_udp(socket, sockopt);
+        }
+        if let Some(inner) = &self.inner {
+            inner.apply_udp_socket(socket)?;
+        }
+        Ok(())
     }
 }
 
@@ -142,6 +169,8 @@ pub struct ServerConnector {
     pub connector: ConnectorConfig,
     pub transport: TransportLayer,
     pub download: Option<Arc<crate::xhttp_outbound::XhttpDownloadTarget>>,
+    pub sockopt: Option<Arc<crate::config::SockoptSettings>>,
+    pub send_through: Option<crate::routing::SendThrough>,
 }
 
 impl fmt::Debug for ServerConnector {
@@ -374,13 +403,21 @@ impl ServerConnector {
 
         let send_through = crate::routing::parse_send_through(outbound.get("sendThrough"))?;
         let _dialer_proxy = crate::routing::parse_dialer_proxy(outbound, tag)?;
+        let sockopt = crate::config::parse_sockopt(
+            stream.get("sockopt").unwrap_or(&Value::Null),
+            &format!("outbound {tag:?}"),
+        )?
+        .map(Arc::new);
 
         let mut dialer =
             TransportDialer::system().map_err(|e| err(&format!("dialer error: {e}")))?;
-        if let Some(ref st) = send_through {
-            dialer = dialer.with_resolved_tcp_connector(Arc::new(SendThroughConnector {
-                send_through: st.clone(),
-            }));
+        if sockopt.is_some() || send_through.is_some() {
+            let inner = dialer.socket_protector_arc();
+            dialer = dialer.with_socket_protector(Arc::new(OutboundProtector::new(
+                sockopt.clone(),
+                send_through.clone(),
+                inner,
+            )));
         }
 
         if let Some(tcp_fragment) = crate::finalmask::parse_finalmask_tcp_fragment(stream)? {
@@ -395,6 +432,8 @@ impl ServerConnector {
             connector,
             transport,
             download,
+            sockopt,
+            send_through,
         })
     }
 

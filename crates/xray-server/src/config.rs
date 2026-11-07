@@ -73,6 +73,7 @@ pub struct SockoptSettings {
     pub v6only: bool,
     pub mptcp: bool,
     pub interface: Option<String>,
+    pub trusted_x_forwarded_for: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1012,7 +1013,6 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
         "penetrate",
         "addressPortStrategy",
         "happyEyeballs",
-        "trustedXForwardedFor",
     ] {
         if map.get(key).is_some_and(|v| !v.is_null()) {
             log::warn(format!(
@@ -1020,6 +1020,15 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
             ));
         }
     }
+    let trusted_x_forwarded_for = match map.get("trustedXForwardedFor") {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::String(s)) if !s.is_empty() => vec![s.clone()],
+        _ => Vec::new(),
+    };
     let int = |key: &str| map.get(key).and_then(Value::as_i64);
     let tcp_fast_open = match map.get("tcpFastOpen") {
         None | Some(Value::Null) => None,
@@ -1053,6 +1062,7 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
         interface: Some(str_field(sockopt, "interface"))
             .filter(|s| !s.is_empty())
             .map(str::to_owned),
+        trusted_x_forwarded_for,
     };
     let unset = SockoptSettings {
         mark: 0,
@@ -1066,6 +1076,7 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
         v6only: false,
         mptcp: false,
         interface: None,
+        trusted_x_forwarded_for: Vec::new(),
     };
     Ok((settings != unset).then_some(settings))
 }

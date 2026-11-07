@@ -112,6 +112,8 @@ pub struct VlessOutbound {
     pub mux_settings: Option<crate::mux::MuxSettings>,
     pub mux_pool: Option<Arc<crate::mux::MuxClientPool>>,
     pub download: Option<Arc<crate::xhttp_outbound::XhttpDownloadTarget>>,
+    pub sockopt: Option<Arc<crate::config::SockoptSettings>>,
+    pub send_through: Option<crate::routing::SendThrough>,
 }
 
 impl fmt::Debug for VlessOutbound {
@@ -125,6 +127,8 @@ impl fmt::Debug for VlessOutbound {
             .field("packet_encoding", &self.packet_encoding)
             .field("connector", &self.connector)
             .field("transport", &self.transport)
+            .field("sockopt", &self.sockopt)
+            .field("send_through", &self.send_through)
             .finish()
     }
 }
@@ -346,6 +350,11 @@ impl VlessOutbound {
             TransportDialer::system().map_err(|e| err(&format!("dialer error: {e}")))?;
         let send_through = crate::routing::parse_send_through(outbound.get("sendThrough"))?;
         let _dialer_proxy = crate::routing::parse_dialer_proxy(outbound, tag)?;
+        let sockopt = crate::config::parse_sockopt(
+            stream.get("sockopt").unwrap_or(&Value::Null),
+            &format!("outbound {tag:?}"),
+        )?
+        .map(Arc::new);
         let mux_settings = crate::mux::MuxSettings::parse(outbound.get("mux"));
         let mux_pool = mux_settings.as_ref().map(|m| {
             Arc::new(crate::mux::MuxClientPool::new(if m.concurrency <= 0 {
@@ -355,11 +364,14 @@ impl VlessOutbound {
             }))
         });
 
-        if let Some(ref st) = send_through {
-            dialer = dialer.with_resolved_tcp_connector(Arc::new(
-                crate::outbound_transport::SendThroughConnector {
-                    send_through: st.clone(),
-                },
+        if sockopt.is_some() || send_through.is_some() {
+            let inner = dialer.socket_protector_arc();
+            dialer = dialer.with_socket_protector(Arc::new(
+                crate::outbound_transport::OutboundProtector::new(
+                    sockopt.clone(),
+                    send_through.clone(),
+                    inner,
+                ),
             ));
         }
 
@@ -385,6 +397,8 @@ impl VlessOutbound {
             mux_settings,
             mux_pool,
             download,
+            sockopt,
+            send_through,
         })
     }
 

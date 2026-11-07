@@ -70,6 +70,28 @@ pub fn apply_dial(socket: &TcpSocket, sockopt: &SockoptSettings) {
         warn("interface", sock.bind_device(Some(iface.as_bytes())));
     }
     apply_tcp(&sock, sockopt);
+    if sockopt.tproxy != TproxyMode::Off {
+        let transparent = sock
+            .set_ip_transparent_v4(true)
+            .or_else(|_| sock.set_ip_transparent_v6(true));
+        warn("tproxy", transparent);
+    }
+}
+
+pub fn apply_dial_udp(socket: &impl AsFd, sockopt: &SockoptSettings) {
+    let sock = SockRef::from(socket);
+    if sockopt.mark != 0 {
+        warn("mark", sock.set_mark(sockopt.mark));
+    }
+    if let Some(iface) = &sockopt.interface {
+        warn("interface", sock.bind_device(Some(iface.as_bytes())));
+    }
+    if sockopt.tproxy != TproxyMode::Off {
+        let transparent = sock
+            .set_ip_transparent_v4(true)
+            .or_else(|_| sock.set_ip_transparent_v6(true));
+        warn("tproxy", transparent);
+    }
 }
 
 /// Connects with TCP Fast Open when it is on: the SYN carries the first write.
@@ -143,7 +165,147 @@ pub fn bind_udp(addr: SocketAddr, sockopt: Option<&SockoptSettings>) -> io::Resu
     if let Some(iface) = &sockopt.interface {
         warn("interface", socket.bind_device(Some(iface.as_bytes())));
     }
+    if sockopt.tproxy != TproxyMode::Off {
+        let transparent = if addr.is_ipv4() {
+            socket.set_ip_transparent_v4(true)
+        } else {
+            socket.set_ip_transparent_v6(true)
+        };
+        warn("tproxy", transparent);
+    }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
     UdpSocket::from_std(socket.into())
+}
+
+pub fn apply_trusted_x_forwarded_for(
+    headers: &http::HeaderMap,
+    trusted: &[String],
+    remote_addr: SocketAddr,
+) -> SocketAddr {
+    let Some(value) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) else {
+        return remote_addr;
+    };
+    apply_trusted_x_forwarded_for_value(
+        value,
+        |header_name| {
+            headers
+                .keys()
+                .any(|k| k.as_str().eq_ignore_ascii_case(header_name))
+        },
+        trusted,
+        remote_addr,
+    )
+}
+
+pub fn apply_trusted_x_forwarded_for_raw<'a>(
+    headers: impl IntoIterator<Item = (&'a str, &'a str)>,
+    trusted: &[String],
+    remote_addr: SocketAddr,
+) -> SocketAddr {
+    let list: Vec<(&str, &str)> = headers.into_iter().collect();
+    let Some((_, value)) = list
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("x-forwarded-for"))
+    else {
+        return remote_addr;
+    };
+    apply_trusted_x_forwarded_for_value(
+        value,
+        |header_name| {
+            list.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case(header_name))
+        },
+        trusted,
+        remote_addr,
+    )
+}
+
+fn apply_trusted_x_forwarded_for_value(
+    value: &str,
+    has_header: impl Fn(&str) -> bool,
+    trusted: &[String],
+    remote_addr: SocketAddr,
+) -> SocketAddr {
+    if value.trim().is_empty() {
+        return remote_addr;
+    }
+    for t in trusted {
+        if has_header(t) {
+            let first = match value.find(',') {
+                Some(idx) => &value[..idx],
+                None => value,
+            };
+            let clean = first.trim().trim_start_matches('[').trim_end_matches(']');
+            if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
+                return SocketAddr::new(ip, 0);
+            }
+            return remote_addr;
+        }
+    }
+    if trusted.is_empty() {
+        log::warn(format!(
+            "received \"X-Forwarded-For\" from {remote_addr} but \"sockopt.trustedXForwardedFor\" is not configured; ignoring it and using the real remote address"
+        ));
+    } else {
+        log::error(format!(
+            "ignored potentially forged \"X-Forwarded-For\" from {remote_addr}: {value}"
+        ));
+    }
+    remote_addr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_trusted_x_forwarded_for() {
+        let remote: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+
+        // 1. Without trusted header configured
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::HeaderName::from_static("x-forwarded-for"),
+            http::HeaderValue::from_static("129.78.138.66, 129.78.64.103"),
+        );
+        assert_eq!(apply_trusted_x_forwarded_for(&headers, &[], remote), remote);
+
+        // 2. With trusted header present
+        headers.insert(
+            http::header::HeaderName::from_static("x-trusted-cdn"),
+            http::HeaderValue::from_static(""),
+        );
+        let trusted = vec!["x-trusted-cdn".to_string()];
+        let expected: SocketAddr = "129.78.138.66:0".parse().unwrap();
+        assert_eq!(
+            apply_trusted_x_forwarded_for(&headers, &trusted, remote),
+            expected
+        );
+
+        // 3. Ignore non-IP X-Forwarded-For
+        let mut non_ip = http::HeaderMap::new();
+        non_ip.insert(
+            http::header::HeaderName::from_static("x-forwarded-for"),
+            http::HeaderValue::from_static("example.com"),
+        );
+        non_ip.insert(
+            http::header::HeaderName::from_static("x-trusted-cdn"),
+            http::HeaderValue::from_static(""),
+        );
+        assert_eq!(
+            apply_trusted_x_forwarded_for(&non_ip, &trusted, remote),
+            remote
+        );
+
+        // 4. Raw iterator version matches
+        let raw = vec![
+            ("X-Forwarded-For", "129.78.138.66, 129.78.64.103"),
+            ("X-Trusted-CDN", ""),
+        ];
+        assert_eq!(
+            apply_trusted_x_forwarded_for_raw(raw, &trusted, remote),
+            expected
+        );
+    }
 }

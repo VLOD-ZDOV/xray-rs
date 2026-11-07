@@ -130,12 +130,25 @@ impl ShadowsocksOutbound {
             port,
             Network::Udp,
         );
-        ShadowsocksUdpLink::new(server, target, self.method.clone()).await
+        ShadowsocksUdpLink::new(
+            server,
+            target,
+            self.method.clone(),
+            self.connector.sockopt.as_deref(),
+            self.connector.send_through.as_ref(),
+        )
+        .await
     }
 
     pub async fn open_cone_udp(&self) -> io::Result<ShadowsocksConeUdp> {
         let server = self.server_addr().await?;
-        ShadowsocksConeUdp::new(server, self.method.clone()).await
+        ShadowsocksConeUdp::new(
+            server,
+            self.method.clone(),
+            self.connector.sockopt.as_deref(),
+            self.connector.send_through.as_ref(),
+        )
+        .await
     }
 }
 
@@ -153,13 +166,21 @@ impl ShadowsocksUdpLink {
         server_addr: SocketAddr,
         target: Target,
         method: ShadowsocksMethod,
+        sockopt: Option<&crate::config::SockoptSettings>,
+        send_through: Option<&crate::routing::SendThrough>,
     ) -> io::Result<Self> {
-        let bind: SocketAddr = if server_addr.is_ipv4() {
-            ([0, 0, 0, 0], 0).into()
-        } else {
-            ([0u16; 8], 0).into()
+        let bind_ip = send_through.and_then(|st| st.resolve_ip());
+        let bind: SocketAddr = match bind_ip {
+            Some(ip) => SocketAddr::new(ip, 0),
+            None => {
+                if server_addr.is_ipv4() {
+                    ([0, 0, 0, 0], 0).into()
+                } else {
+                    ([0u16; 8], 0).into()
+                }
+            }
         };
-        let socket = UdpSocket::bind(bind).await?;
+        let socket = crate::sockopt::bind_udp(bind, sockopt)?;
         socket.connect(server_addr).await?;
         let session2022 = match &method {
             ShadowsocksMethod::Aead2017(_) => None,
@@ -230,13 +251,24 @@ pub struct ShadowsocksConeUdp {
 }
 
 impl ShadowsocksConeUdp {
-    pub async fn new(server_addr: SocketAddr, method: ShadowsocksMethod) -> io::Result<Self> {
-        let bind: SocketAddr = if server_addr.is_ipv4() {
-            ([0, 0, 0, 0], 0).into()
-        } else {
-            ([0u16; 8], 0).into()
+    pub async fn new(
+        server_addr: SocketAddr,
+        method: ShadowsocksMethod,
+        sockopt: Option<&crate::config::SockoptSettings>,
+        send_through: Option<&crate::routing::SendThrough>,
+    ) -> io::Result<Self> {
+        let bind_ip = send_through.and_then(|st| st.resolve_ip());
+        let bind: SocketAddr = match bind_ip {
+            Some(ip) => SocketAddr::new(ip, 0),
+            None => {
+                if server_addr.is_ipv4() {
+                    ([0, 0, 0, 0], 0).into()
+                } else {
+                    ([0u16; 8], 0).into()
+                }
+            }
         };
-        let socket = Arc::new(UdpSocket::bind(bind).await?);
+        let socket = Arc::new(crate::sockopt::bind_udp(bind, sockopt)?);
         socket.connect(server_addr).await?;
 
         let session2022 = match &method {

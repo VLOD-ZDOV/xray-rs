@@ -353,7 +353,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
     }
 }
 
-pub async fn accept<S>(mut stream: S, settings: &WsSettings) -> io::Result<WebSocketStream<S>>
+pub async fn accept<S>(
+    mut stream: S,
+    settings: &WsSettings,
+    trusted_xff: &[String],
+    peer: std::net::SocketAddr,
+) -> io::Result<(WebSocketStream<S>, std::net::SocketAddr)>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin,
 {
@@ -430,6 +435,7 @@ where
     let mut sec_key = None;
     let mut sec_proto = None;
     let mut host_hdr = None;
+    let mut header_pairs = Vec::new();
 
     for line in lines {
         let Some((key, val)) = line.split_once(':') else {
@@ -437,6 +443,7 @@ where
         };
         let key = key.trim();
         let val = val.trim();
+        header_pairs.push((key, val));
 
         if key.eq_ignore_ascii_case("upgrade") && val.to_ascii_lowercase().contains("websocket") {
             upgrade_ok = true;
@@ -452,6 +459,8 @@ where
             host_hdr = Some(val.to_owned());
         }
     }
+
+    let peer = crate::sockopt::apply_trusted_x_forwarded_for_raw(header_pairs, trusted_xff, peer);
 
     if let Some(expected_host) = &settings.host {
         let h = host_hdr.unwrap_or_default();
@@ -507,7 +516,7 @@ where
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await?;
 
-    Ok(WebSocketStream::new(stream, leftover, early_data))
+    Ok((WebSocketStream::new(stream, leftover, early_data), peer))
 }
 
 fn normalize_path(p: &str) -> &str {

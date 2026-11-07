@@ -34,6 +34,7 @@ pub struct Handler {
     settings: XhttpSettings,
     vless: Arc<vless::Context>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    trusted_x_forwarded_for: Vec<String>,
 }
 
 struct Session {
@@ -54,7 +55,21 @@ impl Handler {
             settings,
             vless,
             sessions: Mutex::new(HashMap::new()),
+            trusted_x_forwarded_for: Vec::new(),
         })
+    }
+
+    pub fn with_trusted_x_forwarded_for(self: &mut Arc<Self>, trusted: Vec<String>) {
+        if let Some(handler) = Arc::get_mut(self) {
+            handler.trusted_x_forwarded_for = trusted;
+        } else {
+            *self = Arc::new(Self {
+                settings: self.settings.clone(),
+                vless: self.vless.clone(),
+                sessions: Mutex::new(HashMap::new()),
+                trusted_x_forwarded_for: trusted,
+            });
+        }
     }
 
     pub async fn handle(
@@ -62,6 +77,11 @@ impl Handler {
         req: Request<Incoming>,
         peer: SocketAddr,
     ) -> Response<Body> {
+        let peer = crate::sockopt::apply_trusted_x_forwarded_for(
+            req.headers(),
+            &self.trusted_x_forwarded_for,
+            peer,
+        );
         let s = &self.settings;
         if !s.host.is_empty() && !host_matches(&req, &s.host) {
             log::debug(format!("xhttp: host mismatch from {}", log::mask(peer)));
@@ -237,6 +257,11 @@ impl Handler {
         mut stream: H3Stream,
         peer: SocketAddr,
     ) {
+        let peer = crate::sockopt::apply_trusted_x_forwarded_for(
+            req.headers(),
+            &self.trusted_x_forwarded_for,
+            peer,
+        );
         let s = &self.settings;
         if !s.host.is_empty() && !host_matches(&req, &s.host) {
             log::debug(format!("xhttp: host mismatch from {}", log::mask(peer)));
@@ -984,7 +1009,13 @@ pub async fn start_h3(
 
     crate::log::info(format!("listening {} on {}", inbound.tag, listen_addr));
 
-    let handler = Handler::new(settings, ctx);
+    let mut handler = Handler::new(settings, ctx);
+    let trusted_xff = inbound
+        .sockopt
+        .as_ref()
+        .map(|s| s.trusted_x_forwarded_for.clone())
+        .unwrap_or_default();
+    handler.with_trusted_x_forwarded_for(trusted_xff);
     let task = tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
             let connection = match incoming.await {

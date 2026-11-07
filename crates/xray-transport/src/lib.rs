@@ -386,6 +386,18 @@ impl SocketHandle {
 
 pub trait SocketProtector: Send + Sync {
     fn protect(&self, socket: SocketHandle) -> io::Result<()>;
+
+    fn apply_tcp_socket(&self, _socket: &TcpSocket) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn apply_std_udp_socket(&self, _socket: &StdUdpSocket) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn apply_udp_socket(&self, _socket: &UdpSocket) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -550,6 +562,10 @@ pub async fn connect_tcp_stream(
             .map_err(TransportError::Tcp)?;
 
             socket_protector
+                .apply_tcp_socket(&socket)
+                .map_err(TransportError::Tcp)?;
+
+            socket_protector
                 .protect(SocketHandle::from_tcp_socket(&socket))
                 .map_err(TransportError::SocketProtection)?;
 
@@ -580,6 +596,9 @@ pub fn protect_std_udp_socket(
 ) -> Result<(), TransportError> {
     if let Some(protector) = socket_protector {
         protector
+            .apply_std_udp_socket(socket)
+            .map_err(TransportError::Tcp)?;
+        protector
             .protect(SocketHandle::from_std_udp_socket(socket))
             .map_err(TransportError::SocketProtection)?;
     }
@@ -591,6 +610,9 @@ pub fn protect_udp_socket(
     socket_protector: Option<&dyn SocketProtector>,
 ) -> Result<(), TransportError> {
     if let Some(protector) = socket_protector {
+        protector
+            .apply_udp_socket(socket)
+            .map_err(TransportError::Tcp)?;
         protector
             .protect(SocketHandle::from_udp_socket(socket))
             .map_err(TransportError::SocketProtection)?;

@@ -39,6 +39,7 @@ pub struct WgOutbound {
     mtu: u16,
     reserved: [u8; 3],
     prefer_v6: bool,
+    sockopt: Option<Arc<crate::config::SockoptSettings>>,
     client: Mutex<Option<Client>>,
     started: Instant,
     last_busy_warn: AtomicU64,
@@ -53,8 +54,9 @@ struct Peer {
 }
 
 impl WgOutbound {
-    pub fn parse(tag: &str, settings: &Value) -> Result<Self, String> {
+    pub fn parse(tag: &str, outbound: &Value) -> Result<Self, String> {
         let err = |m: String| format!("outbound {tag:?} (wireguard): {m}");
+        let settings = outbound.get("settings").unwrap_or(outbound);
         let secret_key = KeyMaterial::parse(str_field(settings, "secretKey"))
             .map_err(|_| err("invalid secretKey".into()))?;
         let mut addresses = Vec::new();
@@ -127,6 +129,13 @@ impl WgOutbound {
         let reserved = parse_reserved(settings.get("reserved"))
             .ok_or_else(|| err("reserved must be 3 bytes".into()))?;
         let strategy = str_field(settings, "domainStrategy").to_ascii_lowercase();
+        let sockopt = crate::config::parse_sockopt(
+            outbound
+                .pointer("/streamSettings/sockopt")
+                .unwrap_or(&Value::Null),
+            &format!("outbound {tag:?}"),
+        )?
+        .map(Arc::new);
         let outbound = Self {
             tag: tag.to_owned(),
             secret_key,
@@ -135,6 +144,7 @@ impl WgOutbound {
             mtu,
             reserved,
             prefer_v6: strategy.contains("v6v4") || strategy.ends_with("ipv6"),
+            sockopt,
             client: Mutex::new(None),
             started: Instant::now(),
             last_busy_warn: AtomicU64::new(0),
@@ -200,7 +210,15 @@ impl WgOutbound {
             tcp_flows: TCP_FLOWS,
             pending_opens: PENDING_OPENS,
         };
-        let client = Client::start_with_options(self.config(endpoints), None, options)
+        let protector: Option<Arc<dyn xray_transport::SocketProtector>> =
+            self.sockopt.as_ref().map(|s| {
+                Arc::new(crate::outbound_transport::OutboundProtector::new(
+                    Some(s.clone()),
+                    None,
+                    None,
+                )) as _
+            });
+        let client = Client::start_with_options(self.config(endpoints), protector, options)
             .await
             .map_err(to_io)?;
         log::info(format!("wireguard outbound {:?} started", self.tag));

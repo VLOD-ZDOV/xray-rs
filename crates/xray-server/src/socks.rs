@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 use crate::vless::{resolve, resolve_all, Host, CONNECT_TIMEOUT};
@@ -23,6 +23,7 @@ pub struct SocksOutbound {
     server: (Host, u16),
     auth: Option<(String, String)>,
     pub send_through: Option<crate::routing::SendThrough>,
+    pub sockopt: Option<Arc<crate::config::SockoptSettings>>,
     pub chained_connector:
         Arc<std::sync::RwLock<Option<Arc<dyn xray_transport::ResolvedTcpConnector>>>>,
 }
@@ -83,11 +84,19 @@ impl SocksOutbound {
         };
         let send_through = crate::routing::parse_send_through(outbound.get("sendThrough"))?;
         let _dialer_proxy = crate::routing::parse_dialer_proxy(outbound, tag)?;
+        let sockopt = crate::config::parse_sockopt(
+            outbound
+                .pointer("/streamSettings/sockopt")
+                .unwrap_or(&Value::Null),
+            &format!("outbound {tag:?}"),
+        )?
+        .map(Arc::new);
         Ok(Self {
             tag: tag.to_owned(),
             server: (host, port),
             auth: (!name.is_empty()).then_some((name, pass)),
             send_through,
+            sockopt,
             chained_connector: Arc::new(std::sync::RwLock::new(None)),
         })
     }
@@ -114,12 +123,18 @@ impl SocksOutbound {
             let server_ip = resolve(&self.server.0, self.server.1).await?.ip();
             relay.set_ip(server_ip);
         }
-        let bind: SocketAddr = if relay.is_ipv4() {
-            (Ipv4Addr::UNSPECIFIED, 0).into()
-        } else {
-            (Ipv6Addr::UNSPECIFIED, 0).into()
+        let bind_ip = self.send_through.as_ref().and_then(|st| st.resolve_ip());
+        let bind: SocketAddr = match bind_ip {
+            Some(ip) => SocketAddr::new(ip, 0),
+            None => {
+                if relay.is_ipv4() {
+                    (Ipv4Addr::UNSPECIFIED, 0).into()
+                } else {
+                    (Ipv6Addr::UNSPECIFIED, 0).into()
+                }
+            }
         };
-        let socket = UdpSocket::bind(bind).await?;
+        let socket = crate::sockopt::bind_udp(bind, self.sockopt.as_deref())?;
         socket.connect(relay).await?;
         Ok(SocksUdp {
             _control: tokio::sync::Mutex::new(control),
@@ -196,22 +211,25 @@ impl SocksOutbound {
         let mut last = None;
         for addr in resolve_all(&self.server.0, self.server.1).await? {
             let connect_fut = async {
-                if let Some(ip) = bind_ip {
-                    let socket = if ip.is_ipv4() {
+                let socket = if let Some(ip) = bind_ip {
+                    if ip.is_ipv4() {
                         tokio::net::TcpSocket::new_v4()?
                     } else {
                         tokio::net::TcpSocket::new_v6()?
-                    };
-                    socket.bind(SocketAddr::new(ip, 0))?;
-                    socket.connect(addr).await
+                    }
+                } else if addr.is_ipv4() {
+                    tokio::net::TcpSocket::new_v4()?
                 } else {
-                    TcpStream::connect(addr).await
+                    tokio::net::TcpSocket::new_v6()?
+                };
+                if let Some(ip) = bind_ip {
+                    socket.bind(SocketAddr::new(ip, 0))?;
                 }
+                crate::sockopt::connect(socket, addr, self.sockopt.as_deref()).await
             };
             match connect_fut.await {
                 Ok(stream) => {
-                    stream.set_nodelay(true)?;
-                    return Ok(Box::new(stream));
+                    return Ok(stream);
                 }
                 Err(e) => last = Some(e),
             }
