@@ -225,6 +225,7 @@ async fn run(
     policy::init(config.policy);
     let router = Arc::new(config.router);
     router.init_chained_outbounds(&router);
+    router.start_reverse_bridges(router.clone());
     for tag in router.outbound_tags() {
         stats::get().register("outbound", &tag);
     }

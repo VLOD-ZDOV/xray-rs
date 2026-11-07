@@ -387,6 +387,7 @@ mod tests {
             email: "alice@example.com".into(),
             level: 0,
             flow: String::new(),
+            reverse: None,
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&user.hash);
@@ -415,6 +416,7 @@ mod tests {
             email: "bob@example.com".into(),
             level: 0,
             flow: String::new(),
+            reverse: None,
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&user.hash);
@@ -441,6 +443,7 @@ mod tests {
             email: "bob@example.com".into(),
             level: 0,
             flow: String::new(),
+            reverse: None,
         };
         let mut wire = Vec::new();
         wire.extend_from_slice(&[b'a'; 56]);

@@ -56,6 +56,7 @@ pub async fn connect(
         Action::Shadowsocks(ss) => Ok(ss.connect(host, port).await?),
         Action::Http(http) => Ok(http.connect(host, port).await?),
         Action::Dns(dns) => Ok(dns.connect().await?),
+        Action::Reverse(portal) => portal.connect(host, port).await,
         Action::Loopback(inbound_tag) => {
             let query = Query {
                 inbound: inbound_tag,

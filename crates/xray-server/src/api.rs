@@ -1476,6 +1476,7 @@ async fn handle_handler(
                                         email,
                                         level: u.level,
                                         flow: acc.flow,
+                                        reverse: None,
                                     });
                                 }
                             }
@@ -1487,6 +1488,7 @@ async fn handle_handler(
                                         email,
                                         level: u.level,
                                         flow: String::new(),
+                                        reverse: None,
                                     });
                                 }
                             }
@@ -1642,6 +1644,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 email: user.email,
                 level: user.level,
                 flow: account.flow,
+                reverse: None,
             })
         }
         TROJAN_ACCOUNT => {
@@ -1652,6 +1655,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 email: user.email,
                 level: user.level,
                 flow: String::new(),
+                reverse: None,
             })
         }
         VMESS_ACCOUNT => {
@@ -1662,6 +1666,7 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
                 email: user.email,
                 level: user.level,
                 flow: String::new(),
+                reverse: None,
             })
         }
         SHADOWSOCKS_ACCOUNT => {

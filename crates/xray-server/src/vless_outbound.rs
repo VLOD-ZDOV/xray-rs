@@ -114,6 +114,7 @@ pub struct VlessOutbound {
     pub download: Option<Arc<crate::xhttp_outbound::XhttpDownloadTarget>>,
     pub sockopt: Option<Arc<crate::config::SockoptSettings>>,
     pub send_through: Option<crate::routing::SendThrough>,
+    pub reverse: Option<String>,
 }
 
 impl fmt::Debug for VlessOutbound {
@@ -137,6 +138,32 @@ impl VlessOutbound {
     pub fn parse(tag: &str, outbound: &Value) -> Result<Self, String> {
         let err = |m: &str| format!("outbound {tag:?} (vless): {m}");
         let settings = outbound.get("settings").unwrap_or(&Value::Null);
+
+        if let Some(vnext_arr) = settings.get("vnext").and_then(Value::as_array) {
+            for vn in vnext_arr {
+                if let Some(users) = vn.get("users").and_then(Value::as_array) {
+                    for u in users {
+                        if u.get("reverse").is_some_and(|r| !r.is_null()) {
+                            return Err(r#"VLESS users: please use simplified outbound's config style to use "reverse""#.into());
+                        }
+                    }
+                }
+            }
+        }
+
+        let reverse = if let Some(rev) = settings.get("reverse") {
+            if !rev.is_null() {
+                let rtag = rev.get("tag").and_then(Value::as_str).unwrap_or("");
+                if rtag.is_empty() {
+                    return Err(r#"VLESS reverse: "tag" can't be empty"#.into());
+                }
+                Some(rtag.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let vnext = settings
             .get("vnext")
@@ -399,7 +426,43 @@ impl VlessOutbound {
             download,
             sockopt,
             send_through,
+            reverse,
         })
+    }
+
+    pub fn start_reverse_bridge(self: Arc<Self>, router: Arc<crate::routing::Router>) {
+        let Some(ref reverse_tag) = self.reverse else {
+            return;
+        };
+        let tag = reverse_tag.clone();
+        let outbound = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            loop {
+                let connect_res = outbound
+                    .open_raw_stream(&Host::Domain("v1.rvs.cool".into()), 0, VlessCommand::Reverse)
+                    .await;
+                match connect_res {
+                    Ok(stream) => {
+                        let (mut r, mut w) = tokio::io::split(stream);
+                        let info = crate::mux::Info {
+                            peer: "127.0.0.1:0".parse().unwrap(),
+                            tag: tag.clone(),
+                            port: 0,
+                            email: String::new(),
+                            level: 0,
+                            router: router.clone(),
+                            sniffing: crate::vless::Sniffing::default(),
+                        };
+                        let _ = crate::mux::serve(&mut r, &mut w, &info).await;
+                    }
+                    Err(e) => {
+                        crate::log::warn(format!("reverse bridge {tag} connect error: {e}"));
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
     }
 
     pub fn set_chained_connector(&self, connector: Arc<dyn xray_transport::ResolvedTcpConnector>) {

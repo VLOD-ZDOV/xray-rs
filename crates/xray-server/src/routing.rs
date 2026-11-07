@@ -1019,6 +1019,7 @@ pub enum Action {
     Loopback(String),
     /// The `metrics` section's tag: connections reach its HTTP server.
     Metrics,
+    Reverse(Arc<crate::mux::ReversePortal>),
 }
 
 impl PartialEq for Action {
@@ -1034,6 +1035,7 @@ impl PartialEq for Action {
             (Self::Shadowsocks(a), Self::Shadowsocks(b)) => Arc::ptr_eq(a, b),
             (Self::Http(a), Self::Http(b)) => Arc::ptr_eq(a, b),
             (Self::Dns(a), Self::Dns(b)) => Arc::ptr_eq(a, b),
+            (Self::Reverse(a), Self::Reverse(b)) => Arc::ptr_eq(a, b),
             (Self::Loopback(a), Self::Loopback(b)) => a == b,
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
         }
@@ -1094,6 +1096,7 @@ pub struct Router {
     pub asset_dirs: Vec<PathBuf>,
     pub observatory: Arc<std::sync::RwLock<Option<Arc<crate::observatory::Observatory>>>>,
     pub dialer_proxies: Vec<(String, String)>,
+    pub reverse_portals: std::sync::RwLock<HashMap<String, Arc<crate::mux::ReversePortal>>>,
 }
 
 pub struct Rule {
@@ -1118,6 +1121,23 @@ pub enum UserMatcher {
 impl Router {
     pub fn build(root: &Value, asset_dirs: &[PathBuf]) -> Result<Self, String> {
         let mut outbounds = HashMap::new();
+        let reverse_portals = std::sync::RwLock::new(HashMap::new());
+        for inbound in array(root, "inbounds") {
+            let settings = inbound.get("settings").unwrap_or(&Value::Null);
+            for client in array(settings, "clients") {
+                if let Some(rev) = client.get("reverse") {
+                    let tag = str_field(rev, "tag");
+                    if !tag.is_empty() {
+                        let portal = Arc::new(crate::mux::ReversePortal::new(tag.to_string()));
+                        reverse_portals
+                            .write()
+                            .unwrap()
+                            .insert(tag.to_string(), portal.clone());
+                        outbounds.insert(tag.to_string(), Action::Reverse(portal));
+                    }
+                }
+            }
+        }
         let mut default_tag = None;
         let mut synth_rules = Vec::new();
         let mut pending_final = Vec::new();
@@ -1333,7 +1353,29 @@ impl Router {
             asset_dirs: asset_dirs.to_vec(),
             observatory: Arc::new(std::sync::RwLock::new(None)),
             dialer_proxies,
+            reverse_portals,
         })
+    }
+
+    pub fn get_or_create_reverse_portal(&self, tag: &str) -> Arc<crate::mux::ReversePortal> {
+        let mut portals = self.reverse_portals.write().unwrap();
+        if let Some(p) = portals.get(tag) {
+            return p.clone();
+        }
+        let portal = Arc::new(crate::mux::ReversePortal::new(tag.to_string()));
+        portals.insert(tag.to_string(), portal.clone());
+        let mut outbounds = self.outbounds.write().unwrap();
+        outbounds.insert(tag.to_string(), Action::Reverse(portal.clone()));
+        portal
+    }
+
+    pub fn start_reverse_bridges(&self, router: Arc<Router>) {
+        let outbounds = self.outbounds.read().unwrap();
+        for action in outbounds.values() {
+            if let Action::Vless(vless) = action {
+                vless.clone().start_reverse_bridge(router.clone());
+            }
+        }
     }
 
     pub fn init_chained_outbounds(&self, router: &Arc<Router>) {

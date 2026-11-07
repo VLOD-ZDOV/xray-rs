@@ -167,6 +167,7 @@ pub struct User {
     pub level: u32,
     /// VLESS: `xtls-rprx-vision` or empty.
     pub flow: String,
+    pub reverse: Option<String>,
 }
 
 pub const VISION_FLOW: &str = "xtls-rprx-vision";
@@ -315,7 +316,7 @@ fn normalize_sections(root: &mut Value) {
             }
         }
     }
-    for section in ["reverse", "transport", "env", "geodata"] {
+    for section in ["transport", "env", "geodata"] {
         if map.get(section).is_some_and(|v| !v.is_null()) {
             log::warn(format!("config: {section:?} is not supported yet, ignored"));
         }
@@ -359,6 +360,9 @@ fn check_version(root: &Value) -> Result<(), String> {
 pub fn parse(raw: &str) -> Result<Config, String> {
     let mut root: Value = serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
     normalize_sections(&mut root);
+    if root.get("reverse").is_some_and(|v| !v.is_null()) {
+        return Err("The feature \"legacy reverse\" has been removed and migrated to \"VLESS Reverse Proxy\". Please update your config(s) according to release note and documentation.".into());
+    }
     check_version(&root)?;
     let api_tag = root
         .get("api")
@@ -562,15 +566,26 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             }
             _ => "",
         };
-        // Xray lets such a user open only a reverse tunnel, never a forward proxy.
-        if protocol == InboundProtocol::Vless && client.get("reverse").is_some_and(|r| !r.is_null())
-        {
-            log::warn(format!(
-                "inbound {tag:?}: user {:?} with \"reverse\" skipped, reverse is not supported yet",
-                str_field(client, "email")
-            ));
-            continue;
-        }
+        let reverse = if protocol == InboundProtocol::Vless {
+            if let Some(rev) = client.get("reverse") {
+                if !rev.is_null() {
+                    let tag = str_field(rev, "tag");
+                    if tag.is_empty() {
+                        return Err(r#"VLESS users: "tag" can't be empty for "reverse""#.into());
+                    }
+                    if rev.get("sniffing").is_some_and(|s| !s.is_null()) {
+                        return Err(r#"VLESS users: inbound's "reverse" can't have "sniffing""#.into());
+                    }
+                    Some(tag.to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let id_str = str_field(client, "id");
         let pass_str = str_field(client, "password");
         let key = if !pass_str.is_empty() {
@@ -585,6 +600,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             email: str_field(client, "email").to_owned(),
             level,
             flow: flow.to_owned(),
+            reverse,
         });
     }
 

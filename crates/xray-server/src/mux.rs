@@ -200,6 +200,11 @@ where
                     let Some((network, mut host, port)) = frame.target else {
                         return Err(invalid("mux new frame without target"));
                     };
+                    if let Host::Domain(ref d) = host {
+                        if d == "reverse" {
+                            continue;
+                        }
+                    }
                     if sessions.len() >= MAX_SESSIONS {
                         let _ = out_tx.send(end_frame(frame.id, true)).await;
                         continue;
@@ -759,6 +764,216 @@ impl Drop for MuxSubStream {
             let mut s = sessions.lock().await;
             s.remove(&id);
         });
+    }
+}
+
+#[derive(Clone)]
+pub struct ReversePortal {
+    pub tag: String,
+    parents: Arc<tokio::sync::Mutex<Vec<Arc<MuxParent>>>>,
+}
+
+impl std::fmt::Debug for ReversePortal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReversePortal")
+            .field("tag", &self.tag)
+            .finish()
+    }
+}
+
+impl ReversePortal {
+    pub fn new(tag: String) -> Self {
+        Self {
+            tag,
+            parents: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    pub async fn add_parent<S>(&self, raw_stream: S)
+    where
+        S: AsyncRead + AsyncWrite + Send + 'static,
+    {
+        use std::sync::atomic::Ordering;
+        let (reader, writer) = tokio::io::split(raw_stream);
+        let (writer_tx, mut writer_rx) = mpsc::channel::<Bytes>(512);
+        let sessions: Arc<tokio::sync::Mutex<HashMap<u16, mpsc::Sender<Bytes>>>> =
+            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        let is_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let is_closed_w = Arc::clone(&is_closed);
+        tokio::spawn(async move {
+            let mut writer = writer;
+            while let Some(bytes) = writer_rx.recv().await {
+                if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                    is_closed_w.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+        });
+
+        let sessions_r = Arc::clone(&sessions);
+        let is_closed_r = Arc::clone(&is_closed);
+        tokio::spawn(async move {
+            let mut reader = reader;
+            while let Ok(frame) = read_frame(&mut reader).await {
+                match frame.status {
+                    STATUS_KEEP => {
+                        let lock = sessions_r.lock().await;
+                        if let Some(tx) = lock.get(&frame.id) {
+                            if let Some(data) = frame.data {
+                                let _ = tx.send(Bytes::from(data)).await;
+                            }
+                        }
+                    }
+                    STATUS_END => {
+                        let mut lock = sessions_r.lock().await;
+                        lock.remove(&frame.id);
+                    }
+                    _ => {}
+                }
+            }
+            is_closed_r.store(true, Ordering::Relaxed);
+            let mut lock = sessions_r.lock().await;
+            lock.clear();
+        });
+
+        let p = Arc::new(MuxParent {
+            writer_tx: writer_tx.clone(),
+            sessions,
+            active_count: Arc::new(std::sync::atomic::AtomicU16::new(0)),
+            next_id: std::sync::atomic::AtomicU16::new(2),
+            concurrency: 256,
+            is_closed: Arc::clone(&is_closed),
+        });
+
+        {
+            let mut parents = self.parents.lock().await;
+            parents.retain(|p| !p.is_closed.load(Ordering::Relaxed));
+            parents.push(Arc::clone(&p));
+        }
+
+        // Send initial heartbeat to udp:reverse:0 (session 1)
+        let ctrl_target = xray_routing::Target::new(
+            xray_routing::TargetAddr::Domain("reverse".to_string()),
+            0,
+            xray_routing::Network::Udp,
+        );
+        let ctrl_frame = xray_proxy::mux::Frame {
+            session_id: 1,
+            status: xray_proxy::mux::Status::New,
+            error: false,
+            target: Some(ctrl_target),
+            global_id: None,
+            payload: Some(&[0x08, 0x00]),
+        };
+        if let Ok(wire) = xray_proxy::mux::encode(&ctrl_frame) {
+            let _ = writer_tx.send(Bytes::from(wire)).await;
+        }
+
+        let is_closed_hb = Arc::clone(&is_closed);
+        let writer_tx_hb = writer_tx.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+            while !is_closed_hb.load(Ordering::Relaxed) {
+                interval.tick().await;
+                let ping_frame = xray_proxy::mux::Frame {
+                    session_id: 1,
+                    status: xray_proxy::mux::Status::Keep,
+                    error: false,
+                    target: None,
+                    global_id: None,
+                    payload: Some(&[0x08, 0x00]),
+                };
+                if let Ok(wire) = xray_proxy::mux::encode(&ping_frame) {
+                    if writer_tx_hb.send(Bytes::from(wire)).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    pub async fn connect(
+        &self,
+        host: &Host,
+        port: u16,
+    ) -> io::Result<Box<dyn crate::outbound::Stream>> {
+        self.open_sub_session(host, port, xray_routing::Network::Tcp).await
+    }
+
+    async fn open_sub_session(
+        &self,
+        host: &Host,
+        port: u16,
+        network: xray_routing::Network,
+    ) -> io::Result<Box<dyn crate::outbound::Stream>> {
+        use std::sync::atomic::Ordering;
+
+        let mut parents = self.parents.lock().await;
+        parents.retain(|p| !p.is_closed.load(Ordering::Relaxed));
+
+        let parent = parents
+            .iter()
+            .find(|p| p.active_count.load(Ordering::Relaxed) < p.concurrency)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotConnected, "no reverse connection available")
+            })?;
+
+        let session_id = loop {
+            let id = parent.next_id.fetch_add(1, Ordering::Relaxed);
+            let id = if id <= 1 {
+                parent.next_id.store(2, Ordering::Relaxed);
+                2
+            } else {
+                id
+            };
+            let s = parent.sessions.lock().await;
+            if !s.contains_key(&id) {
+                break id;
+            }
+        };
+
+        let (sub_tx, sub_rx) = mpsc::channel(64);
+        {
+            let mut s = parent.sessions.lock().await;
+            s.insert(session_id, sub_tx);
+            parent.active_count.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let target = xray_routing::Target::new(
+            match host {
+                Host::Ip(ip) => xray_routing::TargetAddr::Ip(*ip),
+                Host::Domain(d) => xray_routing::TargetAddr::Domain(d.clone()),
+            },
+            port,
+            network,
+        );
+        let new_frame = xray_proxy::mux::Frame {
+            session_id,
+            status: xray_proxy::mux::Status::New,
+            error: false,
+            target: Some(target),
+            global_id: None,
+            payload: None,
+        };
+        let wire = xray_proxy::mux::encode(&new_frame)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        parent
+            .writer_tx
+            .send(Bytes::from(wire))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Mux parent closed"))?;
+
+        Ok(Box::new(MuxSubStream {
+            session_id,
+            writer_tx: parent.writer_tx.clone(),
+            sessions: Arc::clone(&parent.sessions),
+            active_count: Arc::clone(&parent.active_count),
+            rx: sub_rx,
+            buffer: Bytes::new(),
+            closed: false,
+        }))
     }
 }
 

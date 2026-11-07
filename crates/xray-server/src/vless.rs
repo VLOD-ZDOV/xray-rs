@@ -39,6 +39,7 @@ pub enum Command {
     Tcp,
     Udp,
     Mux,
+    Reverse,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +97,20 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
                     version,
                     user,
                     command: Command::Mux,
+                    host,
+                    port: 0,
+                    flow,
+                },
+                r.pos,
+            ));
+        }
+        4 => {
+            let host = Host::Domain("v1.rvs.cool".into());
+            return Ok((
+                Request {
+                    version,
+                    user,
+                    command: Command::Reverse,
                     host,
                     port: 0,
                     flow,
@@ -354,6 +369,7 @@ impl Context {
                 email,
                 level,
                 flow: String::new(),
+                reverse: None,
             });
         }
         Ok(())
@@ -397,6 +413,7 @@ impl Context {
                 email: user.email,
                 level: user.level,
                 flow: String::new(),
+                reverse: None,
             });
         }
         Ok(())
@@ -538,6 +555,30 @@ where
         }
     };
     let mut early = buf.split_off(header_len);
+
+    let user_has_reverse = user.reverse.is_some();
+    if user_has_reverse && request.command != Command::Reverse {
+        let uid = uuid::Uuid::from_bytes(user.id);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("for safety reasons, user {uid} is not allowed to use forward proxy"),
+        ));
+    }
+    if !user_has_reverse && request.command == Command::Reverse {
+        let uid = uuid::Uuid::from_bytes(user.id);
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("reverse: user {uid} is not allowed to create reverse proxy"),
+        ));
+    }
+    if request.command == Command::Reverse {
+        let reverse_tag = user.reverse.as_deref().unwrap_or_default();
+        let portal = ctx.router.get_or_create_reverse_portal(reverse_tag);
+        stream.write_all(&[request.version, 0]).await?;
+        stream.flush().await?;
+        portal.add_parent(stream).await;
+        return Ok(());
+    }
 
     // VLESS encryption carries Vision too, as Xray's CommonConn does.
     let vision_capable = tls.vision_capable || ctx.vless_encryption.is_some();
@@ -685,6 +726,7 @@ where
             }
         }
         Command::Mux => unreachable!("handled above"),
+        Command::Reverse => unreachable!("handled above"),
         Command::Udp => {
             let (mut uplink, mut downlink) = tokio::io::split(stream);
             let link = UdpLink::open(&ctx.router, &decision, &request.host, request.port).await?;
@@ -1369,6 +1411,7 @@ mod tests {
             email: "u".into(),
             level: 0,
             flow: String::new(),
+            reverse: None,
         }]
     }
 
