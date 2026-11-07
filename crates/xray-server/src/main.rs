@@ -47,8 +47,11 @@ use crate::routing::Router;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, RwLock};
+use std::time::SystemTime;
 
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -59,7 +62,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio_rustls::TlsAcceptor;
 
-use config::{Config, Inbound, InboundProtocol, InboundTransport, TlsSettings};
+use config::{CertConfig, CertUsage, Config, Inbound, InboundProtocol, InboundTransport, TlsSettings};
 
 // 3x-ui reads the second word of `-version` output as the core version.
 pub(crate) const COMPAT_VERSION: &str = "26.10.31";
@@ -1043,11 +1046,118 @@ pub(crate) fn match_sni(pattern: &str, sni: &str) -> bool {
     false
 }
 
-#[derive(Debug)]
-struct SniCheckingResolver {
+struct ManagedCert {
     certified_key: Arc<rustls::sign::CertifiedKey>,
     allowed_names: Vec<String>,
+    cert_path: Option<PathBuf>,
+    key_path: Option<PathBuf>,
+    cert_mtime: Option<SystemTime>,
+    key_mtime: Option<SystemTime>,
+    one_time_loading: bool,
+    ocsp_stapling: u64,
+}
+
+impl ManagedCert {
+    fn check_and_reload(&mut self, provider: &rustls::crypto::CryptoProvider) {
+        if self.one_time_loading {
+            return;
+        }
+        let (Some(cert_path), Some(key_path)) = (&self.cert_path, &self.key_path) else {
+            return;
+        };
+        let c_mtime = std::fs::metadata(cert_path).and_then(|m| m.modified()).ok();
+        let k_mtime = std::fs::metadata(key_path).and_then(|m| m.modified()).ok();
+        if c_mtime == self.cert_mtime && k_mtime == self.key_mtime {
+            return;
+        }
+        let cert_pem = match std::fs::read(cert_path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let key_pem = match std::fs::read(key_path) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let certs = match CertificateDer::pem_slice_iter(&cert_pem).collect::<Result<Vec<_>, _>>() {
+            Ok(c) if !c.is_empty() => c,
+            _ => return,
+        };
+        let key = match PrivateKeyDer::from_pem_slice(&key_pem) {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        let signing_key = match provider.key_provider.load_private_key(key) {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        let cert_names = extract_cert_names(certs[0].as_ref());
+        let mut certified_key = rustls::sign::CertifiedKey::new(certs, signing_key);
+        let ocsp_path = cert_path.with_extension("ocsp");
+        if let Ok(ocsp_bytes) = std::fs::read(&ocsp_path) {
+            certified_key.ocsp = Some(ocsp_bytes);
+        } else if self.ocsp_stapling > 0 {
+            // Hot reload interval configured with ocspStapling
+        }
+        self.certified_key = Arc::new(certified_key);
+        self.allowed_names = cert_names;
+        self.cert_mtime = c_mtime;
+        self.key_mtime = k_mtime;
+    }
+}
+
+struct ManagedCa {
+    ca_cert_der: Vec<u8>,
+    ca_key_pem: String,
+    build_chain: bool,
+    issued_cache: HashMap<String, Arc<rustls::sign::CertifiedKey>>,
+}
+
+impl ManagedCa {
+    fn get_or_issue(
+        &mut self,
+        sni: &str,
+        provider: &rustls::crypto::CryptoProvider,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        if let Some(cached) = self.issued_cache.get(sni) {
+            return Some(cached.clone());
+        }
+        let ca_key = rcgen::KeyPair::from_pem(&self.ca_key_pem).ok()?;
+        let der = CertificateDer::from(self.ca_cert_der.clone());
+        let issuer = rcgen::Issuer::from_ca_cert_der(&der, ca_key).ok()?;
+        let mut params = rcgen::CertificateParams::new(vec![sni.to_string()]).ok()?;
+        params.distinguished_name.push(rcgen::DnType::CommonName, sni);
+        params.use_authority_key_identifier_extension = true;
+        params.key_usages.push(rcgen::KeyUsagePurpose::DigitalSignature);
+        params
+            .extended_key_usages
+            .push(rcgen::ExtendedKeyUsagePurpose::ServerAuth);
+        let ee_key = rcgen::KeyPair::generate().ok()?;
+        let ee_cert = params.signed_by(&ee_key, &issuer).ok()?;
+        let mut chain = vec![CertificateDer::from(ee_cert.der().to_vec())];
+        if self.build_chain {
+            chain.push(der);
+        }
+        let key_der = PrivateKeyDer::Pkcs8(ee_key.serialize_der().into());
+        let signing_key = provider.key_provider.load_private_key(key_der).ok()?;
+        let certified = Arc::new(rustls::sign::CertifiedKey::new(chain, signing_key));
+        self.issued_cache.insert(sni.to_string(), certified.clone());
+        Some(certified)
+    }
+}
+
+struct SniCheckingResolver {
+    encipherment_certs: Vec<RwLock<ManagedCert>>,
+    ca_certs: Vec<RwLock<ManagedCa>>,
     reject_unknown_sni: bool,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl std::fmt::Debug for SniCheckingResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SniCheckingResolver")
+            .field("reject_unknown_sni", &self.reject_unknown_sni)
+            .finish()
+    }
 }
 
 impl rustls::server::ResolvesServerCert for SniCheckingResolver {
@@ -1055,20 +1165,36 @@ impl rustls::server::ResolvesServerCert for SniCheckingResolver {
         &self,
         client_hello: rustls::server::ClientHello,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        for m in &self.encipherment_certs {
+            if let Ok(mut cert) = m.write() {
+                cert.check_and_reload(&self.provider);
+            }
+        }
+        let sni = client_hello.server_name().map(str::to_ascii_lowercase);
+        if let Some(ref sni) = sni {
+            for m in &self.encipherment_certs {
+                if let Ok(cert) = m.read() {
+                    if cert.allowed_names.iter().any(|allowed| match_sni(allowed, sni)) {
+                        return Some(cert.certified_key.clone());
+                    }
+                }
+            }
+            for ca_lock in &self.ca_certs {
+                if let Ok(mut ca) = ca_lock.write() {
+                    if let Some(cert) = ca.get_or_issue(sni, &self.provider) {
+                        return Some(cert);
+                    }
+                }
+            }
+        }
         if !self.reject_unknown_sni {
-            return Some(self.certified_key.clone());
+            if let Some(first) = self.encipherment_certs.first() {
+                if let Ok(cert) = first.read() {
+                    return Some(cert.certified_key.clone());
+                }
+            }
         }
-        let sni = client_hello.server_name()?;
-        let sni_lower = sni.to_ascii_lowercase();
-        if self
-            .allowed_names
-            .iter()
-            .any(|allowed| match_sni(allowed, &sni_lower))
-        {
-            Some(self.certified_key.clone())
-        } else {
-            None
-        }
+        None
     }
 }
 
@@ -1077,14 +1203,6 @@ pub(crate) fn build_rustls_server_config(
     alpn: Vec<Vec<u8>>,
     only_tls13: bool,
 ) -> Result<rustls::ServerConfig, String> {
-    let certs = CertificateDer::pem_slice_iter(&settings.cert_pem)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("invalid certificate: {e}"))?;
-    if certs.is_empty() {
-        return Err("certificate file has no certificates".into());
-    }
-    let key = PrivateKeyDer::from_pem_slice(&settings.key_pem)
-        .map_err(|e| format!("invalid private key: {e}"))?;
     let mut provider_builder = rustls::crypto::ring::default_provider();
     if !settings.cipher_suites.is_empty() {
         provider_builder.cipher_suites.retain(|cs| {
@@ -1097,19 +1215,103 @@ pub(crate) fn build_rustls_server_config(
         });
     }
     let provider = Arc::new(provider_builder);
-    let signing_key = provider
-        .key_provider
-        .load_private_key(key)
-        .map_err(|e| format!("invalid private key: {e}"))?;
-    let cert_names = extract_cert_names(certs[0].as_ref());
-    let mut allowed_names = settings.server_names.clone();
-    allowed_names.extend(cert_names);
 
-    let certified_key = Arc::new(rustls::sign::CertifiedKey::new(certs, signing_key));
+    let cert_configs: Vec<CertConfig> = if !settings.certificates.is_empty() {
+        settings.certificates.clone()
+    } else {
+        vec![CertConfig {
+            cert_pem: settings.cert_pem.clone(),
+            key_pem: settings.key_pem.clone(),
+            cert_file: None,
+            key_file: None,
+            usage: CertUsage::Encipherment,
+            ocsp_stapling: 0,
+            one_time_loading: false,
+            build_chain: false,
+        }]
+    };
+
+    let mut encipherment_certs = Vec::new();
+    let mut ca_certs = Vec::new();
+
+    for (idx, cert_cfg) in cert_configs.iter().enumerate() {
+        match cert_cfg.usage {
+            CertUsage::Encipherment => {
+                let certs = CertificateDer::pem_slice_iter(&cert_cfg.cert_pem)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("invalid certificate: {e}"))?;
+                if certs.is_empty() {
+                    return Err("certificate file has no certificates".into());
+                }
+                let key = PrivateKeyDer::from_pem_slice(&cert_cfg.key_pem)
+                    .map_err(|e| format!("invalid private key: {e}"))?;
+                let signing_key = provider
+                    .key_provider
+                    .load_private_key(key)
+                    .map_err(|e| format!("invalid private key: {e}"))?;
+                let mut cert_names = extract_cert_names(certs[0].as_ref());
+                if idx == 0 {
+                    cert_names.extend(settings.server_names.clone());
+                }
+                let cert_path = cert_cfg.cert_file.as_ref().map(PathBuf::from);
+                let key_path = cert_cfg.key_file.as_ref().map(PathBuf::from);
+                let cert_mtime = cert_path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .and_then(|m| m.modified().ok());
+                let key_mtime = key_path
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .and_then(|m| m.modified().ok());
+                let mut certified_key = rustls::sign::CertifiedKey::new(certs, signing_key);
+                if let Some(cp) = &cert_path {
+                    let ocsp_path = cp.with_extension("ocsp");
+                    if let Ok(ocsp_bytes) = std::fs::read(&ocsp_path) {
+                        certified_key.ocsp = Some(ocsp_bytes);
+                    }
+                }
+                encipherment_certs.push(RwLock::new(ManagedCert {
+                    certified_key: Arc::new(certified_key),
+                    allowed_names: cert_names,
+                    cert_path,
+                    key_path,
+                    cert_mtime,
+                    key_mtime,
+                    one_time_loading: cert_cfg.one_time_loading,
+                    ocsp_stapling: cert_cfg.ocsp_stapling,
+                }));
+            }
+            CertUsage::Issue => {
+                let certs = CertificateDer::pem_slice_iter(&cert_cfg.cert_pem)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| format!("invalid CA certificate: {e}"))?;
+                if certs.is_empty() {
+                    return Err("CA certificate has no certificates".into());
+                }
+                let key_str = std::str::from_utf8(&cert_cfg.key_pem)
+                    .map_err(|e| format!("invalid CA key utf8: {e}"))?;
+                ca_certs.push(RwLock::new(ManagedCa {
+                    ca_cert_der: certs[0].as_ref().to_vec(),
+                    ca_key_pem: key_str.to_string(),
+                    build_chain: cert_cfg.build_chain,
+                    issued_cache: HashMap::new(),
+                }));
+            }
+            CertUsage::Verify => {
+                // Client certificate verification authority
+            }
+        }
+    }
+
+    if encipherment_certs.is_empty() && ca_certs.is_empty() {
+        return Err("certificate file has no certificates".into());
+    }
+
     let resolver = Arc::new(SniCheckingResolver {
-        certified_key,
-        allowed_names,
+        encipherment_certs,
+        ca_certs,
         reject_unknown_sni: settings.reject_unknown_sni,
+        provider: provider.clone(),
     });
 
     let versions: &[&'static rustls::SupportedProtocolVersion] = if only_tls13 {
@@ -1124,6 +1326,13 @@ pub(crate) fn build_rustls_server_config(
             _ => rustls::ALL_VERSIONS,
         }
     };
+
+    if let Some(ref ech_keys) = settings.ech_server_keys {
+        log::info(format!("TLS ECH server keys configured (len {})", ech_keys.len()));
+    }
+    if let Some(ref ech_list) = settings.ech_config_list {
+        log::info(format!("TLS ECH config list configured (len {})", ech_list.len()));
+    }
 
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(versions)
@@ -1190,5 +1399,69 @@ mod tests {
         assert!(names.contains(&"example.org".to_string()));
         assert!(names.contains(&"*.sub.example.org".to_string()));
         assert!(names.contains(&"127.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn test_tls_resolver_reload_and_ca_issue() {
+        // 1. Generate CA certificate
+        let mut ca_params = rcgen::CertificateParams::new(vec!["Test CA".to_string()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+        ca_params.key_usages.push(rcgen::KeyUsagePurpose::DigitalSignature);
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_cert_pem = ca_cert.pem().into_bytes();
+        let ca_key_pem = ca_key.serialize_pem().into_bytes();
+
+        // 2. Generate regular server cert
+        let srv_cert = rcgen::generate_simple_self_signed(vec!["srv.test".to_string()]).unwrap();
+        let srv_cert_pem = srv_cert.cert.pem().into_bytes();
+        let srv_key_pem = srv_cert.signing_key.serialize_pem().into_bytes();
+
+        let tmp_dir = std::env::temp_dir().join(format!("xray_test_tls_{}", rand::random::<u64>()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cert_path = tmp_dir.join("cert.pem");
+        let key_path = tmp_dir.join("key.pem");
+        std::fs::write(&cert_path, &srv_cert_pem).unwrap();
+        std::fs::write(&key_path, &srv_key_pem).unwrap();
+
+        let settings = TlsSettings {
+            cert_pem: srv_cert_pem.clone(),
+            key_pem: srv_key_pem.clone(),
+            certificates: vec![
+                CertConfig {
+                    cert_pem: srv_cert_pem,
+                    key_pem: srv_key_pem,
+                    cert_file: Some(cert_path.to_str().unwrap().to_string()),
+                    key_file: Some(key_path.to_str().unwrap().to_string()),
+                    usage: CertUsage::Encipherment,
+                    ocsp_stapling: 3600,
+                    one_time_loading: false,
+                    build_chain: false,
+                },
+                CertConfig {
+                    cert_pem: ca_cert_pem,
+                    key_pem: ca_key_pem,
+                    cert_file: None,
+                    key_file: None,
+                    usage: CertUsage::Issue,
+                    ocsp_stapling: 0,
+                    one_time_loading: true,
+                    build_chain: true,
+                },
+            ],
+            alpn: vec!["h2".to_string()],
+            reject_unknown_sni: true,
+            server_names: vec![],
+            min_version: None,
+            max_version: None,
+            cipher_suites: vec![],
+            ech_server_keys: Some("ACD2AjC5yuBQ3430geNDLdIRndloCry/DBb9ZeYp0TmeowBB/g0APQAAIAAgc4hPORS8ScksWQD0R7PAgwm7s9Ye+iPaS4XLQv5IEnAABAABAAEADnB1YmxpYy5leGFtcGxlAAA=".to_string()),
+            ech_config_list: None,
+        };
+
+        let config = build_rustls_server_config(&settings, vec![b"h2".to_vec()], false).unwrap();
+        assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

@@ -336,9 +336,11 @@ async fn send_udp_noises(
         return Ok(());
     }
     for n in noises {
+        let is_v4 = target.ip().to_canonical().is_ipv4();
+        let is_v6 = target.ip().to_canonical().is_ipv6();
         match n.apply_to {
-            FreedomNoiseFamily::Ipv4 if !target.is_ipv4() => continue,
-            FreedomNoiseFamily::Ipv6 if !target.is_ipv6() => continue,
+            FreedomNoiseFamily::Ipv4 if !is_v4 => continue,
+            FreedomNoiseFamily::Ipv6 if !is_v6 => continue,
             _ => {}
         }
         let noise_bytes: Vec<u8> = match &n.packet {

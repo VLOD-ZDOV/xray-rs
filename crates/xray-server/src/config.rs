@@ -178,16 +178,38 @@ pub fn user_id(id: &str) -> [u8; 16] {
         .as_bytes()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertUsage {
+    Encipherment,
+    Issue,
+    Verify,
+}
+
+#[derive(Debug, Clone)]
+pub struct CertConfig {
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
+    pub cert_file: Option<String>,
+    pub key_file: Option<String>,
+    pub usage: CertUsage,
+    pub ocsp_stapling: u64,
+    pub one_time_loading: bool,
+    pub build_chain: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct TlsSettings {
     pub cert_pem: Vec<u8>,
     pub key_pem: Vec<u8>,
+    pub certificates: Vec<CertConfig>,
     pub alpn: Vec<String>,
     pub reject_unknown_sni: bool,
     pub server_names: Vec<String>,
     pub min_version: Option<String>,
     pub max_version: Option<String>,
     pub cipher_suites: Vec<String>,
+    pub ech_server_keys: Option<String>,
+    pub ech_config_list: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1082,11 +1104,49 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
 }
 
 fn parse_tls(tls: &Value) -> Result<TlsSettings, String> {
-    let cert = array(tls, "certificates")
-        .first()
-        .ok_or("tlsSettings.certificates is empty")?;
-    let cert_pem = inline_or_file(cert, "certificate", "certificateFile")?;
-    let key_pem = inline_or_file(cert, "key", "keyFile")?;
+    if tls.get("allowInsecure").and_then(Value::as_bool).unwrap_or(false) {
+        return Err("The feature \"allowInsecure\" has been removed and migrated to \"pinnedPeerCertSha256\"(pcs) and \"verifyPeerCertByName\"(vcn). Please update your config(s) according to release note and documentation.".into());
+    }
+    let cert_array = array(tls, "certificates");
+    if cert_array.is_empty() {
+        return Err("tlsSettings.certificates is empty".into());
+    }
+    let mut certificates = Vec::new();
+    for cert in cert_array {
+        let cert_pem = inline_or_file(cert, "certificate", "certificateFile")?;
+        let key_pem = inline_or_file(cert, "key", "keyFile")?;
+        let cert_file = str_field(cert, "certificateFile");
+        let cert_file = (!cert_file.is_empty()).then(|| cert_file.to_string());
+        let key_file = str_field(cert, "keyFile");
+        let key_file = (!key_file.is_empty()).then(|| key_file.to_string());
+        let usage = match str_field(cert, "usage").to_ascii_lowercase().as_str() {
+            "verify" => CertUsage::Verify,
+            "issue" => CertUsage::Issue,
+            _ => CertUsage::Encipherment,
+        };
+        let ocsp_stapling = cert.get("ocspStapling").and_then(Value::as_u64).unwrap_or(0);
+        let one_time_loading = cert
+            .get("oneTimeLoading")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let build_chain = cert
+            .get("buildChain")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        certificates.push(CertConfig {
+            cert_pem,
+            key_pem,
+            cert_file,
+            key_file,
+            usage,
+            ocsp_stapling,
+            one_time_loading,
+            build_chain,
+        });
+    }
+    let first_cert = &certificates[0];
+    let cert_pem = first_cert.cert_pem.clone();
+    let key_pem = first_cert.key_pem.clone();
     let alpn = array(tls, "alpn")
         .iter()
         .filter_map(Value::as_str)
@@ -1125,15 +1185,35 @@ fn parse_tls(tls: &Value) -> Result<TlsSettings, String> {
             cipher_suites.push(item.to_owned());
         }
     }
+    let ech_server_keys = if let Some(ech_keys) = tls.get("echServerKeys").and_then(Value::as_str) {
+        if !ech_keys.is_empty() {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(ech_keys)
+                .map_err(|_| format!("invalid ECH Config{ech_keys}"))?;
+            Some(ech_keys.to_owned())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let ech_config_list = tls
+        .get("echConfigList")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     Ok(TlsSettings {
         cert_pem,
         key_pem,
+        certificates,
         alpn,
         reject_unknown_sni,
         server_names,
         min_version,
         max_version,
         cipher_suites,
+        ech_server_keys,
+        ech_config_list,
     })
 }
 

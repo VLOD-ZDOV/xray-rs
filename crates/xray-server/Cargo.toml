@@ -46,7 +46,7 @@ zeroize.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 tokio-rustls.workspace = true
 uuid = { workspace = true, features = ["v5"] }
-rcgen = { workspace = true }
+rcgen = { workspace = true, features = ["pem", "x509-parser"] }
 x509-parser = { workspace = true }
 xray-config = { path = "../xray-config" }
 xray-proxy = { path = "../xray-proxy" }
