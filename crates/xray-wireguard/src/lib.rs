@@ -4,7 +4,9 @@
 mod client;
 mod config;
 mod io;
+pub mod server;
 mod stack;
 
 pub use client::{Client, Error, Options, TcpStream, UdpSession};
 pub use config::{Config, PeerConfig};
+pub use server::{IncomingTcpStream, IncomingUdpSession, Server, ServerConfig, ServerPeerConfig};

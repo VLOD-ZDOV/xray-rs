@@ -42,6 +42,7 @@ mod vless_outbound;
 mod vmess;
 mod vmess_outbound;
 mod wg;
+mod wg_inbound;
 mod ws;
 mod xhttp;
 mod xhttp_outbound;
@@ -353,6 +354,9 @@ pub(crate) fn select_inbound_handler(
         (InboundProtocol::Hysteria, _) | (_, InboundTransport::Hysteria) => {
             unreachable!("hysteria is handled above")
         }
+        (InboundProtocol::Wireguard, _) => {
+            unreachable!("wireguard is handled above")
+        }
     }
 }
 
@@ -391,6 +395,11 @@ pub(crate) async fn start_inbound(
 
     if inbound.protocol == InboundProtocol::Hysteria {
         let abort = hysteria::start(inbound, ctx.clone(), router).await?;
+        return Ok((ctx, Some(abort), None));
+    }
+
+    if inbound.protocol == InboundProtocol::Wireguard {
+        let abort = wg_inbound::start(inbound, ctx.clone(), router).await?;
         return Ok((ctx, Some(abort), None));
     }
 

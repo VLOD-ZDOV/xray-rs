@@ -1578,6 +1578,7 @@ async fn handle_handler(
                 vless_encryption: None,
                 sockopt: None,
                 quic_params: None,
+                wireguard: None,
             };
             match crate::start_inbound(&inbound, None, inbound_manager.router().clone()).await {
                 Ok((ctx, tcp_abort, udp_abort)) => {

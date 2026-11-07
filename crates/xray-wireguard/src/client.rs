@@ -195,6 +195,7 @@ impl Client {
             protection_failed: protection_failed.clone(),
             carrier: watch::channel(None).0,
             reserved,
+            listen_addr: None,
         };
         let mut limits = gotatun::device::DeviceLimits::mobile();
         // Keep queue storage bounded while allowing larger batches to cross

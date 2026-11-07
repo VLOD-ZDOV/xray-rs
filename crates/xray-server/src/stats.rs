@@ -309,6 +309,7 @@ mod tests {
 
     #[test]
     fn counts_and_resets_like_xray() {
+        let _lock = crate::policy::TEST_LOCK.lock().unwrap();
         let panel = json!({"stats": {}, "policy": {"levels": {"99": {"statsUserUplink": true, "statsUserDownlink": true}},
             "system": {"statsInboundUplink": true, "statsInboundDownlink": true, "statsOutboundUplink": false}}});
         crate::policy::init(crate::policy::PolicyManager::from_config(&panel));
@@ -345,6 +346,7 @@ mod tests {
 
     #[test]
     fn tracks_online_ips() {
+        let _lock = crate::policy::TEST_LOCK.lock().unwrap();
         let panel = json!({"stats": {}, "policy": {"levels": {"99": {"statsUserOnline": true}}}});
         crate::policy::init(crate::policy::PolicyManager::from_config(&panel));
         let stats = leaked(Policy::from_config(&panel));

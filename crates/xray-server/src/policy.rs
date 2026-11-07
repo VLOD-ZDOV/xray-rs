@@ -93,6 +93,9 @@ impl PolicyManager {
 
 static POLICY_MANAGER: RwLock<Option<PolicyManager>> = RwLock::new(None);
 
+#[cfg(test)]
+pub static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn init(manager: PolicyManager) {
     if let Ok(mut lock) = POLICY_MANAGER.write() {
         if let Some(existing) = lock.as_mut() {

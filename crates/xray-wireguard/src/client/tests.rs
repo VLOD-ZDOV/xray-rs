@@ -153,6 +153,7 @@ async fn idle_carrier_receive_follows_rebind_and_releases_old_sockets() {
                 stop: Stop::new(),
                 carrier: watch::channel(None).0,
                 reserved: [0; 3],
+                listen_addr: None,
             };
             let (send, mut receive) = factory
                 .bind(&UdpTransportFactoryParams {

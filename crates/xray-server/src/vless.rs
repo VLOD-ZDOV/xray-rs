@@ -1588,6 +1588,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn handshake_times_out_when_client_sends_no_data() {
         let (_client, server) = tokio::io::duplex(64);
         let ctx = Context {
@@ -1610,6 +1611,7 @@ mod tests {
             vless_encryption: None,
         };
 
+        let _lock = crate::policy::TEST_LOCK.lock().unwrap();
         crate::policy::init_single(crate::policy::PolicySettings {
             handshake: Duration::from_millis(50),
             ..Default::default()

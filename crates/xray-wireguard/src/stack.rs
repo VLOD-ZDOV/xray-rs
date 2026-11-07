@@ -38,7 +38,7 @@ fn tcp_timestamp() -> u32 {
     (EPOCH.get_or_init(Clock::now).elapsed().as_millis() as u32).wrapping_add(1)
 }
 
-fn tcp_socket() -> tcp::Socket<'static> {
+pub(crate) fn tcp_socket() -> tcp::Socket<'static> {
     let mut socket = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0; TCP_RECEIVE_BUFFER]),
         tcp::SocketBuffer::new(vec![0; TCP_SEND_BUFFER]),
@@ -536,15 +536,15 @@ fn endpoint(addr: SocketAddr) -> IpEndpoint {
     IpEndpoint::new(addr.ip().into(), addr.port())
 }
 
-struct Packets {
-    tx: mpsc::Sender<Packet<Ip>>,
-    rx: Option<Packet<Ip>>,
-    mtu: usize,
+pub(crate) struct Packets {
+    pub(crate) tx: mpsc::Sender<Packet<Ip>>,
+    pub(crate) rx: Option<Packet<Ip>>,
+    pub(crate) mtu: usize,
 }
-struct Receive(Packet<Ip>);
-struct Transmit {
-    permit: mpsc::OwnedPermit<Packet<Ip>>,
-    mtu: usize,
+pub(crate) struct Receive(pub(crate) Packet<Ip>);
+pub(crate) struct Transmit {
+    pub(crate) permit: mpsc::OwnedPermit<Packet<Ip>>,
+    pub(crate) mtu: usize,
 }
 impl Device for Packets {
     type RxToken<'a> = Receive;

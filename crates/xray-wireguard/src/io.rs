@@ -30,6 +30,7 @@ pub(crate) struct Factory {
     pub(crate) stop: Stop,
     pub(crate) carrier: watch::Sender<Option<Arc<Sockets>>>,
     pub(crate) reserved: [u8; 3],
+    pub(crate) listen_addr: Option<SocketAddr>,
 }
 pub(crate) type Sockets = [Option<Arc<UdpSocket>>; 2];
 
@@ -55,7 +56,9 @@ impl Factory {
             if !enabled {
                 continue;
             }
-            let bind = if index == 1 {
+            let bind = if let Some(listen) = self.listen_addr {
+                listen
+            } else if index == 1 {
                 SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
             } else {
                 SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
@@ -65,7 +68,8 @@ impl Factory {
                 socket2::Type::DGRAM,
                 Some(socket2::Protocol::UDP),
             )?;
-            if index == 1 {
+            let _ = socket.set_reuse_address(true);
+            if index == 1 && self.listen_addr.is_none() {
                 socket.set_only_v6(true)?;
             }
             // Concurrent inner TCP windows can arrive in one carrier burst.

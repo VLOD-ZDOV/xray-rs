@@ -65,6 +65,7 @@ pub enum InboundProtocol {
     Shadowsocks,
     Dokodemo,
     Hysteria,
+    Wireguard,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -207,6 +208,7 @@ pub struct Inbound {
     pub vless_encryption: Option<Arc<xray_vless_encryption::Server>>,
     pub sockopt: Option<SockoptSettings>,
     pub quic_params: Option<xray_config::QuicParamsSettings>,
+    pub wireguard: Option<Arc<xray_wireguard::ServerConfig>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -613,38 +615,6 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     })
 }
 
-fn parse_wireguard_key(s: &str) -> Result<[u8; 32], ()> {
-    use base64::Engine;
-    if s.is_empty() {
-        return Err(());
-    }
-    if s.len() == 64 {
-        let mut out = [0u8; 32];
-        for (i, byte) in out.iter_mut().enumerate() {
-            let hi = (s.as_bytes()[i * 2] as char).to_digit(16).ok_or(())? as u8;
-            let lo = (s.as_bytes()[i * 2 + 1] as char).to_digit(16).ok_or(())? as u8;
-            *byte = (hi << 4) | lo;
-        }
-        return Ok(out);
-    }
-    let trimmed = s.trim_end_matches('=');
-    if let Ok(bytes) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed) {
-        if bytes.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            return Ok(key);
-        }
-    }
-    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed) {
-        if bytes.len() == 32 {
-            let mut key = [0u8; 32];
-            key.copy_from_slice(&bytes);
-            return Ok(key);
-        }
-    }
-    Err(())
-}
-
 fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let protocol = match str_field(item, "protocol") {
         "vless" => InboundProtocol::Vless,
@@ -656,35 +626,54 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         "dokodemo-door" | "dokodemo" | "tunnel" => InboundProtocol::Dokodemo,
         "hysteria" | "hysteria2" => InboundProtocol::Hysteria,
         "wireguard" => {
-            let settings = item.get("settings").unwrap_or(&Value::Null);
-            let secret_key = str_field(settings, "secretKey");
-            if secret_key.is_empty() {
-                return Err(
-                    "invalid WireGuard secret key: %winfra/conf: key must not be empty".into(),
-                );
-            }
-            if parse_wireguard_key(secret_key).is_err() {
-                return Err(
-                    "invalid WireGuard secret key: %winfra/conf: failed to deserialize key".into(),
-                );
-            }
-            if let Some(reserved) = settings.get("reserved").and_then(Value::as_array) {
-                if !reserved.is_empty() && reserved.len() != 3 {
-                    return Err("\"reserved\" should be empty or 3 bytes".into());
+            let wg_cfg = crate::wg_inbound::parse(&tag, item)?;
+            let port = parse_port(item.get("port")).unwrap_or(wg_cfg.listen_addr.port());
+            let listen = match str_field(item, "listen") {
+                "" => String::new(),
+                addr if addr.starts_with('/') || addr.starts_with('@') => {
+                    return Err("unix socket listen is not supported".into());
                 }
-            }
-            if let Some(peers) = settings.get("peers").and_then(Value::as_array) {
-                for peer in peers {
-                    let pub_key = str_field(peer, "publicKey");
-                    if !pub_key.is_empty() && parse_wireguard_key(pub_key).is_err() {
-                        return Err("failed to deserialize key".into());
-                    }
-                }
-            }
-            log::warn(format!(
-                "skipping inbound {tag:?}: WireGuard inbound is not supported yet"
-            ));
-            return Ok(None);
+                addr => addr.to_owned(),
+            };
+            let sniffing = parse_sniffing(item.get("sniffing").unwrap_or(&Value::Null), &tag);
+            let stream = item.get("streamSettings").unwrap_or(&Value::Null);
+            let sockopt_settings = parse_sockopt(
+                stream
+                    .get("sockopt")
+                    .or_else(|| item.get("sockopt"))
+                    .unwrap_or(&Value::Null),
+                &format!("inbound {tag:?}"),
+            )?;
+            return Ok(Some(Inbound {
+                tag,
+                listen,
+                port,
+                protocol: InboundProtocol::Wireguard,
+                users: Vec::new(),
+                shadowsocks_users: Vec::new(),
+                shadowsocks_top_method: None,
+                shadowsocks_top_password: None,
+                fallbacks: Vec::new(),
+                socks_auth: xray_proxy::inbound::SocksInboundAuth::NoAuth,
+                udp: true,
+                sniffing,
+                dokodemo: None,
+                http_obfs: None,
+                tls: None,
+                reality: None,
+                transport: InboundTransport::Tcp,
+                accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept::None,
+                hysteria_users: Vec::new(),
+                hysteria_salamander: None,
+                hysteria_gecko: None,
+                hysteria_udp_idle_timeout: None,
+                hysteria_masq: None,
+                has_udphop: false,
+                vless_encryption: None,
+                sockopt: sockopt_settings,
+                quic_params: None,
+                wireguard: Some(Arc::new(wg_cfg)),
+            }));
         }
         "masque" => {
             let settings = item.get("settings").unwrap_or(&Value::Null);
@@ -1309,6 +1298,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         vless_encryption,
         sockopt: sockopt_settings,
         quic_params,
+        wireguard: None,
     }))
 }
 
