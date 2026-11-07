@@ -1568,6 +1568,7 @@ async fn handle_handler(
                 hysteria_salamander: None,
                 hysteria_gecko: None,
                 hysteria_udp_idle_timeout: None,
+                hysteria_masq: None,
                 has_udphop: false,
                 vless_encryption: None,
                 sockopt: None,

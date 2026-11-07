@@ -1019,6 +1019,7 @@ pub enum Action {
     Shadowsocks(Arc<ShadowsocksOutbound>),
     Http(Arc<HttpOutbound>),
     Dns(Arc<DnsOutbound>),
+    Hysteria(Arc<crate::hysteria_outbound::HysteriaOutbound>),
     Loopback(String),
     /// The `metrics` section's tag: connections reach its HTTP server.
     Metrics,
@@ -1038,6 +1039,7 @@ impl PartialEq for Action {
             (Self::Shadowsocks(a), Self::Shadowsocks(b)) => Arc::ptr_eq(a, b),
             (Self::Http(a), Self::Http(b)) => Arc::ptr_eq(a, b),
             (Self::Dns(a), Self::Dns(b)) => Arc::ptr_eq(a, b),
+            (Self::Hysteria(a), Self::Hysteria(b)) => Arc::ptr_eq(a, b),
             (Self::Reverse(a), Self::Reverse(b)) => Arc::ptr_eq(a, b),
             (Self::Loopback(a), Self::Loopback(b)) => a == b,
             (a, b) => std::mem::discriminant(a) == std::mem::discriminant(b),
@@ -1317,6 +1319,65 @@ impl Router {
         for outbound in array(root, "outbounds") {
             let tag = str_field(outbound, "tag").to_owned();
             let protocol = str_field(outbound, "protocol");
+            let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
+            let network = str_field(stream, "network");
+
+            if network == "masque" && protocol != "masque" {
+                return Err("the masque transport can only be used by the masque outbound".into());
+            }
+
+            if network == "xdrive" {
+                if protocol != "vless" {
+                    return Err("the xdrive transport can only be used by VLESS".into());
+                }
+                let settings = outbound.get("settings").unwrap_or(&Value::Null);
+                if let Some(vnext) = settings.get("vnext").and_then(Value::as_array).and_then(|v| v.first()) {
+                    if let Some(users) = vnext.get("users").and_then(Value::as_array).and_then(|u| u.first()) {
+                        if !str_field(users, "flow").is_empty() {
+                            return Err("the xdrive transport doesn't support VLESS \"flow\"".into());
+                        }
+                        if str_field(users, "encryption") == "none" {
+                            return Err("the xdrive transport needs VLESS \"encryption\", run \"xray vlessenc\" to get one".into());
+                        }
+                        if let Some(testpre) = users.get("testpre").and_then(Value::as_i64) {
+                            if testpre != 0 {
+                                return Err("the xdrive transport doesn't support VLESS \"testpre\"".into());
+                            }
+                        }
+                        let has_reverse = users.get("reverse").is_some_and(|r| !r.is_null());
+                        if !has_reverse {
+                            let mux = outbound.get("mux").unwrap_or(&Value::Null);
+                            let mux_enabled = mux.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+                            let concurrency = mux.get("concurrency").and_then(Value::as_i64).unwrap_or(0);
+                            let xudp_concurrency = mux.get("xudpConcurrency").and_then(Value::as_i64).unwrap_or(0);
+                            let xudp_skip = str_field(mux, "xudpProxyUDP443") == "skip";
+                            if !mux_enabled || concurrency < 0 || xudp_concurrency < 0 || xudp_skip {
+                                return Err("the xdrive transport needs \"mux\" enabled, with no negative \"concurrency\" or \"xudpConcurrency\" and no \"xudpProxyUDP443\":\"skip\"".into());
+                            }
+                        }
+                    }
+                }
+            }
+
+            if matches!(network, "kcp" | "mkcp") {
+                let kcp_settings = stream.get("kcpSettings").unwrap_or(&Value::Null);
+                if let Some(mtu) = kcp_settings.get("mtu").and_then(Value::as_u64) {
+                    if mtu < 21 {
+                        return Err("MTU must be at least 21".into());
+                    }
+                }
+                if let Some(tti) = kcp_settings.get("tti").and_then(Value::as_u64) {
+                    if !(10..=1000).contains(&tti) {
+                        return Err("TTI must be between 10 and 1000".into());
+                    }
+                }
+                if let Some(cwnd) = kcp_settings.get("cwndMultiplier").and_then(Value::as_u64) {
+                    if cwnd < 1 {
+                        return Err("CwndMultiplier must be at least 1".into());
+                    }
+                }
+            }
+
             let action = match protocol {
                 "freedom" | "direct" => {
                     let settings = outbound.get("settings").unwrap_or(&Value::Null);
@@ -1418,6 +1479,26 @@ impl Router {
                 }
                 "http" => Action::Http(Arc::new(HttpOutbound::parse(&tag, outbound)?)),
                 "dns" => Action::Dns(Arc::new(DnsOutbound::parse(&tag, outbound)?)),
+                "masque" => {
+                    let settings = outbound.get("settings").unwrap_or(&Value::Null);
+                    if str_field(settings, "address").is_empty() {
+                        return Err("MASQUE: \"address\" is not set".into());
+                    }
+                    log::warn(format!("skipping outbound {tag:?}: MASQUE outbound is not supported yet"));
+                    Action::Block(BlockAction::Drop)
+                }
+                "hysteria" | "hysteria2" => {
+                    let settings = outbound.get("settings").unwrap_or(&Value::Null);
+                    if let Some(v) = settings.get("version") {
+                        if v.as_i64() != Some(2) {
+                            return Err("version != 2".into());
+                        }
+                    }
+                    if !matches!(network, "hysteria" | "hysteria2") {
+                        return Err("not hysteria transport".into());
+                    }
+                    Action::Hysteria(Arc::new(crate::hysteria_outbound::HysteriaOutbound::parse(&tag, outbound)?))
+                }
                 "loopback" => {
                     let settings = outbound.get("settings").unwrap_or(&Value::Null);
                     let inbound_tag = str_field(settings, "inboundTag").to_owned();

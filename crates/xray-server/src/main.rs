@@ -14,6 +14,7 @@ mod http_obfs;
 mod http_outbound;
 mod httpupgrade;
 mod hysteria;
+mod hysteria_outbound;
 mod inbound_proxy;
 mod log;
 mod metrics;

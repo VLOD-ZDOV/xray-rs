@@ -201,10 +201,29 @@ pub struct Inbound {
     pub hysteria_salamander: Option<String>,
     pub hysteria_gecko: Option<xray_transport::hysteria::gecko::GeckoPacketSize>,
     pub hysteria_udp_idle_timeout: Option<u64>,
+    pub hysteria_masq: Option<HysteriaMasqConfig>,
     pub has_udphop: bool,
     pub vless_encryption: Option<Arc<xray_vless_encryption::Server>>,
     pub sockopt: Option<SockoptSettings>,
     pub quic_params: Option<xray_config::QuicParamsSettings>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HysteriaMasqType {
+    NotFound,
+    File,
+    Proxy,
+    String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HysteriaMasqConfig {
+    pub masq_type: HysteriaMasqType,
+    pub masq_file: Option<String>,
+    pub masq_url: Option<String>,
+    pub masq_string: Option<String>,
+    pub masq_string_headers: HashMap<String, String>,
+    pub masq_string_status_code: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -386,11 +405,47 @@ fn normalize_sections(root: &mut Value) {
             }
         }
     }
-    for section in ["transport", "geodata"] {
-        if map.get(section).is_some_and(|v| !v.is_null()) {
-            log::warn(format!("config: {section:?} is not supported yet, ignored"));
+}
+
+fn validate_geodata(geo: &Value) -> Result<(), String> {
+    let cron = geo.get("cron").and_then(Value::as_str);
+    if let Some(cron) = cron {
+        if !cron.is_empty() {
+            let fields: Vec<&str> = cron.split_whitespace().collect();
+            let is_predefined = matches!(
+                cron,
+                "@yearly" | "@annually" | "@monthly" | "@weekly" | "@daily" | "@midnight" | "@hourly"
+            );
+            if !is_predefined && fields.len() != 5 {
+                return Err("failed to build geodata configuration: invalid geodata cron".into());
+            }
         }
     }
+    if let Some(assets) = geo.get("assets").and_then(Value::as_array) {
+        for asset in assets {
+            let url = str_field(asset, "url");
+            if !url.starts_with("https://") || url.len() <= 8 {
+                return Err(format!("failed to build geodata configuration: invalid geodata asset url: {url}: scheme must be https"));
+            }
+            let host_part = &url[8..];
+            let host = host_part.split(['/', '?', '#']).next().unwrap_or("");
+            if host.is_empty() {
+                return Err(format!("failed to build geodata configuration: invalid geodata asset url: {url}: scheme must be https"));
+            }
+        }
+        if cron.is_some_and(|c| !c.is_empty()) {
+            if assets.len() > 100 {
+                return Err("failed to build geodata configuration: geodata supports at most 100 assets".into());
+            }
+            for asset in assets {
+                let file = str_field(asset, "file");
+                if !file.is_empty() && !file.to_ascii_lowercase().ends_with(".dat") {
+                    return Err("failed to build geodata configuration: geodata asset file extension must be .dat".into());
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `version.min` / `version.max` against the Xray version this core stands in for.
@@ -448,6 +503,16 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     }
     if root.get("reverse").is_some_and(|v| !v.is_null()) {
         return Err("The feature \"legacy reverse\" has been removed and migrated to \"VLESS Reverse Proxy\". Please update your config(s) according to release note and documentation.".into());
+    }
+    if let Some(t) = root.get("transport") {
+        if !t.is_null() && t.as_object().is_some_and(|o| !o.is_empty()) {
+            return Err("The feature Global transport config has been removed and migrated to streamSettings in inbounds and outbounds. Please update your config(s) according to release note and documentation.".into());
+        }
+    }
+    if let Some(geo) = root.get("geodata") {
+        if !geo.is_null() && geo.as_object().is_some() {
+            validate_geodata(geo)?;
+        }
     }
     check_version(&root)?;
     let api_tag = root
@@ -538,6 +603,38 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     })
 }
 
+fn parse_wireguard_key(s: &str) -> Result<[u8; 32], ()> {
+    use base64::Engine;
+    if s.is_empty() {
+        return Err(());
+    }
+    if s.len() == 64 {
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            let hi = (s.as_bytes()[i * 2] as char).to_digit(16).ok_or(())? as u8;
+            let lo = (s.as_bytes()[i * 2 + 1] as char).to_digit(16).ok_or(())? as u8;
+            *byte = (hi << 4) | lo;
+        }
+        return Ok(out);
+    }
+    let trimmed = s.trim_end_matches('=');
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD_NO_PAD.decode(trimmed) {
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+    }
+    if let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(trimmed) {
+        if bytes.len() == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&bytes);
+            return Ok(key);
+        }
+    }
+    Err(())
+}
+
 fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let protocol = match str_field(item, "protocol") {
         "vless" => InboundProtocol::Vless,
@@ -548,6 +645,39 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         "shadowsocks" => InboundProtocol::Shadowsocks,
         "dokodemo-door" | "dokodemo" | "tunnel" => InboundProtocol::Dokodemo,
         "hysteria" | "hysteria2" => InboundProtocol::Hysteria,
+        "wireguard" => {
+            let settings = item.get("settings").unwrap_or(&Value::Null);
+            let secret_key = str_field(settings, "secretKey");
+            if secret_key.is_empty() {
+                return Err("invalid WireGuard secret key: %winfra/conf: key must not be empty".into());
+            }
+            if parse_wireguard_key(secret_key).is_err() {
+                return Err("invalid WireGuard secret key: %winfra/conf: failed to deserialize key".into());
+            }
+            if let Some(reserved) = settings.get("reserved").and_then(Value::as_array) {
+                if !reserved.is_empty() && reserved.len() != 3 {
+                    return Err("\"reserved\" should be empty or 3 bytes".into());
+                }
+            }
+            if let Some(peers) = settings.get("peers").and_then(Value::as_array) {
+                for peer in peers {
+                    let pub_key = str_field(peer, "publicKey");
+                    if !pub_key.is_empty() && parse_wireguard_key(pub_key).is_err() {
+                        return Err("failed to deserialize key".into());
+                    }
+                }
+            }
+            log::warn(format!("skipping inbound {tag:?}: WireGuard inbound is not supported yet"));
+            return Ok(None);
+        }
+        "masque" => {
+            let settings = item.get("settings").unwrap_or(&Value::Null);
+            if str_field(settings, "address").is_empty() {
+                return Err("MASQUE: \"address\" is not set".into());
+            }
+            log::warn(format!("skipping inbound {tag:?}: MASQUE inbound is not supported yet"));
+            return Ok(None);
+        }
         other => {
             log::warn(format!(
                 "skipping inbound {tag:?}: protocol {other:?} is not supported yet"
@@ -559,6 +689,61 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let network = str_field(stream, "network");
     let security = str_field(stream, "security");
 
+    if network == "masque" {
+        return Err("the masque transport can only be used by the masque inbound".into());
+    }
+    if network == "xdrive" {
+        if protocol != InboundProtocol::Vless {
+            return Err("the xdrive transport can only be used by VLESS".into());
+        }
+        let settings = item.get("settings").unwrap_or(&Value::Null);
+        let decryption = str_field(settings, "decryption");
+        if decryption == "none" {
+            return Err("the xdrive transport needs VLESS \"decryption\", run \"xray vlessenc\" to get one".into());
+        }
+        if let Some(clients) = settings.get("clients").and_then(Value::as_array) {
+            for client in clients {
+                if !str_field(client, "flow").is_empty() {
+                    return Err("the xdrive transport doesn't support VLESS \"flow\"".into());
+                }
+            }
+        }
+        if let Some(port_val) = item.get("port") {
+            if let Some(s) = port_val.as_str() {
+                if s.contains('-') || s.contains(',') {
+                    return Err("the xdrive transport can only listen on one port".into());
+                }
+            }
+        }
+    }
+    if protocol == InboundProtocol::Hysteria {
+        if !matches!(network, "hysteria" | "hysteria2") {
+            return Err("not hysteria transport".into());
+        }
+        let settings = item.get("settings").unwrap_or(&Value::Null);
+        if let Some(v) = settings.get("version") {
+            if v.as_i64() != Some(2) {
+                return Err("version != 2".into());
+            }
+        }
+        let h_settings = stream.get("hysteriaSettings").unwrap_or(&Value::Null);
+        if let Some(v) = h_settings.get("version") {
+            if v.as_i64() != Some(2) {
+                return Err("version != 2".into());
+            }
+        }
+        let timeout_val = h_settings
+            .get("udpIdleTimeout")
+            .or_else(|| settings.get("udpIdleTimeout"))
+            .and_then(Value::as_u64);
+        if let Some(t) = timeout_val {
+            if t != 0 && !(2..=600).contains(&t) {
+                return Err("UdpIdleTimeout must be between 2 and 600".into());
+            }
+        }
+        let _ = parse_hysteria_masq(h_settings, settings)?;
+    }
+
     let is_hysteria =
         protocol == InboundProtocol::Hysteria || matches!(network, "hysteria" | "hysteria2");
     let is_tcp = matches!(network, "" | "tcp" | "raw");
@@ -567,6 +752,26 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let is_grpc = matches!(network, "grpc" | "gun");
     let is_xhttp = matches!(network, "xhttp" | "splithttp");
     let supported_security = matches!(security, "" | "none" | "tls" | "reality");
+    if matches!(network, "kcp" | "mkcp") {
+        let kcp_settings = stream.get("kcpSettings").unwrap_or(&Value::Null);
+        if let Some(mtu) = kcp_settings.get("mtu").and_then(Value::as_u64) {
+            if mtu < 21 {
+                return Err("MTU must be at least 21".into());
+            }
+        }
+        if let Some(tti) = kcp_settings.get("tti").and_then(Value::as_u64) {
+            if !(10..=1000).contains(&tti) {
+                return Err("TTI must be between 10 and 1000".into());
+            }
+        }
+        if let Some(cwnd) = kcp_settings.get("cwndMultiplier").and_then(Value::as_u64) {
+            if cwnd < 1 {
+                return Err("CwndMultiplier must be at least 1".into());
+            }
+        }
+        log::warn(format!("skipping inbound {tag:?}: mKCP transport is not supported yet"));
+        return Ok(None);
+    }
     if is_hysteria {
         if security != "tls" {
             log::warn(format!("skipping inbound {tag:?}: Hysteria requires TLS"));
@@ -902,6 +1107,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let mut hysteria_salamander = None;
     let mut hysteria_gecko = None;
     let mut hysteria_udp_idle_timeout = None;
+    let mut hysteria_masq = None;
     let mut has_udphop = false;
 
     if is_hysteria {
@@ -937,9 +1143,17 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 level: 0,
             });
         }
-        if let Some(t) = h_settings.get("udpIdleTimeout").and_then(Value::as_u64) {
+        let timeout_val = h_settings
+            .get("udpIdleTimeout")
+            .or_else(|| settings.get("udpIdleTimeout"))
+            .and_then(Value::as_u64);
+        if let Some(t) = timeout_val {
+            if t != 0 && !(2..=600).contains(&t) {
+                return Err("UdpIdleTimeout must be between 2 and 600".into());
+            }
             hysteria_udp_idle_timeout = Some(t);
         }
+        hysteria_masq = parse_hysteria_masq(h_settings, settings)?;
 
         if let Some(masks) = stream
             .get("finalmask")
@@ -1076,10 +1290,69 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         hysteria_salamander,
         hysteria_gecko,
         hysteria_udp_idle_timeout,
+        hysteria_masq,
         has_udphop,
         vless_encryption,
         sockopt: sockopt_settings,
         quic_params,
+    }))
+}
+
+fn parse_hysteria_masq(
+    h_settings: &Value,
+    settings: &Value,
+) -> Result<Option<HysteriaMasqConfig>, String> {
+    let masq = h_settings
+        .get("masquerade")
+        .or_else(|| settings.get("masquerade"));
+    let Some(masq) = masq.filter(|m| !m.is_null()) else {
+        return Ok(None);
+    };
+    let masq_type_str = str_field(masq, "type");
+    let masq_type = match masq_type_str.to_ascii_lowercase().as_str() {
+        "" | "404" => HysteriaMasqType::NotFound,
+        "file" => HysteriaMasqType::File,
+        "proxy" => {
+            let url_str = str_field(masq, "url");
+            if !url_str.is_empty() {
+                let lower = url_str.to_ascii_lowercase();
+                let valid = lower.starts_with("http://")
+                    || lower.starts_with("https://")
+                    || lower.starts_with("unix:")
+                    || lower.starts_with('/');
+                if !valid {
+                    return Err("unknown scheme".into());
+                }
+            }
+            HysteriaMasqType::Proxy
+        }
+        "string" => HysteriaMasqType::String,
+        _ => return Err("unknown masq type".into()),
+    };
+
+    let masq_file = masq.get("dir").and_then(Value::as_str).map(String::from);
+    let masq_url = masq.get("url").and_then(Value::as_str).map(String::from);
+    let masq_string = masq.get("content").and_then(Value::as_str).map(String::from);
+    let masq_string_status_code = masq
+        .get("statusCode")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u16;
+    let mut masq_string_headers = HashMap::new();
+    if let Some(headers) = masq.get("headers").and_then(Value::as_object) {
+        for (k, v) in headers {
+            if let Some(val_str) = v.as_str() {
+                masq_string_headers.insert(k.clone(), val_str.to_string());
+            }
+        }
+    }
+
+    Ok(Some(HysteriaMasqConfig {
+        masq_type,
+        masq_file,
+        masq_url,
+        masq_string,
+        masq_string_headers,
+        masq_string_status_code,
     }))
 }
 
@@ -2049,7 +2322,7 @@ fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
         .map_or(&[], Vec::as_slice)
 }
 
-fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
+pub(crate) fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 

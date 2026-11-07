@@ -368,6 +368,7 @@ pub async fn start(
     .map_err(|e| e.to_string())?;
 
     let udp_idle_timeout = Duration::from_secs(inbound.hysteria_udp_idle_timeout.unwrap_or(60));
+    let masq = inbound.hysteria_masq.clone();
 
     let task = tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
@@ -379,18 +380,132 @@ pub async fn start(
                 }
             };
             let ctx = ctx.clone();
-            tokio::spawn(handle_connection(connection, ctx, udp_idle_timeout));
+            let masq = masq.clone();
+            tokio::spawn(handle_connection(connection, ctx, udp_idle_timeout, masq));
         }
     });
 
     Ok(task.abort_handle())
 }
 
+async fn serve_masq<S>(
+    response: &mut h3::server::RequestStream<S, Bytes>,
+    masq: Option<&crate::config::HysteriaMasqConfig>,
+    req_path: &str,
+) where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    match masq {
+        None
+        | Some(crate::config::HysteriaMasqConfig {
+            masq_type: crate::config::HysteriaMasqType::NotFound,
+            ..
+        }) => {
+            let resp = http::Response::builder()
+                .status(http::StatusCode::NOT_FOUND)
+                .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(())
+                .ok();
+            if let Some(resp) = resp {
+                if response.send_response(resp).await.is_ok() {
+                    let _ = response
+                        .send_data(Bytes::from_static(b"404 page not found\n"))
+                        .await;
+                }
+            }
+        }
+        Some(crate::config::HysteriaMasqConfig {
+            masq_type: crate::config::HysteriaMasqType::String,
+            masq_string,
+            masq_string_headers,
+            masq_string_status_code,
+            ..
+        }) => {
+            let status = if *masq_string_status_code != 0 {
+                http::StatusCode::from_u16(*masq_string_status_code)
+                    .unwrap_or(http::StatusCode::OK)
+            } else {
+                http::StatusCode::OK
+            };
+            let mut builder = http::Response::builder().status(status);
+            for (k, v) in masq_string_headers {
+                builder = builder.header(k.as_str(), v.as_str());
+            }
+            if let Ok(resp) = builder.body(()) {
+                if response.send_response(resp).await.is_ok() {
+                    if let Some(s) = masq_string {
+                        let _ = response.send_data(Bytes::copy_from_slice(s.as_bytes())).await;
+                    }
+                }
+            }
+        }
+        Some(crate::config::HysteriaMasqConfig {
+            masq_type: crate::config::HysteriaMasqType::File,
+            masq_file,
+            ..
+        }) => {
+            let mut served = false;
+            if let Some(dir) = masq_file {
+                let clean_path = req_path.trim_start_matches('/');
+                let target_path = std::path::Path::new(dir).join(clean_path);
+                if let (Ok(canonical_dir), Ok(canonical_target)) = (
+                    std::fs::canonicalize(dir),
+                    std::fs::canonicalize(&target_path),
+                ) {
+                    if canonical_target.starts_with(&canonical_dir) && canonical_target.is_file() {
+                        if let Ok(contents) = std::fs::read(&canonical_target) {
+                            let resp = http::Response::builder()
+                                .status(http::StatusCode::OK)
+                                .body(())
+                                .ok();
+                            if let Some(resp) = resp {
+                                if response.send_response(resp).await.is_ok() {
+                                    let _ = response.send_data(Bytes::from(contents)).await;
+                                    served = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !served {
+                let resp = http::Response::builder()
+                    .status(http::StatusCode::NOT_FOUND)
+                    .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                    .body(())
+                    .ok();
+                if let Some(resp) = resp {
+                    if response.send_response(resp).await.is_ok() {
+                        let _ = response
+                            .send_data(Bytes::from_static(b"404 page not found\n"))
+                            .await;
+                    }
+                }
+            }
+        }
+        Some(crate::config::HysteriaMasqConfig {
+            masq_type: crate::config::HysteriaMasqType::Proxy,
+            ..
+        }) => {
+            let resp = http::Response::builder()
+                .status(http::StatusCode::BAD_GATEWAY)
+                .body(())
+                .ok();
+            if let Some(resp) = resp {
+                let _ = response.send_response(resp).await;
+            }
+        }
+    }
+    let _ = response.finish().await;
+}
+
 async fn handle_connection(
     connection: quinn::Connection,
     ctx: Arc<vless::Context>,
     udp_idle_timeout: Duration,
+    masq: Option<crate::config::HysteriaMasqConfig>,
 ) {
+    let masq_for_auth = masq.clone();
     let auth_res = tokio::time::timeout(Duration::from_secs(4), async {
         let mut h3_conn: h3::server::Connection<_, Bytes> =
             h3::server::Connection::new(h3_quinn::Connection::new(connection.clone()))
@@ -399,17 +514,36 @@ async fn handle_connection(
         let request = h3_conn.accept().await.ok()??;
         let (request, mut response) = request.resolve_request().await.ok()?;
 
-        if request.method() != http::Method::POST || !request.uri().path().ends_with("/auth") {
+        let is_auth_path = request.uri().path().ends_with("/auth") || request.uri().path() == "/";
+        if request.method() != http::Method::POST || !is_auth_path {
+            serve_masq(&mut response, masq_for_auth.as_ref(), request.uri().path()).await;
             return None;
         }
-        let auth_header = request.headers().get("hysteria-auth")?.to_str().ok()?;
+        let auth_header = match request
+            .headers()
+            .get("hysteria-auth")
+            .and_then(|h| h.to_str().ok())
+        {
+            Some(a) => a,
+            None => {
+                serve_masq(&mut response, masq_for_auth.as_ref(), request.uri().path()).await;
+                return None;
+            }
+        };
 
         let user = {
             let users = ctx
                 .hysteria_users
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            users.iter().find(|u| u.auth == auth_header).cloned()?
+            users.iter().find(|u| u.auth == auth_header).cloned()
+        };
+        let user = match user {
+            Some(u) => u,
+            None => {
+                serve_masq(&mut response, masq_for_auth.as_ref(), request.uri().path()).await;
+                return None;
+            }
         };
 
         let padding = random_padding(256, 1024);
