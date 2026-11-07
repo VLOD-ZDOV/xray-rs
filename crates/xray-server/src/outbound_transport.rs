@@ -357,6 +357,9 @@ impl ServerConnector {
                     initial_windows_size,
                 }))
             }
+            "xhttp" | "splithttp" => {
+                crate::xhttp_outbound::transport(stream, &host_fallback).map_err(|e| err(&e))?
+            }
             other => {
                 return Err(err(&format!(
                     "unsupported streamSettings.network {other:?}"
@@ -588,7 +591,9 @@ fn parse_reality(reality: &Value, host: &Host) -> Result<ConnectorConfig, String
         .unwrap_or("chrome")
         .to_owned();
     let public_key_str = reality
-        .get("publicKey")
+        .get("password")
+        .filter(|v| v.as_str().is_some_and(|s| !s.is_empty()))
+        .or_else(|| reality.get("publicKey"))
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "missing reality publicKey".to_string())?;

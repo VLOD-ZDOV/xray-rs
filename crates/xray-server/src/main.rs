@@ -39,6 +39,7 @@ mod vmess_outbound;
 mod wg;
 mod ws;
 mod xhttp;
+mod xhttp_outbound;
 
 use crate::routing::Router;
 use std::convert::Infallible;
