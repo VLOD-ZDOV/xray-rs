@@ -269,12 +269,13 @@ impl Observatory {
                 log::warn("health check interval is too small, 10s is applied");
                 interval = MIN_BURST_INTERVAL;
             }
-            let sampling_count = ping_config
-                .get("sampling")
-                .and_then(Value::as_u64)
-                .map(|n| n as usize)
-                .filter(|n| *n > 0)
-                .unwrap_or(DEFAULT_SAMPLING_COUNT);
+            let sampling_count = match ping_config.get("sampling").and_then(Value::as_u64) {
+                Some(n) if n > i32::MAX as u64 => {
+                    return Err("burst observatory: sampling is out of range".into())
+                }
+                Some(n) if n > 0 => n as usize,
+                _ => DEFAULT_SAMPLING_COUNT,
+            };
             let timeout = ping_config
                 .get("timeout")
                 .and_then(Value::as_str)
@@ -433,7 +434,11 @@ impl Observatory {
 
             {
                 let mut map = self.status.write().unwrap();
-                map.retain(|tag, _| outbounds.contains(tag));
+                // The burst loop owns the tags matching its own selector.
+                map.retain(|tag, _| {
+                    outbounds.contains(tag)
+                        || !config.subject_selector.iter().any(|p| tag.starts_with(p))
+                });
             }
 
             if outbounds.is_empty() {
@@ -527,7 +532,10 @@ impl Observatory {
                 let mut res = self.burst_results.write().unwrap();
                 res.retain(|tag, _| outbounds.contains(tag));
                 let mut map = self.status.write().unwrap();
-                map.retain(|tag, _| outbounds.contains(tag));
+                map.retain(|tag, _| {
+                    outbounds.contains(tag)
+                        || !burst.subject_selector.iter().any(|p| tag.starts_with(p))
+                });
             }
 
             for tag in &outbounds {
@@ -577,8 +585,15 @@ async fn probe_outbound_inner(
     let host = uri
         .host()
         .ok_or_else(|| "missing host in URL".to_string())?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
         .to_owned();
     let port = uri.port_u16().unwrap_or(if is_https { 443 } else { 80 });
+    let host_authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.clone()
+    };
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
     let decision = router.decision_for_tag(outbound_tag);
@@ -623,9 +638,9 @@ async fn probe_outbound_inner(
     let mut headers = xray_transport::stream::HeaderMap::new();
     xray_transport::stream::apply_masquerade(&mut headers, "nav");
     let host_header = if (is_https && port == 443) || (!is_https && port == 80) {
-        host.clone()
+        host_authority.clone()
     } else {
-        format!("{host}:{port}")
+        format!("{host_authority}:{port}")
     };
     let mut req_bytes = xray_transport::stream::serialize_request(
         http_method,
