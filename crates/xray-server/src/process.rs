@@ -26,7 +26,7 @@ impl ProcessMatcher {
         let mut match_xray_self = false;
         let self_exe = std::env::current_exe()
             .ok()
-            .and_then(|p| p.to_str().map(|s| s.to_string()));
+            .map(|p| p.to_string_lossy().into_owned());
 
         for raw in names {
             if raw == "self/" {
@@ -37,6 +37,7 @@ impl ProcessMatcher {
                 if let Some(ref p) = self_exe {
                     p.clone()
                 } else {
+                    crate::log::warn("process rule: cannot resolve the path of \"xray/\"");
                     continue;
                 }
             } else {
@@ -63,12 +64,7 @@ impl ProcessMatcher {
         if self.match_xray_self && pid == std::process::id() {
             return true;
         }
-        let clean_name = name.strip_suffix(".exe").unwrap_or(name);
-        if self
-            .process_names
-            .iter()
-            .any(|p| p == name || p == clean_name)
-        {
+        if self.process_names.iter().any(|p| p == name) {
             return true;
         }
         if self.abs_paths.iter().any(|p| p == abs_path) {
@@ -220,4 +216,18 @@ fn find_pid_by_socket_inode(inode: &str) -> Option<u32> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_names_match_exactly() {
+        let m = ProcessMatcher::new(&["foo.exe".to_owned(), "bar".to_owned()]);
+        assert!(m.matches(1, "foo", ""));
+        assert!(m.matches(1, "bar", ""));
+        assert!(!m.matches(1, "foo.exe", ""));
+        assert!(!m.matches(1, "bar.exe", ""));
+    }
 }
