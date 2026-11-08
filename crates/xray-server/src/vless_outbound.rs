@@ -491,6 +491,7 @@ impl VlessOutbound {
                         &Host::Domain("v1.rvs.cool".into()),
                         0,
                         VlessCommand::Reverse,
+                        false,
                     )
                     .await;
                 match connect_res {
@@ -538,6 +539,7 @@ impl VlessOutbound {
         host: &Host,
         port: u16,
         command: VlessCommand,
+        vision: bool,
     ) -> io::Result<VlessResponseStream<VisionTransportStream>> {
         if let Some(ref xdrive_cfg) = self.xdrive {
             let carrier = timeout(CONNECT_TIMEOUT, async {
@@ -579,7 +581,7 @@ impl VlessOutbound {
                 },
             );
 
-            let flow = if command == VlessCommand::Tcp {
+            let flow = if command == VlessCommand::Tcp || vision {
                 self.flow.clone()
             } else {
                 None
@@ -763,7 +765,7 @@ impl VlessOutbound {
             },
         );
 
-        let flow = if command == VlessCommand::Tcp {
+        let flow = if command == VlessCommand::Tcp || vision {
             self.flow.clone()
         } else {
             None
@@ -819,11 +821,11 @@ impl VlessOutbound {
             Host::Domain(d) if d == "v1.mux.cool" => VlessCommand::Mux,
             _ => VlessCommand::Tcp,
         };
-        let response_stream = self.open_raw_stream(host, port, command).await?;
         let is_vision = matches!(
             self.flow.as_deref(),
             Some("xtls-rprx-vision" | "xtls-rprx-vision-udp443")
         );
+        let response_stream = self.open_raw_stream(host, port, command, is_vision).await?;
         if is_vision {
             let vision_stream =
                 VisionStream::new(response_stream, *self.user_id.as_bytes(), self.testseed);
@@ -834,7 +836,9 @@ impl VlessOutbound {
     }
 
     pub async fn open_udp(&self, host: &Host, port: u16) -> io::Result<VlessUdpLink> {
-        let stream = self.open_raw_stream(host, port, VlessCommand::Udp).await?;
+        let stream = self
+            .open_raw_stream(host, port, VlessCommand::Udp, false)
+            .await?;
         Ok(VlessUdpLink::new(stream))
     }
 
@@ -984,7 +988,12 @@ impl VlessConeUdp {
     async fn open_xudp_conn(&self) -> io::Result<Arc<XudpConn>> {
         let stream = self
             .vless
-            .open_raw_stream(&Host::Domain("v1.mux.cool".into()), 0, VlessCommand::Mux)
+            .open_raw_stream(
+                &Host::Domain("v1.mux.cool".into()),
+                0,
+                VlessCommand::Mux,
+                false,
+            )
             .await?;
         let (mut reader, writer) = tokio::io::split(stream);
         let sessions = Arc::new(Mutex::new(XudpSessions {
