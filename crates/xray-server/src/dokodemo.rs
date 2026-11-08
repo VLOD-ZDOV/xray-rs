@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -14,9 +14,21 @@ use xray_config::Network;
 use crate::config::DokodemoSettings;
 use crate::log;
 use crate::outbound::{self, ConeUdp};
-use crate::routing::{Action, Query};
+use crate::routing::Action;
 use crate::stats;
 use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest};
+
+impl DokodemoSettings {
+    // Xray falls back to localhost and the listening port when they are not configured.
+    fn fallback_target(&self, listen_port: u16) -> (Host, u16) {
+        (
+            self.address
+                .clone()
+                .unwrap_or(Host::Ip(std::net::Ipv4Addr::LOCALHOST.into())),
+            self.port.unwrap_or(listen_port),
+        )
+    }
+}
 
 pub async fn serve_tcp<S>(
     mut stream: S,
@@ -29,15 +41,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let redirected = original.filter(|_| settings.follow_redirect);
-    let (host, port) = match (redirected, &settings.address, settings.port) {
-        (Some(addr), _, _) => (Host::Ip(addr.ip().to_canonical()), addr.port()),
-        (None, Some(host), Some(port)) => (host.clone(), port),
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unable to get destination",
-            ))
-        }
+    let (host, port) = match redirected {
+        Some(addr) => (Host::Ip(addr.ip().to_canonical()), addr.port()),
+        None => settings.fallback_target(ctx.port),
     };
 
     let mut early = Vec::new();
@@ -84,6 +90,8 @@ where
     .await
 }
 
+const MAX_UDP_SESSIONS: usize = 4096;
+
 type SessionsMap = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>;
 
 #[derive(Clone)]
@@ -105,13 +113,7 @@ impl DokodemoUdpHandler {
     }
 
     pub async fn run(self) {
-        let (host, port) = match (&self.settings.address, self.settings.port) {
-            (Some(h), Some(p)) => (h.clone(), p),
-            _ => {
-                log::warn("dokodemo udp missing address or port");
-                return;
-            }
-        };
+        let (host, port) = self.settings.fallback_target(self.ctx.port);
 
         let mut buf = vec![0u8; 65535];
         loop {
@@ -137,99 +139,90 @@ impl DokodemoUdpHandler {
                 packet
             };
 
+            if sessions.len() >= MAX_UDP_SESSIONS {
+                continue;
+            }
             let (tx, rx) = mpsc::channel(128);
-            sessions.insert(peer, tx);
+            sessions.insert(peer, tx.clone());
             drop(sessions);
 
-            let handler = self.clone();
+            // Sessions hold the socket weakly so that removing the inbound frees the port.
+            let socket = Arc::downgrade(&self.socket);
+            let ctx = self.ctx.clone();
+            let map = self.sessions.clone();
             let target_host = host.clone();
             tokio::spawn(async move {
-                if let Err(e) = handler
-                    .serve_udp_session(peer, target_host, port, packet, rx)
-                    .await
+                if let Err(e) =
+                    serve_udp_session(socket, ctx, peer, target_host, port, packet, rx).await
                 {
-                    log::debug(format!("dokodemo udp session {peer} ended: {e}"));
+                    log::debug(format!(
+                        "dokodemo udp session {} ended: {e}",
+                        log::mask(peer)
+                    ));
                 }
-                handler.sessions.lock().await.remove(&peer);
+                let mut map = map.lock().await;
+                if map.get(&peer).is_some_and(|cur| cur.same_channel(&tx)) {
+                    map.remove(&peer);
+                }
             });
         }
     }
+}
 
-    async fn serve_udp_session(
-        &self,
-        peer: SocketAddr,
-        host: Host,
-        port: u16,
-        initial_payload: Vec<u8>,
-        mut rx: mpsc::Receiver<Vec<u8>>,
-    ) -> io::Result<()> {
-        let route = RouteRequest {
-            ctx_tag: &self.ctx.tag,
-            inbound_port: self.ctx.port,
-            email: "",
-            peer,
-            network: Network::Udp,
-            host: &host,
-            port,
-            sniffing: &self.ctx.sniffing,
-        };
-        let Some(decision) = route.allow(&self.ctx.router, &initial_payload).await else {
-            return Ok(());
-        };
-        if let Action::Block(_) = decision.action {
-            return Ok(());
-        }
-        let cone = ConeUdp::open(self.ctx.router.clone(), &decision).await?;
-        let traffic = stats::get().traffic(&self.ctx.tag, "", 0, &decision.tag);
-        let activity = Activity::new();
-        if let Ok(target) = cone.target(&host, port).await {
-            cone.send_to(&initial_payload, target).await?;
-            traffic.up(initial_payload.len());
-        }
-
-        let up = Box::pin(async {
-            while let Some(packet) = rx.recv().await {
-                activity.touch();
-                let query = Query {
-                    inbound: &self.ctx.tag,
-                    inbound_port: self.ctx.port,
-                    user: "",
-                    source: peer,
-                    network: Network::Udp,
-                    domain: match &host {
-                        Host::Domain(d) => Some(d.as_str()),
-                        Host::Ip(_) => None,
-                    },
-                    ip: match &host {
-                        Host::Ip(ip) => Some(*ip),
-                        Host::Domain(_) => None,
-                    },
-                    port,
-                    protocol: None,
-                    attributes: None,
-                    local_ip: None,
-                    vless_route: None,
-                    process_info: None,
-                };
-                if self.ctx.router.route(&query).await.tag != decision.tag {
-                    continue;
-                }
-                if let Ok(addr) = cone.target(&host, port).await {
-                    let _ = cone.send_to(&packet, addr).await;
-                    traffic.up(packet.len());
-                }
-            }
-            Ok(())
-        });
-        let down = Box::pin(async {
-            let mut buf = vec![0u8; 65535];
-            loop {
-                let (n, _from) = cone.recv_from(&mut buf).await?;
-                activity.touch();
-                let _ = self.socket.send_to(&buf[..n], peer).await;
-                traffic.down(n);
-            }
-        });
-        relay(up, down, &activity).await
+async fn serve_udp_session(
+    socket: Weak<UdpSocket>,
+    ctx: Arc<Context>,
+    peer: SocketAddr,
+    host: Host,
+    port: u16,
+    initial_payload: Vec<u8>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+) -> io::Result<()> {
+    let route = RouteRequest {
+        ctx_tag: &ctx.tag,
+        inbound_port: ctx.port,
+        email: "",
+        peer,
+        network: Network::Udp,
+        host: &host,
+        port,
+        sniffing: &ctx.sniffing,
+    };
+    let Some(decision) = route.allow(&ctx.router, &initial_payload).await else {
+        return Ok(());
+    };
+    if let Action::Block(_) = decision.action {
+        return Ok(());
     }
+    let cone = ConeUdp::open(ctx.router.clone(), &decision).await?;
+    let traffic = stats::get().traffic(&ctx.tag, "", 0, &decision.tag);
+    let activity = Activity::new();
+    if let Ok(target) = cone.target(&host, port).await {
+        cone.send_to(&initial_payload, target).await?;
+        traffic.up(initial_payload.len());
+    }
+
+    let up = Box::pin(async {
+        while let Some(packet) = rx.recv().await {
+            activity.touch();
+            if let Ok(addr) = cone.target(&host, port).await {
+                let _ = cone.send_to(&packet, addr).await;
+                traffic.up(packet.len());
+            }
+        }
+        Ok(())
+    });
+    let down = Box::pin(async {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (n, _from) = cone.recv_from(&mut buf).await?;
+            activity.touch();
+            let Some(socket) = socket.upgrade() else {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "inbound removed"));
+            };
+            let _ = socket.send_to(&buf[..n], peer).await;
+            traffic.down(n);
+        }
+    });
+    relay(up, down, &activity).await
 }
