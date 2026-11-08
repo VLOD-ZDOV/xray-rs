@@ -375,11 +375,13 @@ impl VlessOutbound {
                 let idle_timeout_secs = grpc
                     .get("idle_timeout")
                     .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32;
+                    .map_or(Ok(0), |v| i32::try_from(v).map(|v| v as u32))
+                    .map_err(|_| err("grpc idle_timeout is out of range"))?;
                 let health_check_timeout_secs = grpc
                     .get("health_check_timeout")
                     .and_then(Value::as_u64)
-                    .unwrap_or(20) as u32;
+                    .map_or(Ok(20), |v| i32::try_from(v).map(|v| v as u32))
+                    .map_err(|_| err("grpc health_check_timeout is out of range"))?;
                 let permit_without_stream = grpc
                     .get("permit_without_stream")
                     .and_then(Value::as_bool)
@@ -387,7 +389,8 @@ impl VlessOutbound {
                 let initial_windows_size = grpc
                     .get("initial_windows_size")
                     .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32;
+                    .map_or(Ok(0), |v| i32::try_from(v).map(|v| v as u32))
+                    .map_err(|_| err("grpc initial_windows_size is out of range"))?;
                 TransportLayer::Grpc(GrpcTransport::new(GrpcConfig {
                     service_name,
                     multi_mode,
@@ -1164,49 +1167,57 @@ fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, String> {
             Host::Domain(d) => d.clone(),
             Host::Ip(ip) => ip.to_string(),
         });
+    if tls
+        .get("allowInsecure")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("The feature \"allowInsecure\" has been removed and migrated to \"pinnedPeerCertSha256\"(pcs) and \"verifyPeerCertByName\"(vcn). Please update your config(s) according to release note and documentation.".into());
+    }
     let mut pinned_peer_cert_sha256 = Vec::new();
-    if let Some(pins) = tls.get("pinnedPeerCertSha256").and_then(Value::as_array) {
-        for pin in pins.iter().filter_map(Value::as_str) {
-            if let Ok(bytes) = decode_hex(pin) {
-                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                    pinned_peer_cert_sha256.push(arr);
-                }
-            }
+    let pins: Vec<&str> = match tls.get("pinnedPeerCertSha256") {
+        Some(Value::String(s)) => s.split(',').collect(),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    for pin in pins {
+        let pin = pin.trim();
+        if pin.is_empty() {
+            continue;
         }
+        let bytes = decode_hex(&pin.replace(':', ""))?;
+        let arr = <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| format!("incorrect pinnedPeerCertSha256 length: {pin}"))?;
+        pinned_peer_cert_sha256.push(arr);
     }
     if let Some(certs) = tls.get("certificates").and_then(Value::as_array) {
         for cert in certs {
             let usage = cert.get("usage").and_then(Value::as_str).unwrap_or("");
             if usage == "verify" || usage.is_empty() {
-                if let Some(file) = cert.get("certificateFile").and_then(Value::as_str) {
-                    if let Ok(content) = std::fs::read(file) {
-                        for der in CertificateDer::pem_slice_iter(&content).flatten() {
-                            use sha2::Digest;
-                            let hash: [u8; 32] = sha2::Sha256::digest(&der).into();
-                            pinned_peer_cert_sha256.push(hash);
-                        }
-                    }
+                use sha2::Digest;
+                let content = if let Some(file) =
+                    cert.get("certificateFile").and_then(Value::as_str)
+                {
+                    std::fs::read(file)
+                        .map_err(|e| format!("failed to read certificateFile {file:?}: {e}"))?
                 } else if let Some(cert_lines) = cert.get("certificate").and_then(Value::as_array) {
-                    let pem = cert_lines
+                    cert_lines
                         .iter()
                         .filter_map(Value::as_str)
                         .collect::<Vec<_>>()
-                        .join("\n");
-                    for der in CertificateDer::pem_slice_iter(pem.as_bytes()).flatten() {
-                        use sha2::Digest;
-                        let hash: [u8; 32] = sha2::Sha256::digest(&der).into();
-                        pinned_peer_cert_sha256.push(hash);
-                    }
+                        .join("\n")
+                        .into_bytes()
+                } else {
+                    continue;
+                };
+                for der in CertificateDer::pem_slice_iter(&content) {
+                    let der = der.map_err(|e| format!("invalid certificate PEM: {e}"))?;
+                    let hash: [u8; 32] = sha2::Sha256::digest(&der).into();
+                    pinned_peer_cert_sha256.push(hash);
                 }
             }
         }
     }
-
-    let allow_insecure = tls
-        .get("allowInsecure")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && pinned_peer_cert_sha256.is_empty();
 
     let fingerprint = tls
         .get("fingerprint")
@@ -1226,7 +1237,7 @@ fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, String> {
 
     Ok(ConnectorConfig::Tls(TlsClientConfig {
         server_name,
-        allow_insecure,
+        allow_insecure: false,
         pinned_peer_cert_sha256,
         verify_peer_cert_by_name: Vec::new(),
         alpn,
@@ -1305,6 +1316,9 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     if !hex.len().is_multiple_of(2) {
         return Err("odd hex string length".into());
     }
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid hex character".into());
+    }
     (0..hex.len())
         .step_by(2)
         .map(|i| {
@@ -1318,6 +1332,18 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn tls_rejects_allow_insecure_and_bad_pins() {
+        let host = Host::Domain("example.com".into());
+        assert!(parse_tls(&json!({"allowInsecure": true}), &host).is_err());
+        assert!(parse_tls(&json!({"pinnedPeerCertSha256": ["zz"]}), &host).is_err());
+        assert!(parse_tls(&json!({"pinnedPeerCertSha256": "abcd"}), &host).is_err());
+        assert!(parse_tls(&json!({"pinnedPeerCertSha256": ["aé"]}), &host).is_err());
+        let pin = "ab".repeat(32);
+        let ok = parse_tls(&json!({ "pinnedPeerCertSha256": pin }), &host).unwrap();
+        assert!(matches!(ok, ConnectorConfig::Tls(t) if t.pinned_peer_cert_sha256.len() == 1));
+    }
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
@@ -1342,7 +1368,6 @@ mod tests {
                 "security": "tls",
                 "tlsSettings": {
                     "serverName": "example.com",
-                    "allowInsecure": true,
                     "fingerprint": "chrome",
                     "alpn": ["h2", "http/1.1"]
                 }
@@ -1355,7 +1380,7 @@ mod tests {
         assert!(matches!(out.transport, TransportLayer::Raw));
         if let ConnectorConfig::Tls(tls) = &out.connector {
             assert_eq!(tls.server_name, "example.com");
-            assert!(tls.allow_insecure);
+            assert!(!tls.allow_insecure);
             assert_eq!(tls.fingerprint.as_deref(), Some("chrome"));
             assert_eq!(tls.alpn, vec!["h2", "http/1.1"]);
         } else {
