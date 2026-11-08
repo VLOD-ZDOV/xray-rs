@@ -112,22 +112,30 @@ pub struct Capsule {
     pub value: Vec<u8>,
 }
 
-/// Reads a single RFC 9297 Capsule from an async reader.
+const MAX_CAPSULE_LEN: u64 = 65536 * 2;
+
+/// Reads a single RFC 9297 Capsule from an async reader. Capsules over the
+/// length limit are skipped without buffering, as Xray does for unknown and
+/// oversized capsules, and the next one is returned.
 pub async fn read_capsule<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Capsule> {
-    let capsule_type = read_varint(reader).await?;
-    let length = read_varint(reader).await?;
-    if length > 65536 * 2 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "capsule exceeds maximum allowed length",
-        ));
+    loop {
+        let capsule_type = read_varint(reader).await?;
+        let length = read_varint(reader).await?;
+        if length > MAX_CAPSULE_LEN {
+            let skipped =
+                tokio::io::copy(&mut (&mut *reader).take(length), &mut tokio::io::sink()).await?;
+            if skipped < length {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            continue;
+        }
+        let mut value = vec![0u8; length as usize];
+        reader.read_exact(&mut value).await?;
+        return Ok(Capsule {
+            capsule_type,
+            value,
+        });
     }
-    let mut value = vec![0u8; length as usize];
-    reader.read_exact(&mut value).await?;
-    Ok(Capsule {
-        capsule_type,
-        value,
-    })
 }
 
 /// Encodes an RFC 9297 Capsule into wire format.
@@ -212,9 +220,31 @@ pub fn decode_address_assign_value(mut data: &[u8]) -> Result<Vec<(u64, IpAddr, 
         }
         let prefix_len = data[0];
         data = &data[1..];
+        let bits: u8 = if ip.is_ipv4() { 32 } else { 128 };
+        if prefix_len > bits {
+            return Err(format!(
+                "prefix length {prefix_len} exceeds IP address length ({bits})"
+            ));
+        }
+        let raw = match ip {
+            IpAddr::V4(v) => u128::from(u32::from(v)) << 96,
+            IpAddr::V6(v) => u128::from(v),
+        };
+        let host_mask = u128::MAX.checked_shr(u32::from(prefix_len)).unwrap_or(0);
+        if raw & host_mask != 0 {
+            return Err("lower bits not covered by prefix length are not all zero".into());
+        }
         addrs.push((req_id, ip, prefix_len));
     }
     Ok(addrs)
+}
+
+/// Returns the first address that is not a rejected request (0.0.0.0/32 or ::/128).
+pub fn first_assigned_ip(addrs: &[(u64, IpAddr, u8)]) -> Option<IpAddr> {
+    addrs
+        .iter()
+        .find(|(_, ip, len)| !(ip.is_unspecified() && *len == if ip.is_ipv4() { 32 } else { 128 }))
+        .map(|(_, ip, _)| *ip)
 }
 
 /// Encodes a ROUTE_ADVERTISEMENT capsule (type 3).
@@ -237,6 +267,73 @@ pub fn encode_route_advertisement_capsule(routes: &[(IpAddr, IpAddr, u8)]) -> Ve
         val.push(*proto);
     }
     encode_capsule(CAPSULE_ROUTE_ADVERTISEMENT, &val)
+}
+
+/// Default CONNECT-IP request path (RFC 9484 template with both variables set to `*`).
+pub const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
+
+/// Xray's MasqueConfig path handling: URI-template variables become `*`, and
+/// the result must be an absolute path without leftover braces.
+pub fn normalize_path(path: &str) -> Result<String, String> {
+    if path.is_empty() {
+        return Ok(DEFAULT_PATH.to_owned());
+    }
+    let path = path
+        .replace("{target}", "*")
+        .replace("{ipproto}", "*")
+        .replace("{?target,ipproto}", "?target=*&ipproto=*")
+        .replace("{?ipproto,target}", "?ipproto=*&target=*")
+        .replace("{&target,ipproto}", "&target=*&ipproto=*")
+        .replace("{&ipproto,target}", "&ipproto=*&target=*");
+    if !path.starts_with('/') || path.contains(['{', '}']) {
+        return Err(format!(
+            "invalid \"path\": {path}, only the variables {{target}} and {{ipproto}} are supported"
+        ));
+    }
+    Ok(path)
+}
+
+fn percent_decode(s: &str, plus: bool) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let hex = s.get(i + 1..i + 3)?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                i += 3;
+                continue;
+            }
+            b'+' if plus => out.push(b' '),
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn parse_query(q: &str) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut m = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for pair in q.split('&').filter(|p| !p.is_empty()) {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if let (Some(k), Some(v)) = (percent_decode(k, true), percent_decode(v, true)) {
+            m.entry(k).or_default().push(v);
+        }
+    }
+    m
+}
+
+/// Xray's pathMatcher: the decoded path and the parsed query must both equal
+/// the configured ones.
+pub fn path_matches(request: &str, configured: &str) -> bool {
+    let split = |s: &str| {
+        let (p, q) = s.split_once('?').unwrap_or((s, ""));
+        (percent_decode(p, false), parse_query(q))
+    };
+    let (rp, rq) = split(request);
+    let (cp, cq) = split(configured);
+    rp.is_some() && rp == cp && rq == cq
 }
 
 #[cfg(test)]
@@ -281,6 +378,51 @@ mod tests {
 
         let decoded = decode_datagram_value(&cap.value).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn oversized_capsule_is_skipped() {
+        let big = vec![7u8; 200_000];
+        let mut bytes = encode_capsule(0x99, &big);
+        bytes.extend(encode_capsule(CAPSULE_ADDRESS_REQUEST, &[1, 2]));
+        let mut cursor = std::io::Cursor::new(bytes);
+        let cap = read_capsule(&mut cursor).await.unwrap();
+        assert_eq!(cap.capsule_type, CAPSULE_ADDRESS_REQUEST);
+        assert_eq!(cap.value, vec![1, 2]);
+    }
+
+    #[test]
+    fn path_normalize_and_match() {
+        assert_eq!(
+            normalize_path("/.well-known/masque/ip/{target}/{ipproto}/").unwrap(),
+            DEFAULT_PATH
+        );
+        assert!(normalize_path("masque").is_err());
+        assert!(normalize_path("/a/{x}/").is_err());
+        assert!(path_matches("/.well-known/masque/ip/*/*/", DEFAULT_PATH));
+        assert!(path_matches(
+            "/.well-known/masque/ip/%2A/%2A/",
+            DEFAULT_PATH
+        ));
+        assert!(!path_matches("/.well-known/masque/ip/*/*", DEFAULT_PATH));
+        assert!(!path_matches("/.well-known/masque/ip/*foo", DEFAULT_PATH));
+        assert!(!path_matches(
+            "/.well-known/masque/ip/*/*/?x=1",
+            DEFAULT_PATH
+        ));
+    }
+
+    #[test]
+    fn address_assign_validation() {
+        let bad_len = encode_address_assign_capsule(&[(1, "10.0.0.2".parse().unwrap(), 40)]);
+        assert!(decode_address_assign_value(&bad_len[2..]).is_err());
+        let host_bits = encode_address_assign_capsule(&[(1, "10.0.0.2".parse().unwrap(), 24)]);
+        assert!(decode_address_assign_value(&host_bits[2..]).is_err());
+        let ok = [
+            (1, "0.0.0.0".parse().unwrap(), 32),
+            (2, "10.0.0.2".parse().unwrap(), 32),
+        ];
+        assert_eq!(first_assigned_ip(&ok), Some("10.0.0.2".parse().unwrap()));
     }
 
     #[test]
