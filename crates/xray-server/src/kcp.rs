@@ -957,9 +957,13 @@ pub async fn start(
 
             let mut sess_map = sessions.lock().await;
             if let Some(tx) = sess_map.get(&key) {
-                if tx.send(segments).await.is_err() {
+                // A full session drops the packet, as UDP would; waiting here
+                // would stall every other session behind the shared map.
+                if let Err(mpsc::error::TrySendError::Closed(_)) = tx.try_send(segments) {
                     sess_map.remove(&key);
                 }
+            } else if matches!(&segments[0], Segment::Cmd(c) if c.cmd == CMD_TERMINATE) {
+                // Xray opens no connection for a terminate.
             } else {
                 // New inbound connection
                 let (session, input_rx, duplex_app, duplex_internal) = KcpSession::new(
@@ -971,7 +975,7 @@ pub async fn start(
                 );
 
                 let tx = session.lock().await.input_tx.clone();
-                let _ = tx.send(segments).await;
+                let _ = tx.try_send(segments);
                 sess_map.insert(key, tx);
 
                 // Spawn session driver
