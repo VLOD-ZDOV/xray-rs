@@ -314,10 +314,19 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         let mut pool = self.0.lock().unwrap();
-        if let Some(stack) = &pool.stack {
-            stack.forget(IpAddr::V4(self.1));
+        let addr = u32::from(self.1);
+        match pool.stack.clone() {
+            // The address returns only after the stack has dropped its flows.
+            Some(stack) => {
+                let back = self.0.clone();
+                stack.forget(IpAddr::V4(self.1), move || {
+                    back.lock().unwrap().used.remove(&addr);
+                });
+            }
+            None => {
+                pool.used.remove(&addr);
+            }
         }
-        pool.used.remove(&u32::from(self.1));
     }
 }
 

@@ -69,8 +69,9 @@ pub struct Server {
     wake: Arc<Notify>,
 }
 
-/// Addresses whose flows the stack drops on its next pass.
-type Forget = Arc<std::sync::Mutex<Vec<IpAddr>>>;
+/// Addresses whose flows the stack drops on its next pass, each with what
+/// to run once they are gone.
+type Forget = Arc<std::sync::Mutex<Vec<(IpAddr, Box<dyn FnOnce() + Send>)>>>;
 
 impl Server {
     pub async fn start(config: ServerConfig) -> Result<Self, io::Error> {
@@ -244,9 +245,10 @@ impl Server {
     }
 
     /// Drops every TCP flow and UDP session from `addr`, as Xray closes a
-    /// tunnel's connections before its address can go to another one.
-    pub fn forget(&self, addr: IpAddr) {
-        self.forget.lock().unwrap().push(addr);
+    /// tunnel's connections before its address can go to another one; `done`
+    /// runs after that, so the address is reused only once nothing points at it.
+    pub fn forget(&self, addr: IpAddr, done: impl FnOnce() + Send + 'static) {
+        self.forget.lock().unwrap().push((addr, Box::new(done)));
         self.wake.notify_one();
     }
 }
@@ -468,7 +470,7 @@ impl ServerStack {
         let mut progress = false;
 
         let forgotten = std::mem::take(&mut *self.forget.lock().unwrap());
-        for addr in forgotten {
+        for (addr, done) in forgotten {
             let gone: Vec<u64> = self
                 .flows
                 .iter()
@@ -482,11 +484,17 @@ impl ServerStack {
                 }
             }
             self.udp_sessions.retain(|(src, _), _| src.ip() != addr);
+            done();
             progress = true;
         }
 
         // 1. Drain UDP responses
         while let Poll::Ready(Some((from, to, payload))) = self.udp_resp_rx.poll_recv(cx) {
+            // A late answer for a session already dropped must not reach whoever holds
+            // its address now.
+            if !self.udp_sessions.contains_key(&(to, from)) {
+                continue;
+            }
             self.send_udp_packet(from, to, &payload);
             progress = true;
         }
