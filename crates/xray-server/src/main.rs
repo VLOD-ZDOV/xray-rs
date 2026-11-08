@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(clippy::large_futures)]
 
 mod api;
@@ -31,6 +31,7 @@ mod penetrating_tls;
 mod policy;
 mod process;
 mod proxy_proto;
+mod raw_sockopt;
 mod reality;
 mod routing;
 mod shadowsocks;

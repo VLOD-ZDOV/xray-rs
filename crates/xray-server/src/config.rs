@@ -95,6 +95,23 @@ pub struct SockoptSettings {
     pub penetrate: bool,
     pub address_port_strategy: AddressPortStrategy,
     pub happy_eyeballs: Option<HappyEyeballsSettings>,
+    pub tcp_window_clamp: Option<u32>,
+    pub custom_sockopt: Vec<CustomSockopt>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CustomSockopt {
+    pub system: Option<String>,
+    pub network: Option<String>,
+    pub level: i32,
+    pub opt: i32,
+    pub value: CustomSockoptValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CustomSockoptValue {
+    Int(i32),
+    Str(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1493,15 +1510,65 @@ fn parse_accept_proxy_protocol(val: Option<&Value>) -> crate::proxy_proto::Proxy
     }
 }
 
-pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSettings>, String> {
+pub fn parse_sockopt(sockopt: &Value, _owner: &str) -> Result<Option<SockoptSettings>, String> {
     let Some(map) = sockopt.as_object() else {
         return Ok(None);
     };
-    for key in ["tcpWindowClamp", "customSockopt"] {
-        if map.get(key).is_some_and(|v| !v.is_null()) {
-            log::warn(format!(
-                "{owner}: sockopt.{key} is not supported yet, ignored"
-            ));
+    let parse_i32_val = |v: Option<&Value>| {
+        v.and_then(|val| match val {
+            Value::Number(n) => n.as_i64().map(|x| x as i32),
+            Value::String(s) => {
+                if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+                    i32::from_str_radix(hex, 16).ok()
+                } else {
+                    s.parse::<i32>().ok()
+                }
+            }
+            _ => None,
+        })
+    };
+    let mut custom_sockopt = Vec::new();
+    if let Some(Value::Array(items)) = map.get("customSockopt") {
+        for item in items {
+            if let Some(obj) = item.as_object() {
+                let system = obj
+                    .get("system")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let network = obj
+                    .get("network")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let level = parse_i32_val(obj.get("level")).unwrap_or(libc::IPPROTO_TCP);
+                let Some(opt) = parse_i32_val(obj.get("opt")) else {
+                    continue;
+                };
+                let typ = obj.get("type").and_then(Value::as_str).unwrap_or("int");
+                let value = match typ {
+                    "str" => {
+                        let s = obj
+                            .get("value")
+                            .and_then(|v| match v {
+                                Value::String(s) => Some(s.clone()),
+                                Value::Number(n) => Some(n.to_string()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        CustomSockoptValue::Str(s)
+                    }
+                    _ => {
+                        let v = parse_i32_val(obj.get("value")).unwrap_or(0);
+                        CustomSockoptValue::Int(v)
+                    }
+                };
+                custom_sockopt.push(CustomSockopt {
+                    system,
+                    network,
+                    level,
+                    opt,
+                    value,
+                });
+            }
         }
     }
     let penetrate = map
@@ -1586,6 +1653,8 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
         penetrate,
         address_port_strategy,
         happy_eyeballs,
+        tcp_window_clamp: positive("tcpWindowClamp"),
+        custom_sockopt,
     };
     let unset = SockoptSettings {
         mark: 0,
@@ -1603,6 +1672,8 @@ pub fn parse_sockopt(sockopt: &Value, owner: &str) -> Result<Option<SockoptSetti
         penetrate: false,
         address_port_strategy: AddressPortStrategy::None,
         happy_eyeballs: None,
+        tcp_window_clamp: None,
+        custom_sockopt: Vec::new(),
     };
     Ok((settings != unset).then_some(settings))
 }

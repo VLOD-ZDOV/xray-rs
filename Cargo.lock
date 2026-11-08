@@ -3367,6 +3367,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "ml-dsa",
  "prost",
  "quinn",

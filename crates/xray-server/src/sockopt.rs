@@ -1,5 +1,7 @@
 //! `streamSettings.sockopt`: socket options for listeners and freedom dials.
 
+#![forbid(unsafe_code)]
+
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::AsFd;
@@ -24,6 +26,14 @@ pub fn bind_tcp(addr: SocketAddr, sockopt: &SockoptSettings) -> io::Result<TcpLi
         warn("mark", socket.set_mark(sockopt.mark));
     }
     apply_tcp(&socket, sockopt);
+    if let Some(clamp) = sockopt.tcp_window_clamp {
+        warn(
+            "tcpWindowClamp",
+            crate::raw_sockopt::set_tcp_window_clamp(&socket, clamp),
+        );
+    }
+    let net = if addr.is_ipv6() { "tcp6" } else { "tcp4" };
+    apply_custom_sockopts(&socket, sockopt, net);
     if sockopt.tproxy != TproxyMode::Off {
         let transparent = if addr.is_ipv4() {
             socket.set_ip_transparent_v4(true)
@@ -70,6 +80,13 @@ pub fn apply_dial(socket: &TcpSocket, sockopt: &SockoptSettings) {
         warn("interface", sock.bind_device(Some(iface.as_bytes())));
     }
     apply_tcp(&sock, sockopt);
+    if let Some(clamp) = sockopt.tcp_window_clamp {
+        warn(
+            "tcpWindowClamp",
+            crate::raw_sockopt::set_tcp_window_clamp(socket, clamp),
+        );
+    }
+    apply_custom_sockopts(socket, sockopt, "tcp");
     if sockopt.tproxy != TproxyMode::Off {
         let transparent = sock
             .set_ip_transparent_v4(true)
@@ -86,6 +103,7 @@ pub fn apply_dial_udp(socket: &impl AsFd, sockopt: &SockoptSettings) {
     if let Some(iface) = &sockopt.interface {
         warn("interface", sock.bind_device(Some(iface.as_bytes())));
     }
+    apply_custom_sockopts(socket, sockopt, "udp");
     if sockopt.tproxy != TproxyMode::Off {
         let transparent = sock
             .set_ip_transparent_v4(true)
@@ -148,6 +166,34 @@ fn warn(option: &str, result: io::Result<()>) {
     }
 }
 
+fn apply_custom_sockopts(fd: &impl AsFd, sockopt: &SockoptSettings, network: &str) {
+    let os = std::env::consts::OS;
+    for custom in &sockopt.custom_sockopt {
+        if let Some(sys) = &custom.system {
+            if !sys.is_empty() && !sys.eq_ignore_ascii_case(os) {
+                log::debug(format!(
+                    "CustomSockopt system not match: want {sys} got {os}"
+                ));
+                continue;
+            }
+        }
+        if let Some(net) = &custom.network {
+            if !net.is_empty() && !network.starts_with(net) {
+                continue;
+            }
+        }
+        let res = match &custom.value {
+            crate::config::CustomSockoptValue::Int(v) => {
+                crate::raw_sockopt::setsockopt_int(fd, custom.level, custom.opt, *v)
+            }
+            crate::config::CustomSockoptValue::Str(s) => {
+                crate::raw_sockopt::setsockopt_bytes(fd, custom.level, custom.opt, s.as_bytes())
+            }
+        };
+        warn(&format!("customSockopt({})", custom.opt), res);
+    }
+}
+
 /// A freedom UDP socket with Xray's outbound mark and interface.
 pub fn bind_udp(addr: SocketAddr, sockopt: Option<&SockoptSettings>) -> io::Result<UdpSocket> {
     let Some(sockopt) = sockopt else {
@@ -165,6 +211,8 @@ pub fn bind_udp(addr: SocketAddr, sockopt: Option<&SockoptSettings>) -> io::Resu
     if let Some(iface) = &sockopt.interface {
         warn("interface", socket.bind_device(Some(iface.as_bytes())));
     }
+    let net = if addr.is_ipv6() { "udp6" } else { "udp4" };
+    apply_custom_sockopts(&socket, sockopt, net);
     if sockopt.tproxy != TproxyMode::Off {
         let transparent = if addr.is_ipv4() {
             socket.set_ip_transparent_v4(true)
@@ -797,5 +845,53 @@ mod tests {
             Some(("example.com".to_string(), 443))
         );
         assert_eq!(parse_txt_endpoint("invalid"), None);
+    }
+
+    #[tokio::test]
+    async fn test_tcp_window_clamp_and_custom_sockopt() {
+        let json_cfg = serde_json::json!({
+            "tcpWindowClamp": 65536,
+            "customSockopt": [
+                {
+                    "level": "0",
+                    "opt": "1",
+                    "value": "16",
+                    "type": "int"
+                },
+                {
+                    "system": "windows",
+                    "level": "0",
+                    "opt": "1",
+                    "value": "16",
+                    "type": "int"
+                }
+            ]
+        });
+        let sockopt = crate::config::parse_sockopt(&json_cfg, "test")
+            .unwrap()
+            .expect("should parse");
+        assert_eq!(sockopt.tcp_window_clamp, Some(65536));
+        assert_eq!(sockopt.custom_sockopt.len(), 2);
+
+        let listener = bind_tcp("127.0.0.1:0".parse().unwrap(), &sockopt)
+            .expect("bind_tcp with window clamp and custom sockopt");
+        let local_addr = listener.local_addr().unwrap();
+
+        #[cfg(target_os = "linux")]
+        {
+            let clamp_val = crate::raw_sockopt::getsockopt_int(
+                &listener,
+                libc::IPPROTO_TCP,
+                libc::TCP_WINDOW_CLAMP,
+            )
+            .expect("getsockopt TCP_WINDOW_CLAMP");
+            assert_eq!(clamp_val, 65536);
+        }
+
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        let stream = connect(socket, local_addr, Some(&sockopt)).await.unwrap();
+        let (accepted, _) = listener.accept().await.unwrap();
+        drop(stream);
+        drop(accepted);
     }
 }

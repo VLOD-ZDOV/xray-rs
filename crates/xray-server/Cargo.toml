@@ -23,6 +23,7 @@ prost.workspace = true
 h2 = { workspace = true }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "http1", "http2"] }
+libc.workspace = true
 rand.workspace = true
 regex.workspace = true
 rustls = { workspace = true }
