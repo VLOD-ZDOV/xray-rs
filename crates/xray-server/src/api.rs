@@ -785,6 +785,7 @@ pub async fn serve(
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             };
             let inbound_manager = inbound_manager.clone();
