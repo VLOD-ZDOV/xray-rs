@@ -39,8 +39,17 @@ pub fn transport(
         .or_else(|| stream.get("splithttpSettings"))
         .cloned()
         .unwrap_or(json!({}));
-    if let Some(ds) = xhttp_settings
-        .get_mut("downloadSettings")
+    // Like Xray, "extra" replaces the outer settings wholesale, downloadSettings included.
+    let has_extra = xhttp_settings.get("extra").is_some();
+    let holder = if has_extra {
+        xhttp_settings
+            .get_mut("extra")
+            .and_then(Value::as_object_mut)
+    } else {
+        xhttp_settings.as_object_mut()
+    };
+    if let Some(ds) = holder
+        .and_then(|h| h.get_mut("downloadSettings"))
         .and_then(Value::as_object_mut)
     {
         if !ds.contains_key("network") && !ds.contains_key("method") {
@@ -48,21 +57,6 @@ pub fn transport(
         }
         if let Some(tls) = ds.get_mut("tlsSettings").and_then(Value::as_object_mut) {
             tls.remove("certificates");
-        }
-    } else if let Some(extra) = xhttp_settings
-        .get_mut("extra")
-        .and_then(Value::as_object_mut)
-    {
-        if let Some(ds) = extra
-            .get_mut("downloadSettings")
-            .and_then(Value::as_object_mut)
-        {
-            if !ds.contains_key("network") && !ds.contains_key("method") {
-                ds.insert("network".to_string(), json!("xhttp"));
-            }
-            if let Some(tls) = ds.get_mut("tlsSettings").and_then(Value::as_object_mut) {
-                tls.remove("certificates");
-            }
         }
     }
 
@@ -161,11 +155,6 @@ pub fn transport(
         {
             return Err("invalid nested downloadSettings or stream-one combination".to_owned());
         }
-        let is_protected_upload = matches!(security, "tls" | "reality");
-        if is_protected_upload && down.stream.security == StreamSecurity::None {
-            return Err("protected upload cannot use plaintext download".to_owned());
-        }
-
         let down_host = match &down.address {
             xray_config::TargetAddr::Ip(ip) => Host::Ip(*ip),
             xray_config::TargetAddr::Domain(domain) if !domain.is_empty() => {
@@ -178,9 +167,9 @@ pub fn transport(
         let xhttp_val = stream
             .get("xhttpSettings")
             .or_else(|| stream.get("splithttpSettings"));
-        let down_val = xhttp_val.and_then(|x| {
-            x.get("downloadSettings")
-                .or_else(|| x.get("extra").and_then(|e| e.get("downloadSettings")))
+        let down_val = xhttp_val.and_then(|x| match x.get("extra") {
+            Some(extra) => extra.get("downloadSettings"),
+            _ => x.get("downloadSettings"),
         });
 
         let down_security = down_val
