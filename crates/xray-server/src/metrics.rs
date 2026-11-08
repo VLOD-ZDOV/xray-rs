@@ -27,8 +27,13 @@ pub fn parse(root: &Value) -> Result<Option<Settings>, String> {
     let Some(section) = root.get("metrics").filter(|v| !v.is_null()) else {
         return Ok(None);
     };
-    let tag = section.get("tag").and_then(Value::as_str).unwrap_or("");
-    let listen = section.get("listen").and_then(Value::as_str).unwrap_or("");
+    let text = |key: &str| match section.get(key) {
+        None | Some(Value::Null) => Ok(""),
+        Some(Value::String(s)) => Ok(s.as_str()),
+        Some(_) => Err(format!("metrics: {key} must be a string")),
+    };
+    let tag = text("tag")?;
+    let listen = text("listen")?;
     if tag.is_empty() && listen.is_empty() {
         return Err("Metrics must have a tag or listen address.".into());
     }
@@ -63,7 +68,10 @@ pub async fn listen(addr: SocketAddr) -> Result<(), String> {
                 Ok((stream, _)) => {
                     tokio::spawn(serve(stream));
                 }
-                Err(e) => log::warn(format!("metrics accept failed: {e}")),
+                Err(e) => {
+                    log::warn(format!("metrics accept failed: {e}"));
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
             }
         }
     });
@@ -79,7 +87,10 @@ where
     let service = hyper::service::service_fn(|req: Request<hyper::body::Incoming>| async move {
         Ok::<_, Infallible>(respond(req.uri().path()))
     });
+    // hyper ignores header_read_timeout unless a timer is set.
     let _ = hyper::server::conn::http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(30))
         .serve_connection(TokioIo::new(io), service)
         .await;
 }
@@ -133,7 +144,9 @@ fn debug_vars() -> Value {
             .collect::<BTreeMap<_, _>>()),
     };
     json!({
-        "cmdline": std::env::args().collect::<Vec<_>>(),
+        "cmdline": std::env::args_os()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
         "observatory": observatory,
         "stats": grouped,
     })
