@@ -381,11 +381,13 @@ impl ServerConnector {
                 let idle_timeout_secs = grpc
                     .get("idle_timeout")
                     .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32;
+                    .map_or(Ok(0), u32::try_from)
+                    .map_err(|_| err("grpcSettings.idle_timeout is out of range"))?;
                 let health_check_timeout_secs = grpc
                     .get("health_check_timeout")
                     .and_then(Value::as_u64)
-                    .unwrap_or(20) as u32;
+                    .map_or(Ok(20), u32::try_from)
+                    .map_err(|_| err("grpcSettings.health_check_timeout is out of range"))?;
                 let permit_without_stream = grpc
                     .get("permit_without_stream")
                     .and_then(Value::as_bool)
@@ -393,7 +395,8 @@ impl ServerConnector {
                 let initial_windows_size = grpc
                     .get("initial_windows_size")
                     .and_then(Value::as_u64)
-                    .unwrap_or(0) as u32;
+                    .map_or(Ok(0), u32::try_from)
+                    .map_err(|_| err("grpcSettings.initial_windows_size is out of range"))?;
                 TransportLayer::Grpc(GrpcTransport::new(GrpcConfig {
                     service_name,
                     multi_mode,
@@ -488,8 +491,7 @@ impl ServerConnector {
         timeout(CONNECT_TIMEOUT, async {
             if let Some(kcp_settings) = &self.kcp {
                 let candidate = candidates[0];
-                let protector =
-                    OutboundProtector::new(self.sockopt.clone(), self.send_through.clone(), None);
+                let protector = OutboundProtector::new(None, None, dialer.socket_protector_arc());
                 let duplex = crate::kcp::dial(candidate, kcp_settings, Some(&protector)).await?;
                 let base: BoxedTransportStream = Box::new(TransportStreamWrapper(duplex));
                 return match &self.connector {
