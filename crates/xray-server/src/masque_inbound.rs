@@ -217,28 +217,26 @@ async fn send_h2_data(stream: &mut h2::SendStream<Bytes>, data: Bytes) -> std::i
     Ok(())
 }
 
+/// Xray's `validator.get`: Basic credentials, the email without case, the
+/// password in constant time. With no users nobody gets in.
 fn check_auth(headers: &http::HeaderMap, users: &[MasqueUser]) -> Option<MasqueUser> {
-    if users.is_empty() {
-        return Some(MasqueUser {
-            email: "anonymous".into(),
-            pass: "".into(),
-            level: 0,
-        });
-    }
     let auth = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
-    let stripped = auth
-        .strip_prefix("Basic ")
-        .or_else(|| auth.strip_prefix("basic "))?;
+    let (scheme, encoded) = auth.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
     use base64::Engine;
     let decoded = base64::engine::general_purpose::STANDARD
-        .decode(stripped.trim())
+        .decode(encoded.trim())
         .ok()?;
     let creds = String::from_utf8(decoded).ok()?;
     let (user, pass) = creds.split_once(':')?;
-    users
-        .iter()
-        .find(|u| u.email.eq_ignore_ascii_case(user) && u.pass == pass)
-        .cloned()
+    let found = users.iter().find(|u| u.email.eq_ignore_ascii_case(user))?;
+    constant_time_eq(found.pass.as_bytes(), pass.as_bytes()).then(|| found.clone())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 pub async fn start(
