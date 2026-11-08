@@ -47,6 +47,7 @@ mod vmess_outbound;
 mod wg;
 mod wg_inbound;
 mod ws;
+mod xdrive;
 mod xhttp;
 mod xhttp_outbound;
 
@@ -363,6 +364,9 @@ pub(crate) fn select_inbound_handler(
         (InboundProtocol::Masque, _) => {
             unreachable!("masque is handled above")
         }
+        (_, InboundTransport::Xdrive(_)) => {
+            unreachable!("xdrive is handled above")
+        }
     }
 }
 
@@ -411,6 +415,11 @@ pub(crate) async fn start_inbound(
 
     if inbound.protocol == InboundProtocol::Masque {
         let abort = masque_inbound::start(inbound, ctx.clone(), router).await?;
+        return Ok((ctx, Some(abort), None));
+    }
+
+    if let InboundTransport::Xdrive(settings) = &inbound.transport {
+        let abort = xdrive::start_inbound(inbound, ctx.clone(), settings.clone()).await?;
         return Ok((ctx, Some(abort), None));
     }
 

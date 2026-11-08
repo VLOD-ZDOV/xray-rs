@@ -53,6 +53,7 @@ pub enum InboundTransport {
     Xhttp(Box<XhttpSettings>),
     Hysteria,
     Kcp(Arc<crate::kcp::KcpSettings>),
+    Xdrive(Arc<crate::xdrive::XdriveConfig>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -816,10 +817,18 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let is_grpc = matches!(network, "grpc" | "gun");
     let is_xhttp = matches!(network, "xhttp" | "splithttp");
     let is_kcp = matches!(network, "kcp" | "mkcp");
+    let is_xdrive = network == "xdrive";
     let supported_security = matches!(security, "" | "none" | "tls" | "reality");
 
     let kcp_settings = if is_kcp {
         Some(Arc::new(parse_kcp(stream)?))
+    } else {
+        None
+    };
+
+    let xdrive_settings = if is_xdrive {
+        let xs = stream.get("xdriveSettings").unwrap_or(&Value::Null);
+        Some(Arc::new(crate::xdrive::parse_xdrive_settings(xs)?))
     } else {
         None
     };
@@ -829,7 +838,13 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             log::warn(format!("skipping inbound {tag:?}: Hysteria requires TLS"));
             return Ok(None);
         }
-    } else if (!is_tcp && !is_ws && !is_httpupgrade && !is_grpc && !is_xhttp && !is_kcp)
+    } else if (!is_tcp
+        && !is_ws
+        && !is_httpupgrade
+        && !is_grpc
+        && !is_xhttp
+        && !is_kcp
+        && !is_xdrive)
         || !supported_security
     {
         log::warn(format!(
@@ -860,10 +875,14 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         None
     };
 
-    let port = parse_port(item.get("port")).ok_or("invalid or missing port")?;
+    let port = if is_xdrive {
+        parse_port(item.get("port")).unwrap_or(0)
+    } else {
+        parse_port(item.get("port")).ok_or("invalid or missing port")?
+    };
     let listen = match str_field(item, "listen") {
         "" => String::new(),
-        addr if addr.starts_with('/') || addr.starts_with('@') => {
+        addr if !is_xdrive && (addr.starts_with('/') || addr.starts_with('@')) => {
             return Err("unix socket listen is not supported".into());
         }
         addr => addr.to_owned(),
@@ -1085,6 +1104,8 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         InboundTransport::Hysteria
     } else if let Some(kcp) = kcp_settings {
         InboundTransport::Kcp(kcp)
+    } else if let Some(xdrive) = xdrive_settings {
+        InboundTransport::Xdrive(xdrive)
     } else if is_tcp {
         InboundTransport::Tcp
     } else if is_ws {

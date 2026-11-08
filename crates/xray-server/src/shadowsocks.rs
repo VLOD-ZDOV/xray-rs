@@ -260,7 +260,7 @@ impl ShadowsocksUdpHandler {
             };
             let handler = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = handler.serve_udp_session_2022(init, rx).await {
+                if let Err(e) = Box::pin(handler.serve_udp_session_2022(init, rx)).await {
                     log::debug(format!("shadowsocks 2022 udp session {peer} ended: {e}"));
                 }
                 handler.sessions.lock().await.remove(&peer);

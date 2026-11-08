@@ -118,6 +118,8 @@ pub struct VlessOutbound {
     pub reverse: Option<String>,
     pub testseed: [u32; 4],
     pub kcp: Option<Arc<crate::kcp::KcpSettings>>,
+    pub xdrive: Option<Arc<crate::xdrive::XdriveConfig>>,
+    pub encryption: Option<xray_vless_encryption::Client>,
 }
 
 impl fmt::Debug for VlessOutbound {
@@ -220,6 +222,22 @@ impl VlessOutbound {
             DEFAULT_VISION_SEED,
         );
 
+        let enc_str = user
+            .get("encryption")
+            .or_else(|| settings.get("encryption"))
+            .and_then(Value::as_str)
+            .unwrap_or("none");
+        let encryption = if enc_str != "none" && !enc_str.is_empty() {
+            let enc: xray_vless_encryption::Encryption = enc_str
+                .parse()
+                .map_err(|e| err(&format!("invalid vless encryption {enc_str:?}: {e:?}")))?;
+            enc.client()
+                .cloned()
+                .map(xray_vless_encryption::Client::new)
+        } else {
+            None
+        };
+
         let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
         let network = stream
             .get("network")
@@ -260,8 +278,17 @@ impl VlessOutbound {
         } else {
             None
         };
+        let is_xdrive = network == "xdrive";
+        let xdrive = if is_xdrive {
+            let xs = stream.get("xdriveSettings").unwrap_or(&Value::Null);
+            Some(Arc::new(
+                crate::xdrive::parse_xdrive_settings(xs).map_err(|e| err(&e))?,
+            ))
+        } else {
+            None
+        };
         let transport = match network {
-            "" | "tcp" | "raw" | "kcp" | "mkcp" => TransportLayer::Raw,
+            "" | "tcp" | "raw" | "kcp" | "mkcp" | "xdrive" => TransportLayer::Raw,
             "ws" | "websocket" => {
                 let ws = stream.get("wsSettings").unwrap_or(&Value::Null);
                 let path = ws
@@ -441,6 +468,8 @@ impl VlessOutbound {
             reverse,
             testseed,
             kcp,
+            xdrive,
+            encryption,
         })
     }
 
@@ -506,6 +535,71 @@ impl VlessOutbound {
         port: u16,
         command: VlessCommand,
     ) -> io::Result<VlessResponseStream<VisionTransportStream>> {
+        if let Some(ref xdrive_cfg) = self.xdrive {
+            let carrier = timeout(CONNECT_TIMEOUT, async {
+                let stream = crate::xdrive::dial(xdrive_cfg).await?;
+                let base: BoxedTransportStream =
+                    Box::new(crate::outbound_transport::TransportStreamWrapper(stream));
+                Ok::<BoxedTransportStream, io::Error>(base)
+            })
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("connect to vless outbound {:?} timed out", self.tag),
+                )
+            })??;
+
+            let carrier = if let Some(ref enc) = self.encryption {
+                let enc_stream = enc
+                    .connect(carrier)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))?;
+                Box::new(crate::outbound_transport::TransportStreamWrapper(
+                    enc_stream,
+                )) as BoxedTransportStream
+            } else {
+                carrier
+            };
+
+            let req_target = Target::new(
+                match host {
+                    Host::Ip(ip) => TargetAddr::Ip(*ip),
+                    Host::Domain(d) => TargetAddr::Domain(d.clone()),
+                },
+                port,
+                match command {
+                    VlessCommand::Tcp => xray_routing::Network::Tcp,
+                    VlessCommand::Udp => xray_routing::Network::Udp,
+                    _ => xray_routing::Network::Tcp,
+                },
+            );
+
+            let flow = if command == VlessCommand::Tcp {
+                self.flow.clone()
+            } else {
+                None
+            };
+
+            let request = VlessRequest {
+                user_id: self.user_id,
+                command,
+                target: req_target,
+                flow,
+            };
+
+            let header = encode_request_header(&request)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+
+            let mut carrier = carrier;
+            carrier.write_all(&header).await?;
+            carrier.flush().await?;
+
+            return Ok(VlessResponseStream::new(VisionTransportStream::new(
+                carrier,
+            )));
+        }
+
         let (server_host, server_port) = match &self.server.0 {
             Host::Domain(d) => {
                 if let Some(strategy) = self.sockopt.as_ref().map(|s| s.address_port_strategy) {
@@ -639,6 +733,18 @@ impl VlessOutbound {
             )
         })??;
 
+        let carrier = if let Some(ref enc) = self.encryption {
+            let enc_stream = enc
+                .connect(carrier)
+                .await
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            Box::new(crate::outbound_transport::TransportStreamWrapper(
+                enc_stream,
+            )) as BoxedTransportStream
+        } else {
+            carrier
+        };
+
         let req_target = Target::new(
             match host {
                 Host::Ip(ip) => TargetAddr::Ip(*ip),
@@ -704,7 +810,11 @@ impl VlessOutbound {
         host: &Host,
         port: u16,
     ) -> io::Result<Box<dyn crate::outbound::Stream>> {
-        let response_stream = self.open_raw_stream(host, port, VlessCommand::Tcp).await?;
+        let command = match host {
+            Host::Domain(d) if d == "v1.mux.cool" => VlessCommand::Mux,
+            _ => VlessCommand::Tcp,
+        };
+        let response_stream = self.open_raw_stream(host, port, command).await?;
         let is_vision = matches!(
             self.flow.as_deref(),
             Some("xtls-rprx-vision" | "xtls-rprx-vision-udp443")
