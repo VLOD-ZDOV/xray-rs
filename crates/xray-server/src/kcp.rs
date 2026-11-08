@@ -335,7 +335,9 @@ impl PacketObfuscator {
             .iter()
             .map(|m| match m {
                 KcpMask::Original => Layer::Original,
-                KcpMask::Header { kind, domain } => Layer::Header(HeaderGenerator::new(*kind, domain)),
+                KcpMask::Header { kind, domain } => {
+                    Layer::Header(HeaderGenerator::new(*kind, domain))
+                }
                 KcpMask::Aes(password) => {
                     let hash = Sha256::digest(password.as_bytes());
                     let key_bytes: [u8; 16] = hash[..16].try_into().unwrap();
@@ -632,6 +634,7 @@ impl KcpDriver {
 
         let mut read_buf = vec![0u8; 4096];
         let mut app_eof = false;
+        let mut send_full = false;
 
         loop {
             tokio::select! {
@@ -685,7 +688,7 @@ impl KcpDriver {
                     s.flush().await;
                 }
                 // Application write from DuplexStream
-                n_res = self.duplex_internal.read(&mut read_buf), if !app_eof => {
+                n_res = self.duplex_internal.read(&mut read_buf), if !app_eof && !send_full => {
                     match n_res {
                         Ok(0) => {
                             app_eof = true;
@@ -711,6 +714,9 @@ impl KcpDriver {
             if s.terminated || (s.terminating && s.peer_closed) {
                 break;
             }
+            // Like Xray's sending worker, stop taking application data while
+            // the unacknowledged window is full.
+            send_full = s.send_queue.len() as u32 > s.settings.max_sending_window / s.settings.mtu;
         }
 
         // Final cleanup
