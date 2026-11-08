@@ -25,12 +25,12 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let server_users: Vec<ServerUser> = {
+    let (server_users, levels): (Vec<ServerUser>, Vec<u32>) = {
         let users = ctx.users.read().unwrap_or_else(PoisonError::into_inner);
         users
             .iter()
-            .map(|u| ServerUser::new(&u.id, u.email.clone()))
-            .collect()
+            .map(|u| (ServerUser::new(&u.id, u.email.clone()), u.level))
+            .unzip()
     };
 
     let hs_res = timeout(
@@ -50,13 +50,7 @@ where
     };
 
     let user_email = server_users[hs.user_index].email.clone();
-    let user_level = ctx
-        .users
-        .read()
-        .unwrap()
-        .get(hs.user_index)
-        .map(|u| u.level)
-        .unwrap_or(0);
+    let user_level = levels.get(hs.user_index).copied().unwrap_or(0);
     let user_policy = crate::policy::for_level(user_level);
     let _online = stats::get().connect(&user_email, user_level, peer.ip());
 
@@ -155,13 +149,11 @@ where
             let up = async {
                 let mut packet = vec![0u8; 65535];
                 loop {
-                    activity.touch();
-                    let n = timeout(user_policy.conn_idle, server_r.read(&mut packet))
-                        .await
-                        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
+                    let n = server_r.read(&mut packet).await?;
                     if n == 0 {
                         break;
                     }
+                    activity.touch();
                     cone.send_to(&packet[..n], target_addr).await?;
                     traffic.up(n);
                 }
@@ -171,10 +163,8 @@ where
             let down = async {
                 let mut buf = vec![0u8; 65535];
                 loop {
+                    let (n, _from) = cone.recv_from(&mut buf).await?;
                     activity.touch();
-                    let (n, _from) = timeout(user_policy.conn_idle, cone.recv_from(&mut buf))
-                        .await
-                        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
                     server_w.write_all(&buf[..n]).await?;
                     server_w.flush().await?;
                     traffic.down(n);
