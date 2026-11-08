@@ -197,7 +197,9 @@ async fn serve_udp_session(
     let cone = ConeUdp::open(ctx.router.clone(), &decision).await?;
     let traffic = stats::get().traffic(&ctx.tag, "", 0, &decision.tag);
     let activity = Activity::new();
-    if let Ok(target) = cone.target(&host, port).await {
+    // The destination is fixed, so resolve it once per session instead of per packet.
+    let mut resolved = cone.target(&host, port).await.ok();
+    if let Some(target) = resolved {
         cone.send_to(&initial_payload, target).await?;
         traffic.up(initial_payload.len());
     }
@@ -205,7 +207,10 @@ async fn serve_udp_session(
     let up = Box::pin(async {
         while let Some(packet) = rx.recv().await {
             activity.touch();
-            if let Ok(addr) = cone.target(&host, port).await {
+            if resolved.is_none() {
+                resolved = cone.target(&host, port).await.ok();
+            }
+            if let Some(addr) = resolved {
                 let _ = cone.send_to(&packet, addr).await;
                 traffic.up(packet.len());
             }
