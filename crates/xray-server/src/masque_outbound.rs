@@ -16,11 +16,13 @@ use xray_wireguard::{Client, Ip, Packet, TcpStream, UdpSession};
 
 use crate::log;
 use crate::masque_capsule::{
-    decode_address_assign_value, decode_datagram_value, encode_datagram_capsule, read_capsule,
-    CAPSULE_ADDRESS_ASSIGN, CAPSULE_DATAGRAM,
+    decode_address_assign_value, decode_datagram_value, encode_datagram_capsule, first_assigned_ip,
+    read_capsule, CAPSULE_ADDRESS_ASSIGN, CAPSULE_DATAGRAM,
 };
 use crate::masque_inbound::H2StreamReader;
 use crate::vless::{resolve_all, Host};
+
+const ESTABLISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug)]
 pub struct MasqueOutbound {
@@ -28,6 +30,7 @@ pub struct MasqueOutbound {
     pub address: String,
     pub port: u16,
     pub path: String,
+    pub host: String,
     pub headers: HashMap<String, String>,
     pub tls_config: TlsClientConfig,
     pub alpn: Vec<String>,
@@ -48,13 +51,13 @@ impl MasqueOutbound {
             return Err(err("MASQUE: \"address\" is not set"));
         }
 
-        let port = settings
-            .get("port")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| err("MASQUE: \"port\" is not set"))? as u16;
-        if port == 0 {
-            return Err(err("MASQUE: \"port\" is not set"));
-        }
+        let port = match settings.get("port").and_then(Value::as_u64) {
+            Some(p) if p > 0 && p <= u64::from(u16::MAX) => p as u16,
+            Some(p) if p > u64::from(u16::MAX) => {
+                return Err(format!("MASQUE: invalid \"port\" {p}"))
+            }
+            _ => return Err(err("MASQUE: \"port\" is not set")),
+        };
 
         if let Some(dns) = settings.get("remoteDNS").and_then(Value::as_array) {
             for d in dns {
@@ -88,25 +91,63 @@ impl MasqueOutbound {
         let alpn = tls_config.alpn.clone();
 
         let masque_settings = stream.get("masqueSettings").unwrap_or(&Value::Null);
-        let path = masque_settings
-            .get("path")
+        if masque_settings.get("warp").is_some_and(|w| !w.is_null()) {
+            return Err(err("MASQUE: \"warp\" in masqueSettings is not supported"));
+        }
+        if masque_settings.get("xmux").is_some_and(|w| !w.is_null()) {
+            log::warn("MASQUE: masqueSettings \"xmux\" is not supported and is ignored");
+        }
+        let path = crate::masque_capsule::normalize_path(
+            masque_settings
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        )?;
+        let host_override = masque_settings
+            .get("host")
             .and_then(Value::as_str)
-            .unwrap_or("/.well-known/masque/ip/*/*/")
+            .unwrap_or("")
             .to_owned();
+        if !host_override.is_empty()
+            && http::uri::Authority::try_from(host_override.as_str()).is_err()
+        {
+            return Err(format!("invalid \"host\": {host_override}"));
+        }
 
+        let user = masque_settings
+            .get("user")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let pass = masque_settings
+            .get("pass")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let has_creds = !user.is_empty() || !pass.is_empty();
         let mut headers = HashMap::new();
         if let Some(hdr_obj) = masque_settings.get("headers").and_then(Value::as_object) {
             for (k, v) in hdr_obj {
                 if let Some(s) = v.as_str() {
+                    match k.to_ascii_lowercase().as_str() {
+                        "host" | "capsule-protocol" => {
+                            return Err(format!("\"headers\" can't contain \"{k}\""));
+                        }
+                        "authorization" if has_creds => {
+                            return Err(format!(
+                                "\"headers\" can't contain \"{k}\" when \"user\" or \"pass\" is set"
+                            ));
+                        }
+                        _ => {}
+                    }
                     headers.insert(k.clone(), s.to_owned());
                 }
             }
         }
-        let user = masque_settings.get("user").and_then(Value::as_str);
-        let pass = masque_settings.get("pass").and_then(Value::as_str);
-        if let (Some(u), Some(p)) = (user, pass) {
+        if has_creds {
+            if user.contains(':') {
+                return Err(format!("invalid \"user\": {user}"));
+            }
             use base64::Engine;
-            let cred = format!("{u}:{p}");
+            let cred = format!("{user}:{pass}");
             let b64 = base64::engine::general_purpose::STANDARD.encode(cred.as_bytes());
             headers.insert("Authorization".to_string(), format!("Basic {b64}"));
         }
@@ -116,6 +157,7 @@ impl MasqueOutbound {
             address,
             port,
             path,
+            host: host_override,
             headers,
             tls_config,
             alpn,
@@ -151,6 +193,22 @@ impl MasqueOutbound {
         session.send(bytes).await.map_err(crate::wg::to_io)
     }
 
+    /// Xray's `authority()`: the host override, else the server name with
+    /// IPv6 literals bracketed and the port left out for 443.
+    fn authority(&self) -> String {
+        if !self.host.is_empty() {
+            return self.host.clone();
+        }
+        let name = self.tls_config.server_name.trim_matches(['[', ']']);
+        let v6 = name.parse::<std::net::Ipv6Addr>().is_ok();
+        match (self.port, v6) {
+            (443, false) => name.to_owned(),
+            (443, true) => format!("[{name}]"),
+            (port, false) => format!("{name}:{port}"),
+            (port, true) => format!("[{name}]:{port}"),
+        }
+    }
+
     async fn get_client(&self) -> io::Result<Client> {
         let mut guard = self.client.lock().await;
         if let Some(ref c) = *guard {
@@ -161,11 +219,18 @@ impl MasqueOutbound {
 
         let use_h2 =
             self.alpn.contains(&"h2".to_string()) && !self.alpn.contains(&"h3".to_string());
-        let client = if use_h2 {
-            self.start_h2_client().await?
-        } else {
-            self.start_h3_client().await?
+        let start = async {
+            if use_h2 {
+                self.start_h2_client().await
+            } else {
+                self.start_h3_client().await
+            }
         };
+        let client = tokio::time::timeout(ESTABLISH_TIMEOUT, start)
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "MASQUE connection timed out")
+            })??;
 
         *guard = Some(client.clone());
         Ok(client)
@@ -213,10 +278,7 @@ impl MasqueOutbound {
 
         let mut req_builder = Request::builder()
             .method(Method::CONNECT)
-            .uri(format!(
-                "https://{}:{}{}",
-                server_name, self.port, self.path
-            ))
+            .uri(format!("https://{}{}", self.authority(), self.path))
             .header("Capsule-Protocol", "?1")
             .header("User-Agent", "Go-http-client/2.0")
             .extension(h2::ext::Protocol::from("connect-ip"));
@@ -254,13 +316,9 @@ impl MasqueOutbound {
         }
         let assignments = decode_address_assign_value(&first_cap.value)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let assigned_ip = assignments
-            .into_iter()
-            .next()
-            .map(|(_, ip, _)| ip)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "no address assigned by server")
-            })?;
+        let assigned_ip = first_assigned_ip(&assignments).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "no address assigned by server")
+        })?;
 
         let (to_tunnel_tx, mut to_tunnel_rx) = mpsc::channel::<Packet<Ip>>(128);
         let (from_tunnel_tx, from_tunnel_rx) = mpsc::channel::<Packet<Ip>>(128);
@@ -363,10 +421,7 @@ impl MasqueOutbound {
 
         let mut req_builder = Request::builder()
             .method(Method::CONNECT)
-            .uri(format!(
-                "https://{}:{}{}",
-                server_name, self.port, self.path
-            ))
+            .uri(format!("https://{}{}", self.authority(), self.path))
             .header("Capsule-Protocol", "?1")
             .header("User-Agent", "Go-http-client/2.0")
             .extension(h2::ext::Protocol::from("connect-ip"));
@@ -392,14 +447,28 @@ impl MasqueOutbound {
         let stream_id = stream.id();
         let quarter_stream_id = stream_id.into_inner() / 4;
 
-        // Read initial data from request stream
+        // Read until the first capsule is complete
         let mut initial_data = BytesMut::new();
-        while initial_data.len() < 16 {
-            if let Some(mut chunk) = stream.recv_data().await.map_err(io::Error::other)? {
-                let bytes = chunk.copy_to_bytes(chunk.remaining());
-                initial_data.extend_from_slice(&bytes);
-            } else {
-                break;
+        loop {
+            if let Some((_, o1)) = crate::masque_capsule::decode_varint(&initial_data) {
+                if let Some((len, o2)) = crate::masque_capsule::decode_varint(&initial_data[o1..]) {
+                    if len > 65536 * 2 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "capsule exceeds maximum allowed length",
+                        ));
+                    }
+                    if initial_data.len() as u64 >= (o1 + o2) as u64 + len {
+                        break;
+                    }
+                }
+            }
+            match stream.recv_data().await.map_err(io::Error::other)? {
+                Some(mut chunk) => {
+                    let bytes = chunk.copy_to_bytes(chunk.remaining());
+                    initial_data.extend_from_slice(&bytes);
+                }
+                None => return Err(io::ErrorKind::UnexpectedEof.into()),
             }
         }
 
@@ -416,13 +485,9 @@ impl MasqueOutbound {
         }
         let assignments = decode_address_assign_value(&first_cap.value)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let assigned_ip = assignments
-            .into_iter()
-            .next()
-            .map(|(_, ip, _)| ip)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "no address assigned by server")
-            })?;
+        let assigned_ip = first_assigned_ip(&assignments).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "no address assigned by server")
+        })?;
 
         let (to_tunnel_tx, mut to_tunnel_rx) = mpsc::channel::<Packet<Ip>>(128);
         let (from_tunnel_tx, from_tunnel_rx) = mpsc::channel::<Packet<Ip>>(128);
