@@ -551,6 +551,7 @@ impl DnsOutbound {
                     allow_insecure: *allow_insecure,
                     pinned_peer_cert_sha256: pinned_peer_cert_sha256.clone(),
                     verify_peer_cert_by_name: verify_peer_cert_by_name.clone(),
+                    custom_roots: Vec::new(),
                     alpn: alpn.clone(),
                     fingerprint: fingerprint.clone(),
                 }))
@@ -4104,6 +4105,7 @@ fn dns_tcp_connector(stream: &StreamSettings) -> Result<DnsTcpConnector, CoreErr
                     allow_insecure: tls.allow_insecure,
                     pinned_peer_cert_sha256: tls.pinned_peer_cert_sha256.clone(),
                     verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
+                    custom_roots: Vec::new(),
                     alpn: tls.alpn.clone(),
                     fingerprint: tls.fingerprint.clone(),
                 }),
@@ -5317,6 +5319,7 @@ mod tests {
                 allow_insecure: false,
                 pinned_peer_cert_sha256: vec![[0x11; 32]],
                 verify_peer_cert_by_name: vec!["resolver-cert.example".to_owned()],
+                custom_roots: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: None,
             })
@@ -5358,6 +5361,7 @@ mod tests {
                     allow_insecure: false,
                     pinned_peer_cert_sha256: vec![[0x22; 32]],
                     verify_peer_cert_by_name: vec!["dynamic-cert.example".to_owned()],
+                    custom_roots: Vec::new(),
                     alpn: Vec::new(),
                     fingerprint: None,
                 })
@@ -5438,6 +5442,7 @@ mod tests {
                 allow_insecure: false,
                 pinned_peer_cert_sha256: vec![[0x44; 32]],
                 verify_peer_cert_by_name: vec!["cert.example".to_owned()],
+                custom_roots: Vec::new(),
                 alpn: vec!["h2".to_owned()],
                 fingerprint: Some("firefox".to_owned()),
             })
@@ -5480,6 +5485,7 @@ mod tests {
                     allow_insecure: false,
                     pinned_peer_cert_sha256: vec![[0x55; 32]],
                     verify_peer_cert_by_name: vec!["cert.example".to_owned()],
+                    custom_roots: Vec::new(),
                     alpn: vec!["h2".to_owned()],
                     fingerprint: Some("unsafe".to_owned()),
                 })
@@ -9958,6 +9964,7 @@ mod tests {
                 allow_insecure: false,
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
+                custom_roots: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some("chrome".to_owned()),
             }),
@@ -10072,6 +10079,7 @@ mod tests {
                 allow_insecure: false,
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
+                custom_roots: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some("chrome".to_owned()),
             }),

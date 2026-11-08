@@ -91,6 +91,7 @@ async fn protect_rejection_sends_no_tcp_tls_or_reality_bytes() {
             allow_insecure: false,
             pinned_peer_cert_sha256: vec![],
             verify_peer_cert_by_name: vec![],
+            custom_roots: Vec::new(),
             alpn: vec![],
             fingerprint: None,
         }),

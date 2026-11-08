@@ -102,6 +102,10 @@ pub struct TlsClientConfig {
     /// when any DNS or IP SAN matches; the handshake still sends
     /// `server_name` as SNI independently.
     pub verify_peer_cert_by_name: Vec<String>,
+    /// `tlsSettings.certificates` with usage `verify`: added to the system
+    /// roots, as Xray's `getCertPool` does. A peer that presents one of them
+    /// as its own certificate is checked for time and name like Go's x509.
+    pub custom_roots: Vec<rustls::pki_types::CertificateDer<'static>>,
     /// `tlsSettings.alpn`. The TLS dial combines this list with the stream
     /// transport's handshake policy: RAW follows Xray's exact-list gate,
     /// WebSocket/HTTPUpgrade force HTTP/1.1 except for Xray's h2/http1

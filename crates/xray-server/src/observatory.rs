@@ -627,6 +627,7 @@ async fn probe_outbound_inner(
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: vec!["http/1.1".to_string()],
             fingerprint: None,
         };

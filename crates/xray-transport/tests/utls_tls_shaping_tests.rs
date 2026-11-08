@@ -68,6 +68,7 @@ mod utls_tls_shaping_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: alpn.iter().map(|value| (*value).to_owned()).collect(),
             fingerprint: Some(fingerprint.to_owned()),
         }
@@ -407,6 +408,7 @@ mod utls_tls_shaping_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("unsafe".to_owned()),
         })
@@ -431,6 +433,7 @@ mod utls_tls_shaping_tests {
                 allow_insecure: false,
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
+                custom_roots: Vec::new(),
                 alpn: vec!["h2".to_owned(), "http/1.1".to_owned()],
                 fingerprint: fingerprint.clone(),
             })
@@ -457,6 +460,7 @@ mod utls_tls_shaping_tests {
                 allow_insecure: false,
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
+                custom_roots: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: fingerprint.clone(),
             })
@@ -946,6 +950,7 @@ mod utls_tls_shaping_tests {
                     allow_insecure: true,
                     pinned_peer_cert_sha256: Vec::new(),
                     verify_peer_cert_by_name: Vec::new(),
+                    custom_roots: Vec::new(),
                     alpn: alpn.iter().map(|value| (*value).to_owned()).collect(),
                     fingerprint: Some(fingerprint.to_owned()),
                 })
@@ -1048,6 +1053,7 @@ mod utls_tls_shaping_tests {
             allow_insecure: true,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
         };
@@ -1334,6 +1340,7 @@ mod utls_tls_shaping_tests {
             allow_insecure: true,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some(fingerprint.to_owned()),
         };

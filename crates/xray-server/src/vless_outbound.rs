@@ -10,8 +10,6 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::CertificateDer;
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::{mpsc, Mutex};
@@ -1202,34 +1200,7 @@ fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, String> {
             .map_err(|_| format!("incorrect pinnedPeerCertSha256 length: {pin}"))?;
         pinned_peer_cert_sha256.push(arr);
     }
-    if let Some(certs) = tls.get("certificates").and_then(Value::as_array) {
-        for cert in certs {
-            let usage = cert.get("usage").and_then(Value::as_str).unwrap_or("");
-            if usage == "verify" || usage.is_empty() {
-                use sha2::Digest;
-                let content = if let Some(file) =
-                    cert.get("certificateFile").and_then(Value::as_str)
-                {
-                    std::fs::read(file)
-                        .map_err(|e| format!("failed to read certificateFile {file:?}: {e}"))?
-                } else if let Some(cert_lines) = cert.get("certificate").and_then(Value::as_array) {
-                    cert_lines
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                        .into_bytes()
-                } else {
-                    continue;
-                };
-                for der in CertificateDer::pem_slice_iter(&content) {
-                    let der = der.map_err(|e| format!("invalid certificate PEM: {e}"))?;
-                    let hash: [u8; 32] = sha2::Sha256::digest(&der).into();
-                    pinned_peer_cert_sha256.push(hash);
-                }
-            }
-        }
-    }
+    let custom_roots = crate::outbound_transport::tls_custom_roots(tls)?;
 
     let fingerprint = tls
         .get("fingerprint")
@@ -1252,6 +1223,7 @@ fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, String> {
         allow_insecure: false,
         pinned_peer_cert_sha256,
         verify_peer_cert_by_name: Vec::new(),
+        custom_roots,
         alpn,
         fingerprint,
     }))

@@ -173,6 +173,7 @@ impl HysteriaOutbound {
                     allow_insecure: false,
                     pinned_peer_cert_sha256: tls.pinned_peer_cert_sha256.clone(),
                     verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
+                    custom_roots: Vec::new(),
                     alpn: vec!["h3".into()],
                     fingerprint: None,
                 },

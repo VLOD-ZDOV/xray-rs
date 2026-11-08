@@ -327,6 +327,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: vec![pin],
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         }
@@ -514,6 +515,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         };
@@ -548,6 +550,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         };
@@ -574,6 +577,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         };
@@ -603,6 +607,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         };
@@ -626,6 +631,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         };
@@ -651,6 +657,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         });
@@ -769,6 +776,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         });
@@ -818,6 +826,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         };
@@ -845,6 +854,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         };
@@ -1038,6 +1048,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         }));
@@ -1122,6 +1133,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
         };
@@ -1161,6 +1173,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
         };
@@ -1188,6 +1201,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: vec!["h2".to_owned()],
             fingerprint: Some("unsafe".to_owned()),
         };
@@ -1228,6 +1242,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
         };
@@ -1309,6 +1324,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: Some("chrome".to_owned()),
         };
@@ -1338,6 +1354,7 @@ mod transport_tests {
                 allow_insecure: false,
                 pinned_peer_cert_sha256: Vec::new(),
                 verify_peer_cert_by_name: Vec::new(),
+                custom_roots: Vec::new(),
                 alpn: Vec::new(),
                 fingerprint: Some("nosuchbrowser".to_owned()),
             })
@@ -1358,6 +1375,7 @@ mod transport_tests {
             allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         })

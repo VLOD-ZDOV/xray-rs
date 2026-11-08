@@ -4736,6 +4736,7 @@ mod stream_grpc_pool_tests {
             allow_insecure: true,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
+            custom_roots: Vec::new(),
             alpn: Vec::new(),
             fingerprint: None,
         });

@@ -2581,6 +2581,7 @@ async fn preprotected_tls_connector_protects_every_production_h3_candidate() {
         allow_insecure: false,
         pinned_peer_cert_sha256: Vec::new(),
         verify_peer_cert_by_name: Vec::new(),
+        custom_roots: Vec::new(),
         alpn: vec!["http/1.1".to_owned()],
         fingerprint: Some("fingerprint-is-ignored-by-h3".to_owned()),
     });

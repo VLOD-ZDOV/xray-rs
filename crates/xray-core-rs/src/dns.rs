@@ -502,6 +502,7 @@ pub(crate) fn dns_tls_client_config(server: &NameServer) -> TlsClientConfig {
         allow_insecure: false,
         pinned_peer_cert_sha256: Vec::new(),
         verify_peer_cert_by_name: Vec::new(),
+        custom_roots: Vec::new(),
         alpn: Vec::new(),
         fingerprint: None,
     }

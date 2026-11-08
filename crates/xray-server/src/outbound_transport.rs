@@ -647,33 +647,7 @@ pub(crate) fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, Str
             .map_err(|_| format!("incorrect pinnedPeerCertSha256 length: {pin}"))?;
         pinned_peer_cert_sha256.push(arr);
     }
-    if let Some(certs) = tls.get("certificates").and_then(Value::as_array) {
-        for cert in certs {
-            let usage = cert.get("usage").and_then(Value::as_str).unwrap_or("");
-            if usage.eq_ignore_ascii_case("verify") {
-                if let Some(file) = cert.get("certificateFile").and_then(Value::as_str) {
-                    let content = std::fs::read(file)
-                        .map_err(|e| format!("failed to read certificate file {file}: {e}"))?;
-                    for der in CertificateDer::pem_slice_iter(&content).flatten() {
-                        use sha2::Digest;
-                        let hash: [u8; 32] = sha2::Sha256::digest(&der).into();
-                        pinned_peer_cert_sha256.push(hash);
-                    }
-                } else if let Some(cert_lines) = cert.get("certificate").and_then(Value::as_array) {
-                    let pem = cert_lines
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    for der in CertificateDer::pem_slice_iter(pem.as_bytes()).flatten() {
-                        use sha2::Digest;
-                        let hash: [u8; 32] = sha2::Sha256::digest(&der).into();
-                        pinned_peer_cert_sha256.push(hash);
-                    }
-                }
-            }
-        }
-    }
+    let custom_roots = tls_custom_roots(tls)?;
 
     let allow_insecure = false;
 
@@ -698,6 +672,7 @@ pub(crate) fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, Str
         allow_insecure,
         pinned_peer_cert_sha256,
         verify_peer_cert_by_name: Vec::new(),
+        custom_roots,
         alpn,
         fingerprint,
     }))
@@ -784,6 +759,44 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
                 .map_err(|e| format!("invalid hex character: {e}"))
         })
         .collect()
+}
+
+/// `tlsSettings.certificates` as Xray's client `getCertPool` reads them: every
+/// certificate joins the system roots.
+pub(crate) fn tls_custom_roots(tls: &Value) -> Result<Vec<CertificateDer<'static>>, String> {
+    let mut roots = Vec::new();
+    for cert in tls
+        .get("certificates")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let content = if let Some(file) = cert.get("certificateFile").and_then(Value::as_str) {
+            std::fs::read(file)
+                .map_err(|e| format!("failed to read certificate file {file}: {e}"))?
+        } else if let Some(lines) = cert.get("certificate").and_then(Value::as_array) {
+            lines
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+                .into_bytes()
+        } else {
+            continue;
+        };
+        let mut added = false;
+        for der in CertificateDer::pem_slice_iter(&content) {
+            roots.push(
+                der.map_err(|e| format!("invalid certificate PEM: {e}"))?
+                    .into_owned(),
+            );
+            added = true;
+        }
+        if !added {
+            return Err("append cert to root".into());
+        }
+    }
+    Ok(roots)
 }
 
 #[cfg(test)]

@@ -209,6 +209,7 @@ pub(super) fn build_connector(
                 allow_insecure: tls.allow_insecure,
                 pinned_peer_cert_sha256: tls.pinned_peer_cert_sha256.clone(),
                 verify_peer_cert_by_name: tls.verify_peer_cert_by_name.clone(),
+                custom_roots: Vec::new(),
                 alpn: tls.alpn.clone(),
                 fingerprint: tls.fingerprint.clone(),
             })

@@ -105,6 +105,7 @@ async fn tls_and_reality_start_after_the_handshake() {
             allow_insecure: false,
             pinned_peer_cert_sha256: vec![],
             verify_peer_cert_by_name: vec![],
+            custom_roots: Vec::new(),
             alpn: vec![],
             fingerprint: None,
         }),
