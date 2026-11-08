@@ -105,16 +105,25 @@ async fn http(url: &str, post: Option<&[u8]>) -> Result<Vec<u8>, String> {
         .into_bytes();
         head.extend_from_slice(post.unwrap_or_default());
         stream.write_all(&head).await.map_err(|e| e.to_string())?;
+        let limit = MAX_BODY as u64 + 16 * 1024;
         let mut response = Vec::new();
         (&mut stream)
-            .take(MAX_BODY as u64 + 16 * 1024)
+            .take(limit + 1)
             .read_to_end(&mut response)
             .await
             .map_err(|e| e.to_string())?;
+        if response.len() as u64 > limit {
+            return Err(format!("{url}: response is too large"));
+        }
         let split = response
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
             .ok_or("malformed HTTP response")?;
+        // Unlike Go, an error page is not stapled: clients would reject it.
+        let status = response[..split].split(|b| *b == b' ').nth(1);
+        if status != Some(b"200".as_slice()) {
+            return Err(format!("{url}: HTTP status is not 200"));
+        }
         Ok::<_, String>(response[split + 4..].to_vec())
     };
     tokio::time::timeout(TIMEOUT, exchange)
