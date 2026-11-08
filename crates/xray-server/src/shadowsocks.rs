@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
@@ -12,6 +13,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 use xray_config::Network;
 use xray_proxy::shadowsocks::aead2017::UdpSession;
+use xray_proxy::shadowsocks2022::ServerUdpSession;
 use xray_routing::{Target, TargetAddr};
 
 use crate::config::{ShadowsocksMethod, ShadowsocksUser};
@@ -36,6 +38,8 @@ where
             "no shadowsocks users configured",
         ));
     }
+    // The handshake index counts only users of the inbound's kind.
+    let users = same_kind_users(users);
     let (mut client_r, mut client_w, user_idx, target, mut early) = match &users[0].method {
         ShadowsocksMethod::Ss2022(_) => {
             let methods: Vec<Arc<xray_proxy::shadowsocks2022::Method>> = users
@@ -152,7 +156,19 @@ where
     .await
 }
 
-type SessionsMap = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>;
+type UdpPacket = (Target, Vec<u8>);
+
+struct UdpSessionEntry {
+    id: u64,
+    client_id: u64,
+    tx: mpsc::Sender<UdpPacket>,
+}
+
+type SessionsMap = Arc<Mutex<HashMap<SocketAddr, UdpSessionEntry>>>;
+
+// Replay state outlives the per-peer session: the timestamp window is 30 s.
+const REPLAY_KEEP: Duration = Duration::from_secs(120);
+type ReplayMap = Arc<std::sync::Mutex<HashMap<u64, (Instant, ServerUdpSession)>>>;
 
 struct UdpInit2022 {
     peer: SocketAddr,
@@ -160,7 +176,23 @@ struct UdpInit2022 {
     target: Target,
     payload: Vec<u8>,
     client_id: u64,
-    packet_id: u64,
+}
+
+fn same_kind_users(users: Vec<ShadowsocksUser>) -> Vec<ShadowsocksUser> {
+    let is_2022 = users
+        .first()
+        .is_some_and(|u| matches!(u.method, ShadowsocksMethod::Ss2022(_)));
+    users
+        .into_iter()
+        .filter(|u| matches!(u.method, ShadowsocksMethod::Ss2022(_)) == is_2022)
+        .collect()
+}
+
+async fn remove_session(sessions: &SessionsMap, peer: SocketAddr, id: u64) {
+    let mut sessions = sessions.lock().await;
+    if sessions.get(&peer).is_some_and(|e| e.id == id) {
+        sessions.remove(&peer);
+    }
 }
 
 #[derive(Clone)]
@@ -168,6 +200,8 @@ pub struct ShadowsocksUdpHandler {
     socket: Arc<UdpSocket>,
     ctx: Arc<Context>,
     sessions: SessionsMap,
+    replay: ReplayMap,
+    next_id: Arc<AtomicU64>,
 }
 
 impl ShadowsocksUdpHandler {
@@ -176,6 +210,8 @@ impl ShadowsocksUdpHandler {
             socket,
             ctx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            replay: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            next_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -208,12 +244,13 @@ impl ShadowsocksUdpHandler {
                     continue;
                 }
             };
-            let users = self
-                .ctx
-                .ss_users
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
+            let users = same_kind_users(
+                self.ctx
+                    .ss_users
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            );
             let methods: Vec<Arc<xray_proxy::shadowsocks2022::Method>> = users
                 .iter()
                 .filter_map(|u| match &u.method {
@@ -221,33 +258,39 @@ impl ShadowsocksUdpHandler {
                     _ => None,
                 })
                 .collect();
-            let mut sessions = self.sessions.lock().await;
-            let packet = buf[..n].to_vec();
-            let packet = if let Some(tx) = sessions.get(&peer) {
-                // A full queue drops the datagram rather than stalling every session.
-                match tx.try_send(packet) {
-                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
-                    Err(mpsc::error::TrySendError::Closed(packet)) => {
-                        sessions.remove(&peer);
-                        packet
-                    }
-                }
-            } else {
-                packet
-            };
-
             let Ok((user_idx, target, payload, client_id, packet_id)) =
-                xray_proxy::shadowsocks2022::ServerUdpSession::decode_request(&methods, &packet)
+                ServerUdpSession::decode_request(&methods, &buf[..n])
             else {
                 continue;
             };
-
             let Some(user) = users.get(user_idx).cloned() else {
                 continue;
             };
+            let ShadowsocksMethod::Ss2022(method) = &user.method else {
+                continue;
+            };
+            if !self.check_replay(client_id, packet_id, method) {
+                continue;
+            }
+
+            let mut sessions = self.sessions.lock().await;
+            let mut packet = (target, payload);
+            if let Some(entry) = sessions.get(&peer) {
+                if entry.client_id == client_id {
+                    // A full queue drops the datagram rather than stalling every session.
+                    match entry.tx.try_send(packet) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
+                        Err(mpsc::error::TrySendError::Closed(p)) => packet = p,
+                    }
+                }
+                // A new client session ID on the same address replaces the old session.
+                sessions.remove(&peer);
+            }
+            let (target, payload) = packet;
 
             let (tx, rx) = mpsc::channel(128);
-            sessions.insert(peer, tx);
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            sessions.insert(peer, UdpSessionEntry { id, client_id, tx });
             drop(sessions);
 
             let init = UdpInit2022 {
@@ -256,34 +299,54 @@ impl ShadowsocksUdpHandler {
                 target,
                 payload,
                 client_id,
-                packet_id,
             };
             let handler = self.clone();
             tokio::spawn(async move {
                 if let Err(e) = Box::pin(handler.serve_udp_session_2022(init, rx)).await {
                     log::debug(format!("shadowsocks 2022 udp session {peer} ended: {e}"));
                 }
-                handler.sessions.lock().await.remove(&peer);
+                remove_session(&handler.sessions, peer, id).await;
             });
         }
+    }
+
+    fn check_replay(
+        &self,
+        client_id: u64,
+        packet_id: u64,
+        method: &Arc<xray_proxy::shadowsocks2022::Method>,
+    ) -> bool {
+        let now = Instant::now();
+        let mut map = self
+            .replay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !map.contains_key(&client_id) {
+            if map.len() >= 256 {
+                map.retain(|_, (seen, _)| now.duration_since(*seen) < REPLAY_KEEP);
+            }
+            let Ok(session) = ServerUdpSession::new(method.clone(), client_id) else {
+                return false;
+            };
+            map.insert(client_id, (now, session));
+        }
+        let Some((seen, session)) = map.get_mut(&client_id) else {
+            return false;
+        };
+        *seen = now;
+        session.check_replay(packet_id)
     }
 
     async fn serve_udp_session_2022(
         &self,
         init: UdpInit2022,
-        mut rx: mpsc::Receiver<Vec<u8>>,
+        mut rx: mpsc::Receiver<UdpPacket>,
     ) -> io::Result<()> {
         let user_method = match &init.user.method {
             ShadowsocksMethod::Ss2022(m) => m.clone(),
             _ => return Ok(()),
         };
-        let mut server_session = xray_proxy::shadowsocks2022::ServerUdpSession::new(
-            user_method.clone(),
-            init.client_id,
-        )?;
-        if !server_session.check_replay(init.packet_id) {
-            return Ok(());
-        }
+        let server_session = ServerUdpSession::new(user_method, init.client_id)?;
 
         let user_policy = crate::policy::for_level(init.user.level);
         let _online = stats::get().connect(&init.user.email, init.user.level, init.peer.ip());
@@ -314,31 +377,17 @@ impl ShadowsocksUdpHandler {
         );
         let activity = Activity::new();
         if let Ok(target) = cone.target(&host, port).await {
-            cone.send_to(&init.payload, target).await?;
+            if let Err(e) = cone.send_to(&init.payload, target).await {
+                log::debug(format!("shadowsocks 2022 udp send error: {e}"));
+            }
             traffic.up(init.payload.len());
         }
 
-        let session_lock = Arc::new(Mutex::new(server_session));
-        let session_up = session_lock.clone();
-        let session_down = session_lock.clone();
+        let session_down = Mutex::new(server_session);
 
         let up = async {
-            let methods = [user_method];
-            while let Some(packet) = rx.recv().await {
+            while let Some((target, payload)) = rx.recv().await {
                 activity.touch();
-                let Ok((_idx, target, payload, cid, pid)) =
-                    xray_proxy::shadowsocks2022::ServerUdpSession::decode_request(
-                        &methods, &packet,
-                    )
-                else {
-                    continue;
-                };
-                if cid != init.client_id {
-                    continue;
-                }
-                if !session_up.lock().await.check_replay(pid) {
-                    continue;
-                }
                 let (host, port) = target_to_host_port(&target);
                 let query = Query {
                     inbound: &self.ctx.tag,
@@ -362,6 +411,9 @@ impl ShadowsocksUdpHandler {
                     process_info: None,
                 };
                 if self.ctx.router.route(&query).await.tag != decision.tag {
+                    log::debug(
+                        "shadowsocks udp: packet dropped, its route differs from the session",
+                    );
                     continue;
                 }
                 if let Ok(addr) = cone.target(&host, port).await {
@@ -405,52 +457,50 @@ impl ShadowsocksUdpHandler {
                     continue;
                 }
             };
-            let users = self
-                .ctx
-                .ss_users
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            let methods: Vec<Arc<xray_proxy::shadowsocks::aead2017::Method>> = users
-                .iter()
-                .filter_map(|u| match &u.method {
-                    ShadowsocksMethod::Aead2017(m) => Some(m.clone()),
-                    _ => None,
-                })
-                .collect();
-            let mut sessions = self.sessions.lock().await;
-            let packet = buf[..n].to_vec();
-            let packet = if let Some(tx) = sessions.get(&peer) {
-                // A full queue drops the datagram rather than stalling every session.
-                match tx.try_send(packet) {
-                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
-                    Err(mpsc::error::TrySendError::Closed(packet)) => {
-                        sessions.remove(&peer);
-                        packet
-                    }
-                }
-            } else {
-                packet
-            };
-
-            // Find matching user for new session
+            let users = same_kind_users(
+                self.ctx
+                    .ss_users
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            );
             let mut matched = None;
-            for (idx, m) in methods.iter().enumerate() {
+            for user in &users {
+                let ShadowsocksMethod::Aead2017(m) = &user.method else {
+                    continue;
+                };
                 let mut session = UdpSession::new(m.clone());
-                if let Ok((target, payload)) = session.decode(&packet) {
-                    if let Some(user) = users.get(idx).cloned() {
-                        matched = Some((idx, user, target, payload));
-                        break;
-                    }
+                if let Ok((target, payload)) = session.decode(&buf[..n]) {
+                    matched = Some((user.clone(), target, payload));
+                    break;
                 }
             }
-
-            let Some((_user_idx, user, target, payload)) = matched else {
+            let Some((user, target, payload)) = matched else {
                 continue;
             };
 
+            let mut sessions = self.sessions.lock().await;
+            let mut packet = (target, payload);
+            if let Some(entry) = sessions.get(&peer) {
+                // A full queue drops the datagram rather than stalling every session.
+                match entry.tx.try_send(packet) {
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
+                    Err(mpsc::error::TrySendError::Closed(p)) => packet = p,
+                }
+                sessions.remove(&peer);
+            }
+            let (target, payload) = packet;
+
             let (tx, rx) = mpsc::channel(128);
-            sessions.insert(peer, tx);
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            sessions.insert(
+                peer,
+                UdpSessionEntry {
+                    id,
+                    client_id: 0,
+                    tx,
+                },
+            );
             drop(sessions);
 
             let handler = self.clone();
@@ -461,7 +511,7 @@ impl ShadowsocksUdpHandler {
                 {
                     log::debug(format!("shadowsocks udp session {peer} ended: {e}"));
                 }
-                handler.sessions.lock().await.remove(&peer);
+                remove_session(&handler.sessions, peer, id).await;
             });
         }
     }
@@ -472,7 +522,7 @@ impl ShadowsocksUdpHandler {
         user: ShadowsocksUser,
         initial_target: Target,
         initial_payload: Vec<u8>,
-        mut rx: mpsc::Receiver<Vec<u8>>,
+        mut rx: mpsc::Receiver<UdpPacket>,
     ) -> io::Result<()> {
         let method = match &user.method {
             ShadowsocksMethod::Aead2017(m) => m.clone(),
@@ -502,17 +552,15 @@ impl ShadowsocksUdpHandler {
         let traffic = stats::get().traffic(&self.ctx.tag, &user.email, user.level, &decision.tag);
         let activity = Activity::new();
         if let Ok(target) = cone.target(&host, port).await {
-            cone.send_to(&initial_payload, target).await?;
+            if let Err(e) = cone.send_to(&initial_payload, target).await {
+                log::debug(format!("shadowsocks udp send error: {e}"));
+            }
             traffic.up(initial_payload.len());
         }
 
         let up = async {
-            let mut session = UdpSession::new(method.clone());
-            while let Some(packet) = rx.recv().await {
+            while let Some((target, payload)) = rx.recv().await {
                 activity.touch();
-                let Ok((target, payload)) = session.decode(&packet) else {
-                    continue;
-                };
                 let (host, port) = target_to_host_port(&target);
                 let query = Query {
                     inbound: &self.ctx.tag,
@@ -536,6 +584,9 @@ impl ShadowsocksUdpHandler {
                     process_info: None,
                 };
                 if self.ctx.router.route(&query).await.tag != decision.tag {
+                    log::debug(
+                        "shadowsocks udp: packet dropped, its route differs from the session",
+                    );
                     continue;
                 }
                 if let Ok(addr) = cone.target(&host, port).await {
