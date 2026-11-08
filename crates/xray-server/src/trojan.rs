@@ -157,6 +157,7 @@ where
     let mut buf = Vec::with_capacity(512);
     let handshake_res = timeout(crate::policy::get().handshake, async {
         let mut chunk = [0u8; 512];
+        let mut first = true;
         loop {
             let parsed = {
                 let users = ctx.users.read().unwrap_or_else(PoisonError::into_inner);
@@ -183,12 +184,22 @@ where
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
             buf.extend_from_slice(&chunk[..n]);
+            // A short first packet cannot hold a Trojan header; Xray hands it to the fallback.
+            if first && buf.len() < 58 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "trojan first packet too short",
+                ));
+            }
+            first = false;
         }
     })
     .await;
 
     let (mut request, header_len, user) = match handshake_res {
         Ok(Ok(parsed)) => parsed,
+        // Read failures and EOF never reach the fallback, like in Xray.
+        Ok(Err(e)) if e.kind() != io::ErrorKind::InvalidData => return Err(e),
         Ok(Err(_)) => {
             if let Some(fb) = crate::fallback::find_fallback(&ctx.fallbacks, tls, &buf) {
                 return crate::fallback::serve(uplink, downlink, fb, buf, peer, ctx.port).await;
@@ -306,9 +317,11 @@ where
                                         (Host::Domain(d.clone()), packet.target.port)
                                     }
                                 };
-                                let target_addr = cone.target(&host, port).await?;
-                                cone.send_to(packet.payload, target_addr).await?;
-                                traffic.up(packet.payload.len());
+                                // An unresolvable or blocked destination drops the packet only.
+                                if let Ok(target_addr) = cone.target(&host, port).await {
+                                    cone.send_to(packet.payload, target_addr).await?;
+                                    traffic.up(packet.payload.len());
+                                }
                                 in_buf.drain(..used);
                             }
                             Err(WireError::Incomplete) => break,
@@ -320,9 +333,7 @@ where
                             }
                         }
                     }
-                    let n = timeout(user_policy.conn_idle, uplink.read(&mut temp))
-                        .await
-                        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
+                    let n = uplink.read(&mut temp).await?;
                     if n == 0 {
                         break;
                     }
@@ -334,25 +345,20 @@ where
             let down = async {
                 let mut buf = vec![0u8; 65535];
                 loop {
+                    let (n, from) = cone.recv_from(&mut buf).await?;
                     activity.touch();
-                    let (n, from) = timeout(user_policy.conn_idle, cone.recv_from(&mut buf))
-                        .await
-                        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
                     let target = Target::new(
                         TargetAddr::Ip(from.ip()),
                         from.port(),
                         xray_routing::Network::Udp,
                     );
-                    let wire = encode_udp_packet(&UdpPacket {
+                    // Datagrams over the Trojan payload limit are dropped, not fatal.
+                    let Ok(wire) = encode_udp_packet(&UdpPacket {
                         target,
                         payload: &buf[..n],
-                    })
-                    .map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("trojan udp encode: {e}"),
-                        )
-                    })?;
+                    }) else {
+                        continue;
+                    };
                     downlink.write_all(&wire).await?;
                     downlink.flush().await?;
                     traffic.down(n);
