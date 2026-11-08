@@ -1183,6 +1183,12 @@ where
         .max_concurrent_streams(1024);
     // XHTTP header uplink splits data over many headers; Go limits only their total size.
     builder.http1().max_headers(MAX_HEADERS);
+    // Go's http.Server in Xray's XHTTP hub: ReadHeaderTimeout 4 s. Without a timer hyper
+    // never times a request's headers out.
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(4));
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
         log::debug(format!(
             "http connection from {} ended: {e}",
