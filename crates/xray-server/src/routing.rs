@@ -642,7 +642,7 @@ fn apply_cost(tag: &str, value: Duration, costs: &[StrategyWeight]) -> Duration 
         }
     }
     let scaled = value.as_secs_f64() * weight.powf(0.5);
-    Duration::from_secs_f64(scaled)
+    Duration::try_from_secs_f64(scaled).unwrap_or(Duration::MAX)
 }
 
 pub fn select_least_load_nodes(
