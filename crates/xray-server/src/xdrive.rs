@@ -50,10 +50,21 @@ impl CancellationToken {
     }
 
     pub async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if self.is_cancelled() {
             return;
         }
-        self.notify.notified().await;
+        notified.await;
+    }
+}
+
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
     }
 }
 
@@ -349,11 +360,24 @@ impl LocalStorage {
 
     pub async fn get(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
         let full = self.resolve(name)?;
-        match tokio::fs::read(&full).await {
-            Ok(data) => Ok(Some(data)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e),
+        use tokio::io::AsyncReadExt;
+        let file = match tokio::fs::File::open(&full).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        // The folder is shared with the peer, so the file size is untrusted.
+        let mut data = Vec::new();
+        file.take(MAX_SEGMENT_BYTES as u64 + 1)
+            .read_to_end(&mut data)
+            .await?;
+        if data.len() > MAX_SEGMENT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "xdrive segment is too large",
+            ));
         }
+        Ok(Some(data))
     }
 
     pub async fn delete(&self, name: &str) -> io::Result<()> {
@@ -672,8 +696,14 @@ impl WalWriter {
         }
 
         // Wait for all in-flight uploads to complete
-        while self.active_uploads.load(Ordering::SeqCst) > 0 {
-            self.upload_done.notified().await;
+        loop {
+            let notified = self.upload_done.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.active_uploads.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            notified.await;
         }
 
         {
@@ -1226,6 +1256,8 @@ pub async fn start_inbound(
     listener.start_cleanup_loop();
 
     let task = tokio::spawn(async move {
+        // Aborting the task (RemoveInbound) must also stop the cleanup loop.
+        let _stop_cleanup = CancelOnDrop(cancel_token.clone());
         let mut delay = settings.params.min_poll_interval;
         let mut active = Instant::now();
 
@@ -1282,6 +1314,16 @@ pub async fn start_inbound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_storage_get_rejects_oversized_files() {
+        let dir = std::env::temp_dir().join(format!("xdrive-test-{}", rand::random::<u64>()));
+        let storage = LocalStorage::new(&dir).unwrap();
+        let f = std::fs::File::create(dir.join("big.seg")).unwrap();
+        f.set_len(MAX_SEGMENT_BYTES as u64 + 1).unwrap();
+        assert!(storage.get("big.seg").await.is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn test_local_storage_crud() {
