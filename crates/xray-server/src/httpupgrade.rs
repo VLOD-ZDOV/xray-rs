@@ -5,7 +5,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 
 const MAX_HEADER_SIZE: usize = 16 * 1024;
 
@@ -106,6 +106,8 @@ where
 {
     let mut header_buf = Vec::with_capacity(2048);
     let mut temp = [0u8; 1024];
+    // One deadline for the whole header, like Xray's absolute read deadline.
+    let deadline = tokio::time::Instant::now() + crate::policy::get().handshake;
 
     let header_end = loop {
         if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -117,7 +119,7 @@ where
                 "httpupgrade header too large",
             ));
         }
-        let n = match timeout(crate::policy::get().handshake, stream.read(&mut temp)).await {
+        let n = match timeout_at(deadline, stream.read(&mut temp)).await {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "handshake timeout")),
@@ -140,40 +142,14 @@ where
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty request line"))?;
 
-    let mut req_parts = req_line.split_whitespace();
-    let method = req_parts.next().unwrap_or_default();
-    let req_path = req_parts.next().unwrap_or_default();
-
-    if !method.eq_ignore_ascii_case("GET") {
-        let _ = stream
-            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
-            .await;
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("method {method} not allowed for httpupgrade"),
-        ));
-    }
-
+    // Like Xray, every rejection closes the connection without a reply.
+    let req_path = req_line.split_whitespace().nth(1).unwrap_or_default();
     let target_path = req_path.split('?').next().unwrap_or("/");
-    let clean_target = normalize_path(target_path);
-    let clean_config = normalize_path(&settings.path);
 
-    if clean_target != clean_config {
-        let _ = stream
-            .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
-            .await;
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "httpupgrade path mismatch: got {target_path}, expected {}",
-                settings.path
-            ),
-        ));
-    }
-
-    let mut connection_ok = false;
+    let mut connection = None;
     let mut upgrade_hdr = None;
     let mut host_hdr = None;
+    let mut sec_key = None;
     let mut header_pairs = Vec::new();
 
     for line in lines {
@@ -184,12 +160,19 @@ where
         let val = val.trim();
         header_pairs.push((key, val));
 
-        if key.eq_ignore_ascii_case("connection") && val.to_ascii_lowercase().contains("upgrade") {
-            connection_ok = true;
+        let slot = if key.eq_ignore_ascii_case("connection") {
+            &mut connection
         } else if key.eq_ignore_ascii_case("upgrade") {
-            upgrade_hdr = Some(val.to_owned());
+            &mut upgrade_hdr
         } else if key.eq_ignore_ascii_case("host") {
-            host_hdr = Some(val.to_owned());
+            &mut host_hdr
+        } else if key.eq_ignore_ascii_case("sec-websocket-key") {
+            &mut sec_key
+        } else {
+            continue;
+        };
+        if slot.is_none() {
+            *slot = Some(val.to_owned());
         }
     }
 
@@ -197,52 +180,89 @@ where
 
     if let Some(expected_host) = &settings.host {
         let h = host_hdr.unwrap_or_default();
-        let host_only = h.split(':').next().unwrap_or("");
-        if !host_only.eq_ignore_ascii_case(expected_host) {
-            let _ = stream
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-                .await;
+        if !is_valid_http_host(&h, expected_host) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("httpupgrade host mismatch: got {host_only}, expected {expected_host}"),
+                format!(
+                    "httpupgrade host mismatch: got {}, expected {expected_host}",
+                    h.escape_debug()
+                ),
             ));
         }
     }
 
-    let Some(upgrade_proto) = upgrade_hdr else {
-        let _ = stream
-            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-            .await;
+    if target_path != settings.path {
         return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing Upgrade header",
-        ));
-    };
-
-    if !connection_ok {
-        let _ = stream
-            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
-            .await;
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "missing Connection: upgrade header",
+            io::ErrorKind::NotFound,
+            format!(
+                "httpupgrade path mismatch: got {}, expected {}",
+                target_path.escape_debug(),
+                settings.path
+            ),
         ));
     }
 
-    let resp = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: {upgrade_proto}\r\n\r\n"
-    );
+    let is_upgrade = connection.is_some_and(|c| c.eq_ignore_ascii_case("upgrade"))
+        && upgrade_hdr.is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
+    if !is_upgrade {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unrecognized httpupgrade request",
+        ));
+    }
+
+    let mut resp = String::from("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n");
+    if let Some(key) = sec_key.filter(|k| !k.is_empty()) {
+        resp.push_str(&format!(
+            "Sec-WebSocket-Accept: {}\r\n",
+            crate::ws::accept_key_for(&key)
+        ));
+    }
+    resp.push_str("Upgrade: websocket\r\n\r\n");
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await?;
 
     Ok((PrefixedStream::new(stream, leftover), peer))
 }
 
-fn normalize_path(p: &str) -> &str {
-    let stripped = p.trim_end_matches('/');
-    if stripped.is_empty() {
-        "/"
-    } else {
-        stripped
+/// Mirrors Xray's internet.IsValidHTTPHost.
+pub(crate) fn is_valid_http_host(request: &str, config: &str) -> bool {
+    let r = request.to_ascii_lowercase();
+    let c = config.to_ascii_lowercase();
+    if r.contains(':') {
+        return split_host_port(&r).is_some_and(|h| h == c);
+    }
+    r == c
+}
+
+fn split_host_port(s: &str) -> Option<&str> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let tail = rest[end + 1..].strip_prefix(':')?;
+        if tail.contains(':') {
+            return None;
+        }
+        return Some(&rest[..end]);
+    }
+    let i = s.rfind(':')?;
+    let host = &s[..i];
+    if host.contains([':', '[', ']']) {
+        return None;
+    }
+    Some(host)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_validation_matches_xray() {
+        assert!(is_valid_http_host("Example.com", "example.com"));
+        assert!(is_valid_http_host("example.com:443", "example.com"));
+        assert!(is_valid_http_host("[::1]:443", "::1"));
+        assert!(!is_valid_http_host("::1", "::1"));
+        assert!(!is_valid_http_host("other.com", "example.com"));
+        assert!(!is_valid_http_host("", "example.com"));
     }
 }
