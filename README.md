@@ -16,13 +16,13 @@ The server crate and every workspace crate it is built from (`xray-config`,
 
 | Area | Supported |
 |---|---|
-| Inbound protocols | VLESS (including XTLS Vision and VLESS encryption), VMess (AEAD), Trojan, Shadowsocks (AEAD and 2022, multi-user), Hysteria2, SOCKS 5/4a and HTTP proxy (`mixed`, with keep-alive), dokodemo-door / `tunnel` (including `followRedirect`) |
-| Security | TLS (`minVersion`, `maxVersion`, `cipherSuites`, `rejectUnknownSni`), REALITY (dest mirroring and padding, `mldsa65Seed`), or plain behind nginx |
-| Transports | XHTTP over HTTP/1.1 and HTTP/2 (packet-up, stream-up, stream-one, Xray 26 obfuscation settings, `responseHeaders`), raw TCP (including `header: http`), WebSocket (with early data), HTTPUpgrade, gRPC (gun and multi mode); `acceptProxyProtocol`; `sockopt` (`mark`, `interface`, `tcpFastOpen`, keepalive, `tcpCongestion`, `tcpUserTimeout`, `tcpMaxSeg`, `v6only`, `tcpMptcp`, `tproxy`) |
+| Inbound protocols | VLESS (including XTLS Vision, VLESS encryption and `reverse`), VMess (AEAD), Trojan, Shadowsocks (AEAD and 2022, multi-user), Hysteria2, WireGuard, MASQUE, SOCKS 5/4a and HTTP proxy (`mixed`, with keep-alive), dokodemo-door / `tunnel` (including `followRedirect`) |
+| Security | TLS (`minVersion`, `maxVersion`, `cipherSuites`, `rejectUnknownSni`, certificate reload, `usage`, `ocspStapling`), REALITY (dest mirroring and padding, `mldsa65Seed`), or plain behind nginx |
+| Transports | XHTTP over HTTP/1.1, HTTP/2 and HTTP/3 (packet-up, stream-up, stream-one, Xray 26 obfuscation settings, `responseHeaders`, `downloadSettings`), raw TCP (including `header: http`), WebSocket (with early data), HTTPUpgrade, gRPC (gun and multi mode), mKCP, `masque`, `xdrive`; `acceptProxyProtocol`; `sockopt` (`mark`, `interface`, `tcpFastOpen`, keepalive, `tcpCongestion`, `tcpUserTimeout`, `tcpMaxSeg`, `tcpWindowClamp`, `customSockopt`, `v6only`, `tcpMptcp`, `tproxy`, `trustedXForwardedFor`, `happyEyeballs`); `finalmask` (`fragment`, `noise`, `header-custom` and `sudoku` on TCP, `salamander`, `udphop`, `mkcp-legacy`, `quicParams`) |
 | VLESS / Trojan | TCP, UDP, Mux.Cool and XUDP; `fallbacks` by `name`, `alpn` and `path` with PROXY protocol v1/v2 |
 | Sniffing | `destOverride` `http`, `tls`, `quic`, `fakedns`; `routeOnly`, `metadataOnly`, `domainsExcluded` |
-| Outbound | `freedom` / `direct` (every `domainStrategy`, `fragment`, `noises`, `redirect`), `blackhole` / `block`, `wireguard` (Cloudflare WARP), `socks`, `vless` (raw, WS, gRPC, TLS, REALITY), `vmess`, `trojan`, `shadowsocks`, `http`, `dns`, `loopback`; `sendThrough`, `proxySettings`, `mux`; balancers (`random`, `roundRobin`, `leastPing`, `leastLoad`) with `observatory` and `burstObservatory` |
-| Routing | `domain`, `geosite`, `ip`, `geoip`, `port`, `network`, `inboundTag`, `user`, `source`, `sourcePort`, `localPort`, `localIP`, `protocol`, `attrs`, `vlessRoute`, `balancerTag`; `domainStrategy` AsIs, IPIfNonMatch, IPOnDemand |
+| Outbound | `freedom` / `direct` (every `domainStrategy`, `fragment`, `noises`, `redirect`), `blackhole` / `block`, `wireguard` (Cloudflare WARP), `socks`, `vless` (raw, WS, gRPC, XHTTP, mKCP, TLS, REALITY), `vmess`, `trojan`, `shadowsocks`, `hysteria`, `masque`, `http`, `dns`, `loopback`; `sockopt` on every outbound, `sendThrough`, `proxySettings`, `mux`; balancers (`random`, `roundRobin`, `leastPing`, `leastLoad`) with `observatory` and `burstObservatory` |
+| Routing | `domain`, `geosite`, `ip`, `geoip`, `port`, `network`, `inboundTag`, `user`, `source`, `sourcePort`, `localPort`, `localIP`, `protocol`, `attrs`, `vlessRoute`, `process`, `webhook`, `balancerTag`; `domainStrategy` AsIs, IPIfNonMatch, IPOnDemand |
 | DNS and policy | built-in `dns` section (servers, `hosts`, `queryStrategy`), `fakedns`; `policy` levels (timeouts, `bufferSize`, per-user stats and online tracking) |
 | 3x-ui | `-c`, `run -test -c`, `-version`; gRPC `StatsService`, `HandlerService` (users for VLESS, VMess, Trojan and Shadowsocks, `AddInbound`, `RemoveInbound`, `AddOutbound`, `RemoveOutbound`), `RoutingService`, `LoggerService`, `ObservatoryService`; the `log` section (`loglevel`, `access`, `error`, `maskAddress`, `dnsLog`); `metrics` (`/debug/vars`); `version` |
 
@@ -57,13 +57,10 @@ to run noise.
 
 ## Not supported yet
 
-- Skipped with a warning: XHTTP over HTTP/3, mKCP, the `hysteria`, `masque`
-  and `xdrive` transports, WireGuard and MASQUE inbounds, Hysteria and
-  MASQUE outbounds.
-- `reverse` (both the `reverse` section and VLESS users' `reverse`), `env`,
-  `geodata`, `transport`: skipped with a warning.
-- `sockopt` on outbounds other than `freedom`; `tcpWindowClamp` and
-  `customSockopt`.
+- TLS `echServerKeys` (rustls has no server-side ECH yet): skipped with a
+  warning, ECH stays off.
+- `finalmask` masks `xmc`, `filter`, `xdns`, `xicmp`, `realm`, and
+  `header-custom` / `sudoku` on UDP: skipped with a warning.
 - `metrics` serves `/debug/vars` without Go's `memstats`, and no `pprof`.
 
 ## Build
