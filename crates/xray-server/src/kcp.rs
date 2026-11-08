@@ -1141,7 +1141,14 @@ pub async fn dial(
     let reader_obfs = obfuscator.clone();
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
-        while let Ok(n) = socket.recv(&mut buf).await {
+        loop {
+            let n = tokio::select! {
+                r = socket.recv(&mut buf) => match r {
+                    Ok(n) => n,
+                    Err(_) => break,
+                },
+                _ = tx.closed() => break,
+            };
             if let Some(plain) = reader_obfs.open(&buf[..n]) {
                 let segs = Segment::parse_all(&plain);
                 if !segs.is_empty() && tx.send(segs).await.is_err() {
