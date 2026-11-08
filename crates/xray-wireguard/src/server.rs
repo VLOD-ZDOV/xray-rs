@@ -280,7 +280,7 @@ fn inspect_packet(buf: &[u8]) -> Option<PacketType> {
     let version = buf[0] >> 4;
     if version == 4 && buf.len() >= 20 {
         let ihl = ((buf[0] & 0x0f) as usize) * 4;
-        if buf.len() < ihl {
+        if ihl < 20 || buf.len() < ihl {
             return None;
         }
         let proto = buf[9];
@@ -567,11 +567,20 @@ impl ServerStack {
                                                 read_eof: false,
                                             },
                                         );
-                                        let _ = self.tcp_tx.try_send(IncomingTcpStream {
-                                            stream: bridge_app,
-                                            src,
-                                            dst,
-                                        });
+                                        if self
+                                            .tcp_tx
+                                            .try_send(IncomingTcpStream {
+                                                stream: bridge_app,
+                                                src,
+                                                dst,
+                                            })
+                                            .is_err()
+                                        {
+                                            // Accept queue full: drop the flow instead of
+                                            // leaving an established socket nobody serves.
+                                            self.flows.remove(&id);
+                                            self.sockets.remove(handle);
+                                        }
                                     }
                                 }
                                 if let Ok(pkt) = bytes_pkt.try_into_ip() {
