@@ -2672,7 +2672,10 @@ mod tests {
         assert_eq!(sniff_http_host(http), Some("example.com".to_owned()));
         let binary_body = b"POST / HTTP/1.1\r\nHost: example.com\r\n\r\n\xff\xfe";
         assert_eq!(sniff_http_host(binary_body), Some("example.com".to_owned()));
-        assert_eq!(sniff_http_host(b"GET / HTTP/1.1\r\n\r\nHost: late.com\r\n"), None);
+        assert_eq!(
+            sniff_http_host(b"GET / HTTP/1.1\r\n\r\nHost: late.com\r\n"),
+            None
+        );
 
         // Synthetic minimal TLS 1.2 ClientHello with SNI "test.domain.org"
         let sni_name = b"test.domain.org";
