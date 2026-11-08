@@ -80,6 +80,9 @@ async fn http(url: &str, post: Option<&[u8]>) -> Result<Vec<u8>, String> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("unsupported URL scheme: {url}"))?;
+    if rest.bytes().any(|b| b.is_ascii_control() || b == b' ') {
+        return Err(format!("invalid URL: {url:?}"));
+    }
     let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
     let path = if path.is_empty() { "/" } else { path };
     let addr = if authority
