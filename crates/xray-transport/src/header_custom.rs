@@ -461,6 +461,39 @@ where
     Ok(())
 }
 
+/// The server's side, as Xray's `tcpCustomServerConn`: each client sequence
+/// read and answered with its server sequence, then the server sequences
+/// left. A client sequence that does not match gets the error sequence of
+/// the same index, when there is one.
+pub async fn server_handshake<S>(
+    stream: &mut S,
+    config: &HeaderCustomTcpConfig,
+    errors: &[Vec<CustomItem>],
+    local: Option<SocketAddr>,
+    remote: Option<SocketAddr>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + ?Sized,
+{
+    let mut context = Context::with_addresses(local, remote);
+    let mut servers = config.servers.iter();
+    for (index, client) in config.clients.iter().enumerate() {
+        if let Err(error) = read_sequence(stream, client, &mut context).await {
+            if let Some(answer) = errors.get(index) {
+                let _ = write_sequence(stream, answer, &mut context).await;
+            }
+            return Err(error);
+        }
+        if let Some(server) = servers.next() {
+            write_sequence(stream, server, &mut context).await?;
+        }
+    }
+    for server in servers {
+        write_sequence(stream, server, &mut context).await?;
+    }
+    Ok(())
+}
+
 /// Sends a sequence as Xray's `writeSequenceWithContext` does: items are
 /// merged into one write, and an item with a delay first sends what came
 /// before it and waits.

@@ -1569,6 +1569,7 @@ async fn handle_handler(
                 reality: None,
                 transport,
                 accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept::None,
+                tcp_masks: None,
                 hysteria_users: parsed_hysteria_users,
                 hysteria_salamander: None,
                 hysteria_gecko: None,

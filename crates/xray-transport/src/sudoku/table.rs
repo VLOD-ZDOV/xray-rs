@@ -224,6 +224,11 @@ impl SudokuConfig {
     }
 
     /// `getTables`: one table per distinct layout, built once per process.
+    /// Fails as building the mask would, when the settings give no table.
+    pub fn check(&self) -> io::Result<()> {
+        self.tables().map(drop)
+    }
+
     pub(crate) fn tables(&self) -> io::Result<Arc<Vec<Table>>> {
         static CACHE: OnceLock<Mutex<TableCache>> = OnceLock::new();
         let ascii = ascii_mode(&self.ascii)?;

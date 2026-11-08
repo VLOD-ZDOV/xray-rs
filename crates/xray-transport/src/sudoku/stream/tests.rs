@@ -122,3 +122,26 @@ async fn the_dialer_wraps_the_header_custom_handshake_in_sudoku() {
     client.flush().await.unwrap();
     assert_eq!(server.await.unwrap(), b"HIdata");
 }
+
+#[tokio::test]
+async fn a_client_and_a_server_stream_talk_both_ways() {
+    let config = SudokuConfig {
+        password: "synthetic".into(),
+        padding_min: 5,
+        padding_max: 30,
+        ..Default::default()
+    };
+    let (a, b) = tokio::io::duplex(1 << 20);
+    let mut client = SudokuStream::new(Box::new(a), &config).unwrap();
+    let mut server = SudokuStream::server(Box::new(b), &config).unwrap();
+    let up: Vec<u8> = (0..100_000u32).map(|i| (i * 7) as u8).collect();
+    client.write_all(&up).await.unwrap();
+    client.flush().await.unwrap();
+    let mut got = vec![0; up.len()];
+    server.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, up);
+    server.write_all(&up).await.unwrap();
+    server.flush().await.unwrap();
+    client.read_exact(&mut got).await.unwrap();
+    assert_eq!(got, up);
+}

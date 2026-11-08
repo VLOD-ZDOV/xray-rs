@@ -218,6 +218,7 @@ pub struct Inbound {
     pub reality: Option<RealityInboundSettings>,
     pub transport: InboundTransport,
     pub accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept,
+    pub tcp_masks: Option<Arc<Vec<crate::tcp_mask::TcpMask>>>,
     pub hysteria_users: Vec<crate::vless::HysteriaUser>,
     pub hysteria_salamander: Option<String>,
     pub hysteria_gecko: Option<xray_transport::hysteria::gecko::GeckoPacketSize>,
@@ -688,6 +689,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 reality: None,
                 transport: InboundTransport::Tcp,
                 accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept::None,
+                tcp_masks: None,
                 hysteria_users: Vec::new(),
                 hysteria_salamander: None,
                 hysteria_gecko: None,
@@ -749,6 +751,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 reality: None,
                 transport: InboundTransport::Tcp,
                 accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept::None,
+                tcp_masks: None,
                 hysteria_users: Vec::new(),
                 hysteria_salamander: None,
                 hysteria_gecko: None,
@@ -1191,6 +1194,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         .or_else(|| item.get("sockopt"))
         .unwrap_or(&Value::Null);
     let accept_proxy_protocol = parse_accept_proxy_protocol(sockopt.get("acceptProxyProtocol"));
+    let tcp_masks = crate::tcp_mask::parse(stream).map_err(|e| format!("inbound {tag:?}: {e}"))?;
     let sockopt_settings = parse_sockopt(sockopt, &format!("inbound {tag:?}"))?;
 
     let (shadowsocks_top_method, shadowsocks_top_password) =
@@ -1346,6 +1350,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         reality,
         transport,
         accept_proxy_protocol,
+        tcp_masks,
         hysteria_users,
         hysteria_salamander,
         hysteria_gecko,

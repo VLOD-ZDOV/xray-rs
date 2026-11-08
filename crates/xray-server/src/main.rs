@@ -40,6 +40,7 @@ mod shadowsocks_outbound;
 mod sockopt;
 mod socks;
 mod stats;
+mod tcp_mask;
 mod trojan;
 mod trojan_outbound;
 mod vless;
@@ -489,6 +490,7 @@ pub(crate) async fn start_inbound(
         reality,
         handler,
         http_obfs,
+        inbound.tcp_masks.clone(),
     ));
     let mut udp_abort = None;
     if is_ss_udp {
@@ -616,6 +618,7 @@ fn bracket(host: &str) -> String {
 pub enum InboundIo {
     Tcp(TcpStream),
     Duplex(tokio::io::DuplexStream),
+    Masked(xray_transport::BoxedTransportStream),
 }
 
 impl AsyncRead for InboundIo {
@@ -627,6 +630,7 @@ impl AsyncRead for InboundIo {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_read(cx, buf),
             Self::Duplex(s) => Pin::new(s).poll_read(cx, buf),
+            Self::Masked(s) => Pin::new(s).poll_read(cx, buf),
         }
     }
 }
@@ -640,6 +644,7 @@ impl AsyncWrite for InboundIo {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_write(cx, buf),
             Self::Duplex(s) => Pin::new(s).poll_write(cx, buf),
+            Self::Masked(s) => Pin::new(s).poll_write(cx, buf),
         }
     }
 
@@ -650,6 +655,7 @@ impl AsyncWrite for InboundIo {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_flush(cx),
             Self::Duplex(s) => Pin::new(s).poll_flush(cx),
+            Self::Masked(s) => Pin::new(s).poll_flush(cx),
         }
     }
 
@@ -660,6 +666,7 @@ impl AsyncWrite for InboundIo {
         match self.get_mut() {
             Self::Tcp(s) => Pin::new(s).poll_shutdown(cx),
             Self::Duplex(s) => Pin::new(s).poll_shutdown(cx),
+            Self::Masked(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }
@@ -830,6 +837,7 @@ impl xray_proxy::vless::VisionStreamIo for InboundStream {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: TcpListener,
     tproxy: config::TproxyMode,
@@ -838,6 +846,7 @@ async fn accept_loop(
     reality: Option<Arc<reality::RealityServer>>,
     handler: InboundHandler,
     http_obfs: Option<Arc<http_obfs::HttpObfsSettings>>,
+    tcp_masks: Option<Arc<Vec<tcp_mask::TcpMask>>>,
 ) {
     loop {
         let (mut stream, mut peer) = match listener.accept().await {
@@ -857,11 +866,12 @@ async fn accept_loop(
             config::TproxyMode::Tproxy => local,
             config::TproxyMode::Redirect => sockopt::original_destination(&stream),
         };
-        let (tls, reality, handler, http_obfs) = (
+        let (tls, reality, handler, http_obfs, tcp_masks) = (
             tls.clone(),
             reality.clone(),
             handler.clone(),
             http_obfs.clone(),
+            tcp_masks.clone(),
         );
         tokio::spawn(async move {
             let handshake_timeout = policy::get().handshake;
@@ -892,7 +902,28 @@ async fn accept_loop(
                 Vec::new()
             };
 
-            let stream = httpupgrade::PrefixedStream::new(InboundIo::Tcp(stream), leftover);
+            let mut stream = httpupgrade::PrefixedStream::new(InboundIo::Tcp(stream), leftover);
+            if let Some(masks) = tcp_masks {
+                let masked = tokio::time::timeout(
+                    handshake_timeout,
+                    tcp_mask::accept(stream, &masks, local, peer),
+                )
+                .await;
+                match masked {
+                    Ok(Ok(masked)) => {
+                        stream =
+                            httpupgrade::PrefixedStream::new(InboundIo::Masked(masked), Vec::new())
+                    }
+                    Ok(Err(e)) => {
+                        log::debug(format!("finalmask from {} failed: {e}", log::mask(peer)));
+                        return;
+                    }
+                    Err(_) => {
+                        log::debug(format!("finalmask from {} timed out", log::mask(peer)));
+                        return;
+                    }
+                }
+            }
             if let Some(reality) = reality {
                 match reality.handle(stream, peer).await {
                     Ok(Some(tls_stream)) => {

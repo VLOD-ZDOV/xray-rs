@@ -2,7 +2,7 @@
 //! classic sudoku on the way up, packed on the way down. Every byte passes
 //! through it, so Vision's direct mode reads and writes it too.
 use super::{
-    codec::{Encoder, PackedDecoder},
+    codec::{Decoder, Encoder, PackedDecoder, PackedEncoder},
     table::Table,
     SudokuConfig,
 };
@@ -18,11 +18,23 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 /// Xray's `ioBufferSize`.
 const READ_BUFFER: usize = 32 * 1024;
 
+/// How this side writes: the client classic, the server packed.
+enum Up {
+    Classic(Encoder),
+    Packed(PackedEncoder),
+}
+
+/// How this side reads: the client packed, the server classic.
+enum Down {
+    Packed(PackedDecoder),
+    Classic(Decoder),
+}
+
 pub struct SudokuStream {
     inner: BoxedTransportStream,
     tables: Arc<Vec<Table>>,
-    encoder: Encoder,
-    decoder: PackedDecoder,
+    encoder: Up,
+    decoder: Down,
     /// One write's encoding, and how much of it went out.
     out: Vec<u8>,
     written: usize,
@@ -38,10 +50,10 @@ impl SudokuStream {
     pub fn new(inner: BoxedTransportStream, config: &SudokuConfig) -> io::Result<Self> {
         let tables = config.tables()?;
         Ok(Self {
-            encoder: Encoder::new(tables.clone(), config.padding()),
+            encoder: Up::Classic(Encoder::new(tables.clone(), config.padding())),
             tables,
             inner,
-            decoder: PackedDecoder::default(),
+            decoder: Down::Packed(PackedDecoder::default()),
             out: Vec::new(),
             written: 0,
             pending: Vec::new(),
@@ -49,6 +61,15 @@ impl SudokuStream {
             raw: vec![0; READ_BUFFER].into_boxed_slice(),
             eof: false,
         })
+    }
+
+    /// The server's side, as Xray's `WrapConnServer`: classic sudoku read,
+    /// packed written.
+    pub fn server(inner: BoxedTransportStream, config: &SudokuConfig) -> io::Result<Self> {
+        let mut stream = Self::new(inner, config)?;
+        stream.encoder = Up::Packed(PackedEncoder::new(&stream.tables, config.padding()));
+        stream.decoder = Down::Classic(Decoder::default());
+        Ok(stream)
     }
 
     /// Writes out what an earlier write encoded.
@@ -90,11 +111,16 @@ impl AsyncRead for SudokuStream {
             this.consumed = 0;
             if filled == 0 {
                 this.eof = true;
-                this.decoder.reset();
+                if let Down::Packed(decoder) = &mut this.decoder {
+                    decoder.reset();
+                }
                 continue;
             }
-            this.decoder
-                .decode(&this.tables, &this.raw[..filled], &mut this.pending)?;
+            let raw = &this.raw[..filled];
+            match &mut this.decoder {
+                Down::Packed(decoder) => decoder.decode(&this.tables, raw, &mut this.pending)?,
+                Down::Classic(decoder) => decoder.decode(&this.tables, raw, &mut this.pending)?,
+            }
         }
     }
 }
@@ -110,7 +136,10 @@ impl AsyncWrite for SudokuStream {
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
-        this.encoder.encode(buf, &mut this.out);
+        match &mut this.encoder {
+            Up::Classic(encoder) => encoder.encode(buf, &mut this.out),
+            Up::Packed(encoder) => encoder.encode(buf, &mut this.out),
+        }
         // The bytes are taken; what the socket cannot take yet goes out on
         // the next write or flush.
         if let Poll::Ready(Err(error)) = this.poll_drain(cx) {

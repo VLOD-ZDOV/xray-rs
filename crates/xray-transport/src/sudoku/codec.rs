@@ -3,7 +3,6 @@
 //! the packed form, which the server writes over TCP, sends six bits per
 //! byte. Both scatter padding bytes, which carry no clue, with one chance
 //! drawn per encoder.
-#[cfg(test)]
 use super::table::Layout;
 use super::table::Table;
 use rand::Rng;
@@ -143,14 +142,12 @@ impl Decoder {
 }
 
 /// The packed encoder, which Xray's server writes TCP downlinks with.
-#[cfg(test)]
 pub(crate) struct PackedEncoder {
     layouts: Vec<Layout>,
     chance: u32,
     index: usize,
 }
 
-#[cfg(test)]
 impl PackedEncoder {
     pub(crate) fn new(tables: &[Table], padding: (u32, u32)) -> Self {
         Self {

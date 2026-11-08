@@ -329,8 +329,9 @@ fn validate_quic_params_inner(stream: &Value, kind: &str, tag: &str) -> Result<(
 }
 
 /// Validates outbound finalmask and logs warnings on unsupported mask types.
-/// Inbound masks the server runs: Salamander on Hysteria and `mkcp-legacy`
-/// on mKCP; the rest are skipped with a warning.
+/// Inbound masks the server runs: `header-custom` and `sudoku` on TCP,
+/// Salamander on Hysteria and `mkcp-legacy` on mKCP; the rest are skipped
+/// with a warning.
 pub fn warn_inbound_finalmask(stream: &Value, protocol: &str, tag: &str) {
     let Some(finalmask) = stream.get("finalmask").and_then(Value::as_object) else {
         return;
@@ -340,6 +341,7 @@ pub fn warn_inbound_finalmask(stream: &Value, protocol: &str, tag: &str) {
         for mask in masks.and_then(Value::as_array).into_iter().flatten() {
             let kind = mask.get("type").and_then(Value::as_str).unwrap_or("");
             let supported = match (layer, kind.to_ascii_lowercase().as_str()) {
+                ("tcp", "header-custom" | "sudoku") => true,
                 ("udp", "salamander" | "udphop") => protocol.starts_with("hysteria"),
                 ("udp", "mkcp-legacy") => matches!(network, "kcp" | "mkcp"),
                 _ => false,
