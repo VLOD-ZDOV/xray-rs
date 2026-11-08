@@ -7,6 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use http::{Method, Response, StatusCode};
@@ -138,11 +139,12 @@ pub fn parse(tag: &str, item: &Value) -> Result<MasqueServerConfig, String> {
 
     let stream = item.get("streamSettings").unwrap_or(&Value::Null);
     let masque_settings = stream.get("masqueSettings").unwrap_or(&Value::Null);
-    let path = masque_settings
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or("/.well-known/masque/ip/*/*/")
-        .to_owned();
+    let path = crate::masque_capsule::normalize_path(
+        masque_settings
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or(""),
+    )?;
 
     let _ = tag;
     Ok(MasqueServerConfig {
@@ -152,6 +154,18 @@ pub fn parse(tag: &str, item: &Value) -> Result<MasqueServerConfig, String> {
         mtu,
         path,
     })
+}
+
+const PRE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct AbortOnDrop(Vec<tokio::task::AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
 }
 
 pub struct H2StreamReader {
@@ -367,51 +381,58 @@ pub async fn start(
     let s_ctx = ctx.clone();
     let s_router = router.clone();
 
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                Some(tcp) = server_run.accept_tcp() => {
-                    let ctx = s_ctx.clone();
-                    let router = s_router.clone();
-                    tokio::spawn(async move {
-                        handle_tcp(tcp, ctx, router).await;
-                    });
+    let mut guard = AbortOnDrop(Vec::new());
+    guard.0.push(
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(tcp) = server_run.accept_tcp() => {
+                        let ctx = s_ctx.clone();
+                        let router = s_router.clone();
+                        tokio::spawn(async move {
+                            handle_tcp(tcp, ctx, router).await;
+                        });
+                    }
+                    Some(udp) = server_run.accept_udp() => {
+                        let ctx = s_ctx.clone();
+                        let router = s_router.clone();
+                        tokio::spawn(async move {
+                            Box::pin(handle_udp(udp, ctx, router)).await;
+                        });
+                    }
+                    else => break,
                 }
-                Some(udp) = server_run.accept_udp() => {
-                    let ctx = s_ctx.clone();
-                    let router = s_router.clone();
-                    tokio::spawn(async move {
-                        Box::pin(handle_udp(udp, ctx, router)).await;
-                    });
-                }
-                else => break,
             }
-        }
-    });
+        })
+        .abort_handle(),
+    );
 
     let (broadcast_tx, _) = broadcast::channel::<(IpAddr, Bytes)>(256);
     let bcast_tx = broadcast_tx.clone();
 
-    tokio::spawn(async move {
-        while let Some(packet) = to_tunnel_rx.recv().await {
-            let bytes_pkt = packet.into_bytes();
-            let bytes = bytes_pkt.as_ref();
-            if !bytes.is_empty() {
-                let dest = match bytes[0] >> 4 {
-                    4 if bytes.len() >= 20 => {
-                        let octets: [u8; 4] = bytes[16..20].try_into().unwrap();
-                        IpAddr::V4(octets.into())
-                    }
-                    6 if bytes.len() >= 40 => {
-                        let octets: [u8; 16] = bytes[24..40].try_into().unwrap();
-                        IpAddr::V6(octets.into())
-                    }
-                    _ => continue,
-                };
-                let _ = bcast_tx.send((dest, Bytes::copy_from_slice(bytes)));
+    guard.0.push(
+        tokio::spawn(async move {
+            while let Some(packet) = to_tunnel_rx.recv().await {
+                let bytes_pkt = packet.into_bytes();
+                let bytes = bytes_pkt.as_ref();
+                if !bytes.is_empty() {
+                    let dest = match bytes[0] >> 4 {
+                        4 if bytes.len() >= 20 => {
+                            let octets: [u8; 4] = bytes[16..20].try_into().unwrap();
+                            IpAddr::V4(octets.into())
+                        }
+                        6 if bytes.len() >= 40 => {
+                            let octets: [u8; 16] = bytes[24..40].try_into().unwrap();
+                            IpAddr::V6(octets.into())
+                        }
+                        _ => continue,
+                    };
+                    let _ = bcast_tx.send((dest, Bytes::copy_from_slice(bytes)));
+                }
             }
-        }
-    });
+        })
+        .abort_handle(),
+    );
 
     let tls_settings = inbound
         .tls
@@ -441,7 +462,10 @@ pub async fn start(
     let h2_bcast_tx = broadcast_tx.clone();
 
     let server_task = tokio::spawn(async move {
-        let mut tasks = Vec::new();
+        // Aborting this task (RemoveInbound) drops the guard and the join set,
+        // which stops the netstack tasks and every listener and connection.
+        let _guard = guard;
+        let mut tasks = tokio::task::JoinSet::new();
 
         if use_h2 {
             let rustls_cfg = match crate::build_rustls_server_config(
@@ -474,8 +498,20 @@ pub async fn start(
             let b_tx = h2_bcast_tx.clone();
             let pool = pool.clone();
 
-            tasks.push(tokio::spawn(async move {
-                while let Ok((stream, _peer)) = listener.accept().await {
+            tasks.spawn(async move {
+                let mut conns = tokio::task::JoinSet::new();
+                loop {
+                    let stream = tokio::select! {
+                        r = listener.accept() => match r {
+                            Ok((stream, _peer)) => stream,
+                            Err(e) => {
+                                log::warn(format!("MASQUE accept: {e}"));
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                continue;
+                            }
+                        },
+                        Some(_) = conns.join_next(), if !conns.is_empty() => continue,
+                    };
                     let acc = acceptor.clone();
                     let u = u.clone();
                     let p = p.clone();
@@ -483,22 +519,37 @@ pub async fn start(
                     let b_tx = b_tx.clone();
                     let pool = pool.clone();
 
-                    tokio::spawn(async move {
-                        let tls_stream = match acc.accept(stream).await {
-                            Ok(s) => s,
-                            Err(_) => return,
+                    conns.spawn(async move {
+                        let setup = async {
+                            let tls_stream = acc.accept(stream).await.ok()?;
+                            h2::server::Builder::new()
+                                .enable_connect_protocol()
+                                .max_concurrent_streams(100)
+                                .handshake(tls_stream)
+                                .await
+                                .ok()
                         };
-                        let mut h2_conn = match h2::server::Builder::new()
-                            .enable_connect_protocol()
-                            .max_concurrent_streams(100)
-                            .handshake(tls_stream)
-                            .await
+                        let mut h2_conn = match tokio::time::timeout(PRE_AUTH_TIMEOUT, setup).await
                         {
-                            Ok(c) => c,
-                            Err(_) => return,
+                            Ok(Some(c)) => c,
+                            _ => return,
                         };
 
-                        while let Some(res) = h2_conn.accept().await {
+                        let mut reqs = tokio::task::JoinSet::new();
+                        // A connection that never sends a request is dropped.
+                        let mut first = true;
+                        loop {
+                            let next = if first {
+                                match tokio::time::timeout(PRE_AUTH_TIMEOUT, h2_conn.accept()).await
+                                {
+                                    Ok(n) => n,
+                                    Err(_) => return,
+                                }
+                            } else {
+                                h2_conn.accept().await
+                            };
+                            first = false;
+                            let Some(res) = next else { break };
                             let (req, respond) = match res {
                                 Ok(r) => r,
                                 Err(_) => break,
@@ -508,15 +559,14 @@ pub async fn start(
                             let f_tx = f_tx.clone();
                             let b_tx = b_tx.clone();
                             let pool = pool.clone();
-                            let pool = pool.clone();
 
-                            tokio::spawn(async move {
+                            reqs.spawn(async move {
                                 handle_h2_request(req, respond, u, p, pool, f_tx, b_tx).await;
                             });
                         }
                     });
                 }
-            }));
+            });
         }
 
         if use_h3 {
@@ -577,30 +627,40 @@ pub async fn start(
             let b_tx = broadcast_tx.clone();
             let pool = pool.clone();
 
-            tasks.push(tokio::spawn(async move {
-                while let Some(incoming) = endpoint.accept().await {
+            tasks.spawn(async move {
+                let mut conns = tokio::task::JoinSet::new();
+                loop {
+                    let incoming = tokio::select! {
+                        i = endpoint.accept() => match i {
+                            Some(i) => i,
+                            None => break,
+                        },
+                        Some(_) = conns.join_next(), if !conns.is_empty() => continue,
+                    };
                     let u = u.clone();
                     let p = p.clone();
                     let f_tx = f_tx.clone();
                     let b_tx = b_tx.clone();
                     let pool = pool.clone();
 
-                    tokio::spawn(async move {
-                        let conn = match incoming.await {
-                            Ok(c) => c,
-                            Err(_) => return,
+                    conns.spawn(async move {
+                        let setup = async {
+                            let conn = incoming.await.ok()?;
+                            let mut h3_builder = h3::server::builder();
+                            h3_builder.enable_extended_connect(true);
+                            h3_builder.enable_datagram(true);
+                            let h3_conn = h3_builder
+                                .build(h3_quinn::Connection::new(conn.clone()))
+                                .await
+                                .ok()?;
+                            Some((conn, h3_conn))
                         };
-                        let mut h3_builder = h3::server::builder();
-                        h3_builder.enable_extended_connect(true);
-                        h3_builder.enable_datagram(true);
-
-                        let mut h3_conn = match h3_builder
-                            .build(h3_quinn::Connection::new(conn.clone()))
-                            .await
-                        {
-                            Ok(c) => c,
-                            Err(_) => return,
-                        };
+                        let (conn, mut h3_conn) =
+                            match tokio::time::timeout(PRE_AUTH_TIMEOUT, setup).await {
+                                Ok(Some(c)) => c,
+                                _ => return,
+                            };
+                        let mut reqs = tokio::task::JoinSet::new();
 
                         while let Some(resolver) = h3_conn.accept().await.ok().flatten() {
                             let (req, stream) = match resolver.resolve_request().await {
@@ -612,22 +672,19 @@ pub async fn start(
                             let f_tx = f_tx.clone();
                             let b_tx = b_tx.clone();
                             let pool = pool.clone();
-                            let pool = pool.clone();
                             let conn_clone = conn.clone();
 
-                            tokio::spawn(async move {
+                            reqs.spawn(async move {
                                 handle_h3_request(req, stream, conn_clone, u, p, pool, f_tx, b_tx)
                                     .await;
                             });
                         }
                     });
                 }
-            }));
+            });
         }
 
-        for t in tasks {
-            let _ = t.await;
-        }
+        while tasks.join_next().await.is_some() {}
     });
 
     Ok(server_task.abort_handle())
@@ -642,6 +699,21 @@ async fn handle_h2_request(
     from_tunnel_tx: mpsc::Sender<Packet<Ip>>,
     bcast_tx: broadcast::Sender<(IpAddr, Bytes)>,
 ) {
+    let path_matches = crate::masque_capsule::path_matches(
+        req.uri().path_and_query().map_or("", |pq| pq.as_str()),
+        &path,
+    );
+    if !path_matches {
+        let _ = respond.send_response(
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(())
+                .unwrap(),
+            true,
+        );
+        return;
+    }
+
     if req.method() != Method::CONNECT {
         let _ = respond.send_response(
             Response::builder()
@@ -662,25 +734,6 @@ async fn handle_h2_request(
         let _ = respond.send_response(
             Response::builder()
                 .status(StatusCode::NOT_IMPLEMENTED)
-                .body(())
-                .unwrap(),
-            true,
-        );
-        return;
-    }
-
-    let req_path = req.uri().path();
-    let expected_path = path.as_str();
-    let path_matches = if expected_path.ends_with("/*/*/") || expected_path.ends_with("/*/") {
-        let pfx = expected_path.trim_end_matches("/*/");
-        req_path.starts_with(pfx)
-    } else {
-        req_path == expected_path
-    };
-    if !path_matches {
-        let _ = respond.send_response(
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
                 .body(())
                 .unwrap(),
             true,
@@ -813,30 +866,27 @@ async fn handle_h3_request(
     from_tunnel_tx: mpsc::Sender<Packet<Ip>>,
     bcast_tx: broadcast::Sender<(IpAddr, Bytes)>,
 ) {
-    if req.method() != Method::CONNECT {
+    let path_matches = crate::masque_capsule::path_matches(
+        req.uri().path_and_query().map_or("", |pq| pq.as_str()),
+        &path,
+    );
+    if !path_matches {
         let _ = stream
             .send_response(
                 Response::builder()
-                    .status(StatusCode::METHOD_NOT_ALLOWED)
+                    .status(StatusCode::NOT_FOUND)
                     .body(())
                     .unwrap(),
             )
             .await;
         return;
     }
-    let req_path = req.uri().path();
-    let expected_path = path.as_str();
-    let path_matches = if expected_path.ends_with("/*/*/") || expected_path.ends_with("/*/") {
-        let pfx = expected_path.trim_end_matches("/*/");
-        req_path.starts_with(pfx)
-    } else {
-        req_path == expected_path
-    };
-    if !path_matches {
+
+    if req.method() != Method::CONNECT {
         let _ = stream
             .send_response(
                 Response::builder()
-                    .status(StatusCode::NOT_FOUND)
+                    .status(StatusCode::METHOD_NOT_ALLOWED)
                     .body(())
                     .unwrap(),
             )
@@ -1055,38 +1105,44 @@ async fn handle_udp(udp: IncomingUdpSession, ctx: Arc<crate::vless::Context>, ro
         traffic.up(udp.first_packet.len());
     }
 
-    let (mut client_rx, resp_tx) = (udp.rx, udp.response_tx);
+    let activity = Activity::new();
+    let mut client_rx = udp.rx;
+    let resp_tx = udp.response_tx;
     let src = udp.src;
     let dst = udp.dst;
-    let cone_send = cone.clone();
-    let traffic_up = traffic.clone();
-    let host_up = host.clone();
 
-    let up = tokio::spawn(async move {
-        while let Some(pkt) = client_rx.recv().await {
-            traffic_up.up(pkt.len());
-            if let Ok(addr) = cone_send.target(&host_up, port).await {
-                if cone_send.send_to(&pkt, addr).await.is_err() {
-                    break;
+    let up = {
+        let cone = cone.clone();
+        let traffic = traffic.clone();
+        let activity = &activity;
+        async move {
+            while let Some(pkt) = client_rx.recv().await {
+                activity.touch();
+                traffic.up(pkt.len());
+                if let Ok(addr) = cone.target(&host, port).await {
+                    cone.send_to(&pkt, addr).await?;
+                }
+            }
+            Ok(())
+        }
+    };
+
+    let down = {
+        let activity = &activity;
+        async move {
+            let mut buf = vec![0u8; 65535];
+            loop {
+                let (n, _from) = cone.recv_from(&mut buf).await?;
+                activity.touch();
+                traffic.down(n);
+                if resp_tx.send((dst, src, buf[..n].to_vec())).await.is_err() {
+                    return Ok(());
                 }
             }
         }
-    });
+    };
 
-    let down = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        while let Ok((n, _from)) = cone.recv_from(&mut buf).await {
-            traffic.down(n);
-            if resp_tx.send((dst, src, buf[..n].to_vec())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    tokio::select! {
-        _ = up => {}
-        _ = down => {}
-    }
+    let _ = Box::pin(relay(up, down, &activity)).await;
 }
 
 #[cfg(test)]
