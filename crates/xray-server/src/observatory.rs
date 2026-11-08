@@ -513,6 +513,7 @@ impl Observatory {
 
         let loop_interval = interval * (burst.sampling_count as u32);
         let mut ticker = tokio::time::interval(loop_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
 
         loop {
@@ -538,17 +539,28 @@ impl Observatory {
                 });
             }
 
+            // Like Xray, take `sampling` probes per tag at random offsets inside the window.
+            let rounds = burst.sampling_count.max(1);
+            let mut probes = Vec::with_capacity(outbounds.len() * rounds);
             for tag in &outbounds {
-                let res = probe_outbound(
-                    &router,
-                    tag,
-                    &burst.destination,
-                    &burst.http_method,
-                    burst.timeout,
-                )
-                .await;
-                self.update_status_for_burst(tag, res);
+                for _ in 0..rounds {
+                    let offset = loop_interval.mul_f64(rand::random::<f64>());
+                    let (router, burst) = (&router, &burst);
+                    probes.push(async move {
+                        tokio::time::sleep(offset).await;
+                        let res = probe_outbound(
+                            router,
+                            tag,
+                            &burst.destination,
+                            &burst.http_method,
+                            burst.timeout,
+                        )
+                        .await;
+                        self.update_status_for_burst(tag, res);
+                    });
+                }
             }
+            futures_util::future::join_all(probes).await;
         }
     }
 }
@@ -610,10 +622,9 @@ async fn probe_outbound_inner(
     let mut stream: Box<dyn Stream> = if is_https {
         let tls_connector = xray_transport::TlsConnector::system()
             .map_err(|e| format!("tls connector error: {e}"))?;
-        let is_loopback = host == "127.0.0.1" || host == "localhost" || host == "::1";
         let tls_config = xray_transport::TlsClientConfig {
             server_name: host.clone(),
-            allow_insecure: is_loopback,
+            allow_insecure: false,
             pinned_peer_cert_sha256: Vec::new(),
             verify_peer_cert_by_name: Vec::new(),
             alpn: vec!["http/1.1".to_string()],
