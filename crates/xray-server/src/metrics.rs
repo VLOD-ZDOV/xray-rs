@@ -39,10 +39,13 @@ pub fn parse(root: &Value) -> Result<Option<Settings>, String> {
     }
     let listen = match listen {
         "" => None,
-        addr => Some(
-            addr.parse()
-                .map_err(|_| format!("metrics: invalid listen {addr:?}"))?,
-        ),
+        addr => Some(match addr.parse() {
+            Ok(a) => a,
+            Err(_) => std::net::ToSocketAddrs::to_socket_addrs(addr)
+                .ok()
+                .and_then(|mut it| it.next())
+                .ok_or_else(|| format!("metrics: invalid listen {addr:?}"))?,
+        }),
     };
     Ok(Some(Settings {
         // Xray names the outbound "Metrics" when only listen is set.
@@ -200,4 +203,17 @@ fn outbound_status(status: &crate::observatory::OutboundStatus) -> Value {
         put("health_ping", Value::Object(health), true);
     }
     Value::Object(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn listen_accepts_a_hostname() {
+        let root = json!({"metrics": {"listen": "localhost:11111"}});
+        let settings = parse(&root).unwrap().unwrap();
+        assert_eq!(settings.listen.unwrap().port(), 11111);
+        assert!(parse(&json!({"metrics": {"listen": "no port"}})).is_err());
+    }
 }
