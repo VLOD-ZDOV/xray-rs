@@ -169,7 +169,7 @@ pub fn mask(addr: SocketAddr) -> String {
         (IpAddr::V4(v4), level) => {
             let o = v4.octets();
             match level {
-                1 => format!("{}.{}.{}.*", o[0], o[1], o[2]),
+                1 => format!("{}.*.*.*", o[0]),
                 2 => format!("{}.{}.*.*", o[0], o[1]),
                 _ => "*.*.*.*".into(),
             }
@@ -177,7 +177,7 @@ pub fn mask(addr: SocketAddr) -> String {
         (IpAddr::V6(v6), level) => {
             let s = v6.segments();
             match level {
-                1 => format!("{:x}:{:x}:{:x}::*", s[0], s[1], s[2]),
+                1 => format!("{:x}::*", s[0]),
                 2 => format!("{:x}:{:x}::*", s[0], s[1]),
                 _ => "*::*".into(),
             }
@@ -303,8 +303,8 @@ mod tests {
     #[test]
     fn masks_addresses() {
         MASK.store(1, Ordering::Relaxed);
-        assert_eq!(mask("1.2.3.4:5".parse().unwrap()), "1.2.3.*:5");
-        assert_eq!(mask("[::ffff:1.2.3.4]:5".parse().unwrap()), "1.2.3.*:5");
+        assert_eq!(mask("1.2.3.4:5".parse().unwrap()), "1.*.*.*:5");
+        assert_eq!(mask("[::ffff:1.2.3.4]:5".parse().unwrap()), "1.*.*.*:5");
         MASK.store(0, Ordering::Relaxed);
         assert_eq!(mask("[::ffff:1.2.3.4]:5".parse().unwrap()), "1.2.3.4:5");
     }
