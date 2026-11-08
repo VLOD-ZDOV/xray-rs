@@ -42,11 +42,16 @@ impl TrojanOutbound {
         let connector = ServerConnector::parse(tag, "trojan", outbound)?;
         let settings = outbound.get("settings").unwrap_or(&Value::Null);
 
-        let password = if let Some(server) = settings
-            .get("servers")
-            .and_then(Value::as_array)
-            .and_then(|s| s.first())
-        {
+        let servers = settings.get("servers").and_then(Value::as_array);
+        let password = if let Some(servers) = servers {
+            if settings.get("address").is_some() {
+                return Err(err("set either address or servers, not both"));
+            }
+            let [server] = servers.as_slice() else {
+                return Err(err(
+                    "Trojan settings: \"servers\" should have one and only one member. Multiple endpoints in \"servers\" should use multiple Trojan outbounds and routing balancer instead",
+                ));
+            };
             server
                 .get("password")
                 .and_then(Value::as_str)
@@ -146,6 +151,10 @@ impl TrojanUdpLink {
         loop {
             if !read_buf.is_empty() {
                 match decode_udp_packet(&read_buf) {
+                    Ok((packet, used)) if packet.payload.is_empty() => {
+                        read_buf.drain(..used);
+                        continue;
+                    }
                     Ok((packet, used)) => {
                         let n = packet.payload.len().min(buf.len());
                         buf[..n].copy_from_slice(&packet.payload[..n]);
@@ -226,6 +235,7 @@ impl TrojanConeUdp {
                     }
                 });
                 let mut sessions = self.sessions.lock().await;
+                sessions.retain(|k, (_, t)| *k == addr || !t.is_finished());
                 if let Some((existing, task_ex)) = sessions.get(&addr) {
                     if !task_ex.is_finished() {
                         task.abort();
@@ -268,5 +278,23 @@ impl TrojanConeUdp {
 impl Drop for TrojanConeUdp {
     fn drop(&mut self) {
         self.abort_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outbound(settings: Value) -> Result<TrojanOutbound, String> {
+        TrojanOutbound::parse("t", &serde_json::json!({ "settings": settings }))
+    }
+
+    #[test]
+    fn servers_must_have_exactly_one_member() {
+        let server = serde_json::json!({"address": "192.0.2.1", "port": 443, "password": "p"});
+        let err = outbound(serde_json::json!({ "servers": [server.clone(), server.clone()] }))
+            .unwrap_err();
+        assert!(err.contains("one and only one member"), "{err}");
+        assert!(outbound(serde_json::json!({ "servers": [server] })).is_ok());
     }
 }
