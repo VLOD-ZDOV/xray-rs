@@ -372,16 +372,17 @@ pub async fn start(
 
     let task = tokio::spawn(async move {
         while let Some(incoming) = endpoint.accept().await {
-            let connection = match incoming.await {
-                Ok(c) => c,
-                Err(e) => {
-                    crate::log::debug(format!("quic handshake failed: {e}"));
-                    continue;
-                }
-            };
             let ctx = ctx.clone();
             let masq = masq.clone();
-            tokio::spawn(handle_connection(connection, ctx, udp_idle_timeout, masq));
+            // The handshake runs in its own task: one stalled peer must not hold up the rest.
+            tokio::spawn(async move {
+                match incoming.await {
+                    Ok(connection) => {
+                        handle_connection(connection, ctx, udp_idle_timeout, masq).await
+                    }
+                    Err(e) => crate::log::debug(format!("quic handshake failed: {e}")),
+                }
+            });
         }
     });
 
