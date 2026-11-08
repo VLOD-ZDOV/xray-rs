@@ -29,18 +29,23 @@ pub fn parse(tag: &str, item: &Value) -> Result<ServerConfig, String> {
     })?;
 
     let mut addresses = Vec::new();
-    if let Some(addrs) = settings.get("address").and_then(Value::as_array) {
-        for a in addrs {
-            if let Some(s) = a.as_str() {
+    match settings.get("address").and_then(Value::as_array) {
+        Some(addrs) => {
+            for a in addrs {
+                let s = a.as_str().unwrap_or("");
                 let ip_str = s.split('/').next().unwrap_or(s);
-                if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                    addresses.push(ip);
-                }
+                let ip = ip_str
+                    .parse::<IpAddr>()
+                    .map_err(|_| format!("invalid WireGuard address {s:?}"))?;
+                addresses.push(ip);
             }
         }
-    }
-    if addresses.is_empty() {
-        addresses = vec!["10.0.0.1".parse().unwrap()];
+        None => {
+            addresses = vec![
+                "10.0.0.1".parse().unwrap(),
+                "fd59:7153:2388:b5fd::1".parse().unwrap(),
+            ];
+        }
     }
 
     let mut peers = Vec::new();
@@ -63,21 +68,23 @@ pub fn parse(tag: &str, item: &Value) -> Result<ServerConfig, String> {
                 None
             };
 
-            let mut allowed_ips = Vec::new();
-            if let Some(ips) = p.get("allowedIPs").and_then(Value::as_array) {
-                for ip in ips {
-                    if let Some(s) = ip.as_str() {
-                        if let Ok(a) = s.parse::<AllowedIp>() {
-                            allowed_ips.push(a);
-                        }
+            let allowed_ips = match p.get("allowedIPs").and_then(Value::as_array) {
+                Some(ips) => {
+                    let mut out = Vec::new();
+                    for ip in ips {
+                        let s = ip.as_str().unwrap_or("");
+                        out.push(
+                            s.parse::<AllowedIp>()
+                                .map_err(|_| format!("invalid WireGuard allowedIPs entry {s:?}"))?,
+                        );
                     }
+                    out
                 }
-            }
-            if allowed_ips.is_empty() {
-                allowed_ips = vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()];
-            }
+                None => vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()],
+            };
 
-            let keepalive = p.get("keepAlive").and_then(Value::as_u64).unwrap_or(0) as u16;
+            let keepalive = u16::try_from(p.get("keepAlive").and_then(Value::as_u64).unwrap_or(0))
+                .map_err(|_| "WireGuard keepAlive is out of range".to_string())?;
 
             peers.push(ServerPeerConfig {
                 public_key,
@@ -100,7 +107,10 @@ pub fn parse(tag: &str, item: &Value) -> Result<ServerConfig, String> {
     if let Some(res_arr) = settings.get("reserved").and_then(Value::as_array) {
         if res_arr.len() == 3 {
             for (i, v) in res_arr.iter().enumerate() {
-                reserved[i] = v.as_u64().unwrap_or(0) as u8;
+                reserved[i] = v
+                    .as_u64()
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or_else(|| "\"reserved\" bytes must be in 0..=255".to_string())?;
             }
         } else if !res_arr.is_empty() {
             return Err("\"reserved\" should be empty or 3 bytes".into());
@@ -108,7 +118,8 @@ pub fn parse(tag: &str, item: &Value) -> Result<ServerConfig, String> {
     }
 
     let listen = item.get("listen").and_then(Value::as_str).unwrap_or("");
-    let port = item.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+    let port = u16::try_from(item.get("port").and_then(Value::as_u64).unwrap_or(0))
+        .map_err(|_| format!("inbound {tag:?}: port is out of range"))?;
     let listen_ip = if listen.is_empty() {
         IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
     } else {
@@ -310,4 +321,38 @@ async fn handle_udp(
     };
 
     let _ = Box::pin(relay(up, down, &activity)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    fn item(settings: Value) -> Value {
+        let mut s = json!({"secretKey": KEY});
+        s.as_object_mut()
+            .unwrap()
+            .extend(settings.as_object().unwrap().clone());
+        json!({"port": 51820, "settings": s})
+    }
+
+    #[test]
+    fn invalid_allowed_ips_and_address_are_rejected() {
+        let peer = |ips: Value| json!({"peers": [{"publicKey": KEY, "allowedIPs": ips}]});
+        assert!(parse("t", &item(peer(json!(["10.0.0.5/33"])))).is_err());
+        assert!(parse("t", &item(peer(json!(["10.0.0.5"])))).is_err());
+        let ok = parse("t", &item(peer(json!([])))).unwrap();
+        assert!(ok.peers[0].allowed_ips.is_empty());
+        assert!(parse("t", &item(json!({"address": ["garbage"]}))).is_err());
+        assert_eq!(parse("t", &item(json!({}))).unwrap().addresses.len(), 2);
+    }
+
+    #[test]
+    fn out_of_range_numbers_are_rejected() {
+        let ka = json!({"peers": [{"publicKey": KEY, "keepAlive": 65537}]});
+        assert!(parse("t", &item(ka)).is_err());
+        assert!(parse("t", &item(json!({"reserved": [1, 2, 300]}))).is_err());
+    }
 }
