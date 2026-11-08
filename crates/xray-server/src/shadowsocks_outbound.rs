@@ -286,9 +286,15 @@ impl ShadowsocksConeUdp {
 
         let reader_task = tokio::spawn(async move {
             let mut wire_buf = vec![0u8; 65535];
-            while let Ok(n) = socket_recv.recv(&mut wire_buf).await {
+            loop {
+                let n = match socket_recv.recv(&mut wire_buf).await {
+                    Ok(n) => n,
+                    // ICMP unreachable from a restarting server must not end the session.
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => continue,
+                    Err(_) => break,
+                };
                 if n == 0 {
-                    break;
+                    continue;
                 }
                 let decoded = match &method_recv {
                     ShadowsocksMethod::Aead2017(m) => {
