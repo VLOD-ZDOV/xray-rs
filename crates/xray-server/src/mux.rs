@@ -59,6 +59,9 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Fram
     let mut global_id = None;
     // A Keep frame may carry a per-packet UDP address; the flag byte must be checked first.
     if status == STATUS_NEW || (status == STATUS_KEEP && meta.len() > 4 && meta[4] == NETWORK_UDP) {
+        if meta.len() <= 4 {
+            return Err(invalid("short mux metadata"));
+        }
         let network = meta[4];
         if network != NETWORK_TCP && network != NETWORK_UDP {
             return Err(invalid("unknown mux network"));
@@ -193,10 +196,18 @@ static XUDP_MANAGER: std::sync::LazyLock<
     std::sync::RwLock<HashMap<[u8; 8], Arc<XudpSessionState>>>,
 > = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
 
-fn detach_xudp(gid: [u8; 8]) {
+/// Expires the worker only when the closing session still owns the downlink,
+/// so a stale session cannot detach a connection that took the flow over.
+fn detach_xudp(gid: [u8; 8], id: u16, out: &mpsc::Sender<Bytes>) {
     let mgr = XUDP_MANAGER.read().unwrap();
     if let Some(state) = mgr.get(&gid) {
-        *state.downlink.write().unwrap() = None;
+        let mut link = state.downlink.write().unwrap();
+        match &*link {
+            Some((cur, tx)) if *cur == id && tx.same_channel(out) => {}
+            _ => return,
+        }
+        *link = None;
+        drop(link);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -210,7 +221,7 @@ fn detach_xudp(gid: [u8; 8]) {
 struct Session {
     input: mpsc::Sender<Packet>,
     udp: bool,
-    global_id: Option<[u8; 8]>,
+    xudp: Option<([u8; 8], u16, mpsc::Sender<Bytes>)>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -219,8 +230,8 @@ impl Drop for Session {
         if let Some(t) = self.task.take() {
             t.abort();
         }
-        if let Some(gid) = self.global_id {
-            detach_xudp(gid);
+        if let Some((gid, id, out)) = &self.xudp {
+            detach_xudp(*gid, *id, out);
         }
     }
 }
@@ -321,7 +332,7 @@ where
                             let session = Session {
                                 input: state.uplink.clone(),
                                 udp: true,
-                                global_id: Some(gid),
+                                xudp: Some((gid, frame.id, out_tx.clone())),
                                 task: None,
                             };
                             if let Some(data) = frame.data {
@@ -362,7 +373,7 @@ where
                         let session = Session {
                             input: tx,
                             udp: true,
-                            global_id: Some(gid),
+                            xudp: Some((gid, frame.id, out_tx.clone())),
                             task: None,
                         };
                         if let Some(data) = frame.data {
@@ -390,7 +401,7 @@ where
                     let session = Session {
                         input: tx,
                         udp,
-                        global_id: None,
+                        xudp: None,
                         task: Some(task),
                     };
                     if let Some(data) = frame.data {
@@ -595,7 +606,12 @@ async fn xudp_worker(
         log::debug(format!("mux xudp worker {gid:?} ended: {e}"));
     }
     let mut mgr = XUDP_MANAGER.write().unwrap();
-    mgr.remove(&gid);
+    if mgr
+        .get(&gid)
+        .is_some_and(|s| Arc::ptr_eq(&s.downlink, &downlink))
+    {
+        mgr.remove(&gid);
+    }
 }
 
 /// Full-cone UDP: one socket per session, any destination, replies tagged
