@@ -24,6 +24,7 @@ mod masque_outbound;
 mod metrics;
 mod mux;
 mod observatory;
+mod ocsp;
 mod outbound;
 mod outbound_transport;
 mod padding;
@@ -230,6 +231,7 @@ async fn run(
     tls: Vec<Option<TlsAcceptor>>,
     _realities: Vec<Option<Arc<reality::RealityServer>>>,
 ) -> Result<(), String> {
+    start_ocsp_stapling();
     log::info(format!("xray-rs {} started", env!("CARGO_PKG_VERSION")));
     stats::init(config.stats);
     if let Some(fakedns) = config.fakedns {
@@ -1259,17 +1261,67 @@ impl ManagedCert {
             Err(_) => return,
         };
         let cert_names = extract_cert_names(certs[0].as_ref());
-        let mut certified_key = rustls::sign::CertifiedKey::new(certs, signing_key);
-        let ocsp_path = cert_path.with_extension("ocsp");
-        if let Ok(ocsp_bytes) = std::fs::read(&ocsp_path) {
-            certified_key.ocsp = Some(ocsp_bytes);
-        } else if self.ocsp_stapling > 0 {
-            // Hot reload interval configured with ocspStapling
-        }
+        let certified_key = rustls::sign::CertifiedKey::new(certs, signing_key);
+        // A reload drops the staple until the next OCSP refresh, as in Xray.
         self.certified_key = Arc::new(certified_key);
         self.allowed_names = cert_names;
         self.cert_mtime = c_mtime;
         self.key_mtime = k_mtime;
+    }
+}
+
+/// Xray's `setupOcspTicker` with `ocspStapling` set: a refresh at start, then
+/// one per interval; a failed one keeps the old staple.
+fn spawn_ocsp_stapling(resolver: &Arc<SniCheckingResolver>, index: usize) {
+    let interval = {
+        let cert = resolver.encipherment_certs[index].read().unwrap();
+        if cert.one_time_loading || cert.ocsp_stapling == 0 {
+            return;
+        }
+        cert.ocsp_stapling
+    };
+    let resolver = Arc::downgrade(resolver);
+    let task = async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval));
+        loop {
+            ticker.tick().await;
+            let Some(resolver) = resolver.upgrade() else {
+                return;
+            };
+            let chain = resolver.encipherment_certs[index]
+                .read()
+                .unwrap()
+                .certified_key
+                .cert
+                .clone();
+            match ocsp::fetch(&chain).await {
+                Ok(staple) => {
+                    let mut cert = resolver.encipherment_certs[index].write().unwrap();
+                    if cert.certified_key.ocsp.as_deref() != Some(staple.as_slice()) {
+                        let mut key = (*cert.certified_key).clone();
+                        key.ocsp = Some(staple);
+                        cert.certified_key = Arc::new(key);
+                    }
+                }
+                Err(e) => log::warn(format!("ignoring invalid OCSP: {e}")),
+            }
+        }
+    };
+    // The startup config builds TLS before the runtime starts; `run` spawns
+    // what waits here. Inbounds added through the API spawn at once.
+    match tokio::runtime::Handle::try_current() {
+        Ok(runtime) => drop(runtime.spawn(task)),
+        Err(_) => OCSP_TASKS.lock().unwrap().push(Box::pin(task)),
+    }
+}
+
+type OcspTask = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+static OCSP_TASKS: std::sync::Mutex<Vec<OcspTask>> = std::sync::Mutex::new(Vec::new());
+
+fn start_ocsp_stapling() {
+    for task in OCSP_TASKS.lock().unwrap().drain(..) {
+        tokio::spawn(task);
     }
 }
 
@@ -1439,13 +1491,7 @@ pub(crate) fn build_rustls_server_config(
                     .as_ref()
                     .and_then(|p| std::fs::metadata(p).ok())
                     .and_then(|m| m.modified().ok());
-                let mut certified_key = rustls::sign::CertifiedKey::new(certs, signing_key);
-                if let Some(cp) = &cert_path {
-                    let ocsp_path = cp.with_extension("ocsp");
-                    if let Ok(ocsp_bytes) = std::fs::read(&ocsp_path) {
-                        certified_key.ocsp = Some(ocsp_bytes);
-                    }
-                }
+                let certified_key = rustls::sign::CertifiedKey::new(certs, signing_key);
                 encipherment_certs.push(RwLock::new(ManagedCert {
                     certified_key: Arc::new(certified_key),
                     allowed_names: cert_names,
@@ -1489,6 +1535,9 @@ pub(crate) fn build_rustls_server_config(
         reject_unknown_sni: settings.reject_unknown_sni,
         provider: provider.clone(),
     });
+    for index in 0..resolver.encipherment_certs.len() {
+        spawn_ocsp_stapling(&resolver, index);
+    }
 
     let versions: &[&'static rustls::SupportedProtocolVersion] = if only_tls13 {
         &[&rustls::version::TLS13]
@@ -1503,17 +1552,8 @@ pub(crate) fn build_rustls_server_config(
         }
     };
 
-    if let Some(ref ech_keys) = settings.ech_server_keys {
-        log::info(format!(
-            "TLS ECH server keys configured (len {})",
-            ech_keys.len()
-        ));
-    }
-    if let Some(ref ech_list) = settings.ech_config_list {
-        log::info(format!(
-            "TLS ECH config list configured (len {})",
-            ech_list.len()
-        ));
+    if settings.ech_server_keys.is_some() {
+        log::warn("tlsSettings.echServerKeys is not supported yet, ECH is off for this inbound");
     }
 
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
