@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 pub const PROXY_V2_SIGNATURE: &[u8; 12] = b"\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A";
+const V1_MAX_LEN: usize = 107;
 pub const PROXY_V1_PREFIX: &[u8; 6] = b"PROXY ";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,14 +61,20 @@ where
                 ));
             }
             if let Some(pos) = find_crlf(&buf) {
+                if pos + 2 > V1_MAX_LEN {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "PROXY protocol v1 header exceeds 107 bytes",
+                    ));
+                }
                 let peer = parse_v1_header(&buf[..pos], original_peer)?;
                 let leftover = buf[pos + 2..].to_vec();
                 return Ok((peer, leftover));
             }
-            if buf.len() > 108 {
+            if buf.len() >= V1_MAX_LEN {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    "PROXY protocol v1 header exceeds 108 bytes",
+                    "PROXY protocol v1 header exceeds 107 bytes",
                 ));
             }
         } else if buf.len() >= 12
@@ -126,11 +133,17 @@ fn parse_v1_header(line_bytes: &[u8], original_peer: SocketAddr) -> io::Result<S
                     format!("invalid src IP in PROXY v1: {e}"),
                 )
             })?;
-            let src_port: u16 = parts[4].parse().map_err(|e| {
-                io::Error::new(
+            if (parts[1] == "TCP4") != src_ip.is_ipv4() {
+                return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("invalid src port in PROXY v1: {e}"),
-                )
+                    "PROXY v1 address does not match its protocol family",
+                ));
+            }
+            let port_ok = !parts[4].is_empty()
+                && parts[4].bytes().all(|b| b.is_ascii_digit())
+                && (parts[4] == "0" || !parts[4].starts_with('0'));
+            let src_port: u16 = parts[4].parse().ok().filter(|_| port_ok).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid src port in PROXY v1")
             })?;
             Ok(SocketAddr::new(src_ip, src_port))
         }
@@ -173,8 +186,13 @@ fn parse_v2_header(header: &[u8], original_peer: SocketAddr) -> io::Result<Socke
     }
 
     let family = fam_proto >> 4;
+    if !matches!(fam_proto & 0x0f, 1 | 2) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported PROXY v2 address family and protocol {fam_proto:#04x}"),
+        ));
+    }
     match family {
-        0 => Ok(original_peer), // AF_UNSPEC
         1 => {
             // AF_INET (IPv4)
             if header.len() < 28 {
@@ -220,6 +238,42 @@ fn parse_v2_header(header: &[u8], original_peer: SocketAddr) -> io::Result<Socke
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn rejects_malformed_v1_and_v2() {
+        let orig: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        for line in [
+            &b"PROXY TCP4 2001:db8::1 203.0.113.1 1 2"[..],
+            b"PROXY TCP6 198.51.100.1 203.0.113.1 1 2",
+            b"PROXY TCP4 198.51.100.1 203.0.113.1 +443 80",
+            b"PROXY TCP4 198.51.100.1 203.0.113.1 0443 80",
+        ] {
+            assert!(parse_v1_header(line, orig).is_err(), "{line:?}");
+        }
+        let v2 = |fam: u8| {
+            let mut h = PROXY_V2_SIGNATURE.to_vec();
+            h.extend_from_slice(&[0x21, fam, 0, 12]);
+            h.extend_from_slice(&[0; 12]);
+            parse_v2_header(&h, orig)
+        };
+        assert!(v2(0x13).is_err());
+        assert!(v2(0x00).is_err());
+        assert!(v2(0x11).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejects_long_v1_in_one_read() {
+        let mut input = b"PROXY TCP4 198.51.100.1 203.0.113.1 54321 443".to_vec();
+        input.resize(110, b' ');
+        input.extend_from_slice(b"\r\n");
+        let mut cursor = Cursor::new(input);
+        let fallback: SocketAddr = "127.0.0.1:80".parse().unwrap();
+        assert!(
+            read_proxy_header(&mut cursor, ProxyProtocolAccept::Any, fallback)
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn parses_v1_tcp4_with_leftover() {
