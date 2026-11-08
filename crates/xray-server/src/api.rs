@@ -1658,7 +1658,14 @@ async fn handle_handler(
             };
             match crate::start_inbound(&inbound, None, inbound_manager.router().clone()).await {
                 Ok((ctx, tcp_abort, udp_abort)) => {
-                    let _ = inbound_manager.add_entry(tag, ctx, tcp_abort, udp_abort);
+                    if let Err(e) =
+                        inbound_manager.add_entry(tag, ctx, tcp_abort.clone(), udp_abort.clone())
+                    {
+                        for handle in [tcp_abort, udp_abort].into_iter().flatten() {
+                            handle.abort();
+                        }
+                        return status(UNKNOWN, &e);
+                    }
                     reply(&AddInboundResponse {})
                 }
                 Err(e) => status(UNKNOWN, &e),
