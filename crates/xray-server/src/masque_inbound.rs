@@ -235,6 +235,85 @@ fn check_auth(headers: &http::HeaderMap, users: &[MasqueUser]) -> Option<MasqueU
     constant_time_eq(found.pass.as_bytes(), pass.as_bytes()).then(|| found.clone())
 }
 
+/// Xray's `addressPool`: one host address per tunnel, never the server's,
+/// the network's or the broadcast address, handed out round robin.
+struct IpPool {
+    server: u32,
+    first: u32,
+    last: u32,
+    next: u32,
+    used: std::collections::HashSet<u32>,
+}
+
+impl IpPool {
+    fn new(server: Ipv4Addr, bits: u8) -> Result<Self, String> {
+        let mask = if bits == 0 {
+            0
+        } else {
+            u32::MAX << (32 - u32::from(bits.min(32)))
+        };
+        let server = u32::from(server);
+        let network = server & mask;
+        let broadcast = network | !mask;
+        if server == network || server == broadcast {
+            return Err(format!(
+                "address {} is not a host address",
+                Ipv4Addr::from(server)
+            ));
+        }
+        let (first, last) = (network + 1, broadcast - 1);
+        if first >= last {
+            return Err(format!(
+                "address {} leaves no addresses to assign",
+                Ipv4Addr::from(server)
+            ));
+        }
+        Ok(Self {
+            server,
+            first,
+            last,
+            next: first,
+            used: Default::default(),
+        })
+    }
+
+    fn allocate(&mut self) -> Option<Ipv4Addr> {
+        let start = self.next;
+        let mut addr = start;
+        loop {
+            let next = if addr == self.last {
+                self.first
+            } else {
+                addr + 1
+            };
+            if addr != self.server && self.used.insert(addr) {
+                self.next = next;
+                return Some(addr.into());
+            }
+            if next == start {
+                return None;
+            }
+            addr = next;
+        }
+    }
+}
+
+/// A tunnel's address, back in the pool when the tunnel ends.
+struct Lease(Arc<std::sync::Mutex<IpPool>>, Ipv4Addr);
+
+impl Lease {
+    fn take(pool: &Arc<std::sync::Mutex<IpPool>>) -> Option<Self> {
+        let ip = pool.lock().unwrap().allocate()?;
+        Some(Self(pool.clone(), ip))
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().used.remove(&u32::from(self.1));
+    }
+}
+
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
@@ -250,22 +329,17 @@ pub async fn start(
         .ok_or_else(|| "missing masque settings".to_string())?;
 
     let mut stack_addrs = Vec::new();
-    let mut client_ip = IpAddr::V4(Ipv4Addr::new(10, 14, 0, 2));
-
-    for &(ip, _) in &config.prefixes {
+    let mut pool = None;
+    for &(ip, bits) in &config.prefixes {
         stack_addrs.push(ip);
-        if ip.is_ipv4() {
-            if let IpAddr::V4(v4) = ip {
-                let oct = v4.octets();
-                client_ip = IpAddr::V4(Ipv4Addr::new(
-                    oct[0],
-                    oct[1],
-                    oct[2],
-                    oct[3].wrapping_add(1),
-                ));
-            }
+        if let (IpAddr::V4(v4), None) = (ip, &pool) {
+            pool = Some(IpPool::new(v4, bits)?);
         }
     }
+    let pool = Arc::new(std::sync::Mutex::new(match pool {
+        Some(pool) => pool,
+        None => IpPool::new(Ipv4Addr::new(10, 14, 0, 1), 24)?,
+    }));
 
     let (to_tunnel_tx, mut to_tunnel_rx) = mpsc::channel::<Packet<Ip>>(128);
     let (from_tunnel_tx, from_tunnel_rx) = mpsc::channel::<Packet<Ip>>(128);
@@ -381,6 +455,7 @@ pub async fn start(
             let p = h2_path.clone();
             let f_tx = h2_from_tx.clone();
             let b_tx = h2_bcast_tx.clone();
+            let pool = pool.clone();
 
             tasks.push(tokio::spawn(async move {
                 while let Ok((stream, _peer)) = listener.accept().await {
@@ -389,6 +464,7 @@ pub async fn start(
                     let p = p.clone();
                     let f_tx = f_tx.clone();
                     let b_tx = b_tx.clone();
+                    let pool = pool.clone();
 
                     tokio::spawn(async move {
                         let tls_stream = match acc.accept(stream).await {
@@ -414,9 +490,11 @@ pub async fn start(
                             let p = p.clone();
                             let f_tx = f_tx.clone();
                             let b_tx = b_tx.clone();
+                            let pool = pool.clone();
+                            let pool = pool.clone();
 
                             tokio::spawn(async move {
-                                handle_h2_request(req, respond, u, p, client_ip, f_tx, b_tx).await;
+                                handle_h2_request(req, respond, u, p, pool, f_tx, b_tx).await;
                             });
                         }
                     });
@@ -480,6 +558,7 @@ pub async fn start(
             let p = path.clone();
             let f_tx = from_tunnel_tx.clone();
             let b_tx = broadcast_tx.clone();
+            let pool = pool.clone();
 
             tasks.push(tokio::spawn(async move {
                 while let Some(incoming) = endpoint.accept().await {
@@ -487,6 +566,7 @@ pub async fn start(
                     let p = p.clone();
                     let f_tx = f_tx.clone();
                     let b_tx = b_tx.clone();
+                    let pool = pool.clone();
 
                     tokio::spawn(async move {
                         let conn = match incoming.await {
@@ -514,13 +594,13 @@ pub async fn start(
                             let p = p.clone();
                             let f_tx = f_tx.clone();
                             let b_tx = b_tx.clone();
+                            let pool = pool.clone();
+                            let pool = pool.clone();
                             let conn_clone = conn.clone();
 
                             tokio::spawn(async move {
-                                handle_h3_request(
-                                    req, stream, conn_clone, u, p, client_ip, f_tx, b_tx,
-                                )
-                                .await;
+                                handle_h3_request(req, stream, conn_clone, u, p, pool, f_tx, b_tx)
+                                    .await;
                             });
                         }
                     });
@@ -541,7 +621,7 @@ async fn handle_h2_request(
     mut respond: h2::server::SendResponse<Bytes>,
     users: Arc<Vec<MasqueUser>>,
     path: Arc<String>,
-    client_ip: IpAddr,
+    pool: Arc<std::sync::Mutex<IpPool>>,
     from_tunnel_tx: mpsc::Sender<Packet<Ip>>,
     bcast_tx: broadcast::Sender<(IpAddr, Bytes)>,
 ) {
@@ -605,6 +685,18 @@ async fn handle_h2_request(
         );
         return;
     }
+    // Xray's `pool.allocate`: no address left is 503.
+    let Some(lease) = Lease::take(&pool) else {
+        let _ = respond.send_response(
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .body(())
+                .unwrap(),
+            true,
+        );
+        return;
+    };
+    let client_ip = IpAddr::V4(lease.1);
 
     let mut send_stream = match respond.send_response(
         Response::builder()
@@ -645,7 +737,13 @@ async fn handle_h2_request(
     let mut bcast_rx = bcast_tx.subscribe();
 
     let writer_task = tokio::spawn(async move {
-        while let Ok((dest, packet_bytes)) = bcast_rx.recv().await {
+        loop {
+            let (dest, packet_bytes) = match bcast_rx.recv().await {
+                Ok(item) => item,
+                // A slow tunnel skips what it missed, as a full queue drops packets.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
             if dest == client_ip {
                 let cap = encode_datagram_capsule(&packet_bytes);
                 let mut s = send_for_writer.lock().await;
@@ -674,10 +772,17 @@ async fn handle_h2_request(
         }
     });
 
+    let (mut reader_task, mut writer_task) = (reader_task, writer_task);
     tokio::select! {
-        _ = reader_task => {}
-        _ = writer_task => {}
+        _ = &mut reader_task => {}
+        _ = &mut writer_task => {}
     }
+    // Both halves end before the address goes back to the pool for another tunnel.
+    reader_task.abort();
+    writer_task.abort();
+    let _ = reader_task.await;
+    let _ = writer_task.await;
+    drop(lease);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -687,7 +792,7 @@ async fn handle_h3_request(
     conn: quinn::Connection,
     users: Arc<Vec<MasqueUser>>,
     path: Arc<String>,
-    client_ip: IpAddr,
+    pool: Arc<std::sync::Mutex<IpPool>>,
     from_tunnel_tx: mpsc::Sender<Packet<Ip>>,
     bcast_tx: broadcast::Sender<(IpAddr, Bytes)>,
 ) {
@@ -737,6 +842,18 @@ async fn handle_h3_request(
             .await;
         return;
     }
+    let Some(lease) = Lease::take(&pool) else {
+        let _ = stream
+            .send_response(
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(())
+                    .unwrap(),
+            )
+            .await;
+        return;
+    };
+    let client_ip = IpAddr::V4(lease.1);
 
     if stream
         .send_response(
@@ -797,7 +914,13 @@ async fn handle_h3_request(
         crate::masque_capsule::encode_varint(quarter_stream_id, &mut prefix);
         crate::masque_capsule::encode_varint(0, &mut prefix); // Context ID = 0
 
-        while let Ok((dest, packet_bytes)) = bcast_rx.recv().await {
+        loop {
+            let (dest, packet_bytes) = match bcast_rx.recv().await {
+                Ok(item) => item,
+                // A slow tunnel skips what it missed, as a full queue drops packets.
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
             if dest == client_ip {
                 let mut dgram = prefix.clone();
                 dgram.extend_from_slice(&packet_bytes);
@@ -808,10 +931,17 @@ async fn handle_h3_request(
         }
     });
 
+    let (mut reader_task, mut writer_task) = (reader_task, writer_task);
     tokio::select! {
-        _ = reader_task => {}
-        _ = writer_task => {}
+        _ = &mut reader_task => {}
+        _ = &mut writer_task => {}
     }
+    // Both halves end before the address goes back to the pool for another tunnel.
+    reader_task.abort();
+    writer_task.abort();
+    let _ = reader_task.await;
+    let _ = writer_task.await;
+    drop(lease);
 }
 
 async fn handle_tcp(tcp: IncomingTcpStream, ctx: Arc<crate::vless::Context>, router: Arc<Router>) {
@@ -939,5 +1069,23 @@ async fn handle_udp(udp: IncomingUdpSession, ctx: Arc<crate::vless::Context>, ro
     tokio::select! {
         _ = up => {}
         _ = down => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_tunnel_gets_its_own_address_and_returns_it() {
+        let pool = Arc::new(std::sync::Mutex::new(
+            IpPool::new(Ipv4Addr::new(10, 0, 0, 1), 30).unwrap(),
+        ));
+        let a = Lease::take(&pool).unwrap();
+        assert_eq!(a.1, Ipv4Addr::new(10, 0, 0, 2));
+        assert!(Lease::take(&pool).is_none());
+        drop(a);
+        assert_eq!(Lease::take(&pool).unwrap().1, Ipv4Addr::new(10, 0, 0, 2));
+        assert!(IpPool::new(Ipv4Addr::new(10, 0, 0, 0), 24).is_err());
     }
 }
