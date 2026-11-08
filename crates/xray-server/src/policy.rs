@@ -20,10 +20,10 @@ pub struct PolicySettings {
 impl Default for PolicySettings {
     fn default() -> Self {
         Self {
-            handshake: Duration::from_secs(4),
+            handshake: Duration::from_secs(60),
             conn_idle: Duration::from_secs(300),
-            uplink_only: Duration::from_secs(2),
-            downlink_only: Duration::from_secs(5),
+            uplink_only: Duration::from_secs(1),
+            downlink_only: Duration::from_secs(1),
             buffer_size: 32 * 1024,
             stats_user_uplink: false,
             stats_user_downlink: false,
@@ -63,8 +63,12 @@ impl PolicyManager {
                         settings.downlink_only = v;
                     }
                     if let Some(kib) = val.get("bufferSize").and_then(Value::as_u64) {
-                        if kib > 0 {
-                            settings.buffer_size = kib as usize * 1024;
+                        if let Some(bytes) = kib
+                            .checked_mul(1024)
+                            .and_then(|b| usize::try_from(b).ok())
+                            .filter(|&b| b > 0)
+                        {
+                            settings.buffer_size = bytes;
                         }
                     }
                     if let Some(b) = val.get("statsUserUplink").and_then(Value::as_bool) {
@@ -171,6 +175,20 @@ mod tests {
         assert_eq!(
             PolicyManager::from_config(&serde_json::json!({})).for_level(0),
             PolicySettings::default()
+        );
+    }
+
+    #[test]
+    fn defaults_follow_xray_and_oversized_buffer_is_ignored() {
+        let d = PolicySettings::default();
+        assert_eq!(d.handshake, Duration::from_secs(60));
+        assert_eq!(d.uplink_only, Duration::from_secs(1));
+        assert_eq!(d.downlink_only, Duration::from_secs(1));
+        let root =
+            serde_json::json!({"policy": {"levels": {"0": {"bufferSize": 18014398509481984u64}}}});
+        assert_eq!(
+            PolicyManager::from_config(&root).for_level(0).buffer_size,
+            d.buffer_size
         );
     }
 }
