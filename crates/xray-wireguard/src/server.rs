@@ -280,6 +280,10 @@ fn inspect_packet(buf: &[u8]) -> Option<PacketType> {
             let src_port = u16::from_be_bytes([buf[ihl], buf[ihl + 1]]);
             let dst_port = u16::from_be_bytes([buf[ihl + 2], buf[ihl + 3]]);
             let len = u16::from_be_bytes([buf[ihl + 4], buf[ihl + 5]]) as usize;
+            // A UDP length below its own 8-byte header is malformed; the kernel drops it too.
+            if len < 8 {
+                return None;
+            }
             let end = (ihl + len).min(buf.len());
             let payload = buf[ihl + 8..end].to_vec();
             return Some(PacketType::Udp {
@@ -311,6 +315,10 @@ fn inspect_packet(buf: &[u8]) -> Option<PacketType> {
             let src_port = u16::from_be_bytes([buf[ihl], buf[ihl + 1]]);
             let dst_port = u16::from_be_bytes([buf[ihl + 2], buf[ihl + 3]]);
             let len = u16::from_be_bytes([buf[ihl + 4], buf[ihl + 5]]) as usize;
+            // A UDP length below its own 8-byte header is malformed; the kernel drops it too.
+            if len < 8 {
+                return None;
+            }
             let end = (ihl + len).min(buf.len());
             let payload = buf[ihl + 8..end].to_vec();
             return Some(PacketType::Udp {
