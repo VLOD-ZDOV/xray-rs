@@ -866,6 +866,7 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                 let config = req.config.unwrap_or_default();
                 if config.r#type.contains("xray.app.router.Config") {
                     if let Ok(cfg) = RouterConfigProto::decode(config.value) {
+                        let mut parsed_rules = Vec::new();
                         for r in cfg.rule {
                             let mut rule_obj = serde_json::Map::new();
                             rule_obj.insert("type".into(), serde_json::json!("field"));
@@ -896,15 +897,22 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                             for ip in r.ip {
                                 if let Some(c) = ip.custom {
                                     if !c.ip.is_empty() {
-                                        let ip_str = if c.ip.len() == 4 {
-                                            format!(
-                                                "{}.{}.{}.{}/{}",
-                                                c.ip[0], c.ip[1], c.ip[2], c.ip[3], c.prefix
-                                            )
-                                        } else {
-                                            format!("{:?}/{}", c.ip, c.prefix)
+                                        let ip = match c.ip.len() {
+                                            4 => <[u8; 4]>::try_from(&c.ip[..])
+                                                .map(std::net::IpAddr::from),
+                                            16 => <[u8; 16]>::try_from(&c.ip[..])
+                                                .map(std::net::IpAddr::from),
+                                            _ => {
+                                                return status(
+                                                    INVALID_ARGUMENT,
+                                                    "invalid IP length",
+                                                )
+                                            }
                                         };
-                                        ips.push(ip_str);
+                                        let Ok(ip) = ip else {
+                                            return status(INVALID_ARGUMENT, "invalid IP length");
+                                        };
+                                        ips.push(format!("{ip}/{}", c.prefix));
                                     }
                                 } else if let Some(g) = ip.geoip {
                                     ips.push(format!("geoip:{}", g.code));
@@ -961,11 +969,16 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                                 }
                             }
                             match router.parse_rule(&serde_json::Value::Object(rule_obj)) {
-                                Ok(parsed_rule) => {
-                                    router.add_rule(parsed_rule, req.should_append);
-                                }
+                                Ok(parsed_rule) => parsed_rules.push(parsed_rule),
                                 Err(e) => return status(UNKNOWN, &e),
                             }
+                        }
+                        // Prepending one by one would reverse the given order.
+                        if !req.should_append {
+                            parsed_rules.reverse();
+                        }
+                        for rule in parsed_rules {
+                            router.add_rule(rule, req.should_append);
                         }
                     }
                 }
