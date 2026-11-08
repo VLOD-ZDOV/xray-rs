@@ -16,6 +16,7 @@ const MAX_HEADER_SIZE: usize = 16 * 1024;
 const CHUNK_SIZE: usize = 4096;
 // Xray clients send one frame per write (a few KiB at most).
 const MAX_FRAME_SIZE: usize = 1 << 20;
+const MAX_QUEUED_PONGS: usize = 64 * 1024;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 pub fn accept_key_for(client_key: &str) -> String {
@@ -116,6 +117,13 @@ impl ServerFrameDecoder {
             }
             len => (len as usize, 2),
         };
+        // RFC 6455 §5.5: control frames carry at most 125 bytes and are never fragmented.
+        if opcode & 0x8 != 0 && (payload_len > 125 || b0 & 0x80 == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid websocket control frame",
+            ));
+        }
         // Frames are buffered whole before unmasking, so their size must be bounded.
         if payload_len > MAX_FRAME_SIZE {
             return Err(io::Error::new(
@@ -288,6 +296,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketStream<S> {
                     }
                 }
                 Ok(Some(FrameEvent::Pong(ping_data))) => {
+                    // A peer that pings without reading would grow the queue forever.
+                    if out.len() > MAX_QUEUED_PONGS {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "websocket peer does not read its pongs",
+                        )));
+                    }
                     encode_server_frame(out, 0x8A, &ping_data);
                     let _ = flush_buffer(inner, out, out_pos, cx);
                 }
