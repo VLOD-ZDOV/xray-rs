@@ -817,7 +817,8 @@ impl KcpSession {
             }
         } else if sn > self.next_recv_num {
             let max_wnd = self.settings.receiving_in_flight_size();
-            if sn - self.next_recv_num < max_wnd {
+            if sn - self.next_recv_num < max_wnd && seg.payload.len() <= self.settings.mtu as usize
+            {
                 self.recv_window.insert(sn, seg.payload);
             }
         }
