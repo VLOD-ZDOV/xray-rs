@@ -272,6 +272,10 @@ impl ServerConnector {
             }
         };
 
+        if matches!(connector, ConnectorConfig::Reality(_)) && matches!(network, "kcp" | "mkcp") {
+            return Err(err("REALITY only supports RAW, XHTTP and gRPC for now."));
+        }
+
         let host_fallback = match &connector {
             ConnectorConfig::Tls(tls) if !tls.server_name.is_empty() => tls.server_name.clone(),
             ConnectorConfig::Reality(reality) if !reality.server_name.is_empty() => {
@@ -618,27 +622,40 @@ pub(crate) fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, Str
             Host::Domain(d) => d.clone(),
             Host::Ip(ip) => ip.to_string(),
         });
+    if tls
+        .get("allowInsecure")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err("The feature \"allowInsecure\" has been removed and migrated to \"pinnedPeerCertSha256\"(pcs) and \"verifyPeerCertByName\"(vcn). Please update your config(s) according to release note and documentation.".into());
+    }
     let mut pinned_peer_cert_sha256 = Vec::new();
-    if let Some(pins) = tls.get("pinnedPeerCertSha256").and_then(Value::as_array) {
-        for pin in pins.iter().filter_map(Value::as_str) {
-            if let Ok(bytes) = decode_hex(pin) {
-                if let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice()) {
-                    pinned_peer_cert_sha256.push(arr);
-                }
-            }
+    let pin_list: Vec<&str> = match tls.get("pinnedPeerCertSha256") {
+        Some(Value::String(s)) => s.split(',').collect(),
+        Some(Value::Array(pins)) => pins.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    for pin in pin_list {
+        let pin = pin.trim();
+        if pin.is_empty() {
+            continue;
         }
+        let bytes = decode_hex(&pin.replace(':', ""))?;
+        let arr = <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| format!("incorrect pinnedPeerCertSha256 length: {pin}"))?;
+        pinned_peer_cert_sha256.push(arr);
     }
     if let Some(certs) = tls.get("certificates").and_then(Value::as_array) {
         for cert in certs {
             let usage = cert.get("usage").and_then(Value::as_str).unwrap_or("");
-            if usage == "verify" || usage.is_empty() {
+            if usage.eq_ignore_ascii_case("verify") {
                 if let Some(file) = cert.get("certificateFile").and_then(Value::as_str) {
-                    if let Ok(content) = std::fs::read(file) {
-                        for der in CertificateDer::pem_slice_iter(&content).flatten() {
-                            use sha2::Digest;
-                            let hash: [u8; 32] = sha2::Sha256::digest(&der).into();
-                            pinned_peer_cert_sha256.push(hash);
-                        }
+                    let content = std::fs::read(file)
+                        .map_err(|e| format!("failed to read certificate file {file}: {e}"))?;
+                    for der in CertificateDer::pem_slice_iter(&content).flatten() {
+                        use sha2::Digest;
+                        let hash: [u8; 32] = sha2::Sha256::digest(&der).into();
+                        pinned_peer_cert_sha256.push(hash);
                     }
                 } else if let Some(cert_lines) = cert.get("certificate").and_then(Value::as_array) {
                     let pem = cert_lines
@@ -656,11 +673,7 @@ pub(crate) fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, Str
         }
     }
 
-    let allow_insecure = tls
-        .get("allowInsecure")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-        && pinned_peer_cert_sha256.is_empty();
+    let allow_insecure = false;
 
     let fingerprint = tls
         .get("fingerprint")
@@ -759,6 +772,9 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     if !hex.len().is_multiple_of(2) {
         return Err("odd hex string length".into());
     }
+    if !hex.is_ascii() {
+        return Err("invalid hex character".into());
+    }
     (0..hex.len())
         .step_by(2)
         .map(|i| {
@@ -766,4 +782,45 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
                 .map_err(|e| format!("invalid hex character: {e}"))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn host() -> Host {
+        Host::Domain("example.com".into())
+    }
+
+    #[test]
+    fn tls_rejects_allow_insecure() {
+        let tls = serde_json::json!({"allowInsecure": true});
+        assert!(parse_tls(&tls, &host())
+            .unwrap_err()
+            .contains("allowInsecure"));
+    }
+
+    #[test]
+    fn tls_pins_accept_xray_string_form() {
+        let pin = "ab".repeat(32);
+        let colons = pin
+            .as_bytes()
+            .chunks(2)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(":");
+        let tls = serde_json::json!({"pinnedPeerCertSha256": format!("{colons}, {pin}")});
+        let Ok(ConnectorConfig::Tls(cfg)) = parse_tls(&tls, &host()) else {
+            panic!("expected tls");
+        };
+        assert_eq!(cfg.pinned_peer_cert_sha256, vec![[0xab; 32], [0xab; 32]]);
+        let bad = serde_json::json!({"pinnedPeerCertSha256": "abcd"});
+        assert!(parse_tls(&bad, &host()).is_err());
+    }
+
+    #[test]
+    fn decode_hex_rejects_non_ascii() {
+        assert!(decode_hex("a\u{20ac}").is_err());
+        assert_eq!(decode_hex("0aFf").unwrap(), vec![0x0a, 0xff]);
+    }
 }
