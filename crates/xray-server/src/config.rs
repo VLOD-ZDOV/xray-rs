@@ -1295,27 +1295,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                     let pwd = str_field(m_settings, "password");
                     if !pwd.is_empty() {
                         hysteria_salamander = Some(pwd.to_owned());
-                        if let Some(ps) = m_settings.get("packetSize") {
-                            if let Some(n) = ps.as_u64() {
-                                if n > 0 && n <= 2048 {
-                                    hysteria_gecko =
-                                        xray_transport::hysteria::gecko::GeckoPacketSize::new(
-                                            n as u16, n as u16,
-                                        );
-                                }
-                            } else if let Some(s) = ps.as_str() {
-                                if let Some((left, right)) = s.split_once('-') {
-                                    if let (Ok(l), Ok(r)) =
-                                        (left.parse::<u16>(), right.parse::<u16>())
-                                    {
-                                        let min = l.min(r);
-                                        let max = l.max(r);
-                                        hysteria_gecko =
-                                            xray_transport::hysteria::gecko::GeckoPacketSize::new(
-                                                min, max,
-                                            );
-                                    }
-                                }
+                        if let Some((min, max)) = parse_packet_size(m_settings.get("packetSize"))? {
+                            if max > 0 {
+                                hysteria_gecko = Some(gecko_packet_size(min, max)?);
                             }
                         }
                     }
@@ -1339,13 +1321,12 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                     let min = g_obj
                         .get("minPacketSize")
                         .and_then(Value::as_u64)
-                        .unwrap_or(512) as u16;
+                        .unwrap_or(512);
                     let max = g_obj
                         .get("maxPacketSize")
                         .and_then(Value::as_u64)
-                        .unwrap_or(1200) as u16;
-                    hysteria_gecko =
-                        xray_transport::hysteria::gecko::GeckoPacketSize::new(min, max);
+                        .unwrap_or(1200);
+                    hysteria_gecko = Some(gecko_packet_size(min, max)?);
                 }
             }
         }
@@ -1862,6 +1843,33 @@ fn parse_fakedns_pool(item: &Value) -> Result<crate::fakedns::FakeDnsPoolConfig,
         ip_pool: ip_pool.to_owned(),
         pool_size,
     })
+}
+
+/// Int32Range as in Xray: a number, or "from-to" in a string.
+fn parse_packet_size(v: Option<&Value>) -> Result<Option<(u64, u64)>, String> {
+    let invalid = || "gecko: invalid min/max packet size".to_owned();
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n.as_u64().map(|n| Some((n, n))).ok_or_else(invalid),
+        Some(Value::String(s)) => {
+            let (l, r) = s.split_once('-').unwrap_or((s, s));
+            let l: u64 = l.trim().parse().map_err(|_| invalid())?;
+            let r: u64 = r.trim().parse().map_err(|_| invalid())?;
+            Ok(Some((l.min(r), l.max(r))))
+        }
+        Some(_) => Err(invalid()),
+    }
+}
+
+fn gecko_packet_size(
+    min: u64,
+    max: u64,
+) -> Result<xray_transport::hysteria::gecko::GeckoPacketSize, String> {
+    let min = u16::try_from(min).ok();
+    let max = u16::try_from(max).ok();
+    min.zip(max)
+        .and_then(|(min, max)| xray_transport::hysteria::gecko::GeckoPacketSize::new(min, max))
+        .ok_or_else(|| "gecko: invalid min/max packet size".to_owned())
 }
 
 fn parse_fakedns(
@@ -3490,6 +3498,22 @@ mod tests {
             Some(&"world".to_string())
         );
         assert_eq!(get_env("XRAY_TEST_VAR_1"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn gecko_packet_sizes_are_validated() {
+        use serde_json::json;
+        assert_eq!(
+            parse_packet_size(Some(&json!("512-1200"))),
+            Ok(Some((512, 1200)))
+        );
+        assert_eq!(parse_packet_size(Some(&json!(700))), Ok(Some((700, 700))));
+        assert_eq!(parse_packet_size(None), Ok(None));
+        assert!(parse_packet_size(Some(&json!("abc"))).is_err());
+        assert!(gecko_packet_size(512, 1200).is_ok());
+        assert!(gecko_packet_size(0, 1200).is_err());
+        assert!(gecko_packet_size(512, 3000).is_err());
+        assert!(gecko_packet_size(66736, 66736).is_err());
     }
 
     #[test]
