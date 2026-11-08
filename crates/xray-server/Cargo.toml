@@ -1,6 +1,6 @@
 [package]
 name = "xray-server"
-version = "26.10.31"
+version = "26.10.31+1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
