@@ -519,6 +519,13 @@ async fn tcp_session(
     let _ = out.send(end_frame(id, result.is_err())).await;
 }
 
+fn unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 async fn xudp_worker(
     gid: [u8; 8],
     target: (Host, u16),
@@ -530,8 +537,10 @@ async fn xudp_worker(
     let result: io::Result<()> = async {
         let cone = ConeUdp::open(dial.router.clone(), &dial.decision).await?;
         let mut resolved: HashMap<(String, u16), SocketAddr> = HashMap::new();
+        let last_active = std::sync::atomic::AtomicU64::new(unix_secs());
         let up = async {
             while let Some(packet) = input.recv().await {
+                last_active.store(unix_secs(), std::sync::atomic::Ordering::Relaxed);
                 let (host, port) = packet
                     .dest
                     .as_ref()
@@ -580,10 +589,16 @@ async fn xudp_worker(
                         if exp != 0 && now >= exp {
                             return Ok(());
                         }
+                        let idle = now
+                            .saturating_sub(last_active.load(std::sync::atomic::Ordering::Relaxed));
+                        if idle >= CONN_IDLE.as_secs() {
+                            return Ok(());
+                        }
                         continue;
                     }
                 };
                 dial.traffic.down(n);
+                last_active.store(unix_secs(), std::sync::atomic::Ordering::Relaxed);
 
                 let current_downlink = downlink.read().unwrap().clone();
                 if let Some((id, ref out)) = current_downlink {
