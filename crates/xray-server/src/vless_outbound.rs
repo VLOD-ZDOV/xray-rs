@@ -920,11 +920,14 @@ impl XudpConn {
                 xray_proxy::mux::encode(&frame)
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?
             } else {
-                let session_id = s.next_id;
-                s.next_id = s.next_id.wrapping_add(1);
-                if s.next_id == 0 {
-                    s.next_id = 1;
+                let mut session_id = s.next_id;
+                while s.by_id.contains_key(&session_id) {
+                    session_id = session_id.checked_add(1).unwrap_or(1);
+                    if session_id == s.next_id {
+                        return Err(io::Error::other("too many xudp sessions"));
+                    }
                 }
+                s.next_id = session_id.checked_add(1).unwrap_or(1);
                 s.by_addr.insert(addr, session_id);
                 s.by_id.insert(session_id, addr);
                 let global_id: [u8; 8] = rand::random();
