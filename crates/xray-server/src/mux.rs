@@ -803,11 +803,9 @@ impl MuxClientPool {
                     while let Ok(frame) = read_frame(&mut reader).await {
                         match frame.status {
                             STATUS_KEEP => {
-                                let lock = sessions_r.lock().await;
-                                if let Some(tx) = lock.get(&frame.id) {
-                                    if let Some(data) = frame.data {
-                                        let _ = tx.send(Bytes::from(data)).await;
-                                    }
+                                let tx = sessions_r.lock().await.get(&frame.id).cloned();
+                                if let (Some(tx), Some(data)) = (tx, frame.data) {
+                                    let _ = tx.send(Bytes::from(data)).await;
                                 }
                             }
                             STATUS_END => {
@@ -834,6 +832,7 @@ impl MuxClientPool {
                 p
             }
         };
+        drop(parents);
 
         let session_id = loop {
             let id = parent.next_id.fetch_add(1, Ordering::Relaxed);
@@ -888,6 +887,7 @@ impl MuxClientPool {
             rx: sub_rx,
             buffer: Bytes::new(),
             closed: false,
+            reserving: None,
         }))
     }
 }
@@ -900,7 +900,16 @@ pub struct MuxSubStream {
     rx: mpsc::Receiver<Bytes>,
     buffer: Bytes,
     closed: bool,
+    reserving: Option<ReserveFuture>,
 }
+
+type ReserveFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<
+                Output = Result<mpsc::OwnedPermit<Bytes>, mpsc::error::SendError<()>>,
+            > + Send,
+    >,
+>;
 
 impl AsyncRead for MuxSubStream {
     fn poll_read(
@@ -951,15 +960,38 @@ impl AsyncWrite for MuxSubStream {
         };
         let wire = xray_proxy::mux::encode(&frame)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        match self.writer_tx.try_send(Bytes::from(wire)) {
-            Ok(()) => std::task::Poll::Ready(Ok(chunk_len)),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
+        let this = self.get_mut();
+        let wire = Bytes::from(wire);
+        if this.reserving.is_none() {
+            match this.writer_tx.try_send(wire.clone()) {
+                Ok(()) => return std::task::Poll::Ready(Ok(chunk_len)),
+                Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return std::task::Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "Mux parent closed",
+                    )));
+                }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => std::task::Poll::Ready(Err(
-                io::Error::new(io::ErrorKind::BrokenPipe, "Mux parent closed"),
-            )),
+        }
+        let tx = this.writer_tx.clone();
+        let fut = this
+            .reserving
+            .get_or_insert_with(|| Box::pin(tx.reserve_owned()));
+        match fut.as_mut().poll(cx) {
+            std::task::Poll::Ready(Ok(permit)) => {
+                this.reserving = None;
+                permit.send(wire);
+                std::task::Poll::Ready(Ok(chunk_len))
+            }
+            std::task::Poll::Ready(Err(_)) => {
+                this.reserving = None;
+                std::task::Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "Mux parent closed",
+                )))
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 
@@ -976,10 +1008,22 @@ impl AsyncWrite for MuxSubStream {
     ) -> std::task::Poll<io::Result<()>> {
         if !self.closed {
             self.closed = true;
-            let end = end_frame(self.session_id, false);
-            let _ = self.writer_tx.try_send(end);
+            self.send_end();
         }
         std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl MuxSubStream {
+    /// Queues the End frame; when the writer channel is full it waits for room in a task.
+    fn send_end(&self) {
+        let end = end_frame(self.session_id, false);
+        if let Err(mpsc::error::TrySendError::Full(end)) = self.writer_tx.try_send(end) {
+            let tx = self.writer_tx.clone();
+            tokio::spawn(async move {
+                let _ = tx.send(end).await;
+            });
+        }
     }
 }
 
@@ -987,8 +1031,7 @@ impl Drop for MuxSubStream {
     fn drop(&mut self) {
         if !self.closed {
             self.closed = true;
-            let end = end_frame(self.session_id, false);
-            let _ = self.writer_tx.try_send(end);
+            self.send_end();
         }
         self.active_count
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -1052,11 +1095,9 @@ impl ReversePortal {
             while let Ok(frame) = read_frame(&mut reader).await {
                 match frame.status {
                     STATUS_KEEP => {
-                        let lock = sessions_r.lock().await;
-                        if let Some(tx) = lock.get(&frame.id) {
-                            if let Some(data) = frame.data {
-                                let _ = tx.send(Bytes::from(data)).await;
-                            }
+                        let tx = sessions_r.lock().await.get(&frame.id).cloned();
+                        if let (Some(tx), Some(data)) = (tx, frame.data) {
+                            let _ = tx.send(Bytes::from(data)).await;
                         }
                     }
                     STATUS_END => {
@@ -1211,6 +1252,7 @@ impl ReversePortal {
             rx: sub_rx,
             buffer: Bytes::new(),
             closed: false,
+            reserving: None,
         }))
     }
 }
