@@ -3,7 +3,6 @@
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
@@ -120,16 +119,12 @@ impl Handler {
         let (client_r, client_w) = tokio::io::split(duplex_a);
         let (mut duplex_r, mut duplex_w) = tokio::io::split(duplex_b);
 
-        let err_status = Arc::new(AtomicU32::new(0));
-        let err_status_clone = err_status.clone();
-
         match &self.protocol {
             GrpcProtocol::Vless(ctx) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = vless::serve(client_r, client_w, &ctx, peer).await {
                         log::info(format!("vless-grpc from {} rejected: {e}", log::mask(peer)));
-                        err_status_clone.store(16, Ordering::Relaxed);
                     }
                 });
             }
@@ -143,13 +138,12 @@ impl Handler {
                             "trojan-grpc from {} rejected: {e}",
                             log::mask(peer)
                         ));
-                        err_status_clone.store(16, Ordering::Relaxed);
                     }
                 });
             }
         }
 
-        tokio::spawn(async move {
+        let uplink = tokio::spawn(async move {
             let mut incoming_buf = BytesMut::with_capacity(32 * 1024);
             let mut body = req.into_body();
 
@@ -188,6 +182,8 @@ impl Handler {
 
         let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, io::Error>>(32);
         tokio::spawn(async move {
+            // Stop reading the request body once the session is over.
+            let _uplink_guard = AbortOnDrop(uplink);
             let mut buf = vec![0u8; 16384];
             loop {
                 match duplex_r.read(&mut buf).await {
@@ -199,16 +195,14 @@ impl Handler {
                     }
                     Ok(_) => {
                         let mut trailers = http::HeaderMap::new();
-                        let code = err_status.load(Ordering::Relaxed);
-                        let status_str = if code == 0 { "0" } else { "16" };
-                        trailers.insert("grpc-status", HeaderValue::from_static(status_str));
+                        trailers.insert("grpc-status", HeaderValue::from_static("0"));
                         let _ = tx.send(Ok(Frame::trailers(trailers))).await;
                         break;
                     }
                     Err(e) => {
                         log::debug(format!("grpc downlink read error: {e}"));
                         let mut trailers = http::HeaderMap::new();
-                        trailers.insert("grpc-status", HeaderValue::from_static("2"));
+                        trailers.insert("grpc-status", HeaderValue::from_static("0"));
                         let _ = tx.send(Ok(Frame::trailers(trailers))).await;
                         break;
                     }
@@ -221,6 +215,14 @@ impl Handler {
             .header(CONTENT_TYPE, "application/grpc")
             .body(channel_body(rx))
             .unwrap()
+    }
+}
+
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
@@ -265,21 +267,47 @@ fn status(code: StatusCode) -> Response<Body> {
     Response::builder().status(code).body(empty()).unwrap()
 }
 
-fn path_matches(req_path: &str, service_name: &str) -> bool {
-    let clean_service = service_name.trim_matches('/');
-    let clean_req = req_path.trim_matches('/');
-
-    if clean_service.is_empty() {
-        clean_req == "Tun"
-            || clean_req == "TunMulti"
-            || clean_req.ends_with("/Tun")
-            || clean_req.ends_with("/TunMulti")
-    } else {
-        clean_req == format!("{clean_service}/Tun")
-            || clean_req == format!("{clean_service}/TunMulti")
-            || clean_req.ends_with(&format!("/{clean_service}/Tun"))
-            || clean_req.ends_with(&format!("/{clean_service}/TunMulti"))
+fn path_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~$&+=:@".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
     }
+    out
+}
+
+// Mirrors Xray's getServiceName / getTunStreamName / getTunMultiStreamName
+// (server side) and matches the full gRPC method path exactly.
+fn path_matches(req_path: &str, service_name: &str) -> bool {
+    let (service, tun, multi) = if let Some(rest) = service_name.strip_prefix('/') {
+        let last = service_name.rfind('/').unwrap_or(0);
+        let raw = &service_name[1..last.max(1)];
+        let service = raw
+            .split('/')
+            .map(path_escape)
+            .collect::<Vec<_>>()
+            .join("/");
+        let ending = &rest[rest.rfind('/').map_or(0, |i| i + 1)..];
+        let mut names = ending.split('|');
+        let tun = path_escape(names.next().unwrap_or(""));
+        let multi = names.next().map_or_else(|| tun.clone(), path_escape);
+        (service, tun, multi)
+    } else {
+        (path_escape(service_name), "Tun".into(), "TunMulti".into())
+    };
+    let Some(rest) = req_path.strip_prefix('/') else {
+        return false;
+    };
+    let Some(method) = rest
+        .strip_prefix(service.as_str())
+        .and_then(|r| r.strip_prefix('/'))
+    else {
+        return false;
+    };
+    method == tun || method == multi
 }
 
 fn host_matches(req: &Request<Incoming>, expected: &str) -> bool {
@@ -369,7 +397,7 @@ fn skip_field(data: &[u8], pos: usize, wire_type: u8) -> io::Result<usize> {
             let (len, n) = decode_varint(&data[pos..])?;
             let start = pos + n;
             // `len` comes from the peer; `start + len` could wrap.
-            if len > data.len() - start {
+            if start > data.len() || len > data.len() - start {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "truncated length-delimited",
@@ -469,14 +497,24 @@ mod tests {
     fn path_matches_service_variations() {
         assert!(path_matches("/GunService/Tun", "GunService"));
         assert!(path_matches("/GunService/TunMulti", "GunService"));
-        assert!(path_matches("GunService/Tun", "GunService"));
-        assert!(path_matches("/Tun", ""));
-        assert!(path_matches("/TunMulti", ""));
-        assert!(path_matches(
-            "/xray.transport.internet.grpc.encoding.GRPCService/Tun",
-            ""
-        ));
+        assert!(!path_matches("GunService/Tun", "GunService"));
+        assert!(!path_matches("/x/GunService/Tun", "GunService"));
         assert!(!path_matches("/OtherService/Tun", "GunService"));
+        assert!(path_matches("//Tun", ""));
+        assert!(path_matches("/a/b/Tun", "/a/b/Tun"));
+        assert!(!path_matches("/a/b/Tun/Tun", "/a/b/Tun"));
+        assert!(path_matches("/a/b/S", "/a/b/S|M"));
+        assert!(path_matches("/a/b/M", "/a/b/S|M"));
+        assert!(!path_matches("/a/b/X", "/a/b/S|M"));
+    }
+
+    #[tokio::test]
+    async fn hunk_payload_rejects_overflowing_length() {
+        let mut p = vec![0x0a];
+        p.extend_from_slice(&[0xFF; 9]);
+        p.push(0x01);
+        let mut out = Vec::new();
+        assert!(decode_hunk_payload(&p, &mut out).await.is_err());
     }
 
     #[tokio::test]
