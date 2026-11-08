@@ -7,12 +7,13 @@ const BASE62: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnop
 const TOLERANCE: usize = 2;
 const MAX_ADJUSTMENTS: usize = 150;
 
-/// Xray draws from `[from, to)`; equal bounds are exact.
+/// Xray draws from `[from, to)` after swapping reversed bounds; a gap of 0 or 1 gives `from`.
 pub fn draw(range: (usize, usize)) -> usize {
-    if range.0 >= range.1 {
-        return range.0;
+    let (from, to) = (range.0.min(range.1), range.0.max(range.1));
+    if to - from <= 1 {
+        return from;
     }
-    rand::thread_rng().gen_range(range.0..range.1)
+    rand::thread_rng().gen_range(from..to)
 }
 
 pub fn generate(tokenish: bool, length: usize) -> String {
@@ -20,7 +21,7 @@ pub fn generate(tokenish: bool, length: usize) -> String {
         return "X".repeat(length);
     }
     let mut rng = rand::thread_rng();
-    let initial = (length * 5).div_ceil(4).max(1);
+    let initial = length.saturating_mul(5).div_ceil(4).max(1);
     let mut padding: String = (0..initial)
         .map(|_| BASE62[rng.gen_range(0..BASE62.len())] as char)
         .collect();
@@ -49,7 +50,7 @@ pub fn is_valid(value: &str, range: (usize, usize), tokenish: bool) -> bool {
     }
     if tokenish {
         let n = huffman_len(value);
-        n >= range.0.saturating_sub(TOLERANCE) && n <= range.1 + TOLERANCE
+        n >= range.0.saturating_sub(TOLERANCE) && n <= range.1.saturating_add(TOLERANCE)
     } else {
         (range.0..=range.1).contains(&value.len())
     }
@@ -80,6 +81,15 @@ const HPACK_HUFFMAN_CODE_LENGTHS: [u8; 256] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draw_swaps_reversed_bounds() {
+        for _ in 0..100 {
+            assert!((100..500).contains(&draw((500, 100))));
+        }
+        assert_eq!(draw((101, 100)), 100);
+        assert_eq!(draw((7, 7)), 7);
+    }
 
     #[test]
     fn tokenish_targets_huffman_length() {
