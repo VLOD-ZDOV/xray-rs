@@ -16,7 +16,7 @@ use blake2::{digest::consts::U32, Blake2b, Digest};
 use bytes::Bytes;
 use quinn::{udp, AsyncUdpSocket, Runtime, UdpPoller};
 use rand::{Rng, RngCore};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -38,6 +38,7 @@ use xray_config::Network;
 const SALT_LEN: usize = 8;
 
 const MAX_REASSEMBLERS: usize = 256;
+const MAX_UDP_SESSIONS: usize = 1024;
 
 fn key(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2b::<U32>::new();
@@ -224,10 +225,15 @@ impl AsyncUdpSocket for ServerCarrierSocket {
                         let completed = {
                             let mut reassemblies =
                                 self.reassemblies.lock().unwrap_or_else(|e| e.into_inner());
-                            if reassemblies.len() > 4096 {
+                            if reassemblies.len() >= 4096 {
                                 reassemblies.retain(|_, (_, last)| {
                                     now.duration_since(*last) < Duration::from_secs(10)
                                 });
+                                if reassemblies.len() >= 4096
+                                    && !reassemblies.contains_key(&meta[0].addr)
+                                {
+                                    continue;
+                                }
                             }
                             let entry = reassemblies
                                 .entry(meta[0].addr)
@@ -616,23 +622,30 @@ async fn handle_tcp_streams(
         tokio::spawn(async move {
             let mut wire = Vec::new();
             let mut buf = [0u8; 2048];
-            let (req, consumed) = loop {
-                let n =
-                    match tokio::time::timeout(Duration::from_secs(5), recv.read(&mut buf)).await {
-                        Ok(Ok(Some(n))) => n,
-                        _ => return,
+            let header = tokio::time::timeout(crate::policy::get().handshake, async {
+                loop {
+                    let n = match recv.read(&mut buf).await {
+                        Ok(Some(n)) => n,
+                        _ => return None,
                     };
-                wire.extend_from_slice(&buf[..n]);
-                match decode_tcp_request(&wire) {
-                    Ok((req, consumed)) => break (req, consumed),
-                    Err(WireError::Incomplete) => {
-                        if wire.len() > 8192 {
-                            return;
+                    wire.extend_from_slice(&buf[..n]);
+                    match decode_tcp_request(&wire) {
+                        Ok(_) => return Some(()),
+                        Err(WireError::Incomplete) => {
+                            if wire.len() > 8192 {
+                                return None;
+                            }
                         }
-                        continue;
+                        Err(_) => return None,
                     }
-                    Err(_) => return,
                 }
+            })
+            .await;
+            let Ok(Some(())) = header else {
+                return;
+            };
+            let Ok((req, consumed)) = decode_tcp_request(&wire) else {
+                return;
             };
 
             let host_port = req.address;
@@ -693,44 +706,32 @@ async fn handle_tcp_streams(
             let traffic = stats::get().traffic(&ctx.tag, &user.email, user.level, &decision.tag);
             let (mut out_r, mut out_w) = tokio::io::split(outbound_stream);
 
-            let up = async {
-                let mut buf = vec![0u8; 16384];
-                loop {
-                    match recv.read(&mut buf).await {
-                        Ok(Some(n)) if n > 0 => {
-                            traffic.up(n);
-                            if out_w.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-                let _ = out_w.shutdown().await;
-            };
-
-            let down = async {
-                let mut buf = vec![0u8; 16384];
-                loop {
-                    match out_r.read(&mut buf).await {
-                        Ok(n) if n > 0 => {
-                            traffic.down(n);
-                            if send.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                        }
-                        _ => break,
-                    }
-                }
-                let _ = send.finish();
-            };
-
-            tokio::join!(up, down);
+            let policy = crate::policy::for_level(user.level);
+            let activity = vless::Activity::new();
+            let _ = vless::relay_policy(
+                vless::copy_buf(
+                    &mut recv,
+                    &mut out_w,
+                    &activity,
+                    |n| traffic.up(n),
+                    policy.buffer_size,
+                ),
+                vless::copy_buf(
+                    &mut out_r,
+                    &mut send,
+                    &activity,
+                    |n| traffic.down(n),
+                    policy.buffer_size,
+                ),
+                &activity,
+                policy,
+            )
+            .await;
         });
     }
 }
 
-type SessionEntry = (mpsc::Sender<Vec<u8>>, Instant);
+type SessionEntry = (mpsc::Sender<Vec<u8>>, Instant, u64);
 type UdpSessions = Arc<Mutex<HashMap<u32, SessionEntry>>>;
 
 async fn handle_udp_datagrams(
@@ -741,6 +742,7 @@ async fn handle_udp_datagrams(
 ) {
     let peer = connection.remote_address();
     let sessions: UdpSessions = Arc::new(Mutex::new(HashMap::new()));
+    let mut next_generation = 0u64;
     let reassemblers: Arc<Mutex<HashMap<u32, Reassembler>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let sessions_sweep = sessions.clone();
@@ -751,7 +753,7 @@ async fn handle_udp_datagrams(
             interval.tick().await;
             let now = Instant::now();
             let mut s = sessions_sweep.lock().unwrap_or_else(|e| e.into_inner());
-            s.retain(|_, (_, last_active)| now.duration_since(*last_active) < udp_idle_timeout);
+            s.retain(|_, (_, last_active, _)| now.duration_since(*last_active) < udp_idle_timeout);
             drop(s);
             let mut r = reassemblers_sweep.lock().unwrap_or_else(|e| e.into_inner());
             r.retain(|_, reassembler| {
@@ -788,7 +790,7 @@ async fn handle_udp_datagrams(
         let session_id = message.session_id;
         let session_tx = {
             let mut s_map = sessions.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((tx, last_active)) = s_map.get_mut(&session_id) {
+            if let Some((tx, last_active, _)) = s_map.get_mut(&session_id) {
                 *last_active = Instant::now();
                 Some(tx.clone())
             } else {
@@ -799,6 +801,9 @@ async fn handle_udp_datagrams(
         if let Some(tx) = session_tx {
             let _ = tx.try_send(payload);
         } else {
+            if sessions.lock().unwrap_or_else(|e| e.into_inner()).len() >= MAX_UDP_SESSIONS {
+                continue;
+            }
             let (host, port) = match parse_host_port(&address_str) {
                 Some(hp) => hp,
                 None => continue,
@@ -823,18 +828,19 @@ async fn handle_udp_datagrams(
             };
 
             let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+            next_generation += 1;
+            let generation = next_generation;
+            // The task sends the first packet so a slow target cannot stall this loop.
+            let _ = tx.try_send(payload);
             sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(session_id, (tx, Instant::now()));
+                .insert(session_id, (tx, Instant::now(), generation));
 
             let conn = connection.clone();
             let sessions_for_task = sessions.clone();
             let traffic = stats::get().traffic(&ctx.tag, &user.email, user.level, &decision.tag);
             let addr_for_down = address_str.clone();
-
-            traffic.up(payload.len());
-            let _ = link.send(&payload).await;
 
             tokio::spawn(async move {
                 let link_up = link.clone();
@@ -898,10 +904,10 @@ async fn handle_udp_datagrams(
                     _ = down => {},
                 }
 
-                sessions_for_task
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .remove(&session_id);
+                let mut s_map = sessions_for_task.lock().unwrap_or_else(|e| e.into_inner());
+                if s_map.get(&session_id).is_some_and(|e| e.2 == generation) {
+                    s_map.remove(&session_id);
+                }
             });
         }
     }
