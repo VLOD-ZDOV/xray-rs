@@ -42,7 +42,7 @@ pub fn parse_tcp_fragment_settings(v: &Value) -> Result<Arc<TcpFragmentConfig>, 
         .ok_or_else(|| "Length can't be empty".to_string())?;
     let mut lengths = parse_ranges_list(length_val)?;
     for r in &mut lengths {
-        let start = (*r.start()).max(1);
+        let start = (*r.start()).clamp(1, 16384);
         let end = (*r.end()).clamp(start, 16384);
         *r = start..=end;
     }
@@ -55,7 +55,7 @@ pub fn parse_tcp_fragment_settings(v: &Value) -> Result<Arc<TcpFragmentConfig>, 
         .ok_or_else(|| "Interval can't be empty".to_string())?;
     let mut delays = parse_ranges_list(delay_val)?;
     for r in &mut delays {
-        let start = *r.start();
+        let start = (*r.start()).min(1000);
         let end = (*r.end()).clamp(start, 1000);
         *r = start..=end;
     }
@@ -468,9 +468,12 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
     if !s.len().is_multiple_of(2) {
         return Err(());
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| ()))
+    s.as_bytes()
+        .chunks(2)
+        .map(|c| {
+            let h = std::str::from_utf8(c).map_err(|_| ())?;
+            u8::from_str_radix(h, 16).map_err(|_| ())
+        })
         .collect()
 }
 
@@ -478,6 +481,13 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn fragment_out_of_range_values_do_not_panic() {
+        let v = json!({"lengths": "20000-30000", "delays": 2000});
+        assert!(parse_tcp_fragment_settings(&v).is_ok());
+        assert!(decode_hex("a\u{e9}a").is_err());
+    }
 
     #[test]
     fn test_finalmask_tcp_fragment_parsing() {
