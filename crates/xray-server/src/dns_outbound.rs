@@ -13,6 +13,8 @@ use xray_config::Network;
 use crate::outbound::Stream;
 use crate::vless::{resolve, Host};
 
+const LOCAL_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub struct DnsOutbound {
     pub tag: String,
     pub address: Option<Host>,
@@ -132,7 +134,15 @@ impl DnsOutbound {
             return Ok(resp);
         }
 
-        let ips: Vec<IpAddr> = match crate::dns::resolve_dns_query(&qname, 0).await {
+        let lookup = tokio::time::timeout(
+            LOCAL_RESOLVE_TIMEOUT,
+            crate::dns::resolve_dns_query(&qname, 0),
+        )
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS lookup timed out"))?;
+        // NotFound means the name has no address at all; Xray answers that as an
+        // empty NOERROR, while other failures get no reply so the client retries.
+        let ips: Vec<IpAddr> = match lookup {
             Ok(addrs) => addrs
                 .into_iter()
                 .map(|a| a.ip())
@@ -142,16 +152,13 @@ impl DnsOutbound {
                     _ => false,
                 })
                 .collect(),
-            Err(_) => Vec::new(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
         };
 
         let mut resp = Vec::with_capacity(qend + ips.len() * 16);
         resp.extend_from_slice(&id);
-        let flags: u16 = if ips.is_empty() {
-            0x8183 // NXDOMAIN
-        } else {
-            0x8180 // NOERROR
-        };
+        let flags: u16 = 0x8180; // NOERROR, possibly with zero answers
         resp.extend_from_slice(&flags.to_be_bytes());
         resp.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT = 1
         resp.extend_from_slice(&(ips.len() as u16).to_be_bytes()); // ANCOUNT
@@ -216,7 +223,9 @@ impl DnsOutbound {
                         }
                         let _ = server.flush().await;
                     }
-                    Err(_) => break,
+                    // Malformed queries close the stream; lookup failures only skip the query.
+                    Err(e) if e.kind() == io::ErrorKind::InvalidData => break,
+                    Err(_) => {}
                 }
             }
         });
@@ -242,9 +251,15 @@ impl DnsUdpSession {
     }
 
     pub async fn send(&self, data: &[u8]) -> io::Result<()> {
-        let resp = self.outbound.resolve_query(data).await?;
-        let _ = self.tx.send(resp).await;
-        Ok(())
+        match self.outbound.resolve_query(data).await {
+            Ok(resp) => {
+                let _ = self.tx.send(resp).await;
+                Ok(())
+            }
+            // No reply for a failed lookup; the client retries.
+            Err(e) if e.kind() != io::ErrorKind::InvalidData => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
