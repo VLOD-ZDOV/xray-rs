@@ -47,10 +47,9 @@ pub enum KcpHeaderType {
 impl KcpHeaderType {
     pub fn parse(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "none" | "" => Some(Self::None),
             "srtp" => Some(Self::Srtp),
             "utp" => Some(Self::Utp),
-            "wechat" | "wechat-video" => Some(Self::Wechat),
+            "wechat" => Some(Self::Wechat),
             "dtls" => Some(Self::Dtls),
             "wireguard" => Some(Self::Wireguard),
             "dns" => Some(Self::Dns),
@@ -82,9 +81,15 @@ pub struct KcpSettings {
     pub read_buffer_size: u32,
     pub write_buffer_size: u32,
     pub max_sending_window: u32,
-    pub header_type: KcpHeaderType,
-    pub header_domain: String,
-    pub seed: Option<String>,
+    /// finalmask.udp mkcp-legacy layers in config order; the first one sits next to KCP.
+    pub masks: Vec<KcpMask>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KcpMask {
+    Original,
+    Header { kind: KcpHeaderType, domain: String },
+    Aes(String),
 }
 
 impl Default for KcpSettings {
@@ -99,9 +104,7 @@ impl Default for KcpSettings {
             read_buffer_size: 2,
             write_buffer_size: 2,
             max_sending_window: 2 * 1024 * 1024,
-            header_type: KcpHeaderType::None,
-            header_domain: "www.baidu.com".to_string(),
-            seed: None,
+            masks: Vec::new(),
         }
     }
 }
@@ -246,71 +249,121 @@ impl HeaderGenerator {
     }
 }
 
+enum Layer {
+    Original,
+    Header(HeaderGenerator),
+    Aes(Key<Aes128Gcm>),
+}
+
+impl Layer {
+    fn overhead(&self) -> usize {
+        match self {
+            Layer::Original => 6,
+            Layer::Header(h) => h.size(),
+            Layer::Aes(_) => 12 + 16,
+        }
+    }
+
+    fn seal(&self, plain: &[u8]) -> Vec<u8> {
+        match self {
+            Layer::Original => {
+                let mut out = vec![0u8; 6];
+                out[4..6].copy_from_slice(&(plain.len() as u16).to_be_bytes());
+                out.extend_from_slice(plain);
+                let hash = fnv1a_32(&out[4..]);
+                out[..4].copy_from_slice(&hash.to_be_bytes());
+                xorfwd(&mut out);
+                out
+            }
+            Layer::Header(h) => {
+                let mut out = Vec::with_capacity(h.size() + plain.len());
+                h.serialize(&mut out);
+                out.extend_from_slice(plain);
+                out
+            }
+            Layer::Aes(key) => {
+                let mut nonce_bytes = [0u8; 12];
+                rand::thread_rng().fill_bytes(&mut nonce_bytes);
+                let mut out = nonce_bytes.to_vec();
+                if let Ok(ct) = Aes128Gcm::new(key).encrypt(&Nonce::from(nonce_bytes), plain) {
+                    out.extend_from_slice(&ct);
+                }
+                out
+            }
+        }
+    }
+
+    fn open(&self, packet: &[u8]) -> Option<Vec<u8>> {
+        match self {
+            Layer::Original => {
+                if packet.len() < 6 {
+                    return None;
+                }
+                let mut buf = packet.to_vec();
+                xorbkd(&mut buf);
+                let len = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+                if fnv1a_32(&buf[4..]).to_be_bytes() != buf[..4] || buf.len() - 6 != len {
+                    return None;
+                }
+                buf.drain(..6);
+                Some(buf)
+            }
+            Layer::Header(h) => packet.get(h.size()..).map(<[u8]>::to_vec),
+            Layer::Aes(key) => {
+                if packet.len() < 12 + 16 {
+                    return None;
+                }
+                let (nonce, ct) = packet.split_at(12);
+                let nonce: [u8; 12] = nonce.try_into().ok()?;
+                Aes128Gcm::new(key).decrypt(&Nonce::from(nonce), ct).ok()
+            }
+        }
+    }
+}
+
+/// Applies the mkcp-legacy masks like Xray's finalmask chain: the first mask
+/// in the list is applied to the KCP segments first and the last one is
+/// outermost on the wire.
 pub struct PacketObfuscator {
-    header: HeaderGenerator,
-    key: Option<Key<Aes128Gcm>>,
+    layers: Vec<Layer>,
 }
 
 impl PacketObfuscator {
     pub fn new(settings: &KcpSettings) -> Self {
-        let key = settings.seed.as_ref().filter(|s| !s.is_empty()).map(|s| {
-            let hash = Sha256::digest(s.as_bytes());
-            let key_bytes: [u8; 16] = hash[..16].try_into().unwrap();
-            Key::<Aes128Gcm>::from(key_bytes)
-        });
-        let header = HeaderGenerator::new(settings.header_type, &settings.header_domain);
-        Self { header, key }
+        let layers = settings
+            .masks
+            .iter()
+            .map(|m| match m {
+                KcpMask::Original => Layer::Original,
+                KcpMask::Header { kind, domain } => Layer::Header(HeaderGenerator::new(*kind, domain)),
+                KcpMask::Aes(password) => {
+                    let hash = Sha256::digest(password.as_bytes());
+                    let key_bytes: [u8; 16] = hash[..16].try_into().unwrap();
+                    Layer::Aes(Key::<Aes128Gcm>::from(key_bytes))
+                }
+            })
+            .collect();
+        Self { layers }
     }
 
     pub fn overhead(&self) -> usize {
-        let h_size = self.header.size();
-        if self.key.is_some() {
-            h_size + 12 + 16 // header + nonce(12) + tag(16)
-        } else {
-            h_size
-        }
+        self.layers.iter().map(Layer::overhead).sum()
     }
 
     pub fn seal(&self, plain: &[u8], out: &mut Vec<u8>) {
         out.clear();
-        self.header.serialize(out);
-
-        if let Some(key) = &self.key {
-            let mut nonce_bytes = [0u8; 12];
-            rand::thread_rng().fill_bytes(&mut nonce_bytes);
-            let nonce = Nonce::from(nonce_bytes);
-            let cipher = Aes128Gcm::new(key);
-            if let Ok(ciphertext) = cipher.encrypt(&nonce, plain) {
-                out.extend_from_slice(&nonce_bytes);
-                out.extend_from_slice(&ciphertext);
-            }
-        } else {
-            out.extend_from_slice(plain);
+        out.extend_from_slice(plain);
+        for layer in &self.layers {
+            *out = layer.seal(out);
         }
     }
 
-    pub fn open<'a>(&self, packet: &'a mut [u8]) -> Option<&'a [u8]> {
-        let h_size = self.header.size();
-        if packet.len() < h_size {
-            return None;
+    pub fn open(&self, packet: &[u8]) -> Option<Vec<u8>> {
+        let mut data = packet.to_vec();
+        for layer in self.layers.iter().rev() {
+            data = layer.open(&data)?;
         }
-        let body = &mut packet[h_size..];
-
-        if let Some(key) = &self.key {
-            if body.len() < 12 + 16 {
-                return None;
-            }
-            let (nonce_bytes, ciphertext) = body.split_at(12);
-            let nonce_arr: [u8; 12] = nonce_bytes.try_into().ok()?;
-            let nonce = Nonce::from(nonce_arr);
-            let cipher = Aes128Gcm::new(key);
-            let plain = cipher.decrypt(&nonce, ciphertext).ok()?;
-            let plain_len = plain.len();
-            body[..plain_len].copy_from_slice(&plain);
-            Some(&body[..plain_len])
-        } else {
-            Some(body)
-        }
+        Some(data)
     }
 }
 
@@ -943,11 +996,11 @@ pub async fn start(
                 }
             };
 
-            let Some(plain) = obfuscator.open(&mut buf[..n]) else {
+            let Some(plain) = obfuscator.open(&buf[..n]) else {
                 continue;
             };
 
-            let segments = Segment::parse_all(plain);
+            let segments = Segment::parse_all(&plain);
             if segments.is_empty() {
                 continue;
             }
@@ -1078,8 +1131,8 @@ pub async fn dial(
     tokio::spawn(async move {
         let mut buf = vec![0u8; 65535];
         while let Ok(n) = socket.recv(&mut buf).await {
-            if let Some(plain) = reader_obfs.open(&mut buf[..n]) {
-                let segs = Segment::parse_all(plain);
+            if let Some(plain) = reader_obfs.open(&buf[..n]) {
+                let segs = Segment::parse_all(&plain);
                 if !segs.is_empty() && tx.send(segs).await.is_err() {
                     break;
                 }
@@ -1099,39 +1152,24 @@ mod tests {
         assert_eq!(fnv1a_32(b"hello"), 0x4f9f2cab);
     }
 
-    #[test]
-    fn test_simple_obfuscator_roundtrip() {
-        let settings = KcpSettings::default();
-        let obfs = PacketObfuscator::new(&settings);
+    fn roundtrip(masks: Vec<KcpMask>) {
+        let obfs = PacketObfuscator::new(&KcpSettings {
+            masks,
+            ..Default::default()
+        });
         let plain = b"test payload 1234567890";
         let mut sealed = Vec::new();
         obfs.seal(plain, &mut sealed);
-
-        let mut opened = sealed.clone();
-        let res = obfs.open(&mut opened);
-        assert_eq!(res, Some(plain.as_slice()));
+        assert_eq!(sealed.len(), plain.len() + obfs.overhead());
+        assert_eq!(obfs.open(&sealed).as_deref(), Some(plain.as_slice()));
     }
 
     #[test]
-    fn test_seed_aes_gcm_obfuscator_roundtrip() {
-        let settings = KcpSettings {
-            seed: Some("my-secret-password".to_string()),
-            ..Default::default()
-        };
-        let obfs = PacketObfuscator::new(&settings);
-        let plain = b"test payload with aes-gcm";
-        let mut sealed = Vec::new();
-        obfs.seal(plain, &mut sealed);
-
-        let mut opened = sealed.clone();
-        let res = obfs.open(&mut opened);
-        assert_eq!(res, Some(plain.as_slice()));
-    }
-
-    #[test]
-    fn test_headers_roundtrip() {
-        for h in [
-            KcpHeaderType::None,
+    fn test_masks_roundtrip() {
+        roundtrip(Vec::new());
+        roundtrip(vec![KcpMask::Original]);
+        roundtrip(vec![KcpMask::Aes("my-secret-password".into())]);
+        for kind in [
             KcpHeaderType::Srtp,
             KcpHeaderType::Utp,
             KcpHeaderType::Wechat,
@@ -1139,19 +1177,56 @@ mod tests {
             KcpHeaderType::Wireguard,
             KcpHeaderType::Dns,
         ] {
-            let settings = KcpSettings {
-                header_type: h,
-                ..Default::default()
-            };
-            let obfs = PacketObfuscator::new(&settings);
-            let plain = b"payload for header test";
-            let mut sealed = Vec::new();
-            obfs.seal(plain, &mut sealed);
-
-            let mut opened = sealed.clone();
-            let res = obfs.open(&mut opened);
-            assert_eq!(res, Some(plain.as_slice()), "Header {:?} failed", h);
+            roundtrip(vec![KcpMask::Header {
+                kind,
+                domain: "example.com".into(),
+            }]);
         }
+        roundtrip(vec![
+            KcpMask::Header {
+                kind: KcpHeaderType::Dns,
+                domain: "example.com".into(),
+            },
+            KcpMask::Aes("pw".into()),
+            KcpMask::Original,
+        ]);
+    }
+
+    #[test]
+    fn test_mask_order_is_wire_order() {
+        let obfs = PacketObfuscator::new(&KcpSettings {
+            masks: vec![
+                KcpMask::Header {
+                    kind: KcpHeaderType::Wireguard,
+                    domain: String::new(),
+                },
+                KcpMask::Aes("pw".into()),
+            ],
+            ..Default::default()
+        });
+        let mut sealed = Vec::new();
+        obfs.seal(b"abc", &mut sealed);
+        // The header is inside the encryption, so the wire starts with the nonce.
+        assert_ne!(&sealed[..4], &[0x04, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_original_mask_known_vector() {
+        let obfs = PacketObfuscator::new(&KcpSettings {
+            masks: vec![KcpMask::Original],
+            ..Default::default()
+        });
+        let mut sealed = Vec::new();
+        obfs.seal(b"hello", &mut sealed);
+        let mut expect = vec![0u8; 6];
+        expect[4..6].copy_from_slice(&5u16.to_be_bytes());
+        expect.extend_from_slice(b"hello");
+        let hash = fnv1a_32(&expect[4..]);
+        expect[..4].copy_from_slice(&hash.to_be_bytes());
+        xorfwd(&mut expect);
+        assert_eq!(sealed, expect);
+        sealed[7] ^= 1;
+        assert_eq!(obfs.open(&sealed), None);
     }
 
     #[test]

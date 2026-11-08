@@ -2223,43 +2223,36 @@ pub fn parse_kcp(stream: &Value) -> Result<crate::kcp::KcpSettings, String> {
         settings.max_sending_window = m as u32;
     }
 
-    if let Some(h) = k.get("header") {
-        let h_type = h.get("type").and_then(Value::as_str).unwrap_or("");
-        if let Some(ht) = crate::kcp::KcpHeaderType::parse(h_type) {
-            settings.header_type = ht;
-        }
-        if let Some(domain) = h.get("domain").and_then(Value::as_str) {
-            settings.header_domain = domain.to_string();
-        }
-    }
-    if let Some(seed) = k.get("seed").and_then(Value::as_str) {
-        if !seed.is_empty() {
-            settings.seed = Some(seed.to_string());
-        }
-    }
-
-    // Also check finalmask.udp for mkcp-legacy if not set in kcpSettings
+    // kcpSettings.header and kcpSettings.seed are ignored by Xray; obfuscation
+    // comes only from finalmask.udp mkcp-legacy, first entry next to KCP.
     if let Some(udp_masks) = stream
         .get("finalmask")
         .and_then(|f| f.get("udp"))
         .and_then(Value::as_array)
     {
         for mask in udp_masks {
-            if mask.get("type").and_then(Value::as_str) == Some("mkcp-legacy") {
-                let s = mask.get("settings").unwrap_or(&Value::Null);
-                let h = s.get("header").and_then(Value::as_str).unwrap_or("");
-                let val = s.get("value").and_then(Value::as_str).unwrap_or("");
-                if !h.is_empty() {
-                    if let Some(ht) = crate::kcp::KcpHeaderType::parse(h) {
-                        settings.header_type = ht;
-                    }
-                    if settings.header_type == crate::kcp::KcpHeaderType::Dns && !val.is_empty() {
-                        settings.header_domain = val.to_string();
-                    }
-                } else if !val.is_empty() {
-                    settings.seed = Some(val.to_string());
-                }
+            if mask.get("type").and_then(Value::as_str) != Some("mkcp-legacy") {
+                continue;
             }
+            let s = mask.get("settings").unwrap_or(&Value::Null);
+            let h = s.get("header").and_then(Value::as_str).unwrap_or("");
+            let val = s.get("value").and_then(Value::as_str).unwrap_or("");
+            settings.masks.push(if h.is_empty() {
+                if val.is_empty() {
+                    crate::kcp::KcpMask::Original
+                } else {
+                    crate::kcp::KcpMask::Aes(val.to_string())
+                }
+            } else {
+                let kind = crate::kcp::KcpHeaderType::parse(h)
+                    .ok_or_else(|| format!("invalid mkcp-legacy header {h:?}"))?;
+                let domain = if kind == crate::kcp::KcpHeaderType::Dns && !val.is_empty() {
+                    val.to_string()
+                } else {
+                    "www.baidu.com".to_string()
+                };
+                crate::kcp::KcpMask::Header { kind, domain }
+            });
         }
     }
 
@@ -3470,5 +3463,35 @@ mod tests {
             Some(&"world".to_string())
         );
         assert_eq!(get_env("XRAY_TEST_VAR_1"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn kcp_masks_come_from_finalmask_only() {
+        use crate::kcp::{KcpHeaderType, KcpMask};
+        let stream: Value = serde_json::from_str(
+            r#"{"kcpSettings": {"seed": "x", "header": {"type": "srtp"}},
+                "finalmask": {"udp": [
+                  {"type": "mkcp-legacy", "settings": {"header": "dns"}},
+                  {"type": "mkcp-legacy", "settings": {"value": "pw"}},
+                  {"type": "mkcp-legacy"}]}}"#,
+        )
+        .unwrap();
+        let k = parse_kcp(&stream).unwrap();
+        assert_eq!(
+            k.masks,
+            vec![
+                KcpMask::Header {
+                    kind: KcpHeaderType::Dns,
+                    domain: "www.baidu.com".into()
+                },
+                KcpMask::Aes("pw".into()),
+                KcpMask::Original
+            ]
+        );
+        let bad: Value = serde_json::from_str(
+            r#"{"finalmask": {"udp": [{"type": "mkcp-legacy", "settings": {"header": "none"}}]}}"#,
+        )
+        .unwrap();
+        assert!(parse_kcp(&bad).is_err());
     }
 }
