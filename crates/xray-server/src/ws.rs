@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
-use tokio::time::timeout;
+use tokio::time::timeout_at;
 
 const MAX_HEADER_SIZE: usize = 16 * 1024;
 const CHUNK_SIZE: usize = 4096;
@@ -129,6 +129,14 @@ impl ServerFrameDecoder {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "websocket frame too large",
+            ));
+        }
+
+        // RFC 6455 §5.5: control frames are unfragmented and carry at most 125 bytes.
+        if opcode >= 0x8 && (payload_len > 125 || b0 & 0x80 == 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid websocket control frame",
             ));
         }
 
@@ -363,7 +371,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         let this = &mut *self;
-        let _ = this.poll_flush_out(cx);
+        if this.poll_flush_out(cx)?.is_pending() {
+            return Poll::Pending;
+        }
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
@@ -379,6 +389,8 @@ where
 {
     let mut header_buf = Vec::with_capacity(2048);
     let mut temp = [0u8; 1024];
+    // One deadline for the whole header, like Xray's ReadHeaderTimeout.
+    let deadline = tokio::time::Instant::now() + crate::policy::get().handshake;
 
     let header_end = loop {
         if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -390,7 +402,7 @@ where
                 "websocket header too large",
             ));
         }
-        let n = match timeout(crate::policy::get().handshake, stream.read(&mut temp)).await {
+        let n = match timeout_at(deadline, stream.read(&mut temp)).await {
             Ok(Ok(n)) => n,
             Ok(Err(e)) => return Err(e),
             Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "handshake timeout")),
@@ -423,27 +435,12 @@ where
             .await;
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("method {method} not allowed for websocket"),
+            format!("method {} not allowed for websocket", method.escape_debug()),
         ));
     }
 
     // Match path: strip query parameters for comparison
     let target_path = req_path.split('?').next().unwrap_or("/");
-    let clean_target = normalize_path(target_path);
-    let clean_config = normalize_path(&settings.path);
-
-    if clean_target != clean_config {
-        let _ = stream
-            .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
-            .await;
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!(
-                "websocket path mismatch: got {target_path}, expected {}",
-                settings.path
-            ),
-        ));
-    }
 
     let mut upgrade_ok = false;
     let mut connection_ok = false;
@@ -479,16 +476,32 @@ where
 
     if let Some(expected_host) = &settings.host {
         let h = host_hdr.unwrap_or_default();
-        let host_only = h.split(':').next().unwrap_or("");
-        if !host_only.eq_ignore_ascii_case(expected_host) {
+        if !crate::httpupgrade::is_valid_http_host(&h, expected_host) {
             let _ = stream
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
                 .await;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("websocket host mismatch: got {host_only}, expected {expected_host}"),
+                format!(
+                    "websocket host mismatch: got {}, expected {expected_host}",
+                    h.escape_debug()
+                ),
             ));
         }
+    }
+
+    if target_path != settings.path {
+        let _ = stream
+            .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
+            .await;
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "websocket path mismatch: got {}, expected {}",
+                target_path.escape_debug(),
+                settings.path
+            ),
+        ));
     }
 
     let Some(key) = sec_key else {
@@ -514,16 +527,16 @@ where
     let accept_key = accept_key_for(&key);
 
     // Parse early data if Sec-WebSocket-Protocol is provided
-    let early_data = if let Some(proto) = &sec_proto {
-        decode_early_data(proto)
-    } else {
-        Vec::new()
-    };
+    let early_data = sec_proto
+        .as_deref()
+        .map(decode_early_data)
+        .unwrap_or_default();
 
     let mut resp = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n"
     );
-    if let Some(proto) = &sec_proto {
+    // Xray echoes the header only when it carried non-empty early data.
+    if let Some(proto) = sec_proto.as_ref().filter(|_| !early_data.is_empty()) {
         resp.push_str(&format!("Sec-WebSocket-Protocol: {proto}\r\n"));
     }
     resp.push_str("\r\n");
@@ -534,23 +547,17 @@ where
     Ok((WebSocketStream::new(stream, leftover, early_data), peer))
 }
 
-fn normalize_path(p: &str) -> &str {
-    let stripped = p.trim_end_matches('/');
-    if stripped.is_empty() {
-        "/"
-    } else {
-        stripped
-    }
-}
-
 fn decode_early_data(val: &str) -> Vec<u8> {
-    let clean = val.trim();
-    if let Ok(data) = URL_SAFE_NO_PAD.decode(clean) {
-        return data;
-    }
-    base64::engine::general_purpose::STANDARD
-        .decode(clean)
-        .unwrap_or_default()
+    let clean: String = val
+        .chars()
+        .filter(|&c| c != '=')
+        .map(|c| match c {
+            '+' => '-',
+            '/' => '_',
+            c => c,
+        })
+        .collect();
+    URL_SAFE_NO_PAD.decode(clean).unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -598,5 +605,23 @@ mod tests {
         frame.extend_from_slice(&u64::MAX.to_be_bytes());
         decoder.extend(&frame);
         assert!(decoder.next_event().is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_control_frames() {
+        let mut decoder = ServerFrameDecoder::new();
+        let mut frame = vec![0x89, 0xFE, 0x01, 0x2C, 0, 0, 0, 0];
+        frame.extend_from_slice(&[0u8; 300]);
+        decoder.extend(&frame);
+        assert!(decoder.next_event().is_err());
+    }
+
+    #[test]
+    fn early_data_accepts_url_safe_base64_only() {
+        assert_eq!(decode_early_data("aGk"), b"hi");
+        assert_eq!(decode_early_data("aGk="), b"hi");
+        assert_eq!(decode_early_data("-_8"), vec![0xfb, 0xff]);
+        assert!(decode_early_data("xmux").len() == 3);
+        assert!(decode_early_data("a b").is_empty());
     }
 }
