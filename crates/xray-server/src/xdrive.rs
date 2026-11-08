@@ -194,6 +194,12 @@ pub fn parse_xdrive_settings(settings: &Value) -> Result<XdriveConfig, String> {
         }
         _ => {}
     }
+    // Only local storage is implemented; the others would quietly fall back to it.
+    if service != "local" {
+        return Err(format!(
+            r#"xdrive "service": "{service}" is not supported yet, only "local""#
+        ));
+    }
 
     let segment_bytes = settings
         .get("segmentBytes")
