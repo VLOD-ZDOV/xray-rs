@@ -525,6 +525,12 @@ impl RealityServer {
         is_grpc: bool,
         _is_xhttp: bool,
     ) -> Result<Self, String> {
+        if settings.server_names.is_empty() {
+            return Err(r#"empty "serverNames""#.into());
+        }
+        if settings.short_ids.is_empty() {
+            return Err(r#"empty "shortIds""#.into());
+        }
         let key_pair = aws_lc_rs::signature::Ed25519KeyPair::generate()
             .map_err(|e| format!("failed to generate reality ed25519 key: {e:?}"))?;
         let mut ed25519_pub = [0u8; 32];
@@ -627,7 +633,8 @@ impl RealityServer {
             Ok(d) => d,
             Err(e) => {
                 log::info(format!(
-                    "REALITY remoteAddr: {peer} failed to connect dest: {e}"
+                    "REALITY remoteAddr: {peer} failed to connect dest: {e}",
+                    peer = log::mask(peer),
                 ));
                 return Ok(None);
             }
@@ -642,14 +649,16 @@ impl RealityServer {
         .await
         {
             log::info(format!(
-                "REALITY remoteAddr: {peer} failed to write proxy header: {e}"
+                "REALITY remoteAddr: {peer} failed to write proxy header: {e}",
+                peer = log::mask(peer),
             ));
             return Ok(None);
         }
 
         if let Err(e) = dest.write_all(&full_record).await {
             log::info(format!(
-                "REALITY remoteAddr: {peer} failed to write ClientHello to dest: {e}"
+                "REALITY remoteAddr: {peer} failed to write ClientHello to dest: {e}",
+                peer = log::mask(peer),
             ));
             return Ok(None);
         }
@@ -670,7 +679,7 @@ impl RealityServer {
             Ok(dh) => dh,
             Err((s2c_saved, reason)) => {
                 if self.settings.show {
-                    log::info(format!("REALITY remoteAddr: {peer} dest not TLS 1.3 or bad hello ({reason}), forwarding client to dest"));
+                    log::info(format!("REALITY remoteAddr: {peer} dest not TLS 1.3 or bad hello ({reason}), forwarding client to dest", peer = log::mask(peer)));
                 }
                 self.forward_client_to_dest(stream, dest, &s2c_saved)
                     .await?;
@@ -679,17 +688,26 @@ impl RealityServer {
         };
 
         // 6. Complete TLS 1.3 handshake with client, mirroring dest
-        match self
-            .serve_handshake(stream, &payload, &auth_key, dest_handshake)
-            .await
+        let served = match tokio::time::timeout(
+            handshake_timeout,
+            self.serve_handshake(stream, &payload, &auth_key, dest_handshake),
+        )
+        .await
         {
+            Ok(r) => r,
+            Err(_) => Err(io::Error::other("timed out waiting for client Finished")),
+        };
+        match served {
             Ok(tls_stream) => {
                 // Drop dest connection, client is successfully authenticated and served
                 drop(dest);
                 Ok(Some(tls_stream))
             }
             Err(e) => {
-                log::debug(format!("REALITY handshake from {peer} failed: {e}"));
+                log::debug(format!(
+                    "REALITY handshake from {peer} failed: {e}",
+                    peer = log::mask(peer)
+                ));
                 Ok(None)
             }
         }
@@ -704,7 +722,7 @@ impl RealityServer {
                 self.settings
                     .server_names
                     .iter()
-                    .any(|pattern| crate::match_sni(pattern, &sni_lower))
+                    .any(|name| name.eq_ignore_ascii_case(&sni_lower))
             }
             None => false,
         };
@@ -712,7 +730,8 @@ impl RealityServer {
             if self.settings.show {
                 log::info(format!(
                     "REALITY remoteAddr: {peer} forwarded SNI: {:?}",
-                    client_hello.server_name
+                    client_hello.server_name,
+                    peer = log::mask(peer),
                 ));
             }
             return None;
@@ -752,16 +771,15 @@ impl RealityServer {
             }
         }
 
-        if !self.settings.short_ids.is_empty()
-            && !self.settings.short_ids.contains(&decrypted.short_id)
-        {
+        if !self.settings.short_ids.contains(&decrypted.short_id) {
             return None;
         }
 
         if self.settings.show {
             log::info(format!(
                 "REALITY remoteAddr: {peer} valid REALITY client: ver={:?}, time={}, short_id={:02x?}",
-                decrypted.version, decrypted.unix_time, decrypted.short_id
+                decrypted.version, decrypted.unix_time, decrypted.short_id,
+                peer = log::mask(peer),
             ));
         }
 
@@ -812,6 +830,10 @@ impl RealityServer {
                     }
                     handshake_lens[1] = 5 + ccs_len;
                     offset += 5 + ccs_len;
+                }
+
+                if offset < s2c_saved.len() && s2c_saved[offset] != 0x17 {
+                    return Err("dest sent unexpected record after ServerHello");
                 }
 
                 // Check encrypted handshake records (ApplicationData 0x17)
@@ -885,8 +907,10 @@ impl RealityServer {
             Ok(())
         };
 
-        if tokio::time::timeout(timeout, read_future).await.is_err() {
-            return Err((s2c_saved, "timeout waiting for dest handshake"));
+        match tokio::time::timeout(timeout, read_future).await {
+            Err(_) => return Err((s2c_saved, "timeout waiting for dest handshake")),
+            Ok(Err(reason)) => return Err((s2c_saved, reason)),
+            Ok(Ok(())) => {}
         }
 
         // Parse ServerHello message
@@ -1445,7 +1469,7 @@ struct ParsedServerHello {
 }
 
 fn parse_server_hello(sh: &[u8]) -> Option<ParsedServerHello> {
-    if sh.len() < 38 || sh[0] != 0x02 {
+    if sh.len() < 39 || sh[0] != 0x02 {
         return None;
     }
     let sid_len = sh[38] as usize;
@@ -2173,6 +2197,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStreamIo for Tls13Stream<S> {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[test]
+    fn parse_server_hello_rejects_truncated() {
+        let mut sh = vec![0u8; 38];
+        sh[0] = 0x02;
+        assert!(parse_server_hello(&sh).is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_short_ids() {
+        let settings = RealityInboundSettings {
+            dest: FallbackDest::Tcp(crate::vless::Host::Domain("localhost".into()), 80),
+            server_names: vec!["example.com".to_string()],
+            private_key: [0x11; 32],
+            short_ids: vec![],
+            min_client_ver: None,
+            max_client_ver: None,
+            max_time_diff: 0,
+            xver: 0,
+            show: false,
+            alpn: vec![],
+            mldsa65_seed: None,
+        };
+        let err = RealityServer::new(settings, 443, false, false)
+            .err()
+            .unwrap();
+        assert_eq!(err, r#"empty "shortIds""#);
+    }
 
     #[tokio::test]
     async fn test_reality_server_init() {
