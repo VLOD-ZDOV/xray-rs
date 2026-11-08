@@ -292,6 +292,22 @@ pub fn user_id(id: &str) -> [u8; 16] {
         .as_bytes()
 }
 
+/// Like Xray's uuid.ParseString: only ids of 1..=30 characters are hashed,
+/// anything else must be a UUID.
+fn parse_user_id(id: &str) -> Result<[u8; 16], String> {
+    let n = id.len();
+    if !(32..=36).contains(&n) {
+        if n == 0 || n > 30 {
+            return Err(format!("invalid UUID: {id}"));
+        }
+        return Ok(user_id(id));
+    }
+    let hex: String = id.chars().filter(|c| *c != '-').collect();
+    Uuid::parse_str(&hex)
+        .map(|u| *u.as_bytes())
+        .map_err(|_| format!("invalid UUID: {id}"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CertUsage {
     Encipherment,
@@ -984,14 +1000,20 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         };
         let id_str = str_field(client, "id");
         let pass_str = str_field(client, "password");
-        let key = if !pass_str.is_empty() {
-            pass_str
+        let key = match protocol {
+            InboundProtocol::Trojan => pass_str,
+            InboundProtocol::Vless | InboundProtocol::Vmess => id_str,
+            _ if !pass_str.is_empty() => pass_str,
+            _ => id_str,
+        };
+        let uuid = if matches!(protocol, InboundProtocol::Vless | InboundProtocol::Vmess) {
+            parse_user_id(key)?
         } else {
-            id_str
+            user_id(key)
         };
         let level = client.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
         users.push(User {
-            id: user_id(key),
+            id: uuid,
             hash: crate::trojan::trojan_password_hash(key),
             email: str_field(client, "email").to_owned(),
             level,
@@ -3463,6 +3485,24 @@ mod tests {
             Some(&"world".to_string())
         );
         assert_eq!(get_env("XRAY_TEST_VAR_1"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn vless_user_ids_follow_xray_rules() {
+        assert!(parse_user_id("").is_err());
+        assert!(parse_user_id(&"a".repeat(31)).is_err());
+        assert!(parse_user_id(&"a".repeat(33)).is_err());
+        assert_eq!(parse_user_id("abc").unwrap(), user_id("abc"));
+        let id = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        assert_eq!(parse_user_id(id).unwrap(), user_id(id));
+        let raw = r#"{"inbounds": [{"tag": "v", "port": 443, "protocol": "vless",
+            "settings": {"clients": [{"email": "x"}], "decryption": "none"}}]}"#;
+        assert!(parse(raw).is_err());
+        let raw = r#"{"inbounds": [{"tag": "v", "port": 443, "protocol": "vless",
+            "settings": {"clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "password": "p"}],
+            "decryption": "none"}}]}"#;
+        let cfg = parse(raw).unwrap();
+        assert_eq!(cfg.inbounds[0].users[0].id, user_id(id));
     }
 
     #[test]
