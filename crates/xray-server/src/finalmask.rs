@@ -364,7 +364,10 @@ pub fn validate_and_log_finalmask(outbound: &Value, tag: &str) -> Result<(), Str
     if let Some(tcp) = finalmask.get("tcp").and_then(Value::as_array) {
         for mask in tcp {
             let mask_type = mask.get("type").and_then(Value::as_str).unwrap_or("");
-            if !mask_type.eq_ignore_ascii_case("fragment") {
+            if !["fragment", "header-custom", "sudoku"]
+                .iter()
+                .any(|kind| mask_type.eq_ignore_ascii_case(kind))
+            {
                 crate::log::warn(format!(
                     "outbound {tag:?}: streamSettings.finalmask.tcp: mask type {mask_type:?} is not supported yet, ignored"
                 ));

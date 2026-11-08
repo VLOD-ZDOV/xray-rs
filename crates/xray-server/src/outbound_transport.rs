@@ -436,6 +436,7 @@ impl ServerConnector {
         if let Some(tcp_fragment) = crate::finalmask::parse_finalmask_tcp_fragment(stream)? {
             dialer = dialer.with_tcp_fragment(tcp_fragment);
         }
+        dialer = crate::tcp_mask::apply_outbound(dialer, stream).map_err(|e| err(&e))?;
 
         Ok(Self {
             tag: tag.to_owned(),

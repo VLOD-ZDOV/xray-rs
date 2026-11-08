@@ -444,6 +444,7 @@ impl VlessOutbound {
         if let Some(tcp_fragment) = crate::finalmask::parse_finalmask_tcp_fragment(stream)? {
             dialer = dialer.with_tcp_fragment(tcp_fragment);
         }
+        dialer = crate::tcp_mask::apply_outbound(dialer, stream).map_err(|e| err(&e))?;
 
         let packet_encoding = settings
             .get("packetEncoding")

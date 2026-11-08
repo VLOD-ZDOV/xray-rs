@@ -122,6 +122,37 @@ fn items(source: &[xray_config::HeaderCustomItem]) -> Vec<CustomItem> {
         .collect()
 }
 
+/// The masks on an outbound's TCP carriers, through the transport's dialer.
+/// The dialer puts `sudoku` next to the wire, as Xray does with `sudoku`
+/// listed after `header-custom`; the other order is refused.
+pub fn apply_outbound(
+    mut dialer: xray_transport::TransportDialer,
+    stream: &Value,
+) -> Result<xray_transport::TransportDialer, String> {
+    let Some(masks) = parse(stream)? else {
+        return Ok(dialer);
+    };
+    let mut seen_sudoku = false;
+    for mask in masks.iter() {
+        match mask {
+            TcpMask::HeaderCustom { config, .. } => {
+                if seen_sudoku {
+                    return Err(
+                        "finalmask.tcp: header-custom after sudoku is not supported yet on outbounds"
+                            .into(),
+                    );
+                }
+                dialer = dialer.with_tcp_header_custom(Arc::new(config.clone()));
+            }
+            TcpMask::Sudoku(config) => {
+                seen_sudoku = true;
+                dialer = dialer.with_tcp_sudoku(Arc::new(config.clone()));
+            }
+        }
+    }
+    Ok(dialer)
+}
+
 /// Runs each mask over `stream`: a `header-custom` handshake on what came
 /// before it, a `sudoku` wrap around it.
 pub async fn accept<S>(
