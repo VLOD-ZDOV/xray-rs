@@ -293,6 +293,9 @@ where
     .await
 }
 
+// The head is read before authentication; Go's net/http allows the same 1 MiB.
+const MAX_HTTP_HEAD: u64 = 1 << 20;
+
 const HTTP_CONNECT_ESTABLISHED: &[u8] = b"HTTP/1.1 200 Connection established\r\n\r\n";
 const HTTP_PROXY_AUTH_REQUIRED: &[u8] =
     b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
@@ -317,7 +320,7 @@ where
     loop {
         let head = timeout(
             crate::policy::get().handshake,
-            read_http_request_head(&mut stream),
+            read_http_request_head(&mut (&mut stream).take(MAX_HTTP_HEAD)),
         )
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http request timeout"))?
