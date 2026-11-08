@@ -501,6 +501,10 @@ async fn serve_masq<S>(
     let _ = response.finish().await;
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 async fn handle_connection(
     connection: quinn::Connection,
     ctx: Arc<vless::Context>,
@@ -538,7 +542,10 @@ async fn handle_connection(
                 .hysteria_users
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            users.iter().find(|u| u.auth == auth_header).cloned()
+            users
+                .iter()
+                .find(|u| constant_time_eq(u.auth.as_bytes(), auth_header.as_bytes()))
+                .cloned()
         };
         let user = match user {
             Some(u) => u,
@@ -561,8 +568,12 @@ async fn handle_connection(
 
         // h3::server::Connection::drop sends H3_NO_ERROR closing the underlying
         // QUIC connection. In Hysteria 2, HTTP/3 is only used for the initial auth
-        // exchange; we must not close the QUIC connection on completion.
-        std::mem::forget(h3_conn);
+        // exchange; keep it alive until the QUIC connection is gone.
+        let closed = connection.clone();
+        tokio::spawn(async move {
+            closed.closed().await;
+            drop(h3_conn);
+        });
         Some(user)
     })
     .await;
