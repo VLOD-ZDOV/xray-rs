@@ -40,20 +40,17 @@ impl HysteriaOutbound {
         if address.is_empty() {
             return Err("no target server found".into());
         }
-        let port = settings.get("port").and_then(Value::as_u64).unwrap_or(0) as u16;
+        let port = match settings.get("port").and_then(Value::as_u64) {
+            Some(p) => u16::try_from(p).map_err(|_| format!("invalid port {p}"))?,
+            None => 0,
+        };
         if port == 0 {
             return Err("no target server found".into());
         }
 
         let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
         let h_settings = stream.get("hysteriaSettings").unwrap_or(&Value::Null);
-        let top_auth = str_field(settings, "auth");
-        let stream_auth = str_field(h_settings, "auth");
-        let auth = if !top_auth.is_empty() {
-            top_auth
-        } else {
-            stream_auth
-        };
+        let auth = str_field(h_settings, "auth");
 
         let tls_settings = stream.get("tlsSettings").unwrap_or(&Value::Null);
         let server_name = tls_settings
@@ -87,21 +84,24 @@ impl HysteriaOutbound {
     }
 
     pub async fn connect(&self, host: &Host, port: u16) -> io::Result<Box<dyn Stream>> {
-        let mut guard = self.client.lock().await;
-        let client = match &*guard {
-            Some(c) if c.is_live() => c.clone(),
-            _ => {
-                let resolved = resolve(&Host::Domain(self.address.clone()), self.port)
-                    .await
-                    .map_err(|e| io::Error::other(format!("Hysteria resolve failed: {e}")))?;
-                let cfg = HysteriaConfig::new(resolved, self.tls_config.clone(), self.auth.clone());
-                let tls_connector = TlsConnector::system()
-                    .map_err(|e| io::Error::other(format!("Hysteria TLS init failed: {e}")))?;
-                let c = HysteriaClient::connect(cfg, &tls_connector)
-                    .await
-                    .map_err(|e| io::Error::other(format!("Hysteria connect failed: {e}")))?;
-                *guard = Some(c.clone());
-                c
+        let client = {
+            let mut guard = self.client.lock().await;
+            match &*guard {
+                Some(c) if c.is_live() => c.clone(),
+                _ => {
+                    let resolved = resolve(&Host::Domain(self.address.clone()), self.port)
+                        .await
+                        .map_err(|e| io::Error::other(format!("Hysteria resolve failed: {e}")))?;
+                    let cfg =
+                        HysteriaConfig::new(resolved, self.tls_config.clone(), self.auth.clone());
+                    let tls_connector = TlsConnector::system()
+                        .map_err(|e| io::Error::other(format!("Hysteria TLS init failed: {e}")))?;
+                    let c = HysteriaClient::connect(cfg, &tls_connector)
+                        .await
+                        .map_err(|e| io::Error::other(format!("Hysteria connect failed: {e}")))?;
+                    *guard = Some(c.clone());
+                    c
+                }
             }
         };
 
@@ -115,5 +115,21 @@ impl HysteriaOutbound {
             .await
             .map_err(|e| io::Error::other(format!("Hysteria open_tcp failed: {e}")))?;
         Ok(Box::new(stream))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_out_of_range_port_and_reads_stream_auth() {
+        let bad = serde_json::json!({"settings": {"address": "example.com", "port": 65537}});
+        assert!(HysteriaOutbound::parse("h", &bad).is_err());
+        let ok = serde_json::json!({
+            "settings": {"address": "example.com", "port": 443, "auth": "top"},
+            "streamSettings": {"hysteriaSettings": {"auth": "B"}}
+        });
+        assert_eq!(HysteriaOutbound::parse("h", &ok).unwrap().auth, "B");
     }
 }
