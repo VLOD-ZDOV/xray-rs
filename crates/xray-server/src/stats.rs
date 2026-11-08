@@ -208,7 +208,10 @@ impl Stats {
             IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
             ip => ip,
         };
-        if ip == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+        // Xray's OnlineMap skips both loopback spellings.
+        if ip == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+            || ip == IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        {
             return None;
         }
         let mut online = lock(&self.online);
