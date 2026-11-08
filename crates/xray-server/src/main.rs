@@ -407,6 +407,15 @@ pub(crate) async fn start_inbound(
         vless_encryption: inbound.vless_encryption.clone(),
     });
 
+    if inbound.protocol != InboundProtocol::Hysteria
+        && matches!(inbound.transport, InboundTransport::Hysteria)
+    {
+        return Err(format!(
+            "inbound {}: {:?} over Hysteria is not supported",
+            inbound.tag, inbound.protocol
+        ));
+    }
+
     if inbound.protocol == InboundProtocol::Hysteria {
         let abort = hysteria::start(inbound, ctx.clone(), router).await?;
         return Ok((ctx, Some(abort), None));
@@ -494,7 +503,13 @@ pub(crate) async fn start_inbound(
     ));
     let mut udp_abort = None;
     if is_ss_udp {
-        let udp_socket = bind_udp_addr(&ss_listen, ss_port).await?;
+        let udp_socket = match bind_udp_addr(&ss_listen, ss_port).await {
+            Ok(s) => s,
+            Err(e) => {
+                tcp_task.abort();
+                return Err(e);
+            }
+        };
         log::info(format!(
             "listening udp {} on {}",
             ss_inbound_tag,
@@ -507,7 +522,13 @@ pub(crate) async fn start_inbound(
     }
     if is_dokodemo_udp {
         if let Some(settings) = dokodemo_settings {
-            let udp_socket = bind_udp_addr(&inbound.listen, inbound.port).await?;
+            let udp_socket = match bind_udp_addr(&inbound.listen, inbound.port).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tcp_task.abort();
+                    return Err(e);
+                }
+            };
             log::info(format!(
                 "listening udp {} on {}",
                 inbound.tag,
