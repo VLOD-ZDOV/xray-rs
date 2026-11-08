@@ -68,7 +68,9 @@ impl Factory {
                 socket2::Type::DGRAM,
                 Some(socket2::Protocol::UDP),
             )?;
-            let _ = socket.set_reuse_address(true);
+            if self.listen_addr.is_some() {
+                let _ = socket.set_reuse_address(true);
+            }
             if index == 1 && self.listen_addr.is_none() {
                 socket.set_only_v6(true)?;
             }

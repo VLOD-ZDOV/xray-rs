@@ -456,13 +456,21 @@ impl ServerStack {
                             Some(PacketType::Udp { src, dst, payload }) => {
                                 let mut clean = false;
                                 if let Some(tx) = self.udp_sessions.get(&(src, dst)) {
-                                    if tx.try_send(payload.clone()).is_err() {
+                                    // A full session drops the datagram; only a
+                                    // finished one is replaced.
+                                    if let Err(mpsc::error::TrySendError::Closed(_)) =
+                                        tx.try_send(payload.clone())
+                                    {
                                         clean = true;
                                     }
                                 } else {
                                     clean = true;
                                 }
                                 if clean {
+                                    // Finished sessions leave closed senders behind.
+                                    if self.udp_sessions.len() % 256 == 255 {
+                                        self.udp_sessions.retain(|_, tx| !tx.is_closed());
+                                    }
                                     let (tx, rx) = mpsc::channel(128);
                                     self.udp_sessions.insert((src, dst), tx);
                                     let _ = self.udp_tx.try_send(IncomingUdpSession {
