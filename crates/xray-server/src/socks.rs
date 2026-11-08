@@ -43,11 +43,11 @@ impl SocksOutbound {
     pub fn parse(tag: &str, outbound: &Value) -> Result<Self, String> {
         let err = |m: &str| format!("outbound {tag:?} (socks): {m}");
         let settings = outbound.get("settings").unwrap_or(outbound);
-        let server = settings
-            .get("servers")
-            .and_then(Value::as_array)
-            .and_then(|s| s.first())
-            .unwrap_or(settings);
+        let servers = settings.get("servers").and_then(Value::as_array);
+        if servers.is_some_and(|s| s.len() > 1) {
+            return Err(err("\"servers\" should have one and only one member"));
+        }
+        let server = servers.and_then(|s| s.first()).unwrap_or(settings);
         let address = server
             .get("address")
             .and_then(Value::as_str)
@@ -59,11 +59,12 @@ impl SocksOutbound {
             .and_then(|p| u16::try_from(p).ok())
             .filter(|p| *p != 0)
             .ok_or_else(|| err("invalid port"))?;
-        let user = server
-            .get("users")
-            .and_then(Value::as_array)
-            .and_then(|u| u.first())
-            .unwrap_or(server);
+        let users = server.get("users").and_then(Value::as_array);
+        if users.is_some_and(|u| u.len() > 1) {
+            return Err(err("\"users\" should have one member at most"));
+        }
+        let nested = users.and_then(|u| u.first());
+        let user = nested.unwrap_or(server);
         let field = |key| {
             user.get(key)
                 .and_then(Value::as_str)
@@ -94,7 +95,8 @@ impl SocksOutbound {
         Ok(Self {
             tag: tag.to_owned(),
             server: (host, port),
-            auth: (!name.is_empty()).then_some((name, pass)),
+            auth: (!name.is_empty() || (nested.is_some() && !pass.is_empty()))
+                .then_some((name, pass)),
             send_through,
             sockopt,
             chained_connector: Arc::new(std::sync::RwLock::new(None)),
@@ -374,6 +376,15 @@ mod tests {
         assert!(matches!(flat.server.0, Host::Domain(_)));
         assert!(flat.auth.is_none());
         assert!(SocksOutbound::parse("t", &json!({"servers": [{"address": "x"}]})).is_err());
+        let two = json!({"address": "h", "port": 1});
+        assert!(SocksOutbound::parse("t", &json!({"servers": [two, two]})).is_err());
+        let users = json!([{"user": "a", "pass": "1"}, {"user": "b", "pass": "2"}]);
+        let multi = json!({"servers": [{"address": "h", "port": 1, "users": users}]});
+        assert!(SocksOutbound::parse("t", &multi).is_err());
+        let empty_name =
+            json!({"servers": [{"address": "h", "port": 1, "users": [{"user": "", "pass": "s"}]}]});
+        let s = SocksOutbound::parse("t", &empty_name).unwrap();
+        assert_eq!(s.auth, Some((String::new(), "s".into())));
     }
 
     #[test]
