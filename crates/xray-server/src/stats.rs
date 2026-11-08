@@ -208,6 +208,9 @@ impl Stats {
             IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
             ip => ip,
         };
+        if ip == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) {
+            return None;
+        }
         let mut online = lock(&self.online);
         let entry = online
             .entry(email.to_owned())
