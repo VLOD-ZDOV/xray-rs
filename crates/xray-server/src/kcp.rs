@@ -1035,6 +1035,7 @@ pub async fn start(
 
                 let tx = session.lock().await.input_tx.clone();
                 let _ = tx.try_send(segments);
+                let own_tx = tx.clone();
                 sess_map.insert(key, tx);
 
                 // Spawn session driver
@@ -1046,7 +1047,10 @@ pub async fn start(
                 let sessions_ref = sessions.clone();
                 tokio::spawn(async move {
                     driver.run().await;
-                    sessions_ref.lock().await.remove(&key);
+                    let mut map = sessions_ref.lock().await;
+                    if map.get(&key).is_some_and(|t| t.same_channel(&own_tx)) {
+                        map.remove(&key);
+                    }
                 });
 
                 // Dispatch to inbound handler (with TLS if configured)
