@@ -1689,6 +1689,9 @@ impl Router {
             .rules
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if rule_tag.is_empty() {
+            return 0;
+        }
         let before = rules.len();
         rules.retain(|r| r.rule_tag != rule_tag);
         before - rules.len()
@@ -2310,8 +2313,12 @@ pub fn sniff_tls_sni(data: &[u8]) -> Option<String> {
 
 /// Extracts the Host header domain from an HTTP request.
 pub fn sniff_http_host(data: &[u8]) -> Option<String> {
-    let header_str = std::str::from_utf8(data).ok()?;
-    for line in header_str.lines() {
+    for raw in data.split(|&b| b == b'\n') {
+        let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if raw.is_empty() {
+            break;
+        }
+        let line = String::from_utf8_lossy(raw);
         if let Some((k, v)) = line.split_once(':') {
             if k.trim().eq_ignore_ascii_case("host") {
                 let host = v.trim().split(':').next()?.trim();
@@ -2663,6 +2670,9 @@ mod tests {
     fn sniffs_domain_from_http_and_tls() {
         let http = b"GET /path HTTP/1.1\r\nHost: example.com:8080\r\nUser-Agent: curl\r\n\r\n";
         assert_eq!(sniff_http_host(http), Some("example.com".to_owned()));
+        let binary_body = b"POST / HTTP/1.1\r\nHost: example.com\r\n\r\n\xff\xfe";
+        assert_eq!(sniff_http_host(binary_body), Some("example.com".to_owned()));
+        assert_eq!(sniff_http_host(b"GET / HTTP/1.1\r\n\r\nHost: late.com\r\n"), None);
 
         // Synthetic minimal TLS 1.2 ClientHello with SNI "test.domain.org"
         let sni_name = b"test.domain.org";
@@ -2937,6 +2947,8 @@ mod tests {
         assert_eq!(rules[0], ("proxy".to_string(), "initial-rule".to_string()));
 
         // Remove rule
+        assert_eq!(r.remove_rule(""), 0);
+        assert_eq!(r.list_rules().len(), 1);
         let removed = r.remove_rule("initial-rule");
         assert_eq!(removed, 1);
         assert_eq!(r.route(&q).await.tag, "direct");
