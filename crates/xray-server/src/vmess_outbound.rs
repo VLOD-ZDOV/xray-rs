@@ -41,17 +41,30 @@ impl VmessOutbound {
         let connector = ServerConnector::parse(tag, "vmess", outbound)?;
         let settings = outbound.get("settings").unwrap_or(&Value::Null);
 
-        let vnext = settings
-            .get("vnext")
-            .and_then(Value::as_array)
-            .and_then(|v| v.first())
-            .unwrap_or(settings);
-        let user = vnext
-            .get("users")
-            .and_then(Value::as_array)
-            .and_then(|u| u.first())
-            .unwrap_or(vnext);
-
+        let user = match settings.get("vnext") {
+            Some(v) => {
+                if settings.get("address").is_some() {
+                    return Err(err("set either address or vnext, not both"));
+                }
+                let [vnext] = v.as_array().map(Vec::as_slice).unwrap_or_default() else {
+                    return Err(err(
+                        "VMess settings: \"vnext\" should have one and only one member. Multiple endpoints in \"vnext\" should use multiple VMess outbounds and routing balancer instead",
+                    ));
+                };
+                let [user] = vnext
+                    .get("users")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                else {
+                    return Err(err(
+                        "VMess vnext: \"users\" should have one and only one member. Multiple members in \"users\" should use multiple VMess outbounds and routing balancer instead",
+                    ));
+                };
+                user
+            }
+            None => settings,
+        };
         let id_str = user
             .get("id")
             .or_else(|| settings.get("id"))
@@ -207,6 +220,7 @@ impl VmessConeUdp {
                     }
                 });
                 let mut sessions = self.sessions.lock().await;
+                sessions.retain(|k, (_, t)| *k == addr || !t.is_finished());
                 if let Some((existing, task_ex)) = sessions.get(&addr) {
                     if !task_ex.is_finished() {
                         task.abort();
@@ -249,5 +263,35 @@ impl VmessConeUdp {
 impl Drop for VmessConeUdp {
     fn drop(&mut self) {
         self.abort_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn outbound(settings: Value) -> Result<VmessOutbound, String> {
+        VmessOutbound::parse("t", &serde_json::json!({ "settings": settings }))
+    }
+
+    #[test]
+    fn vnext_and_users_must_have_one_member() {
+        let id = "b831381d-6324-4d53-ad4f-8cda48b30811";
+        let user = serde_json::json!({ "id": id });
+        let server = |users: Vec<Value>| serde_json::json!({"address": "192.0.2.1", "port": 443, "users": users});
+        let err = outbound(serde_json::json!({ "vnext": [server(vec![user.clone()]), server(vec![user.clone()])] }))
+            .unwrap_err();
+        assert!(
+            err.contains("\"vnext\" should have one and only one member"),
+            "{err}"
+        );
+        let err =
+            outbound(serde_json::json!({ "vnext": [server(vec![user.clone(), user.clone()])] }))
+                .unwrap_err();
+        assert!(
+            err.contains("\"users\" should have one and only one member"),
+            "{err}"
+        );
+        assert!(outbound(serde_json::json!({ "vnext": [server(vec![user])] })).is_ok());
     }
 }
