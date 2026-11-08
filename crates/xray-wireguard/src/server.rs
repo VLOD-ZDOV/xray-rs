@@ -65,7 +65,12 @@ pub struct Server {
     stop: Stop,
     tcp_rx: Arc<Mutex<mpsc::Receiver<IncomingTcpStream>>>,
     udp_rx: Arc<Mutex<mpsc::Receiver<IncomingUdpSession>>>,
+    forget: Forget,
+    wake: Arc<Notify>,
 }
+
+/// Addresses whose flows the stack drops on its next pass.
+type Forget = Arc<std::sync::Mutex<Vec<IpAddr>>>;
 
 impl Server {
     pub async fn start(config: ServerConfig) -> Result<Self, io::Error> {
@@ -163,6 +168,7 @@ impl Server {
             let _ = device.stop().await;
         });
 
+        let forget = stack.forget.clone();
         let stack_stop = stop.clone();
         tokio::spawn(async move {
             stack.run(stack_stop).await;
@@ -172,6 +178,8 @@ impl Server {
             stop,
             tcp_rx: Arc::new(Mutex::new(tcp_rx)),
             udp_rx: Arc::new(Mutex::new(udp_rx)),
+            forget,
+            wake,
         })
     }
 
@@ -216,6 +224,7 @@ impl Server {
             wake.clone(),
         );
 
+        let forget = stack.forget.clone();
         let stack_stop = stop.clone();
         tokio::spawn(async move {
             stack.run(stack_stop).await;
@@ -225,11 +234,20 @@ impl Server {
             stop,
             tcp_rx: Arc::new(Mutex::new(tcp_rx)),
             udp_rx: Arc::new(Mutex::new(udp_rx)),
+            forget,
+            wake,
         }
     }
 
     pub fn close(&self) {
         self.stop.close();
+    }
+
+    /// Drops every TCP flow and UDP session from `addr`, as Xray closes a
+    /// tunnel's connections before its address can go to another one.
+    pub fn forget(&self, addr: IpAddr) {
+        self.forget.lock().unwrap().push(addr);
+        self.wake.notify_one();
     }
 }
 
@@ -355,6 +373,7 @@ struct ServerStack {
     wake: Arc<Notify>,
     start: Clock,
     next_id: u64,
+    forget: Forget,
 }
 
 impl ServerStack {
@@ -415,6 +434,7 @@ impl ServerStack {
             wake,
             start: Clock::now(),
             next_id: 1,
+            forget: Forget::default(),
         }
     }
 
@@ -446,6 +466,24 @@ impl ServerStack {
             return Poll::Ready(false);
         }
         let mut progress = false;
+
+        let forgotten = std::mem::take(&mut *self.forget.lock().unwrap());
+        for addr in forgotten {
+            let gone: Vec<u64> = self
+                .flows
+                .iter()
+                .filter(|(_, flow)| flow.src.ip() == addr)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in gone {
+                if let Some(flow) = self.flows.remove(&id) {
+                    self.sockets.get_mut::<tcp::Socket>(flow.handle).abort();
+                    self.sockets.remove(flow.handle);
+                }
+            }
+            self.udp_sessions.retain(|(src, _), _| src.ip() != addr);
+            progress = true;
+        }
 
         // 1. Drain UDP responses
         while let Poll::Ready(Some((from, to, payload))) = self.udp_resp_rx.poll_recv(cx) {

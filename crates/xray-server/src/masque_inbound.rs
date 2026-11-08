@@ -243,6 +243,8 @@ struct IpPool {
     last: u32,
     next: u32,
     used: std::collections::HashSet<u32>,
+    /// The shared stack, told to drop a tunnel's flows before its address is reused.
+    stack: Option<Arc<Server>>,
 }
 
 impl IpPool {
@@ -274,6 +276,7 @@ impl IpPool {
             last,
             next: first,
             used: Default::default(),
+            stack: None,
         })
     }
 
@@ -310,7 +313,11 @@ impl Lease {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.0.lock().unwrap().used.remove(&u32::from(self.1));
+        let mut pool = self.0.lock().unwrap();
+        if let Some(stack) = &pool.stack {
+            stack.forget(IpAddr::V4(self.1));
+        }
+        pool.used.remove(&u32::from(self.1));
     }
 }
 
@@ -346,6 +353,7 @@ pub async fn start(
 
     let server = Server::start_raw(stack_addrs, config.mtu, to_tunnel_tx, from_tunnel_rx);
     let server = Arc::new(server);
+    pool.lock().unwrap().stack = Some(server.clone());
     let server_run = server.clone();
     let s_ctx = ctx.clone();
     let s_router = router.clone();
