@@ -2159,11 +2159,16 @@ fn parse_reality(reality: &Value, _tag: &str) -> Result<Option<RealityInboundSet
     let short_id_arr = array(reality, "shortIds");
     if !short_id_arr.is_empty() {
         for sid in short_id_arr {
-            let s = sid.as_str().unwrap_or_default();
+            let s = sid
+                .as_str()
+                .ok_or_else(|| format!("realitySettings: invalid shortIds entry {sid}"))?;
             short_ids.push(parse_short_id(s)?);
         }
     } else if let Some(s) = reality.get("shortId").and_then(Value::as_str) {
         short_ids.push(parse_short_id(s)?);
+    }
+    if short_ids.is_empty() {
+        return Err("realitySettings: empty \"shortIds\"".into());
     }
 
     let min_client_ver = reality
@@ -3262,7 +3267,7 @@ mod tests {
                 "security": "reality",
                 "realitySettings": {
                   "dest": "www.yahoo.com:443",
-                  "serverNames": ["www.yahoo.com"],
+                  "serverNames": ["www.yahoo.com"], "shortIds": ["ab"],
                   "privateKey": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10",
                   "mldsa65Seed": "ai9ixjkLpABQyp5J15DrKgz1ik7vFAYprc46d8y512g"
                 }
@@ -3285,7 +3290,7 @@ mod tests {
                 "security": "reality",
                 "realitySettings": {
                   "dest": "www.yahoo.com:443",
-                  "serverNames": ["www.yahoo.com"],
+                  "serverNames": ["www.yahoo.com"], "shortIds": ["ab"],
                   "privateKey": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10",
                   "mldsa65Seed": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10"
                 }
@@ -3310,7 +3315,7 @@ mod tests {
                 "security": "reality",
                 "realitySettings": {
                   "dest": "www.yahoo.com:443",
-                  "serverNames": ["www.yahoo.com"],
+                  "serverNames": ["www.yahoo.com"], "shortIds": ["ab"],
                   "privateKey": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10",
                   "mldsa65Seed": "not-valid-base64!"
                 }
@@ -3335,7 +3340,7 @@ mod tests {
                 "security": "reality",
                 "realitySettings": {
                   "dest": "www.yahoo.com:443",
-                  "serverNames": ["www.yahoo.com"],
+                  "serverNames": ["www.yahoo.com"], "shortIds": ["ab"],
                   "privateKey": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10",
                   "mldsa65Seed": ""
                 }
@@ -3485,6 +3490,23 @@ mod tests {
             Some(&"world".to_string())
         );
         assert_eq!(get_env("XRAY_TEST_VAR_1"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn reality_short_ids_are_required_strings() {
+        let build = |ids: &str| {
+            format!(
+                r#"{{"inbounds": [{{"tag": "r", "port": 443, "protocol": "vless",
+                "streamSettings": {{"network": "tcp", "security": "reality",
+                "realitySettings": {{"dest": "www.yahoo.com:443", "serverNames": ["www.yahoo.com"],
+                "privateKey": "iAIPl1iED4ujD2JWzwdm9mdyZx2EjZgqCQWPuf9HN10"{ids}}}}}}}]}}"#
+            )
+        };
+        assert!(parse(&build("")).is_err());
+        assert!(parse(&build(r#", "shortIds": []"#)).is_err());
+        assert!(parse(&build(r#", "shortIds": [1234]"#)).is_err());
+        assert!(parse(&build(r#", "shortIds": [null]"#)).is_err());
+        assert!(parse(&build(r#", "shortIds": ["", "ab"]"#)).is_ok());
     }
 
     #[test]
