@@ -1345,6 +1345,48 @@ async fn handle_handler(
             if inbound_manager.contains(&tag) {
                 return status(UNKNOWN, &format!("handler already exists: {tag}"));
             }
+            // The API only rebuilds plain TCP inbounds of known protocols; TLS, REALITY and
+            // transport settings would be lost. An error makes 3x-ui restart the core with the
+            // full config instead.
+            let stream = inbound_cfg
+                .receiver_settings
+                .as_ref()
+                .and_then(|r| ReceiverConfig::decode(r.value.clone()).ok())
+                .and_then(|r| r.stream_settings);
+            if let Some(stream) = &stream {
+                if !stream.security_type.is_empty()
+                    || !matches!(stream.protocol_name.as_str(), "" | "tcp" | "raw")
+                {
+                    return status(
+                        UNKNOWN,
+                        &format!(
+                            "AddInbound does not support this stream setting yet: {} {}",
+                            stream.protocol_name, stream.security_type
+                        ),
+                    );
+                }
+            }
+            let proxy_type = inbound_cfg
+                .proxy_settings
+                .as_ref()
+                .map(|p| p.r#type.as_str())
+                .unwrap_or_default();
+            let known = [
+                "trojan",
+                "vmess",
+                "shadowsocks",
+                "dokodemo",
+                "socks",
+                "http",
+                "hysteria",
+                "vless",
+            ];
+            if !known.iter().any(|k| proxy_type.contains(k)) {
+                return status(
+                    UNKNOWN,
+                    &format!("AddInbound does not support proxy type {proxy_type:?} yet"),
+                );
+            }
             let (port, listen, sniffing, transport) =
                 if let Some(rec) = inbound_cfg.receiver_settings {
                     let rec = ReceiverConfig::decode(rec.value).unwrap_or(ReceiverConfig {
@@ -1612,12 +1654,25 @@ async fn handle_handler(
                 .as_ref()
                 .map(|p| p.r#type.as_str())
                 .unwrap_or_default();
+            if inbound_manager
+                .router()
+                .outbounds
+                .read()
+                .unwrap()
+                .contains_key(&tag)
+            {
+                return status(UNKNOWN, &format!("existing tag found: {tag}"));
+            }
             let action = if proxy_type.contains("freedom") {
                 crate::routing::Action::Direct(crate::routing::FreedomStrategy::AsIs.into())
             } else if proxy_type.contains("blackhole") {
                 crate::routing::Action::Block(crate::routing::BlockAction::Drop)
             } else {
-                crate::routing::Action::Direct(crate::routing::FreedomStrategy::AsIs.into())
+                // Anything else would silently send traffic direct.
+                return status(
+                    UNKNOWN,
+                    &format!("AddOutbound does not support proxy type {proxy_type:?} yet"),
+                );
             };
             inbound_manager.router().add_outbound(tag, action);
             reply(&AddOutboundResponse {})
