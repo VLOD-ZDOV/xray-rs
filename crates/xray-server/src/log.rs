@@ -115,8 +115,13 @@ pub fn error(message: impl Display) {
 }
 
 pub fn dns(message: impl Display) {
-    if DNS_LOG.load(Ordering::Relaxed) || LEVEL.load(Ordering::Relaxed) <= INFO {
-        info(format!("[DNS] {message}"));
+    // Xray writes DNS lines to the access log, and only when dnsLog is on.
+    if !DNS_LOG.load(Ordering::Relaxed) {
+        return;
+    }
+    let guard = ACCESS_SINK.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(Some(sink)) = &*guard {
+        write_line(sink, format_args!("{message}"));
     }
 }
 
