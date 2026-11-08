@@ -31,28 +31,29 @@ WireGuard peer and `xray api` client.
 
 ## Resource use
 
-Same server config for both cores, the official Xray-core as the client, only
-the server process measured, on loopback. Median of 5 runs, whiskers show
+Same server config for every core, the official Xray-core as the client, only
+the server process measured, on loopback. Median of 3 to 5 runs, whiskers show
 min and max.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/server-cpu-dark.svg">
-  <img alt="Server CPU time per GiB, lower is better. XHTTP+TLS download: xray-rs 1.18 s, Xray-core 2.00. XHTTP+TLS upload: 1.26 and 2.42. Raw TLS download: 0.22 and 0.36. WebSocket+TLS download: 0.26 and 0.46." src="assets/server-cpu-light.svg">
+  <img alt="Server CPU time per GiB, lower is better. XHTTP+TLS download: xray-rs 1.00 s, Xray-core 26.10.21 2.00, 26.10.31 2.18. XHTTP+TLS upload: 1.42, 2.42 and 2.42. Raw TLS download: 0.26, 0.36 and 0.36. WebSocket+TLS download: 0.28, 0.46 and 0.46." src="assets/server-cpu-light.svg">
 </picture>
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/server-memory-dark.svg">
-  <img alt="Server memory (RSS), lower is better. Idle: xray-rs 8.6 MiB, Xray-core 42.2. 100 open flows: 15.7 and 51.0. 1000 open flows: 60.2 and 125." src="assets/server-memory-light.svg">
+  <img alt="Server memory (RSS), lower is better. Idle: xray-rs 11.8 MiB, Xray-core 26.10.21 42.2, 26.10.31 38.0. 100 open flows: 21.0, 51.0 and 47.9. 1000 open flows: 69.3, 125 and 124." src="assets/server-memory-light.svg">
 </picture>
 
 Throughput over an emulated link (network namespace with netem: 50 ms RTT,
-MTU 1500, 0, 1 and 5% packet loss). Without loss xray-rs is 8 to 20% faster.
-With loss the kernel's TCP recovery dominates and both cores land within run
-to run noise.
+MTU 1500, 0 and 5% packet loss). Without loss xray-rs is up to 14% faster.
+With loss the kernel's TCP recovery dominates and the cores land within run
+to run noise. At 1% loss a single flow on this link stalls in some runs for
+every core, so that panel is left out.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/server-throughput-dark.svg">
-  <img alt="Download through the tunnel in Mbit/s, higher is better. No loss: XHTTP xray-rs 592, Xray-core 550; raw 612 and 560; WebSocket 607 and 504. 1% loss: XHTTP 230 and 196; raw 299 and 292; WebSocket 366 and 388. 5% loss: XHTTP 148 and 142; raw 252 and 251; WebSocket 247 and 245." src="assets/server-throughput-light.svg">
+  <img alt="Download through the tunnel in Mbit/s, higher is better. No loss: XHTTP xray-rs 551, Xray-core 26.10.21 550, 26.10.31 539; raw 584, 560 and 551; WebSocket 560, 504 and 493. 5% loss: XHTTP 93, 142 and 96; raw 266, 251 and 255; WebSocket 256, 245 and 250." src="assets/server-throughput-light.svg">
 </picture>
 
 ## Not supported yet
