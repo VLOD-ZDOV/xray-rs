@@ -337,6 +337,31 @@ pub async fn start(
     transport.send_window(20_971_520);
     transport.datagram_receive_buffer_size(Some(1024 * 1024));
     transport.datagram_send_buffer_size(1024 * 1024);
+    // Xray's hub: reno when asked, otherwise BBR; quinn's own default is Cubic, which
+    // collapses on long or lossy links.
+    let params = inbound.quic_params.as_ref();
+    match params.map(|p| p.congestion) {
+        Some(xray_config::QuicCongestion::Reno) => {
+            transport.congestion_controller_factory(Arc::new(
+                quinn::congestion::NewRenoConfig::default(),
+            ));
+        }
+        congestion => {
+            if matches!(
+                congestion,
+                Some(
+                    xray_config::QuicCongestion::Brutal | xray_config::QuicCongestion::ForceBrutal
+                )
+            ) && params.is_some_and(|p| p.brutal_up_bytes_per_sec > 0)
+            {
+                crate::log::warn(
+                    "hysteria: Brutal congestion is not supported yet on the server, BBR is used",
+                );
+            }
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+        }
+    }
     server_config.transport_config(Arc::new(transport));
 
     let listen_addr: SocketAddr = if inbound.listen.is_empty() {
