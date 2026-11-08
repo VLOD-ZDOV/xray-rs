@@ -18,7 +18,7 @@ use http_body_util::{BodyExt, Empty, Limited, StreamBody};
 use hyper::body::{Frame, Incoming};
 use quinn::Runtime;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::config::{Inbound, Meta, Placement, XhttpSettings};
 use crate::{log, padding, vless};
@@ -42,6 +42,28 @@ struct Session {
     // Taken by the GET request that carries the downlink.
     uplink: Mutex<Option<DuplexStream>>,
     connected: AtomicBool,
+    // Set once a stream-up body is attached; Xray's uploadQueue allows one reader.
+    has_reader: AtomicBool,
+    closed: watch::Sender<bool>,
+}
+
+impl Session {
+    fn close(&self) {
+        self.closed.send_replace(true);
+    }
+
+    async fn wait_closed(&self) {
+        let mut rx = self.closed.subscribe();
+        let _ = rx.wait_for(|closed| *closed).await;
+    }
+
+    /// Queues an upload; false when the session was closed or its pipeline is gone.
+    async fn push(&self, upload: Upload) -> bool {
+        tokio::select! {
+            sent = self.uploads.send(upload) => sent.is_ok(),
+            _ = self.wait_closed() => false,
+        }
+    }
 }
 
 enum Upload {
@@ -139,6 +161,9 @@ impl Handler {
                 if !allowed("stream-up") {
                     return status(StatusCode::BAD_REQUEST);
                 }
+                if session.has_reader.swap(true, Ordering::AcqRel) {
+                    return status(StatusCode::CONFLICT);
+                }
                 let send_padding =
                     (referer.is_some() || obfs_padding_accepted) && s.stream_up_secs.1 > 0;
                 let body = stream_up(
@@ -155,6 +180,9 @@ impl Handler {
             }
             if !allowed("packet-up") {
                 return status(StatusCode::BAD_REQUEST);
+            }
+            if session.has_reader.load(Ordering::Acquire) {
+                return status(StatusCode::CONFLICT);
             }
             let Ok(seq) = seq.parse::<u64>() else {
                 return status(StatusCode::INTERNAL_SERVER_ERROR);
@@ -179,7 +207,10 @@ impl Handler {
                     .await
                 {
                     Ok(collected) => collected.to_bytes(),
-                    Err(_) => return status(StatusCode::PAYLOAD_TOO_LARGE),
+                    Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                        return status(StatusCode::PAYLOAD_TOO_LARGE)
+                    }
+                    Err(_) => return status(StatusCode::BAD_REQUEST),
                 };
                 body_empty = body.is_empty();
                 payload.extend_from_slice(&body);
@@ -192,12 +223,7 @@ impl Handler {
                 response = response.header(CACHE_CONTROL, "no-store");
             }
             let payload = Bytes::from(payload);
-            if session
-                .uploads
-                .send(Upload::Packet(seq, payload))
-                .await
-                .is_err()
-            {
+            if !session.push(Upload::Packet(seq, payload)).await {
                 return status(StatusCode::INTERNAL_SERVER_ERROR);
             }
             return finish(response, StatusCode::OK, empty());
@@ -338,6 +364,11 @@ impl Handler {
                     let _ = stream.finish().await;
                     return;
                 }
+                if session.has_reader.swap(true, Ordering::AcqRel) {
+                    let _ = stream.send_response(h3_status(StatusCode::CONFLICT)).await;
+                    let _ = stream.finish().await;
+                    return;
+                }
                 let send_padding =
                     (referer.is_some() || obfs_padding_accepted) && s.stream_up_secs.1 > 0;
                 response = response
@@ -357,7 +388,6 @@ impl Handler {
                     )) as u64)
                 };
                 let mut next_padding = delay();
-                let uploads = session.uploads.clone();
 
                 loop {
                     tokio::select! {
@@ -369,7 +399,7 @@ impl Handler {
                                         let bytes = Bytes::copy_from_slice(chunk);
                                         let consumed = chunk.len();
                                         data.advance(consumed);
-                                        if uploads.send(Upload::Raw(bytes)).await.is_err() {
+                                        if !session.push(Upload::Raw(bytes)).await {
                                             return;
                                         }
                                     }
@@ -394,6 +424,11 @@ impl Handler {
                 let _ = stream
                     .send_response(h3_status(StatusCode::BAD_REQUEST))
                     .await;
+                let _ = stream.finish().await;
+                return;
+            }
+            if session.has_reader.load(Ordering::Acquire) {
+                let _ = stream.send_response(h3_status(StatusCode::CONFLICT)).await;
                 let _ = stream.finish().await;
                 return;
             }
@@ -426,7 +461,18 @@ impl Handler {
             let mut body_empty = true;
             if matches!(data.placement, Placement::Body | Placement::Auto) {
                 let mut body_bytes = Vec::new();
-                while let Ok(Some(mut data)) = stream.recv_data().await {
+                loop {
+                    let mut data = match stream.recv_data().await {
+                        Ok(Some(data)) => data,
+                        Ok(None) => break,
+                        Err(_) => {
+                            let _ = stream
+                                .send_response(h3_status(StatusCode::BAD_REQUEST))
+                                .await;
+                            let _ = stream.finish().await;
+                            return;
+                        }
+                    };
                     while data.has_remaining() {
                         if body_bytes.len() + data.remaining() > s.max_each_post {
                             let _ = stream
@@ -455,12 +501,7 @@ impl Handler {
                 response = response.header(CACHE_CONTROL, "no-store");
             }
             let payload = Bytes::from(payload);
-            if session
-                .uploads
-                .send(Upload::Packet(seq, payload))
-                .await
-                .is_err()
-            {
+            if !session.push(Upload::Packet(seq, payload)).await {
                 let _ = stream
                     .send_response(h3_status(StatusCode::INTERNAL_SERVER_ERROR))
                     .await;
@@ -530,7 +571,7 @@ impl Handler {
                 }
             }
             let _ = send_stream.finish().await;
-            let _ = recv_task.await;
+            recv_task.abort();
             return;
         }
 
@@ -655,11 +696,20 @@ impl Handler {
         }
         let (writer, reader) = tokio::io::duplex(PIPE_SIZE);
         let (tx, rx) = mpsc::channel(self.settings.max_buffered_posts);
-        tokio::spawn(upload_task(rx, writer, self.settings.max_buffered_posts));
         let session = Arc::new(Session {
             uploads: tx,
             uplink: Mutex::new(Some(reader)),
             connected: AtomicBool::new(false),
+            has_reader: AtomicBool::new(false),
+            closed: watch::channel(false).0,
+        });
+        let upload_session = session.clone();
+        let max_buffered = self.settings.max_buffered_posts;
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = upload_task(rx, writer, max_buffered) => {}
+                _ = upload_session.wait_closed() => {}
+            }
         });
         sessions.insert(id.to_owned(), session.clone());
 
@@ -669,6 +719,7 @@ impl Handler {
             tokio::time::sleep(SESSION_TTL).await;
             if !reaped.connected.load(Ordering::Relaxed) {
                 this.remove(&id, &reaped);
+                reaped.close();
             }
         });
         session
@@ -739,7 +790,7 @@ fn stream_up(
                 frame = body.frame() => {
                     let Some(Ok(frame)) = frame else { break };
                     if let Ok(data) = frame.into_data() {
-                        if session.uploads.send(Upload::Raw(data)).await.is_err() {
+                        if !session.push(Upload::Raw(data)).await {
                             break;
                         }
                     }
