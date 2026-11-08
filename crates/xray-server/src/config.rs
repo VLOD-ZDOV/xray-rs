@@ -1878,7 +1878,7 @@ fn parse_fakedns(
     inbounds: &[Inbound],
 ) -> Result<Option<crate::fakedns::FakeDnsMulti>, String> {
     let mut pools = Vec::new();
-    if let Some(fakedns_val) = root.get("fakedns") {
+    if let Some(fakedns_val) = root.get("fakedns").filter(|v| !v.is_null()) {
         match fakedns_val {
             Value::Object(_) => {
                 pools.push(parse_fakedns_pool(fakedns_val)?);
