@@ -100,7 +100,13 @@ fn main() -> ExitCode {
             }
             "run" if !arg.starts_with('-') => {}
             "t" | "test" => test_only = true,
-            "c" | "config" => config_path = iter.next().map(str::to_owned),
+            "c" | "config" => match iter.next() {
+                Some(value) => config_path = Some(value.to_owned()),
+                None => {
+                    eprintln!("flag needs an argument: {arg}");
+                    return ExitCode::FAILURE;
+                }
+            },
             other if other.starts_with("config=") || other.starts_with("c=") => {
                 config_path = other.split_once('=').map(|(_, v)| v.to_owned());
             }
@@ -1355,6 +1361,10 @@ fn spawn_ocsp_stapling(resolver: &Arc<SniCheckingResolver>, index: usize) {
             match ocsp::fetch(&chain).await {
                 Ok(staple) => {
                     let mut cert = resolver.encipherment_certs[index].write().unwrap();
+                    // A reload during the fetch replaced the chain the staple belongs to.
+                    if cert.certified_key.cert != chain {
+                        continue;
+                    }
                     if cert.certified_key.ocsp.as_deref() != Some(staple.as_slice()) {
                         let mut key = (*cert.certified_key).clone();
                         key.ocsp = Some(staple);
