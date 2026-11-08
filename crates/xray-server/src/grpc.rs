@@ -238,6 +238,10 @@ where
         .initial_stream_window_size(4 * 1024 * 1024)
         .initial_connection_window_size(16 * 1024 * 1024)
         .max_concurrent_streams(1024);
+    builder
+        .http1()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(std::time::Duration::from_secs(4));
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
         log::debug(format!(
             "grpc connection from {} ended: {e}",
@@ -364,7 +368,8 @@ fn skip_field(data: &[u8], pos: usize, wire_type: u8) -> io::Result<usize> {
         2 => {
             let (len, n) = decode_varint(&data[pos..])?;
             let start = pos + n;
-            if start + len > data.len() {
+            // `len` comes from the peer; `start + len` could wrap.
+            if len > data.len() - start {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "truncated length-delimited",
@@ -401,7 +406,7 @@ where
         if field_num == 1 && wire_type == 2 {
             let (len, n) = decode_varint(&payload[pos..])?;
             pos += n;
-            if pos + len > payload.len() {
+            if len > payload.len() - pos {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated hunk data",
@@ -420,6 +425,21 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_huge_length_is_truncated_data_not_a_wrap() {
+        // field 2, length-delimited, length u64::MAX
+        let mut field = vec![0x12];
+        field.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+        assert!(skip_field(&field, 1, 2).is_err());
+        let mut hunk = vec![0x0a];
+        hunk.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+        let mut sink = Vec::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert!(rt.block_on(decode_hunk_payload(&hunk, &mut sink)).is_err());
+    }
 
     #[test]
     fn varint_roundtrips() {
