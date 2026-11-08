@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UnixStream};
@@ -131,9 +132,23 @@ where
 {
     let mut dest: Box<dyn Stream> = match &fallback.dest {
         FallbackDest::Tcp(host, port) => {
-            let stream = match host {
-                Host::Ip(ip) => TcpStream::connect((*ip, *port)).await?,
-                Host::Domain(name) => TcpStream::connect((name.as_str(), *port)).await?,
+            // Xray: retry.ExponentialBackoff(5, 100)
+            let mut delay = Duration::from_millis(100);
+            let mut attempt = 1;
+            let stream = loop {
+                let connected = match host {
+                    Host::Ip(ip) => TcpStream::connect((*ip, *port)).await,
+                    Host::Domain(name) => TcpStream::connect((name.as_str(), *port)).await,
+                };
+                match connected {
+                    Ok(stream) => break stream,
+                    Err(e) if attempt >= 5 => return Err(e),
+                    Err(_) => {
+                        tokio::time::sleep(delay).await;
+                        delay *= 2;
+                        attempt += 1;
+                    }
+                }
             };
             stream.set_nodelay(true)?;
             Box::new(stream)
@@ -170,7 +185,12 @@ pub(crate) async fn connect_unix(path: &str) -> io::Result<UnixStream> {
     } else {
         return UnixStream::connect(path).await;
     };
-    let stream = StdUnixStream::connect_addr(&UnixAddr::from_abstract_name(name)?)?;
+    // A full backlog blocks connect(2), so keep it off the async workers.
+    let stream = tokio::task::spawn_blocking(move || {
+        StdUnixStream::connect_addr(&UnixAddr::from_abstract_name(name)?)
+    })
+    .await
+    .map_err(io::Error::other)??;
     stream.set_nonblocking(true)?;
     UnixStream::from_std(stream)
 }
