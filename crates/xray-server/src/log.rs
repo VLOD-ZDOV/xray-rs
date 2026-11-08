@@ -203,6 +203,9 @@ fn local_offset_seconds() -> i64 {
     static OFFSET: OnceLock<i64> = OnceLock::new();
     *OFFSET.get_or_init(|| {
         if let Some(tz) = crate::config::get_env("TZ") {
+            if tz.is_empty() || tz == "UTC" {
+                return 0;
+            }
             if let Some(off) = parse_tz_string(&tz) {
                 return off;
             }
