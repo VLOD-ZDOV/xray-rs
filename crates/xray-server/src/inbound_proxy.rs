@@ -19,7 +19,7 @@ use xray_routing::{Target, TargetAddr};
 
 use crate::httpupgrade::PrefixedStream;
 use crate::outbound::{self, ConeUdp};
-use crate::routing::{Action, Query};
+use crate::routing::Action;
 use crate::vless::{
     copy, host_label, read_first, relay, Activity, Context, Host, RouteRequest, CONN_IDLE,
 };
@@ -164,7 +164,7 @@ where
 }
 
 /// Relays a SOCKS UDP association. The first datagram picks the outbound, like a
-/// VLESS UDP session; later datagrams routed elsewhere are dropped.
+/// VLESS UDP session and later datagrams follow it, as in Xray.
 async fn relay_udp(
     udp_relay: &UdpSocket,
     ctx: &Context,
@@ -194,12 +194,11 @@ async fn relay_udp(
         port,
         sniffing: &ctx.sniffing,
     };
-    let Some(decision) = route.allow(&ctx.router, &first.payload).await else {
-        return Ok(());
+    let decision = match route.allow(&ctx.router, &first.payload).await {
+        Some(d) if !matches!(d.action, Action::Block(_)) => d,
+        // Keep the association (its TCP control connection) open and drop the packets.
+        _ => return std::future::pending().await,
     };
-    if let Action::Block(_) = decision.action {
-        return Ok(());
-    }
     let cone = ConeUdp::open(ctx.router.clone(), &decision).await?;
     let traffic = stats::get().traffic(&ctx.tag, email, 0, &decision.tag);
     let activity = Activity::new();
@@ -219,32 +218,6 @@ async fn relay_udp(
                 continue;
             };
             let (host, port) = target_to_host_port(&datagram.target);
-            let (domain, ip) = match &host {
-                Host::Domain(name) => (Some(name.as_str()), None),
-                Host::Ip(ip) => (None, Some(*ip)),
-            };
-            let query = Query {
-                inbound: &ctx.tag,
-                inbound_port: ctx.port,
-                user: email,
-                source: peer,
-                network: Network::Udp,
-                domain,
-                ip,
-                port,
-                protocol: None,
-                attributes: None,
-                local_ip: None,
-                vless_route: None,
-                process_info: None,
-            };
-            if ctx.router.route(&query).await.tag != decision.tag {
-                log::debug(format!(
-                    "socks udp to {}:{port} dropped: routed off the session outbound",
-                    host_label(&host)
-                ));
-                continue;
-            }
             if let Ok(target) = cone.target(&host, port).await {
                 let _ = cone.send_to(&datagram.payload, target).await;
                 traffic.up(datagram.payload.len());
