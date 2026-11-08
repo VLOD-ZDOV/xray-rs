@@ -36,6 +36,13 @@ impl fmt::Debug for DnsOutbound {
 impl DnsOutbound {
     pub fn parse(tag: &str, outbound: &Value) -> Result<Self, String> {
         let settings = outbound.get("settings").unwrap_or(outbound);
+        for key in ["nonIPQuery", "blockTypes", "rules"] {
+            if settings.get(key).is_some_and(|v| !v.is_null()) {
+                crate::log::warn(format!(
+                    "dns outbound {tag:?}: {key:?} is not supported and is ignored"
+                ));
+            }
+        }
         let address = settings
             .get("rewriteAddress")
             .or_else(|| settings.get("address"))
