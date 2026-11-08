@@ -1553,10 +1553,20 @@ pub fn parse_sockopt(sockopt: &Value, _owner: &str) -> Result<Option<SockoptSett
                     .and_then(Value::as_str)
                     .map(str::to_string);
                 let level = parse_i32_val(obj.get("level")).unwrap_or(libc::IPPROTO_TCP);
+                // Xray fails the socket setup for entries that apply to this system.
+                let applies = system
+                    .as_deref()
+                    .is_none_or(|s| s.is_empty() || s == "linux");
+                let typ = obj.get("type").and_then(Value::as_str).unwrap_or("");
+                if applies && !matches!(typ, "int" | "str") {
+                    return Err(format!("unknown CustomSockopt type: {typ}"));
+                }
                 let Some(opt) = parse_i32_val(obj.get("opt")) else {
+                    if applies {
+                        return Err("No opt!".into());
+                    }
                     continue;
                 };
-                let typ = obj.get("type").and_then(Value::as_str).unwrap_or("int");
                 let value = match typ {
                     "str" => {
                         let s = obj
@@ -3498,6 +3508,19 @@ mod tests {
             Some(&"world".to_string())
         );
         assert_eq!(get_env("XRAY_TEST_VAR_1"), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn custom_sockopt_errors_match_xray() {
+        let sock = |entry: &str| {
+            let v: Value =
+                serde_json::from_str(&format!(r#"{{"customSockopt": [{entry}]}}"#)).unwrap();
+            parse_sockopt(&v, "t").map(|_| ())
+        };
+        assert!(sock(r#"{"level": "6", "opt": "13", "value": "1"}"#).is_err());
+        assert!(sock(r#"{"type": "int", "level": "6", "value": "1"}"#).is_err());
+        assert!(sock(r#"{"type": "int", "system": "windows", "level": "6"}"#).is_ok());
+        assert!(sock(r#"{"type": "int", "level": "6", "opt": "13", "value": "1"}"#).is_ok());
     }
 
     #[test]
