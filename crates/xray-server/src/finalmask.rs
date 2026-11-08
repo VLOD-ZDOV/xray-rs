@@ -329,6 +329,30 @@ fn validate_quic_params_inner(stream: &Value, kind: &str, tag: &str) -> Result<(
 }
 
 /// Validates outbound finalmask and logs warnings on unsupported mask types.
+/// Inbound masks the server runs: Salamander on Hysteria and `mkcp-legacy`
+/// on mKCP; the rest are skipped with a warning.
+pub fn warn_inbound_finalmask(stream: &Value, protocol: &str, tag: &str) {
+    let Some(finalmask) = stream.get("finalmask").and_then(Value::as_object) else {
+        return;
+    };
+    let network = stream.get("network").and_then(Value::as_str).unwrap_or("");
+    for (layer, masks) in [("tcp", finalmask.get("tcp")), ("udp", finalmask.get("udp"))] {
+        for mask in masks.and_then(Value::as_array).into_iter().flatten() {
+            let kind = mask.get("type").and_then(Value::as_str).unwrap_or("");
+            let supported = match (layer, kind.to_ascii_lowercase().as_str()) {
+                ("udp", "salamander" | "udphop") => protocol.starts_with("hysteria"),
+                ("udp", "mkcp-legacy") => matches!(network, "kcp" | "mkcp"),
+                _ => false,
+            };
+            if !supported {
+                crate::log::warn(format!(
+                    "inbound {tag:?}: streamSettings.finalmask.{layer}: mask type {kind:?} is not supported yet, ignored"
+                ));
+            }
+        }
+    }
+}
+
 pub fn validate_and_log_finalmask(outbound: &Value, tag: &str) -> Result<(), String> {
     let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
     validate_finalmask_quic_params(stream, tag)?;

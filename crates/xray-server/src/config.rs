@@ -636,6 +636,11 @@ pub fn parse(raw: &str) -> Result<Config, String> {
 }
 
 fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
+    crate::finalmask::warn_inbound_finalmask(
+        item.get("streamSettings").unwrap_or(&Value::Null),
+        str_field(item, "protocol"),
+        &tag,
+    );
     let protocol = match str_field(item, "protocol") {
         "vless" => InboundProtocol::Vless,
         "trojan" => InboundProtocol::Trojan,
