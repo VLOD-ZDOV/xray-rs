@@ -207,7 +207,10 @@ impl Handler {
                     .await
                 {
                     Ok(collected) => collected.to_bytes(),
-                    Err(e) if e.downcast_ref::<http_body_util::LengthLimitError>().is_some() => {
+                    Err(e)
+                        if e.downcast_ref::<http_body_util::LengthLimitError>()
+                            .is_some() =>
+                    {
                         return status(StatusCode::PAYLOAD_TOO_LARGE)
                     }
                     Err(_) => return status(StatusCode::BAD_REQUEST),
