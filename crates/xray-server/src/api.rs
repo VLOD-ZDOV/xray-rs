@@ -1527,8 +1527,25 @@ async fn handle_handler(
                         let email = u.email.clone();
                         let account = u.account.unwrap_or_default();
                         match account.r#type.as_str() {
-                            VLESS_ACCOUNT | VMESS_ACCOUNT => {
-                                if let Ok(acc) = VlessAccount::decode(account.value) {
+                            VMESS_ACCOUNT => {
+                                let Ok(acc) = VmessAccount::decode(account.value) else {
+                                    return status(INVALID_ARGUMENT, "bad VMess account");
+                                };
+                                parsed_users.push(InboundUser {
+                                    id: user_id(&acc.id),
+                                    hash: crate::trojan::trojan_password_hash(&acc.id),
+                                    email,
+                                    level: u.level,
+                                    flow: String::new(),
+                                    reverse: None,
+                                    testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                                });
+                            }
+                            VLESS_ACCOUNT => {
+                                let Ok(acc) = VlessAccount::decode(account.value) else {
+                                    return status(INVALID_ARGUMENT, "bad VLESS account");
+                                };
+                                {
                                     let testseed = if acc.testseed.len() >= 4 {
                                         [
                                             acc.testseed[0],
@@ -1551,17 +1568,18 @@ async fn handle_handler(
                                 }
                             }
                             TROJAN_ACCOUNT => {
-                                if let Ok(acc) = TrojanAccount::decode(account.value) {
-                                    parsed_users.push(InboundUser {
-                                        id: user_id(&acc.password),
-                                        hash: crate::trojan::trojan_password_hash(&acc.password),
-                                        email,
-                                        level: u.level,
-                                        flow: String::new(),
-                                        reverse: None,
-                                        testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
-                                    });
-                                }
+                                let Ok(acc) = TrojanAccount::decode(account.value) else {
+                                    return status(INVALID_ARGUMENT, "bad Trojan account");
+                                };
+                                parsed_users.push(InboundUser {
+                                    id: user_id(&acc.password),
+                                    hash: crate::trojan::trojan_password_hash(&acc.password),
+                                    email,
+                                    level: u.level,
+                                    flow: String::new(),
+                                    reverse: None,
+                                    testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                                });
                             }
                             SHADOWSOCKS_ACCOUNT => {
                                 if let Ok(acc) = ShadowsocksAccount::decode(account.value) {
