@@ -404,6 +404,12 @@ pub async fn connect_happy_eyeballs(
         }
 
         tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "happy eyeballs connect timed out",
+                ));
+            }
             _ = &mut delay_sleep, if next_idx < addrs.len() && in_flight.len() < max_concurrent => {
                 in_flight.push(tokio::spawn(make_attempt(addrs[next_idx], next_idx)));
                 next_idx += 1;
@@ -562,11 +568,16 @@ fn encode_dns_query(qname: &str, qtype: u16) -> Vec<u8> {
 }
 
 async fn exchange_dns_query(qname: &str, qtype: u16) -> io::Result<Vec<u8>> {
-    let query = encode_dns_query(qname, qtype);
+    let mut query = encode_dns_query(qname, qtype);
+    let id: [u8; 2] = rand::random();
+    query[..2].copy_from_slice(&id);
     let nameservers = get_system_nameservers();
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let mut buf = [0u8; 4096];
     for ns in nameservers {
+        let bind = if ns.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let Ok(socket) = UdpSocket::bind(bind).await else {
+            continue;
+        };
         if socket.connect(ns).await.is_err() {
             continue;
         }
@@ -576,7 +587,7 @@ async fn exchange_dns_query(qname: &str, qtype: u16) -> io::Result<Vec<u8>> {
         if let Ok(Ok(len)) =
             tokio::time::timeout(Duration::from_millis(1500), socket.recv(&mut buf)).await
         {
-            if len >= 12 && buf[0] == 0x12 && buf[1] == 0x34 {
+            if len >= 12 && buf[..2] == id && buf[2] & 0x80 != 0 {
                 return Ok(buf[..len].to_vec());
             }
         }
