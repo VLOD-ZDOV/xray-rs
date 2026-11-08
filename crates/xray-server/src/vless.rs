@@ -349,6 +349,8 @@ impl Context {
         if email.is_empty() {
             return Err("Email must not be empty.".into());
         }
+        // Lock order is users, then the protocol lists, as in remove_user.
+        let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
         let mut ss_users = self
             .ss_users
             .write()
@@ -361,7 +363,6 @@ impl Context {
         }
         let level = ss_user.level;
         ss_users.push(ss_user);
-        let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
         if !users.iter().any(|u| u.email.eq_ignore_ascii_case(&email)) {
             users.push(User {
                 id: crate::config::user_id(&email),
@@ -389,6 +390,7 @@ impl Context {
                 return Err(format!("User {} already exists.", user.email));
             }
         }
+        let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
         let mut h_users = self
             .hysteria_users
             .write()
@@ -402,7 +404,6 @@ impl Context {
         }
         h_users.retain(|u| u.auth != user.auth);
         h_users.push(user.clone());
-        let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
         if !user.email.is_empty()
             && !users
                 .iter()
