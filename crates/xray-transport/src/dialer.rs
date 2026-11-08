@@ -2,13 +2,17 @@ use std::{fmt, io, net::SocketAddr, sync::Arc};
 
 use tokio::io::AsyncWriteExt;
 
+use crate::happy_eyeballs::{
+    connect_tcp_dual_stack_with_peer, connect_tcp_happy_eyeballs_with_peer,
+};
 use crate::stream::{connect_httpupgrade, connect_websocket, TransportLayer};
 use crate::utls_tls::TlsAlpnPolicy;
 use crate::{
-    connect_tcp_dual_stack, connect_tcp_happy_eyeballs, connect_tcp_stream, connect_tcp_target,
-    BoxedTransportStream, ConnectorConfig, HappyEyeballsConfig, RealityRuntimeEngine,
-    RealityTlsEngine, ResolvedTcpConnector, RouteProbe, RustlsRealityTlsSessionProvider,
-    SocketProtector, SystemRouteProbe, TlsConnector, TransportError,
+    canonicalize_socket_addr, connect_tcp_stream, connect_tcp_target, BoxedTransportStream,
+    ConnectorConfig, HappyEyeballsConfig, RealityRuntimeEngine, RealityTlsEngine, RecordResolver,
+    ResolvedTcpConnector, RouteProbe, RustlsRealityTlsSessionProvider, SocketOptions,
+    SocketOptionsProtector, SocketOptionsReport, SocketProtector, SystemRecordResolver,
+    SystemRouteProbe, TlsConnector, TransportError,
 };
 use xray_routing::{Target, TargetAddr};
 
@@ -16,10 +20,30 @@ use xray_routing::{Target, TargetAddr};
 pub struct TransportDialer {
     tls: TlsConnector,
     reality: Option<Arc<dyn RealityTlsEngine>>,
+    /// The protector every socket this dialer opens goes through: the
+    /// platform's, wrapped with `socket_options` when there are some.
     socket_protector: Option<Arc<dyn SocketProtector>>,
+    /// The platform's own protector, which socket options wrap.
+    platform_protector: Option<Arc<dyn SocketProtector>>,
+    socket_options: Option<Arc<SocketOptions>>,
+    socket_options_report: Option<SocketOptionsReport>,
     resolved_tcp_connector: Option<Arc<dyn ResolvedTcpConnector>>,
     tcp_fragment: Option<Arc<crate::TcpFragmentConfig>>,
+    /// What most dialers leave unset, behind one pointer: every open future
+    /// holds dialers.
+    replaced: Option<Arc<Replaced>>,
+}
+
+/// What [`TransportDialer::with_route_probe`],
+/// [`TransportDialer::with_record_resolver`],
+/// [`TransportDialer::with_tcp_header_custom`] and
+/// [`TransportDialer::with_tcp_sudoku`] set.
+#[derive(Clone, Default)]
+struct Replaced {
     route_probe: Option<Arc<dyn RouteProbe>>,
+    record_resolver: Option<Arc<dyn RecordResolver>>,
+    tcp_header_custom: Option<Arc<crate::header_custom::HeaderCustomTcpConfig>>,
+    tcp_sudoku: Option<Arc<crate::sudoku::SudokuConfig>>,
 }
 
 #[derive(Clone)]
@@ -36,11 +60,25 @@ impl fmt::Debug for TransportDialer {
             .field("tls", &self.tls)
             .field("reality_engine", &self.reality.is_some())
             .field("socket_protector", &self.socket_protector.is_some())
+            .field("socket_options", &self.socket_options)
             .field(
                 "resolved_tcp_connector",
                 &self.resolved_tcp_connector.is_some(),
             )
-            .field("route_probe", &self.route_probe)
+            .field(
+                "route_probe",
+                &self
+                    .replaced
+                    .as_ref()
+                    .and_then(|replaced| replaced.route_probe.as_ref()),
+            )
+            .field(
+                "record_resolver",
+                &self
+                    .replaced
+                    .as_ref()
+                    .is_some_and(|replaced| replaced.record_resolver.is_some()),
+            )
             .finish()
     }
 }
@@ -66,10 +104,13 @@ impl TransportDialer {
         Ok(Self {
             tls,
             reality: Some(Arc::new(reality)),
-            socket_protector,
+            socket_protector: socket_protector.clone(),
+            platform_protector: socket_protector,
+            socket_options: None,
+            socket_options_report: None,
             resolved_tcp_connector: None,
             tcp_fragment: None,
-            route_probe: None,
+            replaced: None,
         })
     }
 
@@ -78,10 +119,35 @@ impl TransportDialer {
         Self {
             tls,
             reality: None,
-            socket_protector,
+            socket_protector: socket_protector.clone(),
+            platform_protector: socket_protector,
+            socket_options: None,
+            socket_options_report: None,
             resolved_tcp_connector: None,
             tcp_fragment: None,
-            route_probe: None,
+            replaced: None,
+        }
+    }
+
+    /// Answers the SRV and TXT lookups of `addressPortStrategy` in place of
+    /// Go's resolver.
+    pub fn with_record_resolver(mut self, resolver: Arc<dyn RecordResolver>) -> Self {
+        Arc::make_mut(self.replaced.get_or_insert_with(Default::default)).record_resolver =
+            Some(resolver);
+        self
+    }
+
+    /// The resolver for `addressPortStrategy` lookups: the one set with
+    /// [`Self::with_record_resolver`], else Go's behind the platform's
+    /// protector.
+    pub fn record_resolver(&self) -> Arc<dyn RecordResolver> {
+        match self
+            .replaced
+            .as_ref()
+            .and_then(|replaced| replaced.record_resolver.as_ref())
+        {
+            Some(resolver) => Arc::clone(resolver),
+            None => Arc::new(SystemRecordResolver::new(self.platform_protector.clone())),
         }
     }
 
@@ -91,14 +157,47 @@ impl TransportDialer {
     }
 
     pub fn with_socket_protector(mut self, protector: Arc<dyn SocketProtector>) -> Self {
-        self.tls = self.tls.with_socket_protector(Arc::clone(&protector));
-        if self.reality.is_some() {
-            let reality =
-                RealityRuntimeEngine::new(Arc::new(RustlsRealityTlsSessionProvider::new()))
-                    .with_socket_protector(Arc::clone(&protector));
-            self.reality = Some(Arc::new(reality));
+        self.platform_protector = Some(protector);
+        self.rewrap_socket_protector()
+    }
+
+    /// Applies `options` to every socket this dialer opens, after the
+    /// platform's protection and in place of any options set before.
+    pub fn with_socket_options(mut self, options: Arc<SocketOptions>) -> Self {
+        self.socket_options = Some(options);
+        self.rewrap_socket_protector()
+    }
+
+    /// Receives each socket option that failed without failing its dial.
+    pub fn with_socket_options_report(mut self, report: SocketOptionsReport) -> Self {
+        self.socket_options_report = Some(report);
+        self.rewrap_socket_protector()
+    }
+
+    /// The options set with [`Self::with_socket_options`].
+    pub fn socket_options(&self) -> Option<&Arc<SocketOptions>> {
+        self.socket_options.as_ref()
+    }
+
+    fn rewrap_socket_protector(mut self) -> Self {
+        let protector = match &self.socket_options {
+            Some(options) => Some(Arc::new(SocketOptionsProtector::new(
+                self.platform_protector.clone(),
+                Arc::clone(options),
+                self.socket_options_report.clone(),
+            )) as Arc<dyn SocketProtector>),
+            None => self.platform_protector.clone(),
+        };
+        if let Some(protector) = &protector {
+            self.tls = self.tls.with_socket_protector(Arc::clone(protector));
+            if self.reality.is_some() {
+                let reality =
+                    RealityRuntimeEngine::new(Arc::new(RustlsRealityTlsSessionProvider::new()))
+                        .with_socket_protector(Arc::clone(protector));
+                self.reality = Some(Arc::new(reality));
+            }
         }
-        self.socket_protector = Some(protector);
+        self.socket_protector = protector;
         self
     }
 
@@ -112,6 +211,58 @@ impl TransportDialer {
         self
     }
 
+    /// Runs this `header-custom` handshake on every TCP carrier as soon as it
+    /// connects, before the fragment mask, TLS or REALITY.
+    pub fn with_tcp_header_custom(
+        mut self,
+        config: Arc<crate::header_custom::HeaderCustomTcpConfig>,
+    ) -> Self {
+        Arc::make_mut(self.replaced.get_or_insert_with(Default::default)).tcp_header_custom =
+            Some(config);
+        self
+    }
+
+    fn tcp_header_custom(&self) -> Option<&crate::header_custom::HeaderCustomTcpConfig> {
+        self.replaced
+            .as_ref()
+            .and_then(|replaced| replaced.tcp_header_custom.as_deref())
+    }
+
+    /// Wraps every TCP carrier in the `sudoku` mask as soon as it connects,
+    /// outside the `header-custom` handshake, the fragment mask, TLS and
+    /// REALITY.
+    pub fn with_tcp_sudoku(mut self, config: Arc<crate::sudoku::SudokuConfig>) -> Self {
+        Arc::make_mut(self.replaced.get_or_insert_with(Default::default)).tcp_sudoku = Some(config);
+        self
+    }
+
+    fn tcp_sudoku(&self) -> Option<&crate::sudoku::SudokuConfig> {
+        self.replaced
+            .as_ref()
+            .and_then(|replaced| replaced.tcp_sudoku.as_deref())
+    }
+
+    /// A connected carrier in the masks the TCP mask list puts outside the
+    /// `header-custom` handshake: `sudoku`, when it is set.
+    fn sudoku_carrier(
+        &self,
+        stream: BoxedTransportStream,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        match self.tcp_sudoku() {
+            Some(config) => Ok(Box::new(
+                crate::sudoku::SudokuStream::new(stream, config).map_err(TransportError::Tcp)?,
+            )),
+            None => Ok(stream),
+        }
+    }
+
+    /// This dialer with its own sockets instead of the outbound that
+    /// [`Self::with_resolved_tcp_connector`] carried TCP through.
+    pub fn without_resolved_tcp_connector(mut self) -> Self {
+        self.resolved_tcp_connector = None;
+        self
+    }
+
     pub fn socket_protector(&self) -> Option<&dyn SocketProtector> {
         self.socket_protector.as_deref()
     }
@@ -119,7 +270,7 @@ impl TransportDialer {
     /// Replaces the system's route probe, as a test or a platform that knows
     /// its routes better may.
     pub fn with_route_probe(mut self, probe: Arc<dyn RouteProbe>) -> Self {
-        self.route_probe = Some(probe);
+        Arc::make_mut(self.replaced.get_or_insert_with(Default::default)).route_probe = Some(probe);
         self
     }
 
@@ -128,9 +279,13 @@ impl TransportDialer {
     /// [`SystemRouteProbe`] whose sockets this dialer protects. Keep the
     /// returned probe; its result is cached.
     pub fn route_probe(&self) -> Arc<dyn RouteProbe> {
-        self.route_probe.clone().unwrap_or_else(|| {
-            Arc::new(SystemRouteProbe::new(self.socket_protector.clone())) as Arc<dyn RouteProbe>
-        })
+        self.replaced
+            .as_ref()
+            .and_then(|replaced| replaced.route_probe.clone())
+            .unwrap_or_else(|| {
+                Arc::new(SystemRouteProbe::new(self.socket_protector.clone()))
+                    as Arc<dyn RouteProbe>
+            })
     }
 
     /// Whether TCP carriers go through another outbound (`dialerProxy`)
@@ -263,6 +418,47 @@ impl TransportDialer {
                 .open_stream(self, config, original_target, candidates, happy_eyeballs)
                 .await
                 .map_err(|error| TransportError::Xhttp(error.to_string())),
+            TransportLayer::Kcp(kcp) => {
+                self.connect_kcp(config, kcp, original_target, candidates)
+                    .await
+            }
+        }
+    }
+
+    /// An mKCP stream to the first candidate, with TLS on it as Xray-core's
+    /// `DialKCP` puts it: the TLS of the raw transport. REALITY never rides
+    /// on mKCP, and a chain cannot carry its UDP.
+    async fn connect_kcp(
+        &self,
+        config: &ConnectorConfig,
+        kcp: &crate::kcp::KcpConfig,
+        original_target: &Target,
+        candidates: &[SocketAddr],
+    ) -> Result<BoxedTransportStream, TransportError> {
+        if self.resolved_tcp_connector.is_some() {
+            return Err(TransportError::UnsupportedChainedTransport("mKCP"));
+        }
+        let prepared = match config {
+            ConnectorConfig::Tcp => None,
+            ConnectorConfig::Tls(tls) => Some(self.tls.prepare_stream(tls, TlsAlpnPolicy::Raw)?),
+            ConnectorConfig::Reality(_) => {
+                return Err(TransportError::UnsupportedConnectorConfig(
+                    "reality over mKCP",
+                ))
+            }
+        };
+        if candidates.is_empty() {
+            return Err(no_resolved_candidates_error(original_target));
+        }
+        let stream: BoxedTransportStream =
+            Box::new(crate::kcp::connect(candidates, self.socket_protector(), kcp).await?);
+        match prepared {
+            None => Ok(stream),
+            Some(prepared) => {
+                self.tls
+                    .connect_prepared_penetrating_stream(stream, prepared)
+                    .await
+            }
         }
     }
 
@@ -315,11 +511,11 @@ impl TransportDialer {
                 ));
             }
         };
-        let tcp = self
+        let (tcp, peer) = self
             .connect_direct_tcp(original_target, candidates, happy_eyeballs)
             .await?;
-        let peer = tcp.peer_addr().map_err(TransportError::Tcp)?;
-        let stream = self.mask_tcp_carrier(Box::new(tcp));
+        let stream = self.masked_direct_carrier(tcp, peer).await?;
+        let stream = self.mask_tcp_carrier(stream);
         let stream = match prepared {
             Some(prepared) => {
                 self.tls
@@ -352,10 +548,9 @@ impl TransportDialer {
                 None,
             ),
             None => {
-                let tcp = self
+                let (tcp, peer) = self
                     .connect_direct_tcp(original_target, candidates, happy_eyeballs)
                     .await?;
-                let peer = tcp.peer_addr().map_err(TransportError::Tcp)?;
                 (Box::new(tcp), Some(peer))
             }
         };
@@ -428,28 +623,50 @@ impl TransportDialer {
                         .ok_or(TransportError::UnsupportedConnectorConfig(
                             "REALITY tlshello fragmentation",
                         ))?;
-                    let stream = self
+                    let (stream, peer) = self
                         .connect_candidates(candidates, first, race_config)
+                        .await?;
+                    if self.tcp_sudoku().is_some() {
+                        let stream = self.masked_direct_carrier(stream, peer).await?;
+                        let stream = crate::fragment::FragmentStream::new(stream, fragment.clone());
+                        return prepared.complete_over_stream(Box::new(stream)).await;
+                    }
+                    let mut stream = stream;
+                    self.direct_header_custom_handshake(&mut stream, peer)
                         .await?;
                     return prepared.complete_fragmented(stream, fragment.clone()).await;
                 }
 
-                if race_config.is_none() && candidates.len() < 2 {
-                    return reality
-                        .connect_socket_addr(reality_config, original_target, first)
-                        .await;
-                }
+                // The socket is this dialer's, so it carries this dialer's
+                // protection and socket options.
                 let Some(prepared) =
                     reality.prepare_preconnected(reality_config, original_target)?
                 else {
+                    // A legacy engine dials its own socket, which this
+                    // dialer cannot run the handshake on or mask.
+                    if self.tcp_header_custom().is_some() {
+                        return Err(TransportError::UnsupportedConnectorConfig(
+                            "REALITY header-custom",
+                        ));
+                    }
+                    if self.tcp_sudoku().is_some() {
+                        return Err(TransportError::UnsupportedConnectorConfig("REALITY sudoku"));
+                    }
                     // Legacy engines remain usable. They may override
                     // `connect_socket_addr` to preserve scoped IPv6 metadata.
                     return reality
                         .connect_socket_addr(reality_config, original_target, first)
                         .await;
                 };
-                let stream = self
+                let (stream, peer) = self
                     .connect_candidates(candidates, first, race_config)
+                    .await?;
+                if self.tcp_sudoku().is_some() {
+                    let stream = self.masked_direct_carrier(stream, peer).await?;
+                    return prepared.complete_over_stream(stream).await;
+                }
+                let mut stream = stream;
+                self.direct_header_custom_handshake(&mut stream, peer)
                     .await?;
 
                 prepared.complete(stream).await
@@ -483,23 +700,80 @@ impl TransportDialer {
         happy_eyeballs: Option<&HappyEyeballsConfig>,
     ) -> Result<BoxedTransportStream, TransportError> {
         if let Some(connector) = &self.resolved_tcp_connector {
-            return connector
+            let stream = connector
                 .connect_resolved(original_target, candidates, happy_eyeballs)
-                .await;
+                .await?;
+            let mut stream = self.sudoku_carrier(stream)?;
+            // Xray's chained connection says 0.0.0.0:0 for both of its ends.
+            let unspecified = SocketAddr::from(([0, 0, 0, 0], 0));
+            self.header_custom_handshake(&mut stream, unspecified, unspecified)
+                .await?;
+            return Ok(stream);
         }
 
-        Ok(Box::new(
-            self.connect_direct_tcp(original_target, candidates, happy_eyeballs)
-                .await?,
-        ))
+        let (stream, peer) = self
+            .connect_direct_tcp(original_target, candidates, happy_eyeballs)
+            .await?;
+        self.masked_direct_carrier(stream, peer).await
     }
 
+    /// A direct carrier in `sudoku`, then past the `header-custom`
+    /// handshake, which reads the socket's own addresses.
+    async fn masked_direct_carrier(
+        &self,
+        mut stream: tokio::net::TcpStream,
+        peer: SocketAddr,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        if self.tcp_sudoku().is_none() {
+            self.direct_header_custom_handshake(&mut stream, peer)
+                .await?;
+            return Ok(Box::new(stream));
+        }
+        let local = stream.local_addr().map_err(TransportError::Tcp)?;
+        let mut stream = self.sudoku_carrier(Box::new(stream))?;
+        self.header_custom_handshake(&mut stream, local, peer)
+            .await?;
+        Ok(stream)
+    }
+
+    /// The `header-custom` handshake over a direct socket connected to `peer`.
+    async fn direct_header_custom_handshake(
+        &self,
+        stream: &mut tokio::net::TcpStream,
+        peer: SocketAddr,
+    ) -> Result<(), TransportError> {
+        if self.tcp_header_custom().is_none() {
+            return Ok(());
+        }
+        let local = stream.local_addr().map_err(TransportError::Tcp)?;
+        self.header_custom_handshake(stream, local, peer).await
+    }
+
+    async fn header_custom_handshake<S>(
+        &self,
+        stream: &mut S,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Result<(), TransportError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
+    {
+        let Some(config) = self.tcp_header_custom() else {
+            return Ok(());
+        };
+        crate::header_custom::client_handshake(stream, config, Some(local), Some(remote))
+            .await
+            .map_err(TransportError::Tcp)
+    }
+
+    /// Connects a direct TCP socket and returns it with the address it
+    /// connected to.
     async fn connect_direct_tcp(
         &self,
         original_target: &Target,
         candidates: &[SocketAddr],
         happy_eyeballs: Option<&HappyEyeballsConfig>,
-    ) -> Result<tokio::net::TcpStream, TransportError> {
+    ) -> Result<(tokio::net::TcpStream, SocketAddr), TransportError> {
         let first = candidates
             .first()
             .copied()
@@ -513,17 +787,26 @@ impl TransportDialer {
     /// Races configured `happyEyeballs`; otherwise dials like Go's
     /// `net.Dialer`, which Xray-core uses, so a dual-stack host whose first
     /// address is unreachable still connects through another.
+    ///
+    /// Returns the address the socket connected to, which Go's
+    /// `Conn.RemoteAddr` reports even when Linux TCP Fast Open has deferred
+    /// the handshake and the kernel has no peer to report yet.
     async fn connect_candidates(
         &self,
         candidates: &[SocketAddr],
         first: SocketAddr,
         race_config: Option<&HappyEyeballsConfig>,
-    ) -> Result<tokio::net::TcpStream, TransportError> {
+    ) -> Result<(tokio::net::TcpStream, SocketAddr), TransportError> {
         let protector = self.socket_protector.as_deref();
         match race_config {
-            Some(race) => connect_tcp_happy_eyeballs(candidates, protector, race).await,
-            None if candidates.len() >= 2 => connect_tcp_dual_stack(candidates, protector).await,
-            None => connect_tcp_stream(first, protector).await,
+            Some(race) => connect_tcp_happy_eyeballs_with_peer(candidates, protector, race).await,
+            None if candidates.len() >= 2 => {
+                connect_tcp_dual_stack_with_peer(candidates, protector).await
+            }
+            None => {
+                let peer = canonicalize_socket_addr(first);
+                Ok((connect_tcp_stream(peer, protector).await?, peer))
+            }
         }
     }
 }

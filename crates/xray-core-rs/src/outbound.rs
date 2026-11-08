@@ -23,6 +23,7 @@ pub(crate) mod hysteria;
 pub use hysteria::HysteriaOutbound;
 pub(crate) mod wireguard;
 pub use wireguard::WireguardOutbound;
+mod address_port;
 mod carrier;
 pub(crate) mod datagram;
 mod domain_strategy;
@@ -30,7 +31,9 @@ pub(crate) mod final_rules;
 pub(crate) mod proxy_protocol;
 pub(crate) use domain_strategy::DomainStrategyResolver;
 mod mux;
+mod preconnect;
 mod routing;
+pub(crate) mod socket_options;
 mod xhttp;
 mod xudp;
 use carrier::StreamCarrier;
@@ -62,7 +65,7 @@ use xray_config::{
 };
 use xray_proxy::vless::{
     encode_request_header, VisionStream, VisionStreamIo, VlessCommand, VlessRequest,
-    VlessResponseStream, DEFAULT_VISION_SEED,
+    VlessResponseStream,
 };
 use xray_routing::{Network as RoutingNetwork, Target, TargetAddr as RoutingTargetAddr};
 use xray_transport::stream::{
@@ -308,6 +311,8 @@ struct VlessTcpOutboundPayload {
     user: VlessUser,
     encryption: Option<xray_vless_encryption::Client>,
     mux: Option<mux::Runtime>,
+    /// `testpre`: carrier connections opened ahead of requests.
+    pre_connections: Option<preconnect::PreConnections>,
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +366,8 @@ pub(crate) enum DnsHappyEyeballsMode {
 pub struct FreedomOutbound {
     fragment: Option<Arc<xray_transport::TcpFragmentConfig>>,
     happy_eyeballs: Option<HappyEyeballsConfig>,
+    /// `sockopt`, for every TCP and UDP socket freedom opens.
+    socket_options: Option<Arc<xray_transport::SocketOptions>>,
     domain_strategy: DomainStrategy,
     /// Present only when it changes the destination.
     redirect: Option<Arc<FreedomRedirect>>,
@@ -604,6 +611,9 @@ impl VlessTcpOutbound {
     pub fn server(&self) -> &Target {
         &self.payload.carrier.server
     }
+    fn carrier(&self) -> &carrier::StreamCarrier {
+        &self.payload.carrier
+    }
 
     pub fn transport(&self) -> &ConnectorConfig {
         &self.payload.carrier.transport
@@ -639,11 +649,43 @@ impl VlessTcpOutbound {
         if let Some(mux) = &self.payload.mux {
             mux.close();
         }
+        if let Some(pre_connections) = &self.payload.pre_connections {
+            pre_connections.close();
+        }
     }
 
     pub(crate) async fn join(&self) {
         if let Some(mux) = &self.payload.mux {
             mux.join().await;
+        }
+        if let Some(pre_connections) = &self.payload.pre_connections {
+            pre_connections.join().await;
+        }
+    }
+
+    /// The carrier stream a request starts on: one opened ahead under
+    /// `testpre`, else a new one. Taking one is boxed, so it adds a pointer
+    /// and not its state to every open future.
+    fn open_carrier<'a>(
+        &'a self,
+        server: &'a [SocketAddr],
+        download: &'a [SocketAddr],
+        dialer: &'a TransportDialer,
+    ) -> impl Future<Output = Result<BoxedTransportStream, CoreError>> + 'a {
+        match &self.payload.pre_connections {
+            None => futures_util::future::Either::Left(
+                self.payload.carrier.open(server, download, dialer),
+            ),
+            Some(pre_connections) => {
+                futures_util::future::Either::Right(Box::pin(pre_connections.take(
+                    preconnect::DialSpec {
+                        server: server.to_vec(),
+                        download: download.to_vec(),
+                        dialer: dialer.clone(),
+                    },
+                    || Arc::new(CarrierOpener(Arc::downgrade(&self.payload))),
+                )))
+            }
         }
     }
 
@@ -675,8 +717,16 @@ impl VlessTcpOutbound {
         let pool = self
             .mux_pool(target)?
             .ok_or(CoreError::UnsupportedOutboundNetwork)?;
-        let server = resolve_server_candidates(self.server(), resolver).await?;
-        let download = self.payload.carrier.resolve_download(resolver).await?;
+        let server = self
+            .payload
+            .carrier
+            .resolve_server(resolver, dialer)
+            .await?;
+        let download = self
+            .payload
+            .carrier
+            .resolve_download(resolver, dialer)
+            .await?;
         let child = pool
             .open_datagram(
                 target,
@@ -728,6 +778,7 @@ impl FreedomOutbound {
         Self {
             fragment: None,
             happy_eyeballs: None,
+            socket_options: socket_options::compile(stream),
             domain_strategy: Self::stream_domain_strategy(stream),
             redirect: (!settings.redirect.is_empty()).then(|| Arc::new(settings.redirect.clone())),
             user_level: settings.user_level,
@@ -883,13 +934,18 @@ impl FreedomOutbound {
             .unwrap_or_default()
     }
 
-    /// The dialer with this outbound's fragment mask, if it has one.
-    fn dialer<'a>(&self, dialer: &'a TransportDialer) -> std::borrow::Cow<'a, TransportDialer> {
+    /// The dialer with this outbound's socket options and fragment mask, if
+    /// it has them.
+    pub(crate) fn dialer<'a>(
+        &self,
+        dialer: &'a TransportDialer,
+    ) -> std::borrow::Cow<'a, TransportDialer> {
+        let dialer = socket_options::dialer(dialer, self.socket_options.as_ref());
         match &self.fragment {
             Some(fragment) => {
-                std::borrow::Cow::Owned(dialer.clone().with_tcp_fragment(fragment.clone()))
+                std::borrow::Cow::Owned(dialer.into_owned().with_tcp_fragment(fragment.clone()))
             }
-            None => std::borrow::Cow::Borrowed(dialer),
+            None => dialer,
         }
     }
 
@@ -1120,37 +1176,37 @@ fn prepare_outbound_proxy_dialer<'a>(
             .map(proxy_chain_requires_local_resolution)
             .unwrap_or(true);
         let server_candidates = match outbound.primary() {
-            TcpOutbound::Vless(vless) if requires_local_resolution => {
-                resolve_server_candidates(vless.server(), dns_resolver)
-                    .await?
-                    .into_boxed_slice()
-            }
+            TcpOutbound::Vless(vless) if requires_local_resolution => vless
+                .carrier()
+                .resolve_server(dns_resolver, &transport_dialer)
+                .await?
+                .into_boxed_slice(),
             TcpOutbound::Vless(_) => Box::default(),
-            TcpOutbound::Trojan(outbound) if requires_local_resolution => {
-                resolve_server_candidates(outbound.server(), dns_resolver)
-                    .await?
-                    .into_boxed_slice()
-            }
-            TcpOutbound::Socks(outbound) if requires_local_resolution => {
-                resolve_server_candidates(outbound.server(), dns_resolver)
-                    .await?
-                    .into_boxed_slice()
-            }
-            TcpOutbound::Http(outbound) if requires_local_resolution => {
-                resolve_server_candidates(outbound.server(), dns_resolver)
-                    .await?
-                    .into_boxed_slice()
-            }
-            TcpOutbound::Vmess(outbound) if requires_local_resolution => {
-                resolve_server_candidates(outbound.server(), dns_resolver)
-                    .await?
-                    .into_boxed_slice()
-            }
-            TcpOutbound::Shadowsocks2022(outbound) if requires_local_resolution => {
-                resolve_server_candidates(outbound.server(), dns_resolver)
-                    .await?
-                    .into_boxed_slice()
-            }
+            TcpOutbound::Trojan(outbound) if requires_local_resolution => outbound
+                .carrier()
+                .resolve_server(dns_resolver, &transport_dialer)
+                .await?
+                .into_boxed_slice(),
+            TcpOutbound::Socks(outbound) if requires_local_resolution => outbound
+                .carrier()
+                .resolve_server(dns_resolver, &transport_dialer)
+                .await?
+                .into_boxed_slice(),
+            TcpOutbound::Http(outbound) if requires_local_resolution => outbound
+                .carrier()
+                .resolve_server(dns_resolver, &transport_dialer)
+                .await?
+                .into_boxed_slice(),
+            TcpOutbound::Vmess(outbound) if requires_local_resolution => outbound
+                .carrier()
+                .resolve_server(dns_resolver, &transport_dialer)
+                .await?
+                .into_boxed_slice(),
+            TcpOutbound::Shadowsocks2022(outbound) if requires_local_resolution => outbound
+                .carrier()
+                .resolve_server(dns_resolver, &transport_dialer)
+                .await?
+                .into_boxed_slice(),
             TcpOutbound::Trojan(_) => Box::default(),
             TcpOutbound::Socks(_) => Box::default(),
             TcpOutbound::Http(_) => Box::default(),
@@ -3721,6 +3777,21 @@ impl OutboundFactory {
         }?;
 
         match self.graph.proxy_target(node) {
+            // Xray-core hands the address and port it looks up to the proxy;
+            // a chain here gives it the configured server.
+            Some(_)
+                if carrier::address_port_strategy(&outbound.stream)
+                    .records()
+                    .is_some() =>
+            {
+                Err(CachedOutboundError::UnsupportedOutboundProxyNetwork(
+                    "addressPortStrategy",
+                ))
+            }
+            // mKCP's datagrams would need the chain's UDP.
+            Some(_) if matches!(outbound.stream.transport, StreamTransport::Kcp(_)) => {
+                Err(CachedOutboundError::UnsupportedOutboundProxyNetwork("mKCP"))
+            }
             Some(proxy) => self
                 .cached_tcp_outbound(proxy)
                 .map(|proxy| TcpOutbound::Chained {
@@ -4004,12 +4075,14 @@ fn build_vless_tcp_outbound(outbound: &OutboundConfig) -> Result<VlessTcpOutboun
         return Err(CoreError::UnsupportedOutboundFlow);
     }
     let mux = mux::Runtime::new(&outbound.mux, &outbound.stream.transport)?;
+    let pre_connections = preconnect::PreConnections::new(user.pre_connections);
     Ok(VlessTcpOutbound {
         payload: Arc::new(VlessTcpOutboundPayload {
             carrier,
             user,
             encryption,
             mux,
+            pre_connections,
         }),
     })
 }
@@ -4119,8 +4192,12 @@ fn validate_connector_flow(
     stream_transport: &TransportLayer,
 ) -> Result<VisionFlow, CoreError> {
     // Without VLESS encryption, only raw TLS/REALITY exposes the security
-    // connection Vision needs. Encrypted outbounds are handled separately.
-    if !matches!(stream_transport, TransportLayer::Raw) {
+    // connection Vision needs, and mKCP's TLS, which Xray's `DialKCP` also
+    // returns undisguised. Encrypted outbounds are handled separately.
+    if !matches!(
+        stream_transport,
+        TransportLayer::Raw | TransportLayer::Kcp(_)
+    ) {
         return validate_vision_flow(flow, false);
     }
 
@@ -4467,11 +4544,15 @@ pub async fn open_vless_tcp_stream_with_resolver_and_dialer(
     // resolved-server helper repeats this check because chained opens enter it
     // directly with candidates supplied by the outer proxy dialer.
     validate_outbound_flow(outbound)?;
-    let resolved_server = resolve_server_candidates(outbound.server(), dns_resolver).await?;
+    let resolved_server = outbound
+        .payload
+        .carrier
+        .resolve_server(dns_resolver, transport_dialer)
+        .await?;
     let resolved_download = outbound
         .payload
         .carrier
-        .resolve_download(dns_resolver)
+        .resolve_download(dns_resolver, transport_dialer)
         .await?;
     open_vless_tcp_stream_with_resolved_server_and_dialer(
         outbound,
@@ -4505,9 +4586,7 @@ async fn open_vless_tcp_stream_with_resolved_server_and_dialer(
     }
 
     let stream = outbound
-        .payload
-        .carrier
-        .open(resolved_server, resolved_download, transport_dialer)
+        .open_carrier(resolved_server, resolved_download, transport_dialer)
         .await?;
     let stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
     let request = VlessRequest {
@@ -4523,7 +4602,11 @@ async fn open_vless_tcp_stream_with_resolved_server_and_dialer(
 
     if flow.uses_vision() {
         let stream = VlessResponseStream::new(VisionTransportStream::new(stream));
-        let stream = VisionStream::new(stream, *outbound.user().id.as_bytes(), DEFAULT_VISION_SEED);
+        let stream = VisionStream::new(
+            stream,
+            *outbound.user().id.as_bytes(),
+            outbound.user().vision_seed,
+        );
         // On timeout Xray-core pads an empty frame to hide the bare header.
         return Ok(Box::new(FirstPayloadDeadline::new(
             VisionOutboundStream::new(stream),
@@ -4590,11 +4673,15 @@ pub(crate) async fn open_vless_udp_stream_with_resolver_dialer_and_options(
     }
     let uses_xudp = uses_vision || should_use_xudp_for_udp_target(target);
 
-    let resolved_server = resolve_server_candidates(outbound.server(), dns_resolver).await?;
+    let resolved_server = outbound
+        .payload
+        .carrier
+        .resolve_server(dns_resolver, transport_dialer)
+        .await?;
     let resolved_download = outbound
         .payload
         .carrier
-        .resolve_download(dns_resolver)
+        .resolve_download(dns_resolver, transport_dialer)
         .await?;
     let command = if uses_xudp {
         VlessCommand::Mux
@@ -4617,6 +4704,27 @@ pub(crate) async fn open_vless_udp_stream_with_resolver_dialer_and_options(
         VlessUdpFraming::LengthPrefixed
     };
     Ok((stream, framing))
+}
+
+/// Opens `testpre` connections on the carrier of a VLESS outbound that is
+/// still alive; the dialers hold no strong reference, so dropping the
+/// outbound ends them.
+struct CarrierOpener(std::sync::Weak<VlessTcpOutboundPayload>);
+
+#[async_trait]
+impl preconnect::Opener for CarrierOpener {
+    async fn open(
+        &self,
+        spec: &preconnect::DialSpec,
+    ) -> Option<Result<BoxedTransportStream, CoreError>> {
+        let payload = self.0.upgrade()?;
+        Some(
+            payload
+                .carrier
+                .open(&spec.server, &spec.download, &spec.dialer)
+                .await,
+        )
+    }
 }
 
 /// Opens one Mux.Cool parent: the VLESS Mux command to `v1.mux.cool:9527`,
@@ -4653,9 +4761,7 @@ async fn open_vless_command_stream(
     transport_dialer: &TransportDialer,
 ) -> Result<BoxedTransportStream, CoreError> {
     let stream = outbound
-        .payload
-        .carrier
-        .open(resolved_server, resolved_download, transport_dialer)
+        .open_carrier(resolved_server, resolved_download, transport_dialer)
         .await?;
     let mut stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
     let request = VlessRequest {
@@ -4673,7 +4779,7 @@ async fn open_vless_command_stream(
         return Ok(Box::new(VisionOutboundStream::new(VisionStream::new(
             stream,
             *outbound.user().id.as_bytes(),
-            DEFAULT_VISION_SEED,
+            outbound.user().vision_seed,
         ))));
     }
 
@@ -4700,14 +4806,22 @@ pub async fn open_vless_tcp_stream(
     open_vless_tcp_stream_with_resolver(outbound, target, &SystemDnsResolver).await
 }
 
+/// UDP masks, noise and `header-custom`, need a UDP carrier: Hysteria, mKCP
+/// or XHTTP with exact `h3` ALPN.
 pub(crate) fn validate_udp_noise(stream: &StreamSettings) -> Result<(), CoreError> {
+    let udp_carrier = matches!(
+        stream.transport,
+        StreamTransport::Hysteria(_) | StreamTransport::Kcp(_)
+    ) || matches!(stream.transport, StreamTransport::Xhttp(_))
+        && matches!(&stream.security, StreamSecurity::Tls(tls) if tls.alpn == ["h3"]);
+    if (stream.udp_noise.is_some() || stream.udp_header_custom.is_some()) && !udp_carrier {
+        return Err(CoreError::UnsupportedOutboundNetwork);
+    }
+    // Sudoku's fourfold datagrams need fragments that QUIC's sockets forbid.
+    if stream.udp_sudoku.is_some() && !matches!(stream.transport, StreamTransport::Kcp(_)) {
+        return Err(CoreError::UnsupportedOutboundNetwork);
+    }
     if let Some(noise) = &stream.udp_noise {
-        if !(matches!(stream.transport, StreamTransport::Hysteria(_))
-            || matches!(stream.transport, StreamTransport::Xhttp(_))
-                && matches!(&stream.security, StreamSecurity::Tls(tls) if tls.alpn == ["h3"]))
-        {
-            return Err(CoreError::UnsupportedOutboundNetwork);
-        }
         xhttp::udp_noise_config(noise)?;
     }
     Ok(())
@@ -4800,6 +4914,10 @@ mod tests {
                 security: StreamSecurity::None,
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
             },
@@ -4818,6 +4936,10 @@ mod tests {
                 security: StreamSecurity::None,
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
             },
@@ -4829,6 +4951,8 @@ mod tests {
                     encryption: Default::default(),
                     flow: None,
                     level: 0,
+                    vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                    pre_connections: 0,
                 }],
             }),
         }
@@ -4845,6 +4969,10 @@ mod tests {
                 security: StreamSecurity::None,
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
             },
@@ -5165,6 +5293,10 @@ mod tests {
                 }),
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
             },
@@ -5207,6 +5339,10 @@ mod tests {
                     }),
                     quic_params: None,
                     tcp_fragment: None,
+                    tcp_header_custom: None,
+                    udp_header_custom: None,
+                    tcp_sudoku: None,
+                    udp_sudoku: None,
                     udp_noise: None,
                     socket_options: None,
                 },
@@ -5244,6 +5380,10 @@ mod tests {
             }),
             quic_params: None,
             tcp_fragment: None,
+            tcp_header_custom: None,
+            udp_header_custom: None,
+            tcp_sudoku: None,
+            udp_sudoku: None,
             udp_noise: None,
             socket_options: None,
         };
@@ -5278,6 +5418,10 @@ mod tests {
                 }),
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
             },
@@ -5353,6 +5497,10 @@ mod tests {
                 security: StreamSecurity::None,
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
             },
@@ -5391,6 +5539,10 @@ mod tests {
                 security: StreamSecurity::Reality(reality.clone()),
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: Some(SocketOptions {
                     happy_eyeballs: Some(HappyEyeballsSettings {
@@ -5435,6 +5587,10 @@ mod tests {
                 security: StreamSecurity::None,
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
             },
@@ -5454,6 +5610,10 @@ mod tests {
                 security: StreamSecurity::None,
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: Some(SocketOptions {
                     happy_eyeballs: Some(HappyEyeballsSettings::default()),
@@ -5479,6 +5639,10 @@ mod tests {
                 security: StreamSecurity::None,
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
             },
@@ -5501,6 +5665,10 @@ mod tests {
                 }),
                 quic_params: None,
                 tcp_fragment: None,
+                tcp_header_custom: None,
+                udp_header_custom: None,
+                tcp_sudoku: None,
+                udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
             },
@@ -6010,15 +6178,22 @@ mod tests {
         let outbound = VlessTcpOutbound {
             payload: Arc::new(VlessTcpOutboundPayload {
                 mux: None,
+                pre_connections: None,
                 user: VlessUser {
                     id: Uuid::parse_str("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap(),
                     encryption: Default::default(),
                     flow: None,
                     level: 0,
+                    vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                    pre_connections: 0,
                 },
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    header_custom: None,
+                    sudoku: None,
+                    socket_options: None,
+                    address_port: Default::default(),
                     download: None,
                     server: domain_tcp_target("proxy.example"),
                     transport: ConnectorConfig::Tcp,
@@ -9271,15 +9446,22 @@ mod tests {
         let outbound = VlessTcpOutbound {
             payload: Arc::new(VlessTcpOutboundPayload {
                 mux: None,
+                pre_connections: None,
                 user: VlessUser {
                     id: Uuid::parse_str("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap(),
                     encryption: Default::default(),
                     flow: Some("xtls-rprx-vision".to_owned()),
                     level: 0,
+                    vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                    pre_connections: 0,
                 },
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    header_custom: None,
+                    sudoku: None,
+                    socket_options: None,
+                    address_port: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -9308,15 +9490,22 @@ mod tests {
         let outbound = VlessTcpOutbound {
             payload: Arc::new(VlessTcpOutboundPayload {
                 mux: None,
+                pre_connections: None,
                 user: VlessUser {
                     id: Uuid::parse_str("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap(),
                     encryption: Default::default(),
                     flow: Some(VISION_FLOW.to_owned()),
                     level: 0,
+                    vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                    pre_connections: 0,
                 },
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    header_custom: None,
+                    sudoku: None,
+                    socket_options: None,
+                    address_port: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -9363,15 +9552,22 @@ mod tests {
         let outbound = VlessTcpOutbound {
             payload: Arc::new(VlessTcpOutboundPayload {
                 mux: None,
+                pre_connections: None,
                 user: VlessUser {
                     id: Uuid::parse_str("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap(),
                     encryption: Default::default(),
                     flow: Some(VISION_FLOW.to_owned()),
                     level: 0,
+                    vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                    pre_connections: 0,
                 },
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    header_custom: None,
+                    sudoku: None,
+                    socket_options: None,
+                    address_port: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -9436,20 +9632,111 @@ mod tests {
         assert_eq!(seen_target.network, outbound.server().network);
     }
 
+    /// `testseed` sets Vision's padding: a zero range pads no frame, where
+    /// Xray-core's default pads each short frame with up to 255 bytes.
     #[tokio::test]
-    async fn open_vless_udp_stream_rejects_udp443_for_regular_vision_flow_before_connecting() {
+    async fn vision_pads_with_the_users_testseed() {
         let outbound = VlessTcpOutbound {
             payload: Arc::new(VlessTcpOutboundPayload {
                 mux: None,
+                pre_connections: None,
                 user: VlessUser {
                     id: Uuid::parse_str("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap(),
                     encryption: Default::default(),
                     flow: Some(VISION_FLOW.to_owned()),
                     level: 0,
+                    vision_seed: [0, 0, 0, 0],
+                    pre_connections: 0,
                 },
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    header_custom: None,
+                    sudoku: None,
+                    socket_options: None,
+                    address_port: Default::default(),
+                    download: None,
+                    server: Target::new(
+                        RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                        443,
+                        RoutingNetwork::Tcp,
+                    ),
+                    transport: ConnectorConfig::Reality(RealityClientConfig {
+                        server_name: "example.com".to_owned(),
+                        fingerprint: "chrome".to_owned(),
+                        public_key: [7; 32],
+                        short_id: vec![1, 2, 3, 4],
+                        spider_x: "/".to_owned(),
+                        mldsa65_verify: None,
+                    }),
+                    transport_layer: TransportLayer::Raw,
+                    happy_eyeballs: None,
+                },
+            }),
+        };
+        let target = Target::new(
+            RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
+            443,
+            RoutingNetwork::Tcp,
+        );
+        let (client, mut protected_side) = tokio::io::duplex(1 << 16);
+        let transport_dialer = TransportDialer::system()
+            .unwrap()
+            .with_reality_engine(Arc::new(DuplexRealityEngine::new(client)));
+        let mut stream = open_vless_tcp_stream_with_resolver_and_dialer(
+            &outbound,
+            &target,
+            &SystemDnsResolver,
+            &transport_dialer,
+        )
+        .await
+        .unwrap();
+        let header_len = encode_request_header(&VlessRequest {
+            user_id: outbound.user().id,
+            command: VlessCommand::Tcp,
+            target: target.clone(),
+            flow: outbound.user().flow.clone(),
+        })
+        .unwrap()
+        .len();
+        let mut header = vec![0; header_len];
+        for (index, payload) in [b"first".as_slice(), b"second", b"third"]
+            .into_iter()
+            .enumerate()
+        {
+            stream.write_all(payload).await.unwrap();
+            stream.flush().await.unwrap();
+            if index == 0 {
+                protected_side.read_exact(&mut header).await.unwrap();
+            }
+            let (_, content_len, padding_len) =
+                read_vision_frame(&mut protected_side, index == 0).await;
+            assert_eq!(content_len, payload.len());
+            assert_eq!(padding_len, 0, "frame {index}");
+        }
+    }
+
+    #[tokio::test]
+    async fn open_vless_udp_stream_rejects_udp443_for_regular_vision_flow_before_connecting() {
+        let outbound = VlessTcpOutbound {
+            payload: Arc::new(VlessTcpOutboundPayload {
+                mux: None,
+                pre_connections: None,
+                user: VlessUser {
+                    id: Uuid::parse_str("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap(),
+                    encryption: Default::default(),
+                    flow: Some(VISION_FLOW.to_owned()),
+                    level: 0,
+                    vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                    pre_connections: 0,
+                },
+                encryption: None,
+                carrier: StreamCarrier {
+                    fragment: None,
+                    header_custom: None,
+                    sudoku: None,
+                    socket_options: None,
+                    address_port: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -9503,15 +9790,22 @@ mod tests {
         let outbound = VlessTcpOutbound {
             payload: Arc::new(VlessTcpOutboundPayload {
                 mux: None,
+                pre_connections: None,
                 user: VlessUser {
                     id: Uuid::parse_str("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap(),
                     encryption: Default::default(),
                     flow: Some("xtls-rprx-vision-udp443".to_owned()),
                     level: 0,
+                    vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                    pre_connections: 0,
                 },
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    header_custom: None,
+                    sudoku: None,
+                    socket_options: None,
+                    address_port: Default::default(),
                     download: None,
                     server: Target::new(
                         RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
@@ -9566,6 +9860,88 @@ mod tests {
             .expect("read VLESS header from protected stream");
         assert_eq!(received_header, expected_header);
         assert!(engine.seen().is_some());
+    }
+
+    /// The command stream UDP and Mux ride pads with the user's `testseed`
+    /// too.
+    #[tokio::test]
+    async fn vision_udp_pads_with_the_users_testseed() {
+        let outbound = VlessTcpOutbound {
+            payload: Arc::new(VlessTcpOutboundPayload {
+                mux: None,
+                pre_connections: None,
+                user: VlessUser {
+                    id: Uuid::parse_str("00010203-0405-0607-0809-0a0b0c0d0e0f").unwrap(),
+                    encryption: Default::default(),
+                    flow: Some("xtls-rprx-vision-udp443".to_owned()),
+                    level: 0,
+                    vision_seed: [0, 0, 0, 0],
+                    pre_connections: 0,
+                },
+                encryption: None,
+                carrier: StreamCarrier {
+                    fragment: None,
+                    header_custom: None,
+                    sudoku: None,
+                    socket_options: None,
+                    address_port: Default::default(),
+                    download: None,
+                    server: Target::new(
+                        RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                        443,
+                        RoutingNetwork::Tcp,
+                    ),
+                    transport: ConnectorConfig::Reality(RealityClientConfig {
+                        server_name: "example.com".to_owned(),
+                        fingerprint: "chrome".to_owned(),
+                        public_key: [7; 32],
+                        short_id: vec![1, 2, 3, 4],
+                        spider_x: "/".to_owned(),
+                        mldsa65_verify: None,
+                    }),
+                    transport_layer: TransportLayer::Raw,
+                    happy_eyeballs: None,
+                },
+            }),
+        };
+        let target = Target::new(
+            RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 10))),
+            443,
+            RoutingNetwork::Udp,
+        );
+        let (client, mut protected_side) = tokio::io::duplex(1 << 16);
+        let transport_dialer = TransportDialer::system()
+            .unwrap()
+            .with_reality_engine(Arc::new(DuplexRealityEngine::new(client)));
+        let (mut stream, _) = open_vless_udp_stream_with_resolver_and_dialer(
+            &outbound,
+            &target,
+            &SystemDnsResolver,
+            &transport_dialer,
+        )
+        .await
+        .unwrap();
+        let header_len = encode_request_header(&VlessRequest {
+            user_id: outbound.user().id,
+            command: VlessCommand::Mux,
+            target: target.clone(),
+            flow: Some(VISION_FLOW.to_owned()),
+        })
+        .unwrap()
+        .len();
+        let mut header = vec![0; header_len];
+        protected_side.read_exact(&mut header).await.unwrap();
+        for (index, payload) in [b"first".as_slice(), b"second", b"third"]
+            .into_iter()
+            .enumerate()
+        {
+            stream.write_all(payload).await.unwrap();
+            stream.flush().await.unwrap();
+            let (_, content_len, padding_len) =
+                read_vision_frame(&mut protected_side, index == 0).await;
+            assert_eq!(content_len, payload.len());
+            assert_eq!(padding_len, 0, "frame {index}");
+        }
     }
 
     #[test]
@@ -10042,5 +10418,933 @@ mod parallel_relay_budget_tests {
             first.factory.parallel_vmess_relays.available_permits(),
             PARALLEL_VMESS_CONNECTIONS
         );
+    }
+}
+
+#[cfg(test)]
+mod socket_option_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    const MISSING: &str = "xray-missing0";
+
+    fn outbound(value: serde_json::Value) -> OutboundConfig {
+        let parsed = xray_config::parse_xray_json(&json!({ "outbounds": [value] }).to_string())
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        parsed.config.outbounds[0].clone()
+    }
+
+    fn missing_interface_error(error: impl std::fmt::Display) -> bool {
+        error.to_string().contains("failed to bind to interface")
+    }
+
+    /// An outbound whose `sockopt` names an interface that does not exist
+    /// fails before its first byte, whatever its protocol and transport, so
+    /// every one of them dials with its own options.
+    #[tokio::test]
+    async fn every_outbound_tcp_dial_takes_its_socket_options() {
+        // A server that accepts and holds: a dial that skipped its options
+        // would get this far and then wait.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let sockopt = json!({ "interface": MISSING });
+        let id = "27848739-7e62-4138-9fd3-098a63964b6b";
+        let vless = |stream: serde_json::Value| {
+            json!({
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": port,
+                                        "users": [{"id": id, "encryption": "none"}]}]},
+                "streamSettings": stream,
+            })
+        };
+        let cases = [
+            (
+                "freedom",
+                json!({"protocol": "freedom", "streamSettings": {"sockopt": sockopt}}),
+            ),
+            ("vless", vless(json!({"sockopt": sockopt}))),
+            (
+                "vless-tls",
+                vless(
+                    json!({"security": "tls", "tlsSettings": {"serverName": "localhost"}, "sockopt": sockopt}),
+                ),
+            ),
+            (
+                "vless-ws",
+                vless(json!({"network": "ws", "sockopt": sockopt})),
+            ),
+            (
+                "vless-httpupgrade",
+                vless(json!({"network": "httpupgrade", "sockopt": sockopt})),
+            ),
+            (
+                "vless-grpc",
+                vless(
+                    json!({"network": "grpc", "grpcSettings": {"serviceName": "x"}, "sockopt": sockopt}),
+                ),
+            ),
+            (
+                "vless-xhttp",
+                vless(
+                    json!({"network": "xhttp", "xhttpSettings": {"path": "/x"}, "sockopt": sockopt}),
+                ),
+            ),
+            (
+                "vless-xhttp-download",
+                vless(json!({"network": "xhttp", "xhttpSettings": {
+                "mode": "packet-up", "path": "/x",
+                "downloadSettings": {"address": "127.0.0.1", "port": port, "network": "xhttp",
+                                     "xhttpSettings": {"path": "/x"}, "sockopt": sockopt}}})),
+            ),
+            (
+                "vless-xhttp-penetrate",
+                vless(
+                    json!({"network": "xhttp", "sockopt": {"penetrate": true, "interface": MISSING},
+                "xhttpSettings": {"mode": "stream-up", "path": "/x",
+                "downloadSettings": {"address": "127.0.0.1", "port": port, "network": "xhttp",
+                                     "xhttpSettings": {"path": "/x"}}}}),
+                ),
+            ),
+            (
+                "trojan",
+                json!({"protocol": "trojan", "settings": {"servers": [{"address": "127.0.0.1", "port": port, "password": "pw"}]},
+                              "streamSettings": {"sockopt": sockopt}}),
+            ),
+            (
+                "socks",
+                json!({"protocol": "socks", "settings": {"address": "127.0.0.1", "port": port},
+                             "streamSettings": {"sockopt": sockopt}}),
+            ),
+            (
+                "http",
+                json!({"protocol": "http", "settings": {"address": "127.0.0.1", "port": port},
+                            "streamSettings": {"sockopt": sockopt}}),
+            ),
+            (
+                "vmess",
+                json!({"protocol": "vmess", "settings": {"vnext": [{"address": "127.0.0.1", "port": port,
+                                                                          "users": [{"id": id}]}]},
+                             "streamSettings": {"sockopt": sockopt}}),
+            ),
+            (
+                "shadowsocks",
+                json!({"protocol": "shadowsocks", "settings": {"servers": [{"address": "127.0.0.1", "port": port,
+                                   "method": "2022-blake3-aes-128-gcm", "password": "AAAAAAAAAAAAAAAAAAAAAA=="}]},
+                                   "streamSettings": {"sockopt": sockopt}}),
+            ),
+            (
+                "hysteria",
+                json!({"protocol": "hysteria", "settings": {"version": 2, "address": "127.0.0.1", "port": port},
+                                "streamSettings": {"network": "hysteria", "security": "tls",
+                                                   "tlsSettings": {"serverName": "localhost", "alpn": ["h3"]},
+                                                   "hysteriaSettings": {"version": 2, "auth": "a"},
+                                                   "sockopt": sockopt}}),
+            ),
+            (
+                "wireguard",
+                json!({"protocol": "wireguard", "settings": {
+                    "secretKey": "4242424242424242424242424242424242424242424242424242424242424242",
+                    "address": ["10.44.0.2/32"],
+                    "peers": [{"publicKey": "5353535353535353535353535353535353535353535353535353535353535353",
+                               "endpoint": format!("127.0.0.1:{port}"), "allowedIPs": ["0.0.0.0/0"]}]},
+                    "streamSettings": {"sockopt": sockopt}}),
+            ),
+        ];
+        let target = Target::new(
+            RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            port,
+            RoutingNetwork::Tcp,
+        );
+        for (name, value) in cases {
+            let tcp = build_tcp_outbound(&outbound(value))
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let dialer = TransportDialer::system().unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                open_tcp_stream_with_resolver_and_dialer(
+                    &tcp,
+                    &target,
+                    &SystemDnsResolver,
+                    &dialer,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the dial went past its socket options"));
+            let Err(error) = result else {
+                panic!("{name}: dialed without its interface");
+            };
+            // Hysteria and WireGuard name the failure without its cause.
+            assert!(
+                missing_interface_error(&error)
+                    || matches!(name, "hysteria" | "wireguard")
+                        && error.to_string().contains("socket protection failed"),
+                "{name}: {error}"
+            );
+        }
+        held.abort();
+    }
+
+    /// Hysteria matches a cached session by its dialer's protector, so the
+    /// dialer with its socket options stays the same while the one given
+    /// does.
+    #[test]
+    fn hysteria_keeps_one_dialer_with_its_socket_options() {
+        let value = json!({"protocol": "hysteria", "settings": {"version": 2, "address": "127.0.0.1", "port": 443},
+                           "streamSettings": {"network": "hysteria", "security": "tls",
+                                              "tlsSettings": {"serverName": "localhost", "alpn": ["h3"]},
+                                              "hysteriaSettings": {"version": 2, "auth": "a"},
+                                              "sockopt": {"mark": 4}}});
+        let TcpOutbound::Hysteria(hysteria) = build_tcp_outbound(&outbound(value)).unwrap() else {
+            panic!("hysteria");
+        };
+        let base = TransportDialer::system().unwrap();
+        let first = hysteria.socket_dialer(&base);
+        let second = hysteria.socket_dialer(&base);
+        assert_eq!(first.socket_options().map(|options| options.mark), Some(4));
+        assert!(first
+            .tls_connector()
+            .shares_session_context(second.tls_connector()));
+        let other = TransportDialer::system().unwrap();
+        let third = hysteria.socket_dialer(&other);
+        assert!(!first
+            .tls_connector()
+            .shares_session_context(third.tls_connector()));
+    }
+
+    /// Records the type of each socket the platform protector is handed.
+    #[derive(Default)]
+    struct SocketTypes(std::sync::Mutex<Vec<socket2::Type>>);
+
+    impl xray_transport::SocketProtector for SocketTypes {
+        fn protect(&self, socket: xray_transport::SocketHandle) -> io::Result<()> {
+            use std::os::fd::BorrowedFd;
+            // SAFETY: the socket stays open for this call.
+            let fd = unsafe { BorrowedFd::borrow_raw(socket.raw() as std::os::fd::RawFd) };
+            let kind = socket2::SockRef::from(&fd).r#type()?;
+            self.0.lock().unwrap().push(kind);
+            Ok(())
+        }
+    }
+
+    /// The UDP sockets SOCKS and Shadowsocks open for datagrams take the
+    /// outbound's options too. Each is bound before any control connection
+    /// opens, so with its options in force no TCP socket is ever handed out.
+    #[tokio::test]
+    async fn outbound_udp_sockets_take_their_socket_options() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let held = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let sockopt = json!({ "interface": MISSING });
+        let target = Target::new(
+            RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            53_053,
+            RoutingNetwork::Udp,
+        );
+        for (name, value) in [
+            (
+                "socks",
+                json!({"protocol": "socks", "settings": {"address": "127.0.0.1", "port": port},
+                             "streamSettings": {"sockopt": sockopt}}),
+            ),
+            (
+                "shadowsocks",
+                json!({"protocol": "shadowsocks", "settings": {"servers": [{"address": "127.0.0.1", "port": port,
+                                   "method": "2022-blake3-aes-128-gcm", "password": "AAAAAAAAAAAAAAAAAAAAAA=="}]},
+                                   "streamSettings": {"sockopt": sockopt}}),
+            ),
+        ] {
+            let udp = build_udp_outbound(&outbound(value))
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let types = Arc::new(SocketTypes::default());
+            let dialer = TransportDialer::system()
+                .unwrap()
+                .with_socket_protector(types.clone());
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                datagram::open(
+                    &udp,
+                    &target,
+                    &SystemDnsResolver,
+                    &SystemDnsResolver,
+                    &dialer,
+                    [0; 8],
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the open went past its socket options"));
+            let Err(error) = result else {
+                panic!("{name}: opened without its interface");
+            };
+            assert!(missing_interface_error(&error), "{name}: {error}");
+            assert_eq!(*types.0.lock().unwrap(), [socket2::Type::DGRAM], "{name}");
+        }
+        held.abort();
+    }
+
+    #[test]
+    fn freedom_udp_takes_its_socket_options() {
+        let value = json!({"protocol": "freedom", "streamSettings": {"sockopt": {"mark": 9}}});
+        let UdpOutbound::Freedom(freedom) = build_udp_outbound(&outbound(value)).unwrap() else {
+            panic!("freedom");
+        };
+        let base = TransportDialer::system().unwrap();
+        let dialer = freedom.dialer(&base);
+        assert_eq!(dialer.socket_options().map(|options| options.mark), Some(9));
+        let plain = json!({"protocol": "freedom"});
+        let UdpOutbound::Freedom(freedom) = build_udp_outbound(&outbound(plain)).unwrap() else {
+            panic!("freedom");
+        };
+        assert!(matches!(
+            freedom.dialer(&base),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// The download leg dials with its own options and without the
+    /// outbound's chain, unless `penetrate` hands it the outbound's dialer.
+    #[test]
+    fn the_download_leg_picks_its_dialer_as_xray_core_does() {
+        struct NoTcp;
+        #[async_trait]
+        impl ResolvedTcpConnector for NoTcp {
+            async fn connect_resolved(
+                &self,
+                _: &Target,
+                _: &[SocketAddr],
+                _: Option<&HappyEyeballsConfig>,
+            ) -> Result<BoxedTransportStream, TransportError> {
+                Err(TransportError::UnsupportedConnectorConfig("test"))
+            }
+        }
+        let chained = TransportDialer::system()
+            .unwrap()
+            .with_resolved_tcp_connector(Arc::new(NoTcp));
+        let upload = chained
+            .clone()
+            .with_socket_options(Arc::new(xray_transport::SocketOptions {
+                mark: 1,
+                ..Default::default()
+            }));
+        let compiled = |upload_sockopt: serde_json::Value, download_sockopt: serde_json::Value| {
+            let value = json!({
+                "protocol": "vless",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "27848739-7e62-4138-9fd3-098a63964b6b", "encryption": "none"}]}]},
+                "streamSettings": {"network": "xhttp", "sockopt": upload_sockopt, "xhttpSettings": {
+                    "mode": "packet-up", "path": "/x",
+                    "downloadSettings": {"address": "127.0.0.1", "port": 443, "network": "xhttp",
+                                         "xhttpSettings": {"path": "/x"}, "sockopt": download_sockopt}}},
+            });
+            let TcpOutbound::Vless(vless) = build_tcp_outbound(&outbound(value)).unwrap() else {
+                panic!("vless");
+            };
+            vless
+        };
+        let own = compiled(json!({"mark": 1}), json!({}));
+        let download = own.payload.carrier.download.as_ref().unwrap();
+        let dialer = download.dialer(&chained, &upload);
+        assert!(!dialer.carries_tcp_through_outbound());
+        assert!(dialer.socket_options().is_none());
+
+        let own = compiled(json!({"mark": 1}), json!({"mark": 2}));
+        let download = own.payload.carrier.download.as_ref().unwrap();
+        let dialer = download.dialer(&chained, &upload);
+        assert!(!dialer.carries_tcp_through_outbound());
+        assert_eq!(dialer.socket_options().map(|options| options.mark), Some(2));
+
+        let penetrate = compiled(json!({"mark": 1, "penetrate": true}), json!({"mark": 2}));
+        let download = penetrate.payload.carrier.download.as_ref().unwrap();
+        let dialer = download.dialer(&chained, &upload);
+        assert!(dialer.carries_tcp_through_outbound());
+        assert_eq!(dialer.socket_options().map(|options| options.mark), Some(1));
+    }
+}
+
+#[cfg(test)]
+mod address_port_tests {
+    use super::*;
+    use serde_json::json;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::net::{TcpListener, UdpSocket};
+    use xray_transport::{RecordResolver, SrvRecord};
+
+    fn outbound(value: serde_json::Value) -> OutboundConfig {
+        let parsed = xray_config::parse_xray_json(&json!({ "outbounds": [value] }).to_string())
+            .unwrap_or_else(|error| panic!("{error:?}"));
+        parsed.config.outbounds[0].clone()
+    }
+
+    /// Every name has the one TXT record given and no SRV record.
+    struct Txt(String);
+
+    #[async_trait]
+    impl RecordResolver for Txt {
+        async fn lookup_srv(&self, _: &str, _: &str, _: &str) -> io::Result<Vec<SrvRecord>> {
+            Err(io::ErrorKind::NotFound.into())
+        }
+        async fn lookup_txt(&self, _: &str) -> io::Result<Vec<String>> {
+            Ok(vec![self.0.clone()])
+        }
+    }
+
+    /// Resolves no name, so a dial reaches only an address a record names.
+    struct NoNames;
+
+    #[async_trait]
+    impl DnsResolver for NoNames {
+        async fn resolve(&self, domain: &str, port: u16) -> Result<SocketAddr, TransportError> {
+            Err(TransportError::DnsNoData(domain.to_owned(), port))
+        }
+    }
+
+    const SERVER: &str = "txt.example";
+    const ID: &str = "27848739-7e62-4138-9fd3-098a63964b6b";
+
+    fn dialer(record: String) -> TransportDialer {
+        TransportDialer::system()
+            .unwrap()
+            .with_record_resolver(Arc::new(Txt(record)))
+    }
+
+    /// Each proxy outbound over each transport dials the address and port a
+    /// TXT record of its server's name gives, as Xray-core's `DialSystem`
+    /// does for every dial.
+    #[tokio::test]
+    async fn every_proxy_outbound_dials_what_its_lookup_gives() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let held = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        let dialer = dialer(format!("127.0.0.1:{port}"));
+        let sockopt = json!({"addressPortStrategy": "TxtPortAndAddress"});
+        let vless = |stream: serde_json::Value| {
+            json!({"protocol": "vless", "settings": {"vnext": [{"address": SERVER, "port": 1,
+                    "users": [{"id": ID, "encryption": "none"}]}]}, "streamSettings": stream})
+        };
+        let cases = [
+            ("vless", vless(json!({"sockopt": sockopt}))),
+            (
+                "vless-ws",
+                vless(json!({"network": "ws", "sockopt": sockopt})),
+            ),
+            (
+                "vless-grpc",
+                vless(
+                    json!({"network": "grpc", "grpcSettings": {"serviceName": "x"}, "sockopt": sockopt}),
+                ),
+            ),
+            (
+                "vless-xhttp",
+                vless(
+                    json!({"network": "xhttp", "xhttpSettings": {"path": "/x"}, "sockopt": sockopt}),
+                ),
+            ),
+            (
+                "trojan",
+                json!({"protocol": "trojan", "settings": {"servers": [{"address": SERVER, "port": 1, "password": "pw"}]},
+                       "streamSettings": {"sockopt": sockopt}}),
+            ),
+            (
+                "socks",
+                json!({"protocol": "socks", "settings": {"address": SERVER, "port": 1},
+                       "streamSettings": {"sockopt": sockopt}}),
+            ),
+            (
+                "http",
+                json!({"protocol": "http", "settings": {"address": SERVER, "port": 1},
+                       "streamSettings": {"sockopt": sockopt}}),
+            ),
+            (
+                "vmess",
+                json!({"protocol": "vmess", "settings": {"vnext": [{"address": SERVER, "port": 1, "users": [{"id": ID}]}]},
+                       "streamSettings": {"sockopt": sockopt}}),
+            ),
+            (
+                "shadowsocks",
+                json!({"protocol": "shadowsocks", "settings": {"servers": [{"address": SERVER, "port": 1,
+                       "method": "2022-blake3-aes-128-gcm", "password": "AAAAAAAAAAAAAAAAAAAAAA=="}]},
+                       "streamSettings": {"sockopt": sockopt}}),
+            ),
+        ];
+        let target = Target::new(
+            RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            9,
+            RoutingNetwork::Tcp,
+        );
+        for (name, value) in cases {
+            let tcp = build_tcp_outbound(&outbound(value))
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let before = accepted.load(Ordering::SeqCst);
+            // What the protocol does after the dial is not this test's.
+            let _ = tokio::time::timeout(
+                Duration::from_secs(2),
+                open_tcp_stream_with_resolver_and_dialer(&tcp, &target, &NoNames, &dialer),
+            )
+            .await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while accepted.load(Ordering::SeqCst) == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{name}: the dial missed the record's address"));
+        }
+        held.abort();
+    }
+
+    /// Hysteria's QUIC socket and Shadowsocks' UDP datagrams go where the
+    /// lookup says too.
+    #[tokio::test]
+    async fn udp_carriers_send_to_what_their_lookup_gives() {
+        let sockopt = json!({"addressPortStrategy": "TxtPortAndAddress"});
+        let hysteria = json!({"protocol": "hysteria", "settings": {"version": 2, "address": SERVER, "port": 1},
+            "streamSettings": {"network": "hysteria", "security": "tls",
+                               "tlsSettings": {"serverName": "localhost", "alpn": ["h3"]},
+                               "hysteriaSettings": {"version": 2, "auth": "a"}, "sockopt": sockopt}});
+        let shadowsocks = json!({"protocol": "shadowsocks", "settings": {"servers": [{"address": SERVER, "port": 1,
+            "method": "2022-blake3-aes-128-gcm", "password": "AAAAAAAAAAAAAAAAAAAAAA=="}]},
+            "streamSettings": {"sockopt": sockopt}});
+        let target = Target::new(
+            RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            9,
+            RoutingNetwork::Udp,
+        );
+        for (name, value) in [("hysteria", hysteria), ("shadowsocks", shadowsocks)] {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let dialer = dialer(format!("127.0.0.1:{}", socket.local_addr().unwrap().port()));
+            let udp = build_udp_outbound(&outbound(value))
+                .unwrap_or_else(|error| panic!("{name}: {error:?}"));
+            let send = async {
+                if let Ok(session) =
+                    datagram::open(&udp, &target, &NoNames, &NoNames, &dialer, [0; 8]).await
+                {
+                    let _ = session.send(&target, b"payload").await;
+                }
+                std::future::pending::<()>().await;
+            };
+            let mut buffer = [0; 2048];
+            tokio::select! {
+                () = send => unreachable!(),
+                received = tokio::time::timeout(Duration::from_secs(3), socket.recv_from(&mut buffer)) => {
+                    received
+                        .unwrap_or_else(|_| panic!("{name}: nothing reached the record's address"))
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    /// The XHTTP download leg looks up with the `sockopt` it dials with: the
+    /// outbound's under `penetrate`, else its own.
+    #[tokio::test]
+    async fn the_download_leg_looks_up_with_its_own_sockopt() {
+        struct Named;
+        #[async_trait]
+        impl DnsResolver for Named {
+            async fn resolve(&self, domain: &str, port: u16) -> Result<SocketAddr, TransportError> {
+                match domain {
+                    "down.example" => Ok(SocketAddr::from(([127, 0, 0, 7], port))),
+                    _ => Err(TransportError::DnsNoData(domain.to_owned(), port)),
+                }
+            }
+        }
+        let txt = json!({"addressPortStrategy": "TxtPortAndAddress"});
+        let vless = |upload: serde_json::Value, download: serde_json::Value| {
+            json!({"protocol": "vless", "settings": {"vnext": [{"address": SERVER, "port": 1,
+                "users": [{"id": ID, "encryption": "none"}]}]},
+                "streamSettings": {"network": "xhttp", "sockopt": upload, "xhttpSettings": {
+                    "mode": "packet-up", "path": "/x",
+                    "downloadSettings": {"address": "down.example", "port": 2, "network": "xhttp",
+                                         "xhttpSettings": {"path": "/x"}, "sockopt": download}}}})
+        };
+        let looked_up = vec![SocketAddr::from(([127, 0, 0, 9], 9))];
+        let configured = vec![SocketAddr::from(([127, 0, 0, 7], 2))];
+        let dialer = dialer("127.0.0.9:9".into());
+        for (upload, download, expected) in [
+            (txt.clone(), json!({}), &configured),
+            (json!({}), txt.clone(), &looked_up),
+            (
+                json!({"penetrate": true, "addressPortStrategy": "TxtPortAndAddress"}),
+                json!({}),
+                &looked_up,
+            ),
+            (json!({"penetrate": true}), txt.clone(), &configured),
+        ] {
+            let TcpOutbound::Vless(outbound) =
+                build_tcp_outbound(&outbound(vless(upload.clone(), download.clone()))).unwrap()
+            else {
+                panic!("vless");
+            };
+            assert_eq!(
+                outbound
+                    .carrier()
+                    .resolve_download(&Named, &dialer)
+                    .await
+                    .unwrap(),
+                *expected,
+                "{upload} {download}"
+            );
+        }
+    }
+
+    /// The outbound a chain dials through looks its own server up.
+    #[tokio::test]
+    async fn a_dialer_proxy_outbound_dials_what_its_lookup_gives() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = xray_config::parse_xray_json(
+            &json!({"outbounds": [
+                {"tag": "front", "protocol": "socks", "settings": {"address": "127.0.0.1", "port": 1080},
+                 "streamSettings": {"sockopt": {"dialerProxy": "back"}}},
+                {"tag": "back", "protocol": "vless", "settings": {"vnext": [{"address": SERVER, "port": 1,
+                    "users": [{"id": ID, "encryption": "none"}]}]},
+                 "streamSettings": {"sockopt": {"addressPortStrategy": "TxtPortAndAddress"}}}
+            ]})
+            .to_string(),
+        )
+        .unwrap()
+        .config;
+        let router = OutboundRouter::new(Arc::new(config));
+        let front = router.select_tcp_outbound_direct(Some("front")).unwrap();
+        let dialer = dialer(format!("127.0.0.1:{port}"));
+        let target = Target::new(
+            RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            9,
+            RoutingNetwork::Tcp,
+        );
+        let opened = tokio::spawn(async move {
+            let _ =
+                open_tcp_stream_with_resolver_and_dialer(&front, &target, &NoNames, &dialer).await;
+        });
+        tokio::time::timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .expect("the proxy missed the record's address")
+            .unwrap();
+        opened.abort();
+    }
+
+    /// A chain hands its proxy the configured server, which Xray-core
+    /// replaces with what it looks up, so the two are not combined.
+    #[test]
+    fn a_chained_outbound_takes_no_address_port_strategy() {
+        let mut config = xray_config::parse_xray_json(
+            &json!({"outbounds": [
+                {"tag": "proxy", "protocol": "vless", "settings": {"vnext": [{"address": SERVER, "port": 1,
+                    "users": [{"id": ID, "encryption": "none"}]}]},
+                 "streamSettings": {"sockopt": {"dialerProxy": "next"}}},
+                {"tag": "next", "protocol": "socks", "settings": {"address": "127.0.0.1", "port": 1080}}
+            ]})
+            .to_string(),
+        )
+        .unwrap()
+        .config;
+        config.outbounds[0]
+            .stream
+            .socket_options
+            .as_mut()
+            .unwrap()
+            .address_port_strategy = xray_config::AddressPortStrategy::TxtPortOnly;
+        let router = OutboundRouter::new(Arc::new(config));
+        assert!(matches!(
+            router.select_tcp_outbound_direct(Some("proxy")),
+            Err(CoreError::UnsupportedOutboundProxyNetwork(
+                "addressPortStrategy"
+            ))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod testpre_tests {
+    use super::*;
+    use serde_json::json;
+    use tokio::{io::AsyncReadExt, net::TcpListener, sync::mpsc};
+
+    const ID: &str = "27848739-7e62-4138-9fd3-098a63964b6b";
+
+    fn vless(port: u16, testpre: u32) -> VlessTcpOutbound {
+        let config = xray_config::parse_xray_json(
+            &json!({"outbounds": [{"protocol": "vless", "settings": {"address": "127.0.0.1",
+                "port": port, "id": ID, "encryption": "none", "testpre": testpre}}]})
+            .to_string(),
+        )
+        .unwrap_or_else(|error| panic!("{error:?}"))
+        .config;
+        let TcpOutbound::Vless(outbound) = build_tcp_outbound(&config.outbounds[0]).unwrap() else {
+            panic!("vless");
+        };
+        *outbound
+    }
+
+    /// A listener that hands over every connection it accepts.
+    async fn server() -> (u16, mpsc::UnboundedReceiver<tokio::net::TcpStream>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted, connections) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                if accepted.send(stream).is_err() {
+                    return;
+                }
+            }
+        });
+        (port, connections)
+    }
+
+    fn drain(
+        connections: &mut mpsc::UnboundedReceiver<tokio::net::TcpStream>,
+    ) -> Vec<tokio::net::TcpStream> {
+        std::iter::from_fn(|| connections.try_recv().ok()).collect()
+    }
+
+    fn target() -> Target {
+        Target::new(
+            RoutingTargetAddr::Domain("example.com".into()),
+            443,
+            RoutingNetwork::Tcp,
+        )
+    }
+
+    /// Nothing opens before the first request. Then each of the `testpre`
+    /// dialers opens a connection, the request takes one, and its dialer
+    /// opens another 200 ms later; the next request takes a held one.
+    #[tokio::test]
+    async fn vless_opens_testpre_connections_ahead_of_requests() {
+        let (port, mut connections) = server().await;
+        let outbound = vless(port, 2);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(drain(&mut connections).is_empty());
+
+        let dialer = TransportDialer::system().unwrap();
+        let mut stream = open_vless_tcp_stream_with_resolver_and_dialer(
+            &outbound,
+            &target(),
+            &SystemDnsResolver,
+            &dialer,
+        )
+        .await
+        .unwrap();
+        stream.write_all(b"payload").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut first = drain(&mut connections);
+        assert_eq!(first.len(), 2);
+        // One of them carries the request: VLESS version 0, then the ID.
+        let mut carried = 0;
+        for connection in &mut first {
+            let mut header = [0; 17];
+            if tokio::time::timeout(
+                Duration::from_millis(200),
+                connection.read_exact(&mut header),
+            )
+            .await
+            .is_ok()
+            {
+                assert_eq!(header[0], 0);
+                assert_eq!(&header[1..], uuid::Uuid::parse_str(ID).unwrap().as_bytes());
+                carried += 1;
+            }
+        }
+        assert_eq!(carried, 1);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(drain(&mut connections).len(), 1);
+
+        // A held connection serves the next request without a new dial.
+        let _second = open_vless_tcp_stream_with_resolver_and_dialer(
+            &outbound,
+            &target(),
+            &SystemDnsResolver,
+            &dialer,
+        )
+        .await
+        .unwrap();
+        assert!(drain(&mut connections).is_empty());
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(drain(&mut connections).len(), 1);
+        outbound.close();
+        outbound.join().await;
+    }
+
+    /// UDP requests, which open a command stream, take them too, and
+    /// closing the outbound closes the held ones.
+    #[tokio::test]
+    async fn vless_udp_takes_testpre_connections_and_close_closes_them() {
+        let (port, mut connections) = server().await;
+        let outbound = vless(port, 1);
+        let dialer = TransportDialer::system().unwrap();
+        let udp = Target::new(
+            RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53))),
+            53,
+            RoutingNetwork::Udp,
+        );
+        let _udp = open_vless_udp_stream_with_resolver_and_dialer(
+            &outbound,
+            &udp,
+            &SystemDnsResolver,
+            &dialer,
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut accepted = drain(&mut connections);
+        // The one that carried the request, and its refill.
+        assert_eq!(accepted.len(), 2);
+        outbound.close();
+        outbound.join().await;
+        let mut byte = [0; 1];
+        let held = accepted.pop().unwrap();
+        let mut held = held;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), held.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let error = open_vless_tcp_stream_with_resolver_and_dialer(
+            &outbound,
+            &target(),
+            &SystemDnsResolver,
+            &dialer,
+        )
+        .await
+        .err()
+        .expect("a closed outbound has no testpre connections");
+        assert!(error.to_string().contains("closed"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod kcp_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    const ID: &str = "27848739-7e62-4138-9fd3-098a63964b6b";
+
+    fn vless(stream: Value) -> OutboundConfig {
+        xray_config::parse_xray_json(
+            &json!({"outbounds": [{"tag": "proxy", "protocol": "vless", "settings": {"vnext": [{
+                "address": "10.0.0.1", "port": 443, "users": [{"id": ID, "encryption": "none",
+                "flow": stream.get("flow").cloned().unwrap_or(Value::Null)}]}]},
+                "streamSettings": stream.get("stream").cloned().unwrap_or(stream)}]})
+            .to_string(),
+        )
+        .unwrap()
+        .config
+        .outbounds
+        .remove(0)
+    }
+
+    #[test]
+    fn the_carrier_takes_mkcps_settings_masks_and_noise() {
+        let outbound = vless(json!({"network": "kcp",
+        "kcpSettings": {"mtu": 1200, "tti": 20, "uplinkCapacity": 9, "downlinkCapacity": 30,
+            "cwndMultiplier": 2, "maxSendingWindow": 65536},
+        "finalmask": {"udp": [
+            {"type": "mkcp-legacy", "settings": {"value": "seed"}},
+            {"type": "noise", "settings": {"noise": [{"type": "str", "packet": "hi"}]}},
+            {"type": "mkcp-legacy", "settings": {"header": "dns", "value": "kcp.example"}},
+        ]}}));
+        let built = build_vless_tcp_outbound(&outbound).unwrap();
+        let TransportLayer::Kcp(kcp) = built.transport_layer() else {
+            panic!("not mKCP");
+        };
+        assert_eq!(
+            (
+                kcp.mtu,
+                kcp.tti,
+                kcp.uplink_capacity,
+                kcp.downlink_capacity,
+                kcp.cwnd_multiplier,
+                kcp.max_sending_window
+            ),
+            (1200, 20, 9, 30, 2, 65536)
+        );
+        use xray_transport::kcp::{KcpHeader, KcpMask};
+        assert_eq!(
+            kcp.masks,
+            [
+                KcpMask::Aes128Gcm("seed".to_owned().into()),
+                KcpMask::Noise,
+                KcpMask::Header(KcpHeader::Dns("kcp.example".to_owned())),
+            ]
+        );
+        assert_eq!(kcp.noise.as_ref().unwrap().items[0].packet, b"hi");
+        assert!(matches!(built.transport(), ConnectorConfig::Tcp));
+    }
+
+    #[test]
+    fn vision_rides_mkcps_tls_and_not_plain_mkcp() {
+        let tls = vless(
+            json!({"flow": "xtls-rprx-vision", "stream": {"network": "kcp",
+            "security": "tls", "tlsSettings": {"serverName": "kcp.example"}}}),
+        );
+        let built = build_vless_tcp_outbound(&tls).unwrap();
+        assert!(validate_connector_flow(
+            built.user().flow.as_deref(),
+            built.transport(),
+            built.transport_layer(),
+        )
+        .unwrap()
+        .uses_vision());
+        // Without TLS the build refuses it, as it refuses raw without TLS.
+        let plain = vless(json!({"flow": "xtls-rprx-vision", "stream": {"network": "kcp"}}));
+        assert!(matches!(
+            build_vless_tcp_outbound(&plain),
+            Err(CoreError::UnsupportedOutboundFlow)
+        ));
+    }
+
+    /// Xray-core ignores TCP masks on mKCP's UDP dial; here they are refused,
+    /// as on XHTTP's HTTP/3.
+    #[test]
+    fn tcp_masks_are_refused_on_mkcp() {
+        let outbound = vless(json!({"network": "kcp", "security": "tls",
+            "tlsSettings": {"serverName": "kcp.example"},
+            "finalmask": {"tcp": [{"type": "fragment", "settings": {"packets": "tlshello",
+                "length": "100-200", "delay": "10-20"}}]}}));
+        assert!(matches!(
+            build_vless_tcp_outbound(&outbound),
+            Err(CoreError::UnsupportedOutboundNetwork)
+        ));
+    }
+
+    /// A chain would have to carry mKCP's datagrams.
+    #[test]
+    fn a_chained_outbound_takes_no_mkcp() {
+        let config = xray_config::parse_xray_json(
+            &json!({"outbounds": [
+                {"tag": "proxy", "protocol": "vless", "settings": {"vnext": [{"address": "10.0.0.1",
+                    "port": 443, "users": [{"id": ID, "encryption": "none"}]}]},
+                 "streamSettings": {"network": "kcp", "sockopt": {"dialerProxy": "next"}}},
+                {"tag": "next", "protocol": "socks", "settings": {"address": "127.0.0.1", "port": 1080}}
+            ]})
+            .to_string(),
+        )
+        .unwrap()
+        .config;
+        let router = OutboundRouter::new(Arc::new(config));
+        assert!(matches!(
+            router.select_tcp_outbound_direct(Some("proxy")),
+            Err(CoreError::UnsupportedOutboundProxyNetwork("mKCP"))
+        ));
     }
 }

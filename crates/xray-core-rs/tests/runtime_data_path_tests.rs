@@ -94,6 +94,8 @@ mod routing_attributes;
 mod routing_origin;
 #[path = "runtime_data_path_tests/routing_protocol.rs"]
 mod routing_protocol;
+#[path = "runtime_data_path_tests/socket_options.rs"]
+mod socket_options;
 #[path = "runtime_data_path_tests/socks_inbound_udp.rs"]
 mod socks_inbound_udp;
 #[path = "runtime_data_path_tests/socks_inbound_wire.rs"]
@@ -151,6 +153,10 @@ fn vless_outbound(security: StreamSecurity, server: TargetAddr, port: u16) -> Ou
             security,
             quic_params: None,
             tcp_fragment: None,
+            tcp_header_custom: None,
+            udp_header_custom: None,
+            tcp_sudoku: None,
+            udp_sudoku: None,
             udp_noise: None,
             socket_options: None,
         },
@@ -162,6 +168,8 @@ fn vless_outbound(security: StreamSecurity, server: TargetAddr, port: u16) -> Ou
                 encryption: Default::default(),
                 flow: None,
                 level: 0,
+                vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                pre_connections: 0,
             }],
         }),
     }
@@ -178,6 +186,10 @@ fn freedom_outbound() -> OutboundConfig {
             security: StreamSecurity::None,
             quic_params: None,
             tcp_fragment: None,
+            tcp_header_custom: None,
+            udp_header_custom: None,
+            tcp_sudoku: None,
+            udp_sudoku: None,
             udp_noise: None,
             socket_options: None,
         },
@@ -196,6 +208,10 @@ fn dns_outbound(settings: DnsOutboundSettings) -> OutboundConfig {
             security: StreamSecurity::None,
             quic_params: None,
             tcp_fragment: None,
+            tcp_header_custom: None,
+            udp_header_custom: None,
+            tcp_sudoku: None,
+            udp_sudoku: None,
             udp_noise: None,
             socket_options: None,
         },

@@ -25,6 +25,8 @@ fn trojan_uri_projects_stream_settings_through_the_shared_validator() {
         "type=tcp",
         "type=ws&host=cdn.example.test&path=%2Fpath%3Fed%3D2048",
         "type=httpupgrade&path=%2Ftrojan",
+        // The parser only warns that HTTPUpgrade early data waits for the 101.
+        "type=httpupgrade&path=%2F%3Fed%3D2560",
         "type=grpc&serviceName=test&alpn=h2",
         "type=xhttp&mode=stream-one&path=%2Ftrojan&alpn=h2",
     ] {
@@ -266,6 +268,23 @@ fn trojan_uri_maps_tls_pins_and_rejects_cipher_suites() {
     );
 }
 
+/// An ALPN protocol name is 1..255 bytes (RFC 7301), and Go's TLS client
+/// refuses an empty one at the handshake, so the import refuses it up front.
+#[test]
+fn trojan_uri_rejects_empty_or_padded_alpn_entries() {
+    assert_eq!(
+        stream("alpn=h2%2Chttp%2F1.1")["tlsSettings"]["alpn"],
+        serde_json::json!(["h2", "http/1.1"])
+    );
+    for alpn in ["", "h2%2C%2Chttp%2F1.1", "h2%2C", "h2%2C%20http%2F1.1"] {
+        assert_eq!(
+            import_error(&format!("alpn={alpn}")),
+            ImportError::UnsupportedParameter("alpn"),
+            "{alpn}"
+        );
+    }
+}
+
 /// Percent-encodes a finalmask as Remnawave's `encodeURIComponent` does.
 fn fm(mask: &Value) -> String {
     mask.to_string()
@@ -300,6 +319,15 @@ fn trojan_uri_maps_fm_to_finalmask_through_the_shared_validator() {
     .unwrap();
     let config: Value = serde_json::from_str(&profile.config_json).unwrap();
     assert_eq!(config["outbounds"][0]["streamSettings"]["finalmask"], mask);
+    // A header-custom TCP mask goes through as well.
+    let header = serde_json::json!({"tcp":[{"type":"header-custom","settings":{
+        "clients":[[{"type":"str","packet":"HELLO"}]],"servers":[[{"type":"str","packet":"OK"}]]}}]});
+    let tls = stream(&format!("security=tls&sni=example.test&fm={}", fm(&header)));
+    assert_eq!(tls["finalmask"], header);
+    // And a sudoku TCP mask.
+    let sudoku = serde_json::json!({"tcp":[{"type":"sudoku","settings":{"password":"synthetic"}}]});
+    let tls = stream(&format!("security=tls&sni=example.test&fm={}", fm(&sudoku)));
+    assert_eq!(tls["finalmask"], sudoku);
     // An empty `fm` is no mask.
     assert!(stream("fm=").get("finalmask").is_none());
 
@@ -315,7 +343,7 @@ fn trojan_uri_maps_fm_to_finalmask_through_the_shared_validator() {
     for mask in [
         serde_json::json!({"udp":[{"type":"noise","settings":{"noise":[{"rand":"10-20"}]}}]}),
         serde_json::json!({"tcp":[{"type":"fragment","settings":{"packets":"1-3","length":"100-200"}}]}),
-        serde_json::json!({"tcp":[{"type":"header-custom","settings":{}}]}),
+        serde_json::json!({"tcp":[{"type":"xmc","settings":{}}]}),
         serde_json::json!({"unknown":[]}),
     ] {
         assert_eq!(

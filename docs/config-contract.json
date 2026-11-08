@@ -655,16 +655,25 @@
         "quicParams"
       ],
       "id": "FINALMASK",
-      "notes": "TCP supports one tlshello fragment mask. Hysteria and XHTTP H3 support one UDP noise mask; Hysteria also supports one Salamander mask, preserving array order."
+      "notes": "TCP supports one tlshello fragment mask and one header-custom mask. Hysteria, mKCP and XHTTP H3 support one UDP noise mask and one header-custom mask; Hysteria also supports one Salamander mask and mKCP any number of mkcp-legacy masks, preserving array order."
     },
     {
-      "context": "streamSettings.finalmask.udp[] (Hysteria)",
+      "context": "streamSettings.finalmask.udp[]",
       "fields": [
         "type",
         "settings"
       ],
       "id": "FINALMASK_ENTRY",
-      "notes": "One noise and (Hysteria only) one salamander mask; type is case-insensitive."
+      "notes": "One noise and one header-custom mask, plus one salamander mask on Hysteria or mkcp-legacy masks on mKCP; type is case-insensitive."
+    },
+    {
+      "context": "streamSettings.finalmask.udp[].settings (mkcp-legacy)",
+      "fields": [
+        "header",
+        "value"
+      ],
+      "id": "MKCP_LEGACY",
+      "notes": "mKCP only; absent or null settings mean both empty. No header: original obfuscation without a value, AES-128-GCM keyed by the value's SHA-256 with one. header is dns, dtls, srtp, utp, wechat or wireguard, case-insensitive; dns asks for the value as its domain, www.baidu.com without one, and the others ignore the value."
     },
     {
       "context": "streamSettings.finalmask.udp[].settings (noise)",
@@ -743,7 +752,95 @@
         "settings"
       ],
       "id": "TCP_MASK_ENTRY",
-      "notes": "Exactly one fragment mask; type is case-insensitive."
+      "notes": "At most one fragment and one header-custom mask, the fragment first when both are set; type is case-insensitive."
+    },
+    {
+      "context": "streamSettings.finalmask.tcp[].settings (header-custom)",
+      "fields": [
+        "clients",
+        "servers",
+        "errors"
+      ],
+      "id": "HEADER_CUSTOM_TCP",
+      "notes": "Absent or null settings and sequences are empty. Before any other byte, the client writes clients[0], reads servers[0], writes clients[1], and so on, then reads the servers left; each server sequence must match. errors are read and never sent by a client."
+    },
+    {
+      "context": "streamSettings.finalmask.tcp[].settings.{clients,servers,errors}[][] (header-custom)",
+      "fields": [
+        "delay",
+        "rand",
+        "randRange",
+        "capture",
+        "type",
+        "reuse",
+        "transform",
+        "packet"
+      ],
+      "id": "HEADER_CUSTOM_TCP_ITEM",
+      "notes": "At most one of packet (decoded by type: array, str, hex or base64), rand (random bytes in randRange, default 0-255, at most 65536 here), reuse (a captured variable) and transform; capture saves the item under a name of ASCII letters, digits and underscores. delay waits a random number of milliseconds before the item when its upper bound is positive."
+    },
+    {
+      "context": "streamSettings.finalmask.{tcp,udp}[].settings (sudoku)",
+      "fields": [
+        "password",
+        "ascii",
+        "customTable",
+        "custom_table",
+        "customTables",
+        "custom_tables",
+        "paddingMin",
+        "padding_min",
+        "paddingMax",
+        "padding_max"
+      ],
+      "id": "SUDOKU_MASK",
+      "notes": "TCP: the last mask, outermost on the wire; UDP: mKCP only here. ascii is entropy (default) or ascii; customTable(s) are 8 characters of 2 x, 2 p and 4 v, ignored in ASCII mode; padding is a percentage range, each end at most 100. A snake_case name applies when its camelCase field is empty or zero. Unknown modes and malformed tables are refused here, where Xray-core fails every dial."
+    },
+    {
+      "context": "streamSettings.finalmask.udp[].settings (header-custom)",
+      "fields": [
+        "mode",
+        "client",
+        "server"
+      ],
+      "id": "HEADER_CUSTOM_UDP",
+      "notes": "mKCP, Hysteria and XHTTP with exact h3 ALPN, never with udphop. mode is prefix (or empty), every datagram carrying the client's items in front and the server's checked and taken off, or standalone, the client's items sent alone and the server's answer awaited before the first datagram to a peer and five seconds after each answer; an unanswered request goes out again after a second on QUIC carriers. Case-sensitive, as in Xray-core."
+    },
+    {
+      "context": "streamSettings.finalmask.udp[].settings.{client,server}[] (header-custom)",
+      "fields": [
+        "rand",
+        "randRange",
+        "capture",
+        "type",
+        "reuse",
+        "transform",
+        "packet"
+      ],
+      "id": "HEADER_CUSTOM_UDP_ITEM",
+      "notes": "As a TCP item, without delay."
+    },
+    {
+      "context": "streamSettings.finalmask.*[].settings...transform (header-custom)",
+      "fields": [
+        "op",
+        "args"
+      ],
+      "id": "HEADER_CUSTOM_TRANSFORM",
+      "notes": "op and at least one arg are required. Ops: concat, slice, xor16, xor32, be16, be32, le16, le32, le64, pad, truncate, add, sub, and, or, shl and shr; an unknown op fails when the connection evaluates it, as in Xray-core."
+    },
+    {
+      "context": "streamSettings.finalmask.*[].settings...transform.args[] (header-custom)",
+      "fields": [
+        "type",
+        "bytes",
+        "u64",
+        "reuse",
+        "metadata",
+        "transform"
+      ],
+      "id": "HEADER_CUSTOM_ARG",
+      "notes": "Exactly one of bytes (decoded by type), u64, reuse, metadata (local_port, remote_port, local_ip4_u32, remote_ip4_u32, src_port_u16, dst_port_u16, src_ip4_u32, dst_ip4_u32) and transform."
     },
     {
       "context": "streamSettings.finalmask.tcp[].settings (fragment)",
@@ -1136,12 +1233,42 @@
     {
       "context": "streamSettings.sockopt",
       "fields": [
-        "happyEyeballs",
+        "mark",
+        "tcpFastOpen",
+        "tproxy",
+        "acceptProxyProtocol",
+        "domainStrategy",
         "dialerProxy",
-        "domainStrategy"
+        "tcpKeepAliveInterval",
+        "tcpKeepAliveIdle",
+        "tcpCongestion",
+        "tcpWindowClamp",
+        "tcpMaxSeg",
+        "penetrate",
+        "tcpUserTimeout",
+        "v6only",
+        "interface",
+        "tcpMptcp",
+        "customSockopt",
+        "addressPortStrategy",
+        "happyEyeballs",
+        "trustedXForwardedFor"
       ],
       "id": "SOCKOPT",
-      "notes": "dialerProxy selects transport-layer chaining; conflicts with proxySettings and missing/self/ambiguous targets are rejected. A dedicated freedom fragment handler is inlined before TLS/REALITY. happyEyeballs bounds and activation rules are enforced by the parser. domainStrategy takes Xray-core's eleven names, ignoring case; only freedom reads it, and other outbounds accept only AsIs."
+      "notes": "Read and applied as Xray-core v26.10.31 does, to every socket the outbound opens, on Linux and Android or on Apple platforms. Every outbound TCP socket keeps alive after 45 seconds idle and every 45 seconds, unless tcpKeepAliveIdle or tcpKeepAliveInterval sets another number of seconds or a negative value turns keepalive off; a positive value with a negative one fails each TCP dial. On Linux and Android: mark, interface, tcpFastOpen, tcpCongestion, tcpWindowClamp, tcpUserTimeout, tcpMaxSeg, customSockopt and tproxy, in that order; tcpMptcp asks for Multipath TCP and falls back to TCP. On Apple platforms: tcpFastOpen, which their kernels refuse on a client socket, the keepalive settings, interface and customSockopt. The first option that fails stops the rest and is only logged, except interface, whose failure fails the dial. penetrate gives an XHTTP downloadSettings these options instead of its own. acceptProxyProtocol, v6only and trustedXForwardedFor are inbound options, type-checked and ignored. addressPortStrategy takes Xray-core's names, ignoring case: before a domain server is dialed, the first usable SRV or TXT record of its name, looked up as Go's resolver does from /etc/resolv.conf, replaces its address, its port or both; freedom and chained outbounds refuse it, and WireGuard's endpoint does not read it, as in Xray-core. dialerProxy selects transport-layer chaining; conflicts with proxySettings and missing/self/ambiguous targets are rejected. A dedicated freedom fragment handler is inlined before TLS/REALITY. happyEyeballs bounds and activation rules are enforced by the parser. domainStrategy takes Xray-core's eleven names, ignoring case; freedom and WireGuard read it, and other outbounds accept only AsIs."
+    },
+    {
+      "context": "streamSettings.sockopt.customSockopt[]",
+      "fields": [
+        "system",
+        "network",
+        "level",
+        "opt",
+        "value",
+        "type"
+      ],
+      "id": "CUSTOM_SOCKOPT",
+      "notes": "Strings, read only when a socket is set up, as Xray-core reads them: an entry applies when system is empty or names the running platform as Go's runtime.GOOS does and network is a prefix of tcp4, tcp6, udp4 or udp6. level (default 6, TCP), opt and an int value are decimal integers, any text that is not one reading as 0; type int sets an integer, str sets value's bytes. An empty opt or another type fails, which stops the options after it."
     },
     {
       "context": "$.inbounds[].settings.accounts[] (socks)",
@@ -1216,12 +1343,13 @@
         "grpcSettings",
         "xhttpSettings",
         "splithttpSettings",
+        "kcpSettings",
         "hysteriaSettings",
         "finalmask",
         "sockopt"
       ],
       "id": "STREAM",
-      "notes": "method takes priority over network. raw/tcp, ws/websocket, httpupgrade, grpc, xhttp/splithttp, hysteria; security none/tls/reality. Carrier/security combinations and inactive block handling require the validator."
+      "notes": "method takes priority over network. raw/tcp, ws/websocket, httpupgrade, grpc, xhttp/splithttp, kcp/mkcp, hysteria; security none/tls/reality. Carrier/security combinations and inactive block handling require the validator."
     },
     {
       "context": "streamSettings.tlsSettings",
@@ -1250,7 +1378,7 @@
         "remoteDNS"
       ],
       "id": "WIREGUARD",
-      "notes": "1..8 distinct peers, at most 256 total allowed-IP prefixes, up to one local address per family, MTU 1280..1420; userspace TCP and MTU-sized UDP. Optional 32-byte PSK. remoteDNS accepts up to 8 IP literals, default Cloudflare IPv4/IPv6; destination DNS runs through the tunnel with bounded TTL caching. domainStrategy is legacy address-family selection. Nonzero reserved bytes, custom streams and chaining are unsupported."
+      "notes": "1..8 distinct peers, at most 256 total allowed-IP prefixes, up to one local address per family, MTU 1280..1420; userspace TCP and MTU-sized UDP. Optional 32-byte PSK. remoteDNS accepts up to 8 IP literals, default Cloudflare IPv4/IPv6; destination DNS runs through the tunnel with bounded TTL caching, for the families of the local addresses, IPv6 first when there is an IPv6 one. domainStrategy is not read, of any value, as Xray-core v26.10.31 has none. streamSettings may hold only sockopt: its options go on the UDP sockets, and its domainStrategy selects the address of a domain peer endpoint as Xray-core's does. Nonzero reserved bytes, UDP masks and chaining are unsupported."
     },
     {
       "context": "$.outbounds[].settings.peers[] (wireguard)",
@@ -1273,6 +1401,21 @@
       ],
       "id": "HYSTERIA",
       "notes": "Version 2, one server, nonzero port; requires matching Hysteria transport and TLS. No chaining."
+    },
+    {
+      "context": "streamSettings.kcpSettings",
+      "fields": [
+        "mtu",
+        "tti",
+        "uplinkCapacity",
+        "downlinkCapacity",
+        "cwndMultiplier",
+        "maxSendingWindow",
+        "header",
+        "seed"
+      ],
+      "id": "KCP_SETTINGS",
+      "notes": "Absent or null keeps the defaults (mtu 1350, tti 50, uplinkCapacity 5, downlinkCapacity 20, cwndMultiplier 1, maxSendingWindow 2 MiB); null fields keep theirs. mtu 21..=8192, tti 10..=1000, cwndMultiplier at least 1, maxSendingWindow at least mtu. header and seed are ignored, as by Xray-core v26: mkcp-legacy masks replace them."
     },
     {
       "context": "streamSettings.hysteriaSettings",
@@ -1301,7 +1444,7 @@
         "remotePorts"
       ],
       "id": "UDP_HOP_MASK",
-      "notes": "Hysteria or XHTTP with exact h3 ALPN, first UDP mask: mode is any comma-separated mix of intervalLocal, intervalRemote and perConnRemote; remotePorts and remoteIPs (IPs or prefixes, drawn only within the server's family). Default interval 30 seconds, minimum 5. A remote hop also takes a fresh local socket and always changes the port."
+      "notes": "Hysteria or XHTTP with exact h3 ALPN, last UDP mask, which Xray-core dials outermost: mode is any comma-separated mix of intervalLocal, intervalRemote and perConnRemote; remotePorts and remoteIPs (IPs or prefixes, drawn only within the server's family). Default interval 30 seconds, minimum 5. A remote hop also takes a fresh local socket and always changes the port."
     },
     {
       "context": "$.outbounds[].settings (shadowsocks)",
@@ -1348,7 +1491,7 @@
         "vnext"
       ],
       "id": "VMESS",
-      "notes": "AEAD only, exactly one flattened server/user or one vnext entry with one user. auto/aes-128-gcm/chacha20-poly1305; nonzero alterId rejected."
+      "notes": "AEAD only. A non-null address is the simplified form, the server and its one user in these fields, and vnext is not read, as in Xray-core; otherwise exactly one vnext entry with one user. id is a UUID, or 1 to 30 bytes of text that name one as Xray-core's uuid.ParseString does. auto/aes-128-gcm/chacha20-poly1305; nonzero alterId rejected."
     },
     {
       "context": "$.outbounds[].settings.vnext[0] (vmess)",
@@ -1403,10 +1546,21 @@
     {
       "context": "$.outbounds[].settings (vless)",
       "fields": [
+        "address",
+        "port",
+        "level",
+        "email",
+        "id",
+        "flow",
+        "seed",
+        "encryption",
+        "reverse",
+        "testpre",
+        "testseed",
         "vnext"
       ],
       "id": "VLESS",
-      "notes": "Exactly one vnext server is required."
+      "notes": "Read as Xray-core v26.10.31 reads it. A non-null address is the simplified form: the server and its one user are these fields, and vnext is not read; otherwise exactly one vnext server. Every field decodes in either form. seed is ignored. testseed sets the Vision padding parameters: the first four numbers when there are at least four. testpre keeps that many carrier connections opened ahead of the requests that take them, as Xray-core does, up to 64 here. A reverse proxy (reverse) is unsupported."
     },
     {
       "context": "$.outbounds[].settings.vnext[0]",
@@ -1426,10 +1580,13 @@
         "flow",
         "level",
         "email",
-        "security"
+        "security",
+        "testpre",
+        "testseed",
+        "reverse"
       ],
       "id": "VLESS_USER",
-      "notes": "Runtime selects the first user. encryption defaults to none; non-none uses the bounded VLESS encryption parser. flow supports empty, xtls-rprx-vision and xtls-rprx-vision-udp443. email is ignored; security is type-checked but ignored."
+      "notes": "Runtime selects the first user, where Xray-core wants exactly one. id is a UUID, or 1 to 30 bytes of text that name one as Xray-core's uuid.ParseString does. encryption defaults to none, where Xray-core requires it; non-none uses the bounded VLESS encryption parser. flow supports empty, xtls-rprx-vision and xtls-rprx-vision-udp443. testseed sets the Vision padding parameters, and testpre the connections opened ahead, up to 64. reverse is refused here, as Xray-core refuses it outside the simplified form. email is ignored; security is type-checked but ignored."
     },
     {
       "context": "streamSettings.wsSettings",

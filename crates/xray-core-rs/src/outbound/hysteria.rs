@@ -20,6 +20,14 @@ struct SessionOwner {
     server: Target,
     tls: TlsClientConfig,
     auth: xray_config::HysteriaSettings,
+    /// `sockopt`, for the QUIC socket.
+    socket_options: Option<Arc<xray_transport::SocketOptions>>,
+    /// `sockopt.addressPortStrategy`, for the server's address and port.
+    address_port: xray_config::AddressPortStrategy,
+    /// The dialer given and the one made from it with `socket_options`,
+    /// kept so its protector, which a cached session is matched by, stays
+    /// the same.
+    socket_dialer: Mutex<Option<(TransportDialer, TransportDialer)>>,
     // Synchronous ownership permits deterministic close even while a dial is pending.
     session: Mutex<Option<CachedSession>>,
     connecting: AsyncMutex<()>,
@@ -64,7 +72,6 @@ impl HysteriaOutbound {
         if config.stream.tcp_fragment.is_some()
             || config.stream.network != Network::Udp
             || config.proxy_settings.is_some()
-            || config.stream.socket_options.is_some()
             || tls.allow_insecure
             || tls.fingerprint.is_some()
             || (!tls.alpn.is_empty() && tls.alpn != ["h3"])
@@ -95,6 +102,11 @@ impl HysteriaOutbound {
                 .as_ref()
                 .map(super::xhttp::udp_noise_config)
                 .transpose()?,
+            header_custom: config
+                .stream
+                .udp_header_custom
+                .as_ref()
+                .map(super::carrier::quic_header_custom),
             ..Default::default()
         };
         let (quic, receive_bytes_per_second) =
@@ -141,6 +153,9 @@ impl HysteriaOutbound {
             .map_err(|_| CoreError::UnsupportedOutboundSecurity)?;
         Ok(Self {
             inner: Arc::new(SessionOwner {
+                socket_options: socket_options::compile(&config.stream),
+                address_port: super::carrier::address_port_strategy(&config.stream),
+                socket_dialer: Mutex::new(None),
                 limits: limits.transport_limits(),
                 carrier,
                 quic,
@@ -202,12 +217,40 @@ impl HysteriaOutbound {
         if *shutdown.borrow() {
             return Err(HysteriaError::Closed.into());
         }
+        let dialer = self.socket_dialer(dialer);
         // One total deadline includes contention, endpoint DNS and candidate attempts.
         tokio::select! {
             biased;
             _ = shutdown.changed() => Err(HysteriaError::Closed.into()),
-            result = tokio::time::timeout(Duration::from_secs(10), self.client_inner(resolver, dialer)) => result.map_err(|_| HysteriaError::Timeout)?,
+            result = tokio::time::timeout(Duration::from_secs(10), self.client_inner(resolver, &dialer)) => result.map_err(|_| HysteriaError::Timeout)?,
         }
+    }
+
+    /// `dialer` with this outbound's socket options: the same dialer each
+    /// time `dialer` is the same, so a cached session still matches it.
+    pub(super) fn socket_dialer<'a>(
+        &self,
+        dialer: &'a TransportDialer,
+    ) -> std::borrow::Cow<'a, TransportDialer> {
+        let Some(options) = &self.inner.socket_options else {
+            return std::borrow::Cow::Borrowed(dialer);
+        };
+        let mut cached = self
+            .inner
+            .socket_dialer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((given, derived)) = cached.as_ref() {
+            if given
+                .tls_connector()
+                .shares_session_context(dialer.tls_connector())
+            {
+                return std::borrow::Cow::Owned(derived.clone());
+            }
+        }
+        let derived = dialer.clone().with_socket_options(Arc::clone(options));
+        *cached = Some((dialer.clone(), derived.clone()));
+        std::borrow::Cow::Owned(derived)
     }
 
     async fn client_inner(
@@ -234,7 +277,13 @@ impl HysteriaOutbound {
                 drop(stale);
             }
         }
-        let candidates = resolve_server_candidates(&self.inner.server, resolver).await?;
+        let candidates = super::address_port::resolve_server(
+            &self.inner.server,
+            self.inner.address_port,
+            resolver,
+            dialer,
+        )
+        .await?;
         let mut last = HysteriaError::Connect;
         for candidate in candidates.into_iter().take(8) {
             let mut config = HysteriaConfig::new(candidate, self.inner.tls.clone(), String::new());

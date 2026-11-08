@@ -26,8 +26,11 @@ mod fragment;
 pub use fragment::TcpFragmentConfig;
 mod dns;
 mod happy_eyeballs;
+pub mod header_custom;
 pub mod hysteria;
+pub mod kcp;
 mod memory_class;
+pub mod sudoku;
 
 /// Validate a TLS DNS/IP verification name without performing network I/O.
 pub fn validate_tls_server_name(server_name: &str) -> Result<(), TransportError> {
@@ -42,7 +45,11 @@ pub mod reality_runtime;
 mod reality_rustls;
 mod reality_spider;
 mod route_probe;
+mod socket_options;
+#[cfg(unix)]
+pub mod sockopt_sys;
 pub mod stream;
+mod system_records;
 mod tls;
 mod utls_profiles;
 mod utls_shaping;
@@ -68,6 +75,11 @@ pub use reality_runtime::{
 pub use reality_rustls::extract_server_hello_for_fuzzing;
 pub use reality_rustls::RustlsRealityTlsSessionProvider;
 pub use route_probe::{RouteFamilies, RouteProbe, SystemRouteProbe};
+pub use socket_options::{
+    CustomSocketOption, SocketOptions, SocketOptionsProtector, SocketOptionsReport,
+    DEFAULT_TCP_KEEPALIVE_SECS,
+};
+pub use system_records::{is_domain_name, RecordResolver, SrvRecord, SystemRecordResolver};
 pub use tls::{plain_tls_client_hello_bytes, TlsConnector};
 pub use utls_profiles::draw_modern_fingerprint;
 
@@ -191,6 +203,8 @@ pub enum TransportError {
     Grpc(String),
     #[error("xhttp transport error: {0}")]
     Xhttp(String),
+    #[error("mKCP dial failed: {0}")]
+    Kcp(std::io::Error),
     #[error(transparent)]
     Http2Connect(#[from] stream::Http2ConnectError),
     #[error("reality handshake failed: {0}")]
@@ -384,8 +398,35 @@ impl SocketHandle {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn protect_socket<S: std::os::fd::AsFd>(
+    protector: &dyn SocketProtector,
+    socket: &S,
+    _handle: SocketHandle,
+) -> io::Result<()> {
+    protector.protect_fd(socket.as_fd())
+}
+
+#[cfg(not(unix))]
+pub(crate) fn protect_socket<S>(
+    protector: &dyn SocketProtector,
+    _socket: &S,
+    handle: SocketHandle,
+) -> io::Result<()> {
+    protector.protect(handle)
+}
+
 pub trait SocketProtector: Send + Sync {
     fn protect(&self, socket: SocketHandle) -> io::Result<()>;
+
+    /// [`Self::protect`] with the socket itself, for protectors that set
+    /// options on it.
+    #[cfg(unix)]
+    fn protect_fd(&self, socket: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+        self.protect(SocketHandle {
+            raw: std::os::fd::AsRawFd::as_raw_fd(&socket) as i64,
+        })
+    }
 
     fn apply_tcp_socket(&self, _socket: &TcpSocket) -> io::Result<()> {
         Ok(())
@@ -397,6 +438,12 @@ pub trait SocketProtector: Send + Sync {
 
     fn apply_udp_socket(&self, _socket: &UdpSocket) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Whether TCP sockets ask for Multipath TCP, as Go's
+    /// `Dialer.SetMultipathTCP(true)` does for `sockopt.tcpMptcp`.
+    fn multipath_tcp(&self) -> bool {
+        false
     }
 }
 
@@ -416,6 +463,17 @@ pub trait PreparedRealityTlsConnection: Send {
     ) -> Result<BoxedTransportStream, TransportError> {
         Err(TransportError::UnsupportedConnectorConfig(
             "REALITY tlshello fragmentation",
+        ))
+    }
+
+    /// Completes the handshake over a carrier that TCP masks already wrap,
+    /// such as `sudoku`. Legacy engines fail explicitly.
+    async fn complete_over_stream(
+        self: Box<Self>,
+        _stream: BoxedTransportStream,
+    ) -> Result<BoxedTransportStream, TransportError> {
+        Err(TransportError::UnsupportedConnectorConfig(
+            "REALITY over a masked carrier",
         ))
     }
 }
@@ -549,6 +607,13 @@ pub async fn connect_tcp_stream(
     socket_protector: Option<&dyn SocketProtector>,
 ) -> Result<TcpStream, TransportError> {
     let addr = canonicalize_socket_addr(addr);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(protector) = socket_protector.filter(|protector| protector.multipath_tcp()) {
+        // Go's `dialMPTCP` dials plain TCP after any Multipath TCP failure.
+        if let Ok(stream) = connect_multipath_tcp_stream(addr, protector).await {
+            return Ok(stream);
+        }
+    }
     let stream = match socket_protector {
         None => TcpStream::connect(addr)
             .await
@@ -565,9 +630,12 @@ pub async fn connect_tcp_stream(
                 .apply_tcp_socket(&socket)
                 .map_err(TransportError::Tcp)?;
 
-            socket_protector
-                .protect(SocketHandle::from_tcp_socket(&socket))
-                .map_err(TransportError::SocketProtection)?;
+            protect_socket(
+                socket_protector,
+                &socket,
+                SocketHandle::from_tcp_socket(&socket),
+            )
+            .map_err(TransportError::SocketProtection)?;
 
             socket.connect(addr).await.map_err(TransportError::Tcp)?
         }
@@ -576,6 +644,30 @@ pub async fn connect_tcp_stream(
     // The relay carries many latency-sensitive small frames (VLESS headers,
     // Vision blocks, TLS records); Nagle would delay them behind ACKs.
     stream.set_nodelay(true).map_err(TransportError::Tcp)?;
+    Ok(stream)
+}
+
+/// Opens a protected Multipath TCP socket to `addr`.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+async fn connect_multipath_tcp_stream(
+    addr: SocketAddr,
+    socket_protector: &dyn SocketProtector,
+) -> io::Result<TcpStream> {
+    const IPPROTO_MPTCP: i32 = 262;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        Some(socket2::Protocol::from(IPPROTO_MPTCP)),
+    )?;
+    socket.set_nonblocking(true)?;
+    let socket = TcpSocket::from_std_stream(std::net::TcpStream::from(socket));
+    protect_socket(
+        socket_protector,
+        &socket,
+        SocketHandle::from_tcp_socket(&socket),
+    )?;
+    let stream = socket.connect(addr).await?;
+    stream.set_nodelay(true)?;
     Ok(stream)
 }
 
@@ -598,8 +690,7 @@ pub fn protect_std_udp_socket(
         protector
             .apply_std_udp_socket(socket)
             .map_err(TransportError::Tcp)?;
-        protector
-            .protect(SocketHandle::from_std_udp_socket(socket))
+        protect_socket(protector, socket, SocketHandle::from_std_udp_socket(socket))
             .map_err(TransportError::SocketProtection)?;
     }
     Ok(())
@@ -613,8 +704,7 @@ pub fn protect_udp_socket(
         protector
             .apply_udp_socket(socket)
             .map_err(TransportError::Tcp)?;
-        protector
-            .protect(SocketHandle::from_udp_socket(socket))
+        protect_socket(protector, socket, SocketHandle::from_udp_socket(socket))
             .map_err(TransportError::SocketProtection)?;
     }
 

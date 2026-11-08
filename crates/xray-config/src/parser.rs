@@ -2,9 +2,11 @@ mod blackhole;
 mod dns;
 mod fragment;
 mod freedom;
+mod header_custom;
 mod http_inbound;
 mod http_outbound;
 mod hysteria;
+mod kcp;
 mod loopback;
 mod noise;
 mod routing;
@@ -12,6 +14,7 @@ mod shadowsocks;
 mod socks;
 mod socks_outbound;
 mod stream;
+mod sudoku;
 mod tproxy;
 mod trojan;
 mod vless;
@@ -34,20 +37,20 @@ use xray_routing::{DomainMatcherSet, DomainMatcherSetBuilder, IpMatcherSet, IpMa
 use crate::model::build_domain_matcher_set;
 use crate::{
     geodata::{default_geodata_dirs, GeodataLoader},
-    CoreConfig, Diagnostic, DnsConfig, DnsFakeIpConfig, DnsHostTarget, DnsIpFilter,
-    DnsNameServerConfig, DnsOutboundRule, DnsOutboundRuleAction, DnsOutboundSettings,
-    DnsQTypeRange, DnsQueryStrategy, DnsServerConfig, DnsServerEndpoint, DnsServerTransport,
-    DomainHostIndex, DomainMatcher, DomainNameMode, DomainStrategy, FreedomOutboundSettings,
-    FreedomRedirect, GrpcSettings, HappyEyeballsSettings, HttpUpgradeSettings, InboundConfig,
-    InboundProtocol, InboundSniffingConfig, IpCidr, Network, ObservatoryConfig, OutboundConfig,
-    OutboundProtocol, OutboundProxySettings, OutboundSettings, PolicyConfig, PolicyLevelConfig,
-    PolicySystemConfig, QuicBbrProfile, QuicCongestion, QuicIntervalRange, QuicParamsSettings,
-    QuicUdpHopSettings, RealitySettings, RealityShortId, SniffingDestination, SocketOptions,
-    StreamSecurity, StreamSettings, StreamTransport, TargetAddr, TlsSettings, WebSocketSettings,
-    XhttpMode, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpPlacement, XhttpRange,
-    XhttpSettings, XhttpUplinkDataPlacement, XhttpXmuxSettings, DEFAULT_OBSERVATORY_PROBE_INTERVAL,
-    DEFAULT_OBSERVATORY_PROBE_URL, MAX_DNS_SERVER_TIMEOUT_MS, MAX_DNS_SERVE_EXPIRED_TTL_SECONDS,
-    OBSERVATORY_PROBE_TIMEOUT,
+    AddressPortStrategy, CoreConfig, CustomSocketOption, Diagnostic, DnsConfig, DnsFakeIpConfig,
+    DnsHostTarget, DnsIpFilter, DnsNameServerConfig, DnsOutboundRule, DnsOutboundRuleAction,
+    DnsOutboundSettings, DnsQTypeRange, DnsQueryStrategy, DnsServerConfig, DnsServerEndpoint,
+    DnsServerTransport, DomainHostIndex, DomainMatcher, DomainNameMode, DomainStrategy,
+    FreedomOutboundSettings, FreedomRedirect, GrpcSettings, HappyEyeballsSettings,
+    HttpUpgradeSettings, InboundConfig, InboundProtocol, InboundSniffingConfig, IpCidr, Network,
+    ObservatoryConfig, OutboundConfig, OutboundProtocol, OutboundProxySettings, OutboundSettings,
+    PolicyConfig, PolicyLevelConfig, PolicySystemConfig, QuicBbrProfile, QuicCongestion,
+    QuicIntervalRange, QuicParamsSettings, QuicUdpHopSettings, RealitySettings, RealityShortId,
+    SniffingDestination, SocketOptions, StreamSecurity, StreamSettings, StreamTransport,
+    TargetAddr, TlsSettings, TproxyMode, WebSocketSettings, XhttpMode, XhttpPaddingMethod,
+    XhttpPaddingPlacement, XhttpPlacement, XhttpRange, XhttpSettings, XhttpUplinkDataPlacement,
+    XhttpXmuxSettings, DEFAULT_OBSERVATORY_PROBE_INTERVAL, DEFAULT_OBSERVATORY_PROBE_URL,
+    MAX_DNS_SERVER_TIMEOUT_MS, MAX_DNS_SERVE_EXPIRED_TTL_SECONDS, OBSERVATORY_PROBE_TIMEOUT,
 };
 
 const MAX_ROUTING_RULES: usize = 4_096;
@@ -79,6 +82,7 @@ enum StreamNetwork {
     HttpUpgrade,
     Grpc,
     Xhttp,
+    Kcp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1025,6 +1029,23 @@ impl Parser<'_> {
                     "outbound chaining over REALITY is unsupported",
                 );
             }
+            // Xray-core hands the address and port it looks up to the
+            // dialerProxy outbound as its destination; a chain here takes
+            // the configured server instead.
+            if outbound.proxy_settings.is_some()
+                && outbound
+                    .stream
+                    .socket_options
+                    .as_ref()
+                    .is_some_and(|options| {
+                        options.address_port_strategy != AddressPortStrategy::None
+                    })
+            {
+                self.error(
+                    format!("$.outbounds[{index}].streamSettings.sockopt.addressPortStrategy"),
+                    "addressPortStrategy is unsupported on a chained outbound",
+                );
+            }
         }
         parsed
     }
@@ -1109,6 +1130,16 @@ impl Parser<'_> {
         let mut stream = self.parse_stream_settings(outbound, index)?;
         let target_strategy = target_strategy?;
         if protocol == OutboundProtocol::Freedom {
+            if stream
+                .socket_options
+                .as_ref()
+                .is_some_and(|options| options.address_port_strategy != AddressPortStrategy::None)
+            {
+                self.error(
+                    format!("$.outbounds[{index}].streamSettings.sockopt.addressPortStrategy"),
+                    "freedom outbound does not support \"sockopt.addressPortStrategy\"",
+                );
+            }
             self.migrate_freedom_domain_strategy(outbound, index, target_strategy, &mut stream);
         } else {
             if target_strategy.has_strategy() {
@@ -1117,14 +1148,16 @@ impl Parser<'_> {
                     "targetStrategy is supported only on freedom outbounds",
                 );
             }
-            if stream
-                .socket_options
-                .as_ref()
-                .is_some_and(|options| options.domain_strategy.has_strategy())
+            // WireGuard reads it for its peer endpoints.
+            if protocol != OutboundProtocol::Wireguard
+                && stream
+                    .socket_options
+                    .as_ref()
+                    .is_some_and(|options| options.domain_strategy.has_strategy())
             {
                 self.error(
                     format!("$.outbounds[{index}].streamSettings.sockopt.domainStrategy"),
-                    "sockopt.domainStrategy is supported only on freedom outbounds",
+                    "sockopt.domainStrategy is supported only on freedom and WireGuard outbounds",
                 );
             }
         }

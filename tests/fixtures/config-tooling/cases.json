@@ -1225,7 +1225,7 @@
               ]
             },
             "streamSettings": {
-              "network": "kcp",
+              "network": "masque",
               "security": "tls",
               "tlsSettings": {
                 "fingerprint": "chrome",
@@ -1642,6 +1642,406 @@
         "HYSTERIA_TRANSPORT": "/outbounds/0/streamSettings/hysteriaSettings",
         "FINALMASK_ENTRY": "/outbounds/0/streamSettings/finalmask/udp/0",
         "SALAMANDER": "/outbounds/0/streamSettings/finalmask/udp/0/settings"
+      }
+    },
+    {
+      "name": "mkcp",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+              "vnext": [
+                {
+                  "address": "server.example",
+                  "port": 443,
+                  "users": [
+                    {
+                      "encryption": "none",
+                      "id": "00010203-0405-0607-0809-0a0b0c0d0e0f"
+                    }
+                  ]
+                }
+              ]
+            },
+            "streamSettings": {
+              "network": "kcp",
+              "security": "tls",
+              "tlsSettings": {
+                "fingerprint": "chrome",
+                "serverName": "server.example"
+              },
+              "kcpSettings": {
+                "mtu": 1350,
+                "tti": 50,
+                "uplinkCapacity": 5,
+                "downlinkCapacity": 20,
+                "cwndMultiplier": 1,
+                "maxSendingWindow": 2097152,
+                "header": {
+                  "type": "none"
+                },
+                "seed": ""
+              },
+              "finalmask": {
+                "udp": [
+                  {
+                    "type": "mkcp-legacy",
+                    "settings": {
+                      "value": "synthetic-mkcp-seed"
+                    }
+                  },
+                  {
+                    "type": "mkcp-legacy",
+                    "settings": {
+                      "header": "wechat",
+                      "value": ""
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "objects": {
+        "KCP_SETTINGS": "/outbounds/0/streamSettings/kcpSettings",
+        "MKCP_LEGACY": "/outbounds/0/streamSettings/finalmask/udp/1/settings"
+      }
+    },
+    {
+      "name": "mkcp-mtu-below-21",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.kcpSettings.mtu",
+      "base": "mkcp",
+      "set": {
+        "/outbounds/0/streamSettings/kcpSettings/mtu": 20
+      }
+    },
+    {
+      "name": "mkcp-mtu-above-8192",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.kcpSettings.mtu",
+      "base": "mkcp",
+      "set": {
+        "/outbounds/0/streamSettings/kcpSettings/mtu": 8193
+      }
+    },
+    {
+      "name": "mkcp-legacy-unknown-header",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.header",
+      "base": "mkcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/header": "wechat-video"
+      }
+    },
+    {
+      "name": "mkcp-reality",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.security",
+      "base": "mkcp",
+      "set": {
+        "/outbounds/0/streamSettings/security": "reality",
+        "/outbounds/0/streamSettings/realitySettings": {
+          "serverName": "server.example",
+          "fingerprint": "chrome",
+          "publicKey": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE",
+          "shortId": "02030405"
+        }
+      }
+    },
+    {
+      "name": "mkcp-legacy-on-raw",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[0]",
+      "base": "raw-tls-happy-eyeballs",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask": {
+          "udp": [
+            {
+              "type": "mkcp-legacy"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "header-custom-tcp",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+              "vnext": [
+                {
+                  "address": "server.example",
+                  "port": 443,
+                  "users": [
+                    {
+                      "encryption": "none",
+                      "id": "00010203-0405-0607-0809-0a0b0c0d0e0f"
+                    }
+                  ]
+                }
+              ]
+            },
+            "streamSettings": {
+              "network": "raw",
+              "security": "tls",
+              "tlsSettings": {
+                "fingerprint": "chrome",
+                "serverName": "server.example"
+              },
+              "finalmask": {
+                "tcp": [
+                  {
+                    "type": "header-custom",
+                    "settings": {
+                      "clients": [
+                        [
+                          {
+                            "delay": "0-0",
+                            "rand": 0,
+                            "randRange": "0-255",
+                            "capture": "",
+                            "type": "str",
+                            "reuse": "",
+                            "packet": "HELLO"
+                          },
+                          {
+                            "rand": 8,
+                            "capture": "nonce"
+                          },
+                          {
+                            "transform": {
+                              "op": "be16",
+                              "args": [
+                                {
+                                  "type": "",
+                                  "metadata": "remote_port"
+                                }
+                              ]
+                            }
+                          }
+                        ]
+                      ],
+                      "servers": [
+                        [
+                          {
+                            "reuse": "nonce"
+                          },
+                          {
+                            "transform": {
+                              "op": "concat",
+                              "args": [
+                                {
+                                  "type": "str",
+                                  "bytes": "OK"
+                                },
+                                {
+                                  "transform": {
+                                    "op": "le16",
+                                    "args": [
+                                      {
+                                        "u64": 1
+                                      }
+                                    ]
+                                  }
+                                }
+                              ]
+                            }
+                          }
+                        ]
+                      ],
+                      "errors": [
+                        [
+                          {
+                            "type": "str",
+                            "packet": "NO"
+                          }
+                        ]
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "objects": {
+        "HEADER_CUSTOM_TCP": "/outbounds/0/streamSettings/finalmask/tcp/0/settings",
+        "HEADER_CUSTOM_TCP_ITEM": "/outbounds/0/streamSettings/finalmask/tcp/0/settings/clients/0/0",
+        "HEADER_CUSTOM_TRANSFORM": "/outbounds/0/streamSettings/finalmask/tcp/0/settings/servers/0/1/transform",
+        "HEADER_CUSTOM_ARG": "/outbounds/0/streamSettings/finalmask/tcp/0/settings/clients/0/2/transform/args/0"
+      }
+    },
+    {
+      "name": "header-custom-two-kinds",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.clients[0][0]",
+      "base": "header-custom-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/clients/0/0": {
+          "type": "str",
+          "packet": "x",
+          "rand": 2
+        }
+      }
+    },
+    {
+      "name": "header-custom-bad-variable",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.clients[0][1].capture",
+      "base": "header-custom-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/clients/0/1/capture": "1nonce"
+      }
+    },
+    {
+      "name": "header-custom-rand-range",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.clients[0][1].randRange",
+      "base": "header-custom-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/clients/0/1/randRange": "0-256"
+      }
+    },
+    {
+      "name": "header-custom-transform-without-op",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.servers[0][1].transform.op",
+      "base": "header-custom-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/servers/0/1/transform/op": ""
+      }
+    },
+    {
+      "name": "header-custom-arg-two-values",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.clients[0][2].transform.args[0]",
+      "base": "header-custom-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/clients/0/2/transform/args/0": {
+          "u64": 1,
+          "metadata": "local_port"
+        }
+      }
+    },
+    {
+      "name": "header-custom-before-fragment",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[1]",
+      "base": "header-custom-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp": [
+          {
+            "type": "header-custom",
+            "settings": {
+              "clients": [
+                [
+                  {
+                    "delay": "0-0",
+                    "rand": 0,
+                    "randRange": "0-255",
+                    "capture": "",
+                    "type": "str",
+                    "reuse": "",
+                    "packet": "HELLO"
+                  },
+                  {
+                    "rand": 8,
+                    "capture": "nonce"
+                  },
+                  {
+                    "transform": {
+                      "op": "be16",
+                      "args": [
+                        {
+                          "type": "",
+                          "metadata": "remote_port"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              ],
+              "servers": [
+                [
+                  {
+                    "reuse": "nonce"
+                  },
+                  {
+                    "transform": {
+                      "op": "concat",
+                      "args": [
+                        {
+                          "type": "str",
+                          "bytes": "OK"
+                        },
+                        {
+                          "transform": {
+                            "op": "le16",
+                            "args": [
+                              {
+                                "u64": 1
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                  }
+                ]
+              ],
+              "errors": [
+                [
+                  {
+                    "type": "str",
+                    "packet": "NO"
+                  }
+                ]
+              ]
+            }
+          },
+          {
+            "type": "fragment",
+            "settings": {
+              "packets": "tlshello",
+              "length": "100-200",
+              "delay": "10-20"
+            }
+          }
+        ]
       }
     },
     {
@@ -2743,6 +3143,89 @@
       }
     },
     {
+      "name": "vless-simplified-settings",
+      "base": "raw-tls-happy-eyeballs",
+      "set": {
+        "/outbounds/0/settings": {
+          "address": "server.example",
+          "port": 443,
+          "id": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+          "encryption": "none",
+          "flow": "",
+          "level": 0,
+          "email": "",
+          "seed": "",
+          "testpre": 0,
+          "testseed": [
+            900,
+            500,
+            900,
+            256
+          ]
+        }
+      },
+      "accepted": true,
+      "objects": {
+        "VLESS": "/outbounds/0/settings"
+      }
+    },
+    {
+      "name": "vless-simplified-text-id",
+      "base": "raw-tls-happy-eyeballs",
+      "set": {
+        "/outbounds/0/settings": {
+          "address": "server.example",
+          "port": 443,
+          "id": "my-short-id",
+          "encryption": "none"
+        }
+      },
+      "accepted": true
+    },
+    {
+      "name": "vless-simplified-reverse",
+      "base": "raw-tls-happy-eyeballs",
+      "set": {
+        "/outbounds/0/settings": {
+          "address": "server.example",
+          "port": 443,
+          "id": "my-short-id",
+          "encryption": "none",
+          "reverse": {
+            "tag": "portal"
+          }
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].settings.reverse"
+    },
+    {
+      "name": "vless-testpre",
+      "base": "raw-tls-happy-eyeballs",
+      "set": {
+        "/outbounds/0/settings/vnext/0/users/0/testpre": 2
+      },
+      "accepted": true
+    },
+    {
+      "name": "vless-testpre-over-64",
+      "base": "raw-tls-happy-eyeballs",
+      "set": {
+        "/outbounds/0/settings/vnext/0/users/0/testpre": 65
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].settings.vnext[0].users[0].testpre"
+    },
+    {
+      "name": "vless-id-31-bytes",
+      "base": "raw-tls-happy-eyeballs",
+      "set": {
+        "/outbounds/0/settings/vnext/0/users/0/id": "0001020304050607080900a0b0c0d0e"
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].settings.vnext[0].users[0].id"
+    },
+    {
       "name": "vless-reality-mux",
       "accepted": true,
       "base": "reality-compatible-unknown",
@@ -3174,6 +3657,73 @@
       "accepted": false
     },
     {
+      "name": "wireguard-sockopt",
+      "base": "wireguard",
+      "set": {
+        "/outbounds/0/streamSettings": {
+          "sockopt": {
+            "mark": 255,
+            "interface": "wg-out",
+            "domainStrategy": "ForceIPv6v4"
+          }
+        }
+      },
+      "accepted": true
+    },
+    {
+      "name": "wireguard-stream-network",
+      "base": "wireguard",
+      "set": {
+        "/outbounds/0/streamSettings": {
+          "network": "raw",
+          "sockopt": {
+            "mark": 255
+          }
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.network"
+    },
+    {
+      "name": "wireguard-finalmask",
+      "base": "wireguard",
+      "set": {
+        "/outbounds/0/streamSettings": {
+          "finalmask": {
+            "udp": [
+              {
+                "type": "noise"
+              }
+            ]
+          }
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask"
+    },
+    {
+      "name": "wireguard-dialer-proxy",
+      "base": "wireguard",
+      "set": {
+        "/outbounds/0/streamSettings": {
+          "sockopt": {
+            "dialerProxy": "proxy"
+          }
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0]"
+    },
+    {
+      "name": "wireguard-domain-strategy-not-read",
+      "base": "wireguard",
+      "set": {
+        "/outbounds/0/settings/domainStrategy": "NotAStrategy"
+      },
+      "accepted": true,
+      "warningPath": "$.outbounds[0].settings.domainStrategy"
+    },
+    {
       "name": "quic-unsupported-disableChromeParrot",
       "base": "udp-hop-mask-261021",
       "set": {
@@ -3262,6 +3812,228 @@
         ]
       },
       "accepted": true
+    },
+    {
+      "name": "sockopt-every-field",
+      "base": "freedom-domain-strategy",
+      "set": {
+        "/outbounds/0/streamSettings/sockopt": {
+          "mark": 255,
+          "tcpFastOpen": true,
+          "tproxy": "tproxy",
+          "acceptProxyProtocol": false,
+          "domainStrategy": "UseIPv4",
+          "dialerProxy": "",
+          "tcpKeepAliveInterval": 30,
+          "tcpKeepAliveIdle": 60,
+          "tcpCongestion": "bbr",
+          "tcpWindowClamp": 600,
+          "tcpMaxSeg": 1200,
+          "penetrate": false,
+          "tcpUserTimeout": 5000,
+          "v6only": false,
+          "interface": "eth0",
+          "tcpMptcp": true,
+          "customSockopt": [
+            {
+              "system": "linux",
+              "network": "tcp",
+              "level": "6",
+              "opt": "13",
+              "value": "reno",
+              "type": "str"
+            }
+          ],
+          "addressPortStrategy": "none",
+          "happyEyeballs": {
+            "tryDelayMs": 250
+          },
+          "trustedXForwardedFor": [
+            "10.0.0.1"
+          ]
+        }
+      },
+      "accepted": true,
+      "objects": {
+        "SOCKOPT": "/outbounds/0/streamSettings/sockopt",
+        "CUSTOM_SOCKOPT": "/outbounds/0/streamSettings/sockopt/customSockopt/0",
+        "HAPPY_EYEBALLS": "/outbounds/0/streamSettings/sockopt/happyEyeballs"
+      }
+    },
+    {
+      "name": "sockopt-tcpFastOpen-string",
+      "base": "freedom-domain-strategy",
+      "set": {
+        "/outbounds/0/streamSettings/sockopt/tcpFastOpen": "true"
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.sockopt.tcpFastOpen"
+    },
+    {
+      "name": "sockopt-mark-fraction",
+      "base": "freedom-domain-strategy",
+      "set": {
+        "/outbounds/0/streamSettings/sockopt/mark": 1.5
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.sockopt.mark"
+    },
+    {
+      "name": "sockopt-addressPortStrategy-srv",
+      "base": "freedom-domain-strategy",
+      "set": {
+        "/outbounds/0/streamSettings/sockopt/addressPortStrategy": "SrvPortAndAddress"
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.sockopt.addressPortStrategy"
+    },
+    {
+      "name": "ws-address-port-strategy",
+      "base": "ws",
+      "set": {
+        "/outbounds/0/settings/vnext/0/address": "_xray._tcp.server.example",
+        "/outbounds/0/streamSettings/sockopt": {
+          "addressPortStrategy": "SrvPortAndAddress"
+        }
+      },
+      "accepted": true
+    },
+    {
+      "name": "xhttp-download-address-port-strategy",
+      "base": "xhttp-download",
+      "set": {
+        "/outbounds/0/streamSettings/xhttpSettings/downloadSettings/sockopt": {
+          "addressPortStrategy": "txtportonly"
+        }
+      },
+      "accepted": true
+    },
+    {
+      "name": "ws-address-port-strategy-chained",
+      "config": {
+        "inbounds": [
+          {
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "protocol": "socks",
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            },
+            "tag": "socks-in"
+          }
+        ],
+        "outbounds": [
+          {
+            "protocol": "vless",
+            "settings": {
+              "vnext": [
+                {
+                  "address": "server.example",
+                  "port": 443,
+                  "users": [
+                    {
+                      "encryption": "none",
+                      "id": "00010203-0405-0607-0809-0a0b0c0d0e0f"
+                    }
+                  ]
+                }
+              ]
+            },
+            "streamSettings": {
+              "network": "ws",
+              "security": "tls",
+              "tlsSettings": {
+                "fingerprint": "chrome",
+                "serverName": "server.example"
+              },
+              "wsSettings": {
+                "path": "/ws",
+                "host": "server.example",
+                "headers": {
+                  "User-Agent": "fixture"
+                },
+                "heartbeatPeriod": 10,
+                "acceptProxyProtocol": false
+              },
+              "sockopt": {
+                "addressPortStrategy": "TxtPortAndAddress",
+                "dialerProxy": "socks-out"
+              }
+            },
+            "tag": "proxy"
+          },
+          {
+            "tag": "socks-out",
+            "protocol": "socks",
+            "settings": {
+              "address": "192.0.2.10",
+              "port": 1080
+            }
+          }
+        ]
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.sockopt.addressPortStrategy"
+    },
+    {
+      "name": "ws-address-port-strategy-unknown",
+      "base": "ws",
+      "set": {
+        "/outbounds/0/streamSettings/sockopt": {
+          "addressPortStrategy": "SrvTxt"
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.sockopt.addressPortStrategy"
+    },
+    {
+      "name": "sockopt-customSockopt-null-entry",
+      "base": "freedom-domain-strategy",
+      "set": {
+        "/outbounds/0/streamSettings/sockopt/customSockopt": [
+          null
+        ]
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.sockopt.customSockopt[0]"
+    },
+    {
+      "name": "download-sockopt-penetrate",
+      "base": "xhttp-download",
+      "set": {
+        "/outbounds/0/streamSettings/sockopt": {
+          "penetrate": true,
+          "mark": 7
+        },
+        "/outbounds/0/streamSettings/xhttpSettings/downloadSettings/sockopt": {
+          "mark": 9,
+          "tcpKeepAliveIdle": 30
+        }
+      },
+      "accepted": true
+    },
+    {
+      "name": "download-sockopt-dialerProxy",
+      "base": "xhttp-download",
+      "set": {
+        "/outbounds/0/streamSettings/xhttpSettings/downloadSettings/sockopt": {
+          "dialerProxy": "proxy"
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.xhttpSettings.downloadSettings.sockopt.dialerProxy"
+    },
+    {
+      "name": "download-sockopt-domainStrategy",
+      "base": "xhttp-download",
+      "set": {
+        "/outbounds/0/streamSettings/xhttpSettings/downloadSettings/sockopt": {
+          "domainStrategy": "UseIPv6"
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.xhttpSettings.downloadSettings.sockopt.domainStrategy"
     },
     {
       "name": "freedom-settings-domainStrategy",
@@ -3936,6 +4708,219 @@
       },
       "accepted": false,
       "errorPath": "$.outbounds[0].streamSettings.tlsSettings.enableSessionResumption"
+    },
+    {
+      "name": "header-custom-udp",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+              "vnext": [
+                {
+                  "address": "server.example",
+                  "port": 443,
+                  "users": [
+                    {
+                      "encryption": "none",
+                      "id": "00010203-0405-0607-0809-0a0b0c0d0e0f"
+                    }
+                  ]
+                }
+              ]
+            },
+            "streamSettings": {
+              "network": "kcp",
+              "finalmask": {
+                "udp": [
+                  {
+                    "type": "header-custom",
+                    "settings": {
+                      "mode": "prefix",
+                      "client": [
+                        {
+                          "rand": 0,
+                          "randRange": "0-255",
+                          "capture": "greeting",
+                          "type": "str",
+                          "reuse": "",
+                          "transform": null,
+                          "packet": "HELLO"
+                        }
+                      ],
+                      "server": [
+                        {
+                          "reuse": "greeting"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "objects": {
+        "HEADER_CUSTOM_UDP": "/outbounds/0/streamSettings/finalmask/udp/0/settings",
+        "HEADER_CUSTOM_UDP_ITEM": "/outbounds/0/streamSettings/finalmask/udp/0/settings/client/0"
+      }
+    },
+    {
+      "name": "header-custom-udp-standalone",
+      "accepted": true,
+      "base": "header-custom-udp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/0/settings/mode": "standalone"
+      }
+    },
+    {
+      "name": "header-custom-udp-bad-mode",
+      "accepted": false,
+      "base": "header-custom-udp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/0/settings/mode": "PREFIX"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[0].settings.mode"
+    },
+    {
+      "name": "header-custom-udp-delay",
+      "accepted": false,
+      "base": "header-custom-udp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/0/settings/client/0/delay": 1
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[0].settings.client[0].delay"
+    },
+    {
+      "name": "sudoku-tcp",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+              "vnext": [
+                {
+                  "address": "server.example",
+                  "port": 443,
+                  "users": [
+                    {
+                      "encryption": "none",
+                      "id": "00010203-0405-0607-0809-0a0b0c0d0e0f"
+                    }
+                  ]
+                }
+              ]
+            },
+            "streamSettings": {
+              "network": "raw",
+              "security": "tls",
+              "tlsSettings": {
+                "serverName": "server.example"
+              },
+              "finalmask": {
+                "tcp": [
+                  {
+                    "type": "sudoku",
+                    "settings": {
+                      "password": "synthetic-sudoku-password",
+                      "ascii": "prefer_entropy",
+                      "customTables": [
+                        "xppvvvvx",
+                        "vvxpvxpv"
+                      ],
+                      "paddingMin": 10,
+                      "paddingMax": 30
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "objects": {
+        "SUDOKU_MASK": "/outbounds/0/streamSettings/finalmask/tcp/0/settings"
+      }
+    },
+    {
+      "name": "sudoku-udp-kcp",
+      "accepted": true,
+      "base": "sudoku-tcp",
+      "set": {
+        "/outbounds/0/streamSettings": {
+          "network": "kcp",
+          "finalmask": {
+            "udp": [
+              {
+                "type": "sudoku",
+                "settings": {
+                  "password": "synthetic-sudoku-password",
+                  "ascii": "ascii"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "sudoku-bad-ascii",
+      "accepted": false,
+      "base": "sudoku-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/ascii": "text"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.ascii"
+    },
+    {
+      "name": "sudoku-bad-table",
+      "accepted": false,
+      "base": "sudoku-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/customTables": [
+          "xxppvvvv",
+          "xxxpvvvv"
+        ]
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.customTable"
+    },
+    {
+      "name": "sudoku-unknown-field",
+      "accepted": false,
+      "base": "sudoku-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/seed": 1
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.seed"
     }
   ]
 }

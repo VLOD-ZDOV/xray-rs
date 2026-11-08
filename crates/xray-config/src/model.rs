@@ -1189,7 +1189,6 @@ pub struct WireguardOutboundSettings {
     pub peers: Vec<WireguardPeerSettings>,
     pub addresses: Vec<std::net::IpAddr>,
     pub mtu: u16,
-    pub domain_strategy: WireguardDomainStrategy,
     /// Literal DNS servers contacted through the WireGuard tunnel.
     pub remote_dns: Vec<std::net::IpAddr>,
 }
@@ -1202,15 +1201,6 @@ pub struct WireguardPeerSettings {
     pub port: u16,
     pub allowed_ips: Vec<xray_proxy::wireguard::AllowedIp>,
     pub keepalive: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WireguardDomainStrategy {
-    ForceIp,
-    ForceIpv4,
-    ForceIpv6,
-    ForceIpv4v6,
-    ForceIpv6v4,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1237,6 +1227,88 @@ impl fmt::Debug for HysteriaSettings {
             .field("gecko_packet_size", &self.gecko_packet_size)
             .finish()
     }
+}
+
+/// `kcpSettings`, read as Xray-core v26.10.31's `KCPConfig.Build` reads it,
+/// with the stream's `finalmask.udp` masks that mKCP applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KcpSettings {
+    /// Bytes in a segment with its 18-byte header, at least 21.
+    pub mtu: u32,
+    /// Milliseconds between flushes, 10 to 1000.
+    pub tti: u32,
+    /// Megabytes a second the sender may keep in flight.
+    pub uplink_capacity: u32,
+    /// Megabytes a second the receiver advertises.
+    pub downlink_capacity: u32,
+    pub cwnd_multiplier: u32,
+    /// Bytes the sender buffers; at least `mtu`.
+    pub max_sending_window: u32,
+    /// The `finalmask.udp` masks in array order. The first applies first to
+    /// a datagram on its way out, the last is outermost on the wire.
+    pub masks: Vec<KcpMask>,
+}
+
+impl Default for KcpSettings {
+    /// Xray-core's defaults for an absent or null `kcpSettings`.
+    fn default() -> Self {
+        Self {
+            mtu: 1350,
+            tti: 50,
+            uplink_capacity: 5,
+            downlink_capacity: 20,
+            cwnd_multiplier: 1,
+            max_sending_window: 2 * 1024 * 1024,
+            masks: Vec::new(),
+        }
+    }
+}
+
+/// A `finalmask.udp` mask on an mKCP stream.
+#[derive(Clone, PartialEq, Eq)]
+pub enum KcpMask {
+    /// `mkcp-legacy` without header or value: an FNV-1a checksum and a
+    /// forward XOR, mKCP's original obfuscation.
+    Original,
+    /// `mkcp-legacy` with a value and no header: AES-128-GCM keyed by the
+    /// SHA-256 of the value, mKCP's old `seed`.
+    Aes128Gcm(zeroize::Zeroizing<String>),
+    /// `mkcp-legacy` with a header: bytes mKCP's old `header.type` put first.
+    Header(KcpHeader),
+    /// The stream's noise mask, read into `StreamSettings::udp_noise`, at
+    /// its place in the array.
+    Noise,
+    /// The stream's `header-custom` mask, read into
+    /// `StreamSettings::udp_header_custom`, at its place in the array.
+    HeaderCustom,
+    /// The stream's `sudoku` mask, read into `StreamSettings::udp_sudoku`,
+    /// at its place in the array.
+    Sudoku,
+}
+
+impl fmt::Debug for KcpMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Original => f.write_str("Original"),
+            Self::Aes128Gcm(_) => f.write_str("Aes128Gcm(<redacted>)"),
+            Self::Header(header) => f.debug_tuple("Header").field(header).finish(),
+            Self::Noise => f.write_str("Noise"),
+            Self::HeaderCustom => f.write_str("HeaderCustom"),
+            Self::Sudoku => f.write_str("Sudoku"),
+        }
+    }
+}
+
+/// An `mkcp-legacy` header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KcpHeader {
+    /// A DNS query for this domain: `value`, else `www.baidu.com`.
+    Dns(String),
+    Dtls,
+    Srtp,
+    Utp,
+    Wechat,
+    Wireguard,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1454,6 +1526,12 @@ pub struct VlessUser {
     pub encryption: crate::VlessEncryption,
     pub flow: Option<String>,
     pub level: u32,
+    /// `testseed`: Vision's padding parameters, Xray-core's
+    /// `[900, 500, 900, 256]` unless set.
+    pub vision_seed: [u32; 4],
+    /// `testpre`: how many carrier connections the outbound keeps opened
+    /// ahead of the requests that take them; zero opens none.
+    pub pre_connections: u32,
 }
 
 impl fmt::Debug for VlessUser {
@@ -1464,6 +1542,7 @@ impl fmt::Debug for VlessUser {
             .field("encryption", &self.encryption)
             .field("flow", &self.flow)
             .field("level", &self.level)
+            .field("vision_seed", &self.vision_seed)
             .finish()
     }
 }
@@ -1504,6 +1583,16 @@ pub struct StreamSettings {
     pub quic_params: Option<QuicParamsSettings>,
     /// One normalized FinalMask or legacy freedom `tlshello` transform.
     pub tcp_fragment: Option<TcpFragmentSettings>,
+    /// The `header-custom` TCP mask: the handshake every TCP carrier sends
+    /// and checks before anything else.
+    pub tcp_header_custom: Option<HeaderCustomTcp>,
+    /// The `header-custom` UDP mask, at its place among the stream's UDP
+    /// masks.
+    pub udp_header_custom: Option<HeaderCustomUdp>,
+    /// The `sudoku` TCP mask, the outermost of the TCP masks.
+    pub tcp_sudoku: Option<SudokuMask>,
+    /// The `sudoku` UDP mask, at its place among mKCP's masks.
+    pub udp_sudoku: Option<SudokuMask>,
     pub udp_noise: Option<UdpNoiseSettings>,
     pub socket_options: Option<SocketOptions>,
 }
@@ -1521,6 +1610,95 @@ pub struct UdpNoiseItem {
     pub random_length: FragmentRange,
     pub random_bytes: FragmentRange,
     pub delay_ms: FragmentRange,
+}
+
+/// The `header-custom` TCP mask, as Xray-core v26.10.31's `HeaderCustomTCP`
+/// reads it: sequences the client writes and the server answers with, in
+/// turns, before the connection carries anything else.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeaderCustomTcp {
+    pub clients: Vec<Vec<HeaderCustomItem>>,
+    pub servers: Vec<Vec<HeaderCustomItem>>,
+    /// What a server answers a client sequence that does not match; read
+    /// for parity, never sent by a client.
+    pub errors: Vec<Vec<HeaderCustomItem>>,
+}
+
+/// The `sudoku` mask, as Xray-core v26.10.31's `Sudoku` reads it: the
+/// camelCase fields, or their snake_case names when those are unset.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SudokuMask {
+    pub password: zeroize::Zeroizing<String>,
+    /// `ascii`: empty, `entropy` or `prefer_entropy`, or `ascii` or
+    /// `prefer_ascii`, as given.
+    pub ascii: String,
+    pub custom_table: String,
+    pub custom_tables: Vec<String>,
+    pub padding_min: u32,
+    pub padding_max: u32,
+}
+
+impl fmt::Debug for SudokuMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SudokuMask")
+            .field("password", &"<redacted>")
+            .field("ascii", &self.ascii)
+            .field("custom_table", &self.custom_table)
+            .field("custom_tables", &self.custom_tables)
+            .field("padding_min", &self.padding_min)
+            .field("padding_max", &self.padding_max)
+            .finish()
+    }
+}
+
+/// The `header-custom` UDP mask, as Xray-core v26.10.31's `HeaderCustomUDP`
+/// reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeaderCustomUdp {
+    /// `standalone`: exchange the client's and server's items separately
+    /// before the first datagram and the first write after five seconds.
+    /// Otherwise (`prefix`) every datagram carries the items in front.
+    pub standalone: bool,
+    pub client: Vec<HeaderCustomItem>,
+    pub server: Vec<HeaderCustomItem>,
+    /// Listed before Salamander, which then obfuscates it.
+    pub before_salamander: bool,
+    /// Listed before noise, whose packets then pass through it.
+    pub before_noise: bool,
+}
+
+/// One `header-custom` item: random bytes, fixed bytes, a captured variable
+/// or a transform, or nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderCustomItem {
+    /// TCP only: milliseconds to wait before the item when the upper bound
+    /// is positive. Go's `Int32Range`, so it may be negative.
+    pub delay: (i32, i32),
+    /// Random bytes to send, and the inclusive range of their values.
+    pub rand: i32,
+    pub rand_range: (i32, i32),
+    pub packet: Vec<u8>,
+    /// Saves what the item sends or receives under this name.
+    pub capture: String,
+    /// Sends, or expects, the bytes saved under this name.
+    pub reuse: String,
+    pub transform: Option<HeaderCustomExpr>,
+}
+
+/// A `header-custom` transform: an operation over its arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeaderCustomExpr {
+    pub op: String,
+    pub args: Vec<HeaderCustomArg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeaderCustomArg {
+    Bytes(Vec<u8>),
+    U64(u64),
+    Reuse(String),
+    Metadata(String),
+    Transform(HeaderCustomExpr),
 }
 
 /// Bounded first-ClientHello record fragmentation. Ranges are inclusive.
@@ -1625,6 +1803,8 @@ pub enum StreamTransport {
     Grpc(GrpcSettings),
     /// `xhttp` / the legacy `splithttp` spelling.
     Xhttp(Box<XhttpSettings>),
+    /// `kcp` / `mkcp`.
+    Kcp(KcpSettings),
 }
 
 /// An ordered XHTTP integer range. Xray accepts either a JSON integer or a
@@ -1870,8 +2050,123 @@ pub struct SocketOptions {
     pub happy_eyeballs: Option<HappyEyeballsSettings>,
     /// `sockopt.domainStrategy`, after freedom's deprecated `domainStrategy`
     /// and an outbound `targetStrategy` were migrated into it as Xray-core
-    /// does. Only freedom reads it so far.
+    /// does. Freedom and WireGuard read it.
     pub domain_strategy: DomainStrategy,
+    /// `addressPortStrategy`: an SRV or TXT lookup that replaces a domain
+    /// server's address or port before it is dialed.
+    pub address_port_strategy: AddressPortStrategy,
+    /// `mark`, the Linux and Android `SO_MARK`; zero sets nothing.
+    pub mark: i32,
+    /// `tcpFastOpen` as Xray-core stores it: zero when absent or null, 256
+    /// for `true`, -1 for `false`, otherwise the number truncated and clamped
+    /// to `i32`.
+    pub tcp_fast_open: i32,
+    /// `tproxy`, which on an outbound sets Linux `IP_TRANSPARENT`.
+    pub tproxy: TproxyMode,
+    /// `tcpKeepAliveIdle` and `tcpKeepAliveInterval` in seconds. Zero keeps
+    /// Xray-core's 45-second default, a negative value turns keepalive off.
+    pub tcp_keep_alive_idle: i32,
+    pub tcp_keep_alive_interval: i32,
+    /// `tcpCongestion`, the Linux congestion control algorithm; empty sets
+    /// nothing.
+    pub tcp_congestion: String,
+    /// `tcpWindowClamp`, `tcpMaxSeg` and `tcpUserTimeout` (milliseconds),
+    /// set on Linux when positive.
+    pub tcp_window_clamp: i32,
+    pub tcp_max_seg: i32,
+    pub tcp_user_timeout: i32,
+    /// `interface`, the device every socket is bound to; empty binds none.
+    pub interface: String,
+    /// `tcpMptcp`: Multipath TCP on Linux, falling back to TCP.
+    pub tcp_mptcp: bool,
+    /// `penetrate`: an XHTTP `downloadSettings` takes these options instead
+    /// of its own.
+    pub penetrate: bool,
+    /// `customSockopt`, applied in order after the options above.
+    pub custom: Vec<CustomSocketOption>,
+}
+
+/// Xray-core's `AddressPortStrategy`: which records of a domain server's
+/// name the system resolver is asked for, and what of the first usable one
+/// replaces the server's address and port.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AddressPortStrategy {
+    #[default]
+    None,
+    SrvPortOnly,
+    SrvAddressOnly,
+    SrvPortAndAddress,
+    TxtPortOnly,
+    TxtAddressOnly,
+    TxtPortAndAddress,
+}
+
+/// The records an [`AddressPortStrategy`] looks up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddressPortRecords {
+    Srv,
+    Txt,
+}
+
+impl AddressPortStrategy {
+    /// The records looked up, or `None` for no lookup.
+    pub fn records(self) -> Option<AddressPortRecords> {
+        match self {
+            Self::None => None,
+            Self::SrvPortOnly | Self::SrvAddressOnly | Self::SrvPortAndAddress => {
+                Some(AddressPortRecords::Srv)
+            }
+            Self::TxtPortOnly | Self::TxtAddressOnly | Self::TxtPortAndAddress => {
+                Some(AddressPortRecords::Txt)
+            }
+        }
+    }
+
+    /// Whether the record's port replaces the server's.
+    pub fn replaces_port(self) -> bool {
+        matches!(
+            self,
+            Self::SrvPortOnly
+                | Self::SrvPortAndAddress
+                | Self::TxtPortOnly
+                | Self::TxtPortAndAddress
+        )
+    }
+
+    /// Whether the record's address replaces the server's.
+    pub fn replaces_address(self) -> bool {
+        matches!(
+            self,
+            Self::SrvAddressOnly
+                | Self::SrvPortAndAddress
+                | Self::TxtAddressOnly
+                | Self::TxtPortAndAddress
+        )
+    }
+}
+
+/// Xray-core's `SocketConfig_TProxyMode`. Any other `tproxy` text is off.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TproxyMode {
+    #[default]
+    Off,
+    Tproxy,
+    Redirect,
+}
+
+/// One `sockopt.customSockopt` entry, kept as the text Xray-core keeps and
+/// reads only when a socket is set up.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CustomSocketOption {
+    /// The `runtime.GOOS` the entry applies to; empty applies everywhere.
+    pub system: String,
+    /// A prefix of `tcp4`, `tcp6`, `udp4` or `udp6`; empty matches all.
+    pub network: String,
+    pub level: String,
+    pub opt: String,
+    pub value: String,
+    /// `int` or `str`; anything else fails when the option is applied.
+    pub kind: String,
 }
 
 /// Xray-core's `internet.DomainStrategy`: whether a dial resolves a domain

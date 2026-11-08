@@ -64,6 +64,9 @@ impl SocksOutbound {
     pub fn server(&self) -> &Target {
         &self.0.carrier.server
     }
+    pub(super) fn carrier(&self) -> &super::carrier::StreamCarrier {
+        &self.0.carrier
+    }
     pub fn level(&self) -> u32 {
         self.0.level
     }
@@ -76,8 +79,8 @@ impl SocksOutbound {
     ) -> Result<BoxedTransportStream, CoreError> {
         // Validate before DNS or dialing, including programmatically built targets.
         validate_connect_target(target)?;
-        let candidates = resolve_server_candidates(self.server(), resolver).await?;
-        let download = self.0.carrier.resolve_download(resolver).await?;
+        let candidates = self.0.carrier.resolve_server(resolver, dialer).await?;
+        let download = self.0.carrier.resolve_download(resolver, dialer).await?;
         self.open_resolved(target, &candidates, &download, dialer)
             .await
     }
@@ -127,10 +130,10 @@ impl SocksOutbound {
         // DNS lookups already canonicalize mapped IPv6, but literal endpoints
         // bypass DNS. Use the same normalization before selecting a UDP family.
         let candidates = xray_transport::DnsLookup::new(
-            resolve_server_candidates(self.server(), resolver).await?,
+            self.0.carrier.resolve_server(resolver, dialer).await?,
             None,
         );
-        let download = self.0.carrier.resolve_download(resolver).await?;
+        let download = self.0.carrier.resolve_download(resolver, dialer).await?;
         let mut families = Vec::with_capacity(2);
         for candidate in candidates.socket_addrs() {
             if !families.contains(&candidate.is_ipv4()) {
@@ -138,6 +141,8 @@ impl SocksOutbound {
             }
         }
 
+        // The relay socket takes this outbound's socket options too.
+        let relay_dialer = socket_options::dialer(dialer, self.0.carrier.socket_options.as_ref());
         let mut last_error = None;
         for ipv4 in families {
             let family: Vec<SocketAddr> = candidates
@@ -147,7 +152,7 @@ impl SocksOutbound {
                 .filter(|candidate| candidate.is_ipv4() == ipv4)
                 .collect();
             // A host without this family (e.g. no IPv6) falls through to the next one.
-            let socket = match bind_relay_socket(ipv4, dialer) {
+            let socket = match bind_relay_socket(ipv4, &relay_dialer) {
                 Ok(socket) => socket,
                 Err(error) => {
                     last_error = Some(error.into());
@@ -210,12 +215,8 @@ impl SocksOutbound {
         if matches!(carrier.transport_layer, TransportLayer::Raw)
             && !matches!(carrier.transport, ConnectorConfig::Reality(_))
         {
-            let fragmented_dialer = carrier
-                .fragment
-                .as_ref()
-                .map(|fragment| dialer.clone().with_tcp_fragment(fragment.clone()));
-            let dialer = fragmented_dialer.as_ref().unwrap_or(dialer);
-            let (control, peer) = dialer
+            let (control, peer) = carrier
+                .dialer(dialer)
                 .connect_raw_stream_with_peer(
                     &carrier.transport,
                     self.server(),

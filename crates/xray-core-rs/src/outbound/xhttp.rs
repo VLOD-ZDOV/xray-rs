@@ -7,6 +7,48 @@ pub(super) struct XhttpDownloadOutbound {
     pub(super) connector: ConnectorConfig,
     pub(super) transport: XhttpTransport,
     pub(super) happy_eyeballs: Option<HappyEyeballsConfig>,
+    pub(super) socket_options: DownloadSocketOptions,
+    /// The `addressPortStrategy` of the `sockopt` the leg dials with.
+    pub(super) address_port: xray_config::AddressPortStrategy,
+}
+
+/// The `sockopt` the download leg dials with, as Xray-core's XHTTP picks it.
+#[derive(Debug)]
+pub(super) enum DownloadSocketOptions {
+    /// The outbound's `sockopt` sets `penetrate`: the download leg takes it
+    /// whole, chaining included.
+    Upload,
+    /// The download leg's own `sockopt`, which never chains; `None` keeps
+    /// the dialer's defaults.
+    Own(Option<Arc<xray_transport::SocketOptions>>),
+}
+
+impl XhttpDownloadOutbound {
+    /// The dialer for the download leg: `upload`, the upload leg's own, or
+    /// `base`, the dialer the outbound was given, without its chain and with
+    /// the download leg's options.
+    pub(super) fn dialer<'a>(
+        &self,
+        base: &'a TransportDialer,
+        upload: &'a TransportDialer,
+    ) -> std::borrow::Cow<'a, TransportDialer> {
+        match &self.socket_options {
+            DownloadSocketOptions::Upload => std::borrow::Cow::Borrowed(upload),
+            DownloadSocketOptions::Own(options) => {
+                let base = if base.carries_tcp_through_outbound() {
+                    std::borrow::Cow::Owned(base.clone().without_resolved_tcp_connector())
+                } else {
+                    std::borrow::Cow::Borrowed(base)
+                };
+                match options {
+                    Some(options) => std::borrow::Cow::Owned(
+                        base.into_owned().with_socket_options(Arc::clone(options)),
+                    ),
+                    None => base,
+                }
+            }
+        }
+    }
 }
 
 pub(super) fn build_xhttp_download(
@@ -51,6 +93,10 @@ pub(super) fn build_xhttp_download(
             "downloadSettings cannot disable TLS authentication",
         ));
     }
+    let penetrate = stream
+        .socket_options
+        .as_ref()
+        .is_some_and(|options| options.penetrate);
     let addr = match &download.address {
         TargetAddr::Ip(ip) => RoutingTargetAddr::Ip(*ip),
         TargetAddr::Domain(domain) if !domain.is_empty() => {
@@ -71,8 +117,19 @@ pub(super) fn build_xhttp_download(
             &download.address,
             download.stream.quic_params.as_ref(),
             download.stream.udp_noise.as_ref(),
+            download.stream.udp_header_custom.as_ref(),
         )?,
         happy_eyeballs: happy_eyeballs_config(&download.stream),
+        socket_options: if penetrate {
+            DownloadSocketOptions::Upload
+        } else {
+            DownloadSocketOptions::Own(socket_options::compile(&download.stream))
+        },
+        address_port: carrier::address_port_strategy(if penetrate {
+            stream
+        } else {
+            &download.stream
+        }),
     }))
 }
 
@@ -82,6 +139,7 @@ pub(super) fn build_xhttp_transport(
     destination: &TargetAddr,
     quic_params: Option<&QuicParamsSettings>,
     noise: Option<&xray_config::UdpNoiseSettings>,
+    header_custom: Option<&xray_config::HeaderCustomUdp>,
 ) -> Result<XhttpTransport, CoreError> {
     let http_version = xhttp_http_version(security)?;
     let endpoint = xhttp_endpoint(settings, security, destination)?;
@@ -98,7 +156,13 @@ pub(super) fn build_xhttp_transport(
     if noise.is_some() && http_version != XhttpHttpVersion::Http3 {
         return Err(invalid_xhttp_configuration("UDP noise requires XHTTP H3"));
     }
+    if header_custom.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "a header-custom UDP mask requires XHTTP H3",
+        ));
+    }
     h3_quic.udp_noise = noise.map(udp_noise_config).transpose()?;
+    h3_quic.udp_header_custom = header_custom.map(super::carrier::quic_header_custom);
     XhttpTransport::new_with_h3_quic(config, endpoint, http_version, xmux, h3_quic)
         .map_err(invalid_xhttp_configuration)
 }

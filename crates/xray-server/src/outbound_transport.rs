@@ -125,6 +125,13 @@ impl xray_transport::SocketProtector for OutboundProtector {
         Ok(())
     }
 
+    fn protect_fd(&self, socket: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
+        if let Some(inner) = &self.inner {
+            inner.protect_fd(socket)?;
+        }
+        Ok(())
+    }
+
     fn apply_tcp_socket(&self, socket: &tokio::net::TcpSocket) -> io::Result<()> {
         if let Some(st) = &self.send_through {
             if let Some(ip) = st.resolve_ip() {
@@ -519,6 +526,7 @@ impl ServerConnector {
                         happy_eyeballs: None,
                     },
                     &down.transport,
+                    &dialer,
                     XhttpConnectTarget {
                         connector: &down.connector,
                         target: &down_target,

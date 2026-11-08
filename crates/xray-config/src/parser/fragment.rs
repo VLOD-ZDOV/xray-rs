@@ -2,40 +2,6 @@ use super::*;
 use crate::{FragmentRange, TcpFragmentSettings};
 
 impl Parser<'_> {
-    pub(super) fn parse_tcp_fragment_mask(
-        &mut self,
-        stream: Option<&Value>,
-        index: usize,
-    ) -> Option<TcpFragmentSettings> {
-        let raw = stream?.get("finalmask")?.get("tcp")?;
-        if raw.is_null() {
-            return None;
-        }
-        let path = format!("$.outbounds[{index}].streamSettings.finalmask.tcp");
-        let Some(masks) = raw.as_array() else {
-            self.error(path, "finalmask.tcp must be an array or null");
-            return None;
-        };
-        if masks.is_empty() {
-            return None;
-        }
-        if masks.len() != 1
-            || !masks[0]
-                .get("type")
-                .and_then(Value::as_str)
-                .is_some_and(|v| v.eq_ignore_ascii_case("fragment"))
-        {
-            self.error(path, "only one TCP fragment mask is supported");
-            return None;
-        }
-        self.reject_unknown_fields(&masks[0], &format!("{path}[0]"), &surface::TCP_MASK_ENTRY);
-        self.parse_tcp_fragment(
-            masks[0].get("settings").unwrap_or(&Value::Null),
-            &format!("{path}[0].settings"),
-            false,
-        )
-    }
-
     pub(super) fn parse_tcp_fragment(
         &mut self,
         raw: &Value,
@@ -242,6 +208,18 @@ impl Parser<'_> {
             let fragment = target.stream.tcp_fragment.clone();
             outbounds[index].stream.tcp_fragment = fragment;
             outbounds[index].proxy_settings = None;
+            // Xray-core's sockets here are the handler's, which sets no
+            // socket option, so the caller's own socket options never reach
+            // them; what its dial reads stays.
+            if let Some(options) = outbounds[index].stream.socket_options.take() {
+                outbounds[index].stream.socket_options = Some(SocketOptions {
+                    happy_eyeballs: options.happy_eyeballs,
+                    domain_strategy: options.domain_strategy,
+                    address_port_strategy: options.address_port_strategy,
+                    penetrate: options.penetrate,
+                    ..SocketOptions::default()
+                });
+            }
         }
     }
 

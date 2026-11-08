@@ -1,5 +1,6 @@
 //! Shared endpoint, authenticated connector and stream transport compilation.
 use super::*;
+use std::borrow::Cow;
 use xray_transport::stream::XhttpConnectTarget;
 
 #[derive(Clone, Copy)]
@@ -24,6 +25,14 @@ pub(super) struct StreamCarrier {
     pub(super) download: Option<XhttpDownloadOutbound>,
     pub(super) happy_eyeballs: Option<HappyEyeballsConfig>,
     pub(super) fragment: Option<Arc<xray_transport::TcpFragmentConfig>>,
+    /// The `header-custom` TCP mask, run on every TCP carrier it opens.
+    pub(super) header_custom: Option<Arc<xray_transport::header_custom::HeaderCustomTcpConfig>>,
+    /// The `sudoku` TCP mask, outermost on every TCP carrier it opens.
+    pub(super) sudoku: Option<Arc<xray_transport::sudoku::SudokuConfig>>,
+    /// `sockopt`, for every socket the carrier opens.
+    pub(super) socket_options: Option<Arc<xray_transport::SocketOptions>>,
+    /// `sockopt.addressPortStrategy`, for the server's address and port.
+    pub(super) address_port: xray_config::AddressPortStrategy,
 }
 
 impl StreamCarrier {
@@ -39,11 +48,26 @@ impl StreamCarrier {
         }
         super::validate_udp_noise(stream)?;
         let fragment = fragment_config(stream)?;
+        let header_custom = header_custom_config(stream.tcp_header_custom.as_ref());
+        let sudoku = stream
+            .tcp_sudoku
+            .as_ref()
+            .map(|mask| Arc::new(sudoku_config(mask)));
         let transport = build_connector(&stream.security, server);
         let transport_layer = build_transport_layer(stream, server, port, &transport, paths)?;
+        // Only TCP carriers take TCP masks; a split XHTTP download keeps its
+        // own dialer, which does not run the handshake.
+        if (header_custom.is_some() || sudoku.is_some())
+            && (matches!(&transport_layer, TransportLayer::Xhttp(xhttp) if xhttp.http_version() == XhttpHttpVersion::Http3)
+                || matches!(transport_layer, TransportLayer::Kcp(_))
+                || matches!(&stream.transport, StreamTransport::Xhttp(xhttp) if xhttp.download.is_some()))
+        {
+            return Err(CoreError::UnsupportedOutboundNetwork);
+        }
         if fragment.is_some()
             && (matches!(transport, ConnectorConfig::Tcp)
                 || matches!(&transport_layer, TransportLayer::Xhttp(xhttp) if xhttp.http_version() == XhttpHttpVersion::Http3)
+                || matches!(transport_layer, TransportLayer::Kcp(_))
                 || matches!(&stream.transport, StreamTransport::Xhttp(xhttp) if xhttp.download.is_some()))
         {
             return Err(CoreError::UnsupportedOutboundNetwork);
@@ -56,17 +80,53 @@ impl StreamCarrier {
             server: Target::new(addr, port, RoutingNetwork::Tcp),
             transport_layer,
             fragment,
+            header_custom,
+            sudoku,
             transport,
             download: build_xhttp_download(stream, unencrypted_payload)?,
             happy_eyeballs: happy_eyeballs_config(stream),
+            socket_options: socket_options::compile(stream),
+            address_port: address_port_strategy(stream),
         })
     }
+
+    /// `dialer` with this carrier's socket options and fragment mask.
+    pub(super) fn dialer<'a>(&self, dialer: &'a TransportDialer) -> Cow<'a, TransportDialer> {
+        let dialer = socket_options::dialer(dialer, self.socket_options.as_ref());
+        let dialer = match &self.fragment {
+            Some(fragment) => Cow::Owned(dialer.into_owned().with_tcp_fragment(fragment.clone())),
+            None => dialer,
+        };
+        let dialer = match &self.header_custom {
+            Some(header) => Cow::Owned(dialer.into_owned().with_tcp_header_custom(header.clone())),
+            None => dialer,
+        };
+        match &self.sudoku {
+            Some(sudoku) => Cow::Owned(dialer.into_owned().with_tcp_sudoku(sudoku.clone())),
+            None => dialer,
+        }
+    }
+    /// The server's candidates, after its `addressPortStrategy`.
+    pub(super) fn resolve_server<'a>(
+        &'a self,
+        resolver: &'a dyn DnsResolver,
+        dialer: &'a TransportDialer,
+    ) -> impl Future<Output = Result<Vec<SocketAddr>, CoreError>> + 'a {
+        address_port::resolve_server(&self.server, self.address_port, resolver, dialer)
+    }
+
+    /// The XHTTP download server's candidates, after its leg's
+    /// `addressPortStrategy`.
     pub(super) async fn resolve_download(
         &self,
         resolver: &dyn DnsResolver,
+        dialer: &TransportDialer,
     ) -> Result<Vec<SocketAddr>, CoreError> {
         match &self.download {
-            Some(down) => resolve_server_candidates(&down.server, resolver).await,
+            Some(down) => {
+                address_port::resolve_server(&down.server, down.address_port, resolver, dialer)
+                    .await
+            }
             None => Ok(Vec::new()),
         }
     }
@@ -77,17 +137,16 @@ impl StreamCarrier {
         download_candidates: &[SocketAddr],
         dialer: &TransportDialer,
     ) -> Result<BoxedTransportStream, CoreError> {
-        let fragmented_dialer = self
-            .fragment
-            .as_ref()
-            .map(|fragment| dialer.clone().with_tcp_fragment(fragment.clone()));
-        let dialer = fragmented_dialer.as_ref().unwrap_or(dialer);
+        let base = dialer;
+        let dialer = self.dialer(base);
+        let dialer = dialer.as_ref();
         if let Some(down) = &self.download {
             let TransportLayer::Xhttp(up) = &self.transport_layer else {
                 return Err(invalid_xhttp_configuration(
                     "split download requires XHTTP upload",
                 ));
             };
+            let down_dialer = down.dialer(base, dialer);
             return up
                 .open_split_stream(
                     dialer,
@@ -98,6 +157,7 @@ impl StreamCarrier {
                         happy_eyeballs: self.happy_eyeballs.as_ref(),
                     },
                     &down.transport,
+                    &down_dialer,
                     XhttpConnectTarget {
                         connector: &down.connector,
                         target: &down.server,
@@ -118,6 +178,15 @@ impl StreamCarrier {
             )
             .await?)
     }
+}
+
+/// `stream`'s `sockopt.addressPortStrategy`.
+pub(super) fn address_port_strategy(stream: &StreamSettings) -> xray_config::AddressPortStrategy {
+    stream
+        .socket_options
+        .as_ref()
+        .map(|options| options.address_port_strategy)
+        .unwrap_or_default()
 }
 
 pub(super) fn build_connector(
@@ -222,7 +291,65 @@ fn build_transport_layer(
             server,
             stream.quic_params.as_ref(),
             stream.udp_noise.as_ref(),
+            stream.udp_header_custom.as_ref(),
         )?),
+        StreamTransport::Kcp(kcp) => TransportLayer::Kcp(Arc::new(kcp_config(kcp, stream)?)),
+    })
+}
+
+/// mKCP's settings and masks, with the stream's noise and custom sequences.
+fn kcp_config(
+    kcp: &xray_config::KcpSettings,
+    stream: &StreamSettings,
+) -> Result<xray_transport::kcp::KcpConfig, CoreError> {
+    use xray_config::{KcpHeader, KcpMask};
+    use xray_transport::kcp::{KcpHeader as Header, KcpMask as Mask};
+    let masks = kcp
+        .masks
+        .iter()
+        .map(|mask| {
+            Ok(match mask {
+                KcpMask::Original => Mask::Original,
+                KcpMask::Aes128Gcm(password) => Mask::Aes128Gcm(password.clone()),
+                KcpMask::Noise => Mask::Noise,
+                KcpMask::HeaderCustom => {
+                    let header = stream
+                        .udp_header_custom
+                        .as_ref()
+                        .ok_or(CoreError::UnsupportedOutboundNetwork)?;
+                    Mask::HeaderCustom(udp_header_config(header))
+                }
+                KcpMask::Sudoku => {
+                    let sudoku = stream
+                        .udp_sudoku
+                        .as_ref()
+                        .ok_or(CoreError::UnsupportedOutboundNetwork)?;
+                    Mask::Sudoku(Arc::new(sudoku_config(sudoku)))
+                }
+                KcpMask::Header(header) => Mask::Header(match header {
+                    KcpHeader::Dns(domain) => Header::Dns(domain.clone()),
+                    KcpHeader::Dtls => Header::Dtls,
+                    KcpHeader::Srtp => Header::Srtp,
+                    KcpHeader::Utp => Header::Utp,
+                    KcpHeader::Wechat => Header::Wechat,
+                    KcpHeader::Wireguard => Header::Wireguard,
+                }),
+            })
+        })
+        .collect::<Result<_, CoreError>>()?;
+    Ok(xray_transport::kcp::KcpConfig {
+        mtu: kcp.mtu,
+        tti: kcp.tti,
+        uplink_capacity: kcp.uplink_capacity,
+        downlink_capacity: kcp.downlink_capacity,
+        cwnd_multiplier: kcp.cwnd_multiplier,
+        max_sending_window: kcp.max_sending_window,
+        masks,
+        noise: stream
+            .udp_noise
+            .as_ref()
+            .map(super::xhttp::udp_noise_config)
+            .transpose()?,
     })
 }
 
@@ -429,6 +556,101 @@ fn host_and_port(server: &TargetAddr, port: u16) -> String {
     }
 }
 
+/// The transport's form of a `header-custom` TCP mask.
+pub(super) fn header_custom_config(
+    header: Option<&xray_config::HeaderCustomTcp>,
+) -> Option<Arc<xray_transport::header_custom::HeaderCustomTcpConfig>> {
+    header.map(|header| {
+        Arc::new(xray_transport::header_custom::HeaderCustomTcpConfig {
+            clients: header
+                .clients
+                .iter()
+                .map(|items| custom_items(items))
+                .collect(),
+            servers: header
+                .servers
+                .iter()
+                .map(|items| custom_items(items))
+                .collect(),
+        })
+    })
+}
+
+/// The `sudoku` mask's settings, for either network.
+pub(super) fn sudoku_config(
+    mask: &xray_config::SudokuMask,
+) -> xray_transport::sudoku::SudokuConfig {
+    xray_transport::sudoku::SudokuConfig {
+        password: mask.password.to_string(),
+        ascii: mask.ascii.clone(),
+        custom_table: mask.custom_table.clone(),
+        custom_tables: mask.custom_tables.clone(),
+        padding_min: mask.padding_min,
+        padding_max: mask.padding_max,
+    }
+}
+
+/// A `header-custom` UDP mask's sequences.
+fn udp_header_config(
+    header: &xray_config::HeaderCustomUdp,
+) -> Arc<xray_transport::header_custom::HeaderCustomUdpConfig> {
+    Arc::new(xray_transport::header_custom::HeaderCustomUdpConfig {
+        standalone: header.standalone,
+        client: custom_items(&header.client),
+        server: custom_items(&header.server),
+    })
+}
+
+/// A QUIC carrier's `header-custom` UDP mask, at its place among the
+/// carrier's other masks.
+pub(super) fn quic_header_custom(
+    header: &xray_config::HeaderCustomUdp,
+) -> xray_transport::hysteria::HeaderCustomCarrier {
+    xray_transport::hysteria::HeaderCustomCarrier {
+        config: udp_header_config(header),
+        before_salamander: header.before_salamander,
+        before_noise: header.before_noise,
+    }
+}
+
+fn custom_items(
+    items: &[xray_config::HeaderCustomItem],
+) -> Vec<xray_transport::header_custom::CustomItem> {
+    use xray_transport::header_custom::{CustomArg, CustomExpr, CustomItem};
+    fn expr(source: &xray_config::HeaderCustomExpr) -> CustomExpr {
+        CustomExpr {
+            op: source.op.clone(),
+            args: source
+                .args
+                .iter()
+                .map(|arg| match arg {
+                    xray_config::HeaderCustomArg::Bytes(bytes) => CustomArg::Bytes(bytes.clone()),
+                    xray_config::HeaderCustomArg::U64(value) => CustomArg::U64(*value),
+                    xray_config::HeaderCustomArg::Reuse(name) => CustomArg::Reuse(name.clone()),
+                    xray_config::HeaderCustomArg::Metadata(name) => {
+                        CustomArg::Metadata(name.clone())
+                    }
+                    xray_config::HeaderCustomArg::Transform(inner) => {
+                        CustomArg::Transform(expr(inner))
+                    }
+                })
+                .collect(),
+        }
+    }
+    items
+        .iter()
+        .map(|item| CustomItem {
+            delay: item.delay,
+            rand: item.rand,
+            rand_range: (item.rand_range.0 as u8, item.rand_range.1 as u8),
+            packet: item.packet.clone(),
+            capture: item.capture.clone(),
+            reuse: item.reuse.clone(),
+            transform: item.transform.as_ref().map(expr),
+        })
+        .collect()
+}
+
 pub(super) fn fragment_config(
     stream: &StreamSettings,
 ) -> Result<Option<Arc<xray_transport::TcpFragmentConfig>>, CoreError> {
@@ -446,3 +668,6 @@ pub(super) fn fragment_config(
         })
         .transpose()
 }
+
+#[cfg(test)]
+mod tests;

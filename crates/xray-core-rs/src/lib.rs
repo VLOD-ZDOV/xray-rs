@@ -726,6 +726,19 @@ impl Core {
         transport_dialer: Arc<TransportDialer>,
         tun_runtime_options: TunRuntimeOptions,
     ) -> Result<Self, CoreError> {
+        // Every socket takes Xray-core's defaults, TCP keepalive among them,
+        // unless the dialer given sets options of its own; an outbound's
+        // `sockopt` replaces them for its sockets.
+        let transport_dialer = if transport_dialer.socket_options().is_some() {
+            transport_dialer
+        } else {
+            Arc::new(
+                transport_dialer
+                    .as_ref()
+                    .clone()
+                    .with_socket_options(Arc::new(xray_transport::SocketOptions::default())),
+            )
+        };
         dns.rules
             .route_probe
             .get_or_insert_with(|| transport_dialer.route_probe());
@@ -748,7 +761,9 @@ impl Core {
         ensure_effective_dns_tag(&mut config);
         for outbound in &config.outbounds {
             outbound::validate_udp_noise(&outbound.stream)?;
-            if outbound.stream.udp_noise.is_some()
+            if (outbound.stream.udp_noise.is_some()
+                || outbound.stream.udp_header_custom.is_some()
+                || outbound.stream.udp_sudoku.is_some())
                 && matches!(
                     outbound.settings,
                     xray_config::OutboundSettings::Freedom(_)
@@ -768,6 +783,10 @@ impl Core {
                         && outbound.stream.security == xray_config::StreamSecurity::None
                     || matches!(&outbound.stream.transport, xray_config::StreamTransport::Xhttp(xhttp) if xhttp.download.is_some() || matches!(&outbound.stream.security, xray_config::StreamSecurity::Tls(tls) if tls.alpn == ["h3"]))
                     || matches!(
+                        &outbound.stream.transport,
+                        xray_config::StreamTransport::Kcp(_)
+                    )
+                    || matches!(
                         outbound.settings,
                         xray_config::OutboundSettings::Dns(_)
                             | xray_config::OutboundSettings::Hysteria(_)
@@ -783,6 +802,22 @@ impl Core {
                     fragment.max_split.from..=fragment.max_split.to,
                 )
                 .map_err(|_| CoreError::UnsupportedOutboundNetwork)?;
+            }
+            // `header-custom` and `sudoku` run on the TCP carriers of the
+            // outbounds that proxy over a stream transport, not on direct or
+            // DNS dials.
+            if (outbound.stream.tcp_header_custom.is_some() || outbound.stream.tcp_sudoku.is_some())
+                && !matches!(
+                    outbound.settings,
+                    xray_config::OutboundSettings::Vless(_)
+                        | xray_config::OutboundSettings::Vmess(_)
+                        | xray_config::OutboundSettings::Trojan(_)
+                        | xray_config::OutboundSettings::Shadowsocks2022(_)
+                        | xray_config::OutboundSettings::Socks(_)
+                        | xray_config::OutboundSettings::Http(_)
+                )
+            {
+                return Err(CoreError::UnsupportedOutboundNetwork);
             }
             if matches!(
                 outbound.settings,
@@ -871,6 +906,17 @@ impl Core {
     }
 
     pub fn set_runtime_logger(&mut self, runtime_logger: RuntimeLogger) {
+        // A socket option that fails without failing its dial is logged, as
+        // Xray-core logs it.
+        let logger = runtime_logger.clone();
+        self.transport_dialer = Arc::new(
+            self.transport_dialer
+                .as_ref()
+                .clone()
+                .with_socket_options_report(Arc::new(move |error: &std::io::Error| {
+                    logger.debug(|| format!("failed to apply socket options: {error}"));
+                })),
+        );
         self.runtime_logger = runtime_logger;
     }
 
@@ -2679,5 +2725,39 @@ mod tests {
                 if source.kind() == io::ErrorKind::NotConnected
         ));
         assert_eq!(protector.calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// Every socket the core opens takes Xray-core's default options, TCP
+    /// keepalive among them, unless the dialer given sets its own.
+    #[test]
+    fn the_core_dials_with_xray_cores_default_socket_options() {
+        let raw = r#"{ "outbounds": [ { "tag": "direct", "protocol": "freedom" } ] }"#;
+        let core = Core::with_transport_dialer_and_tun_options(
+            parse_xray_json(raw).unwrap().config,
+            Arc::new(TransportDialer::system().unwrap()),
+            TunRuntimeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            core.transport_dialer
+                .socket_options()
+                .map(|options| options.as_ref()),
+            Some(&xray_transport::SocketOptions::default())
+        );
+        let own = Arc::new(xray_transport::SocketOptions {
+            mark: 3,
+            ..Default::default()
+        });
+        let core = Core::with_transport_dialer_and_tun_options(
+            parse_xray_json(raw).unwrap().config,
+            Arc::new(
+                TransportDialer::system()
+                    .unwrap()
+                    .with_socket_options(own.clone()),
+            ),
+            TunRuntimeOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(core.transport_dialer.socket_options(), Some(&own));
     }
 }

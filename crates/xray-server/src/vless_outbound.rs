@@ -683,6 +683,7 @@ impl VlessOutbound {
                         happy_eyeballs: happy_eyeballs.as_ref(),
                     },
                     &down.transport,
+                    &dialer,
                     XhttpConnectTarget {
                         connector: &down.connector,
                         target: &down_target,

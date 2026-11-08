@@ -2545,9 +2545,300 @@ fn rejects_non_object_sockopt_with_path() {
 
 #[test]
 fn rejects_unknown_sockopt_field_with_path() {
-    let raw = raw_with_sockopt(r#"{ "mark": 1 }"#);
+    let raw = raw_with_sockopt(r#"{ "tcpNoDelay": true }"#);
 
-    assert_parse_error_path(&raw, "$.outbounds[0].streamSettings.sockopt.mark");
+    assert_parse_error_path(&raw, "$.outbounds[0].streamSettings.sockopt.tcpNoDelay");
+}
+
+fn parsed_sockopt(sockopt: &str) -> xray_config::SocketOptions {
+    let parsed = parse_xray_json(&raw_with_sockopt(sockopt))
+        .unwrap_or_else(|error| panic!("{sockopt}: {error:?}"));
+    parsed.config.outbounds[0]
+        .stream
+        .socket_options
+        .clone()
+        .expect("sockopt kept")
+}
+
+#[test]
+fn accepts_every_xray_core_sockopt_field() {
+    let options = parsed_sockopt(
+        r#"{
+            "mark": -2, "tcpFastOpen": 7, "tproxy": "TProxy", "acceptProxyProtocol": true,
+            "domainStrategy": "UseIPv4", "dialerProxy": null, "tcpKeepAliveInterval": 30,
+            "tcpKeepAliveIdle": -1, "tcpCongestion": "bbr", "tcpWindowClamp": 600,
+            "tcpMaxSeg": 1200, "penetrate": true, "tcpUserTimeout": 5000, "v6only": true,
+            "interface": "eth0", "tcpMptcp": true, "addressPortStrategy": "None",
+            "happyEyeballs": null, "trustedXForwardedFor": ["10.0.0.1", null],
+            "customSockopt": [
+                {"system": "linux", "network": "tcp", "level": "6", "opt": "13", "value": "reno", "type": "str"},
+                {"opt": "", "type": null}
+            ]
+        }"#,
+    );
+    assert_eq!(
+        options,
+        xray_config::SocketOptions {
+            happy_eyeballs: None,
+            domain_strategy: xray_config::DomainStrategy::UseIpv4,
+            address_port_strategy: xray_config::AddressPortStrategy::None,
+            mark: -2,
+            tcp_fast_open: 7,
+            tproxy: xray_config::TproxyMode::Tproxy,
+            tcp_keep_alive_idle: -1,
+            tcp_keep_alive_interval: 30,
+            tcp_congestion: "bbr".to_owned(),
+            tcp_window_clamp: 600,
+            tcp_max_seg: 1200,
+            tcp_user_timeout: 5000,
+            interface: "eth0".to_owned(),
+            tcp_mptcp: true,
+            penetrate: true,
+            custom: vec![
+                xray_config::CustomSocketOption {
+                    system: "linux".to_owned(),
+                    network: "tcp".to_owned(),
+                    level: "6".to_owned(),
+                    opt: "13".to_owned(),
+                    value: "reno".to_owned(),
+                    kind: "str".to_owned(),
+                },
+                xray_config::CustomSocketOption::default(),
+            ],
+        }
+    );
+}
+
+#[test]
+fn sockopt_reads_null_and_absent_values_as_go_zero_values() {
+    let options = parsed_sockopt(
+        r#"{
+            "mark": null, "tcpFastOpen": null, "tproxy": null, "tcpKeepAliveIdle": null,
+            "tcpMptcp": null, "penetrate": null, "v6only": null, "interface": null,
+            "customSockopt": null, "trustedXForwardedFor": null, "addressPortStrategy": ""
+        }"#,
+    );
+    assert_eq!(options, xray_config::SocketOptions::default());
+}
+
+#[test]
+fn sockopt_tcp_fast_open_reads_booleans_and_numbers_as_xray_core_does() {
+    for (value, expected) in [
+        ("true", 256),
+        ("false", -1),
+        ("0", 0),
+        ("5", 5),
+        ("1.9", 1),
+        ("-1.9", -1),
+        ("-5", -5),
+        ("1e10", i32::MAX),
+        ("-1e10", i32::MIN),
+    ] {
+        let options = parsed_sockopt(&format!(r#"{{ "tcpFastOpen": {value} }}"#));
+        assert_eq!(options.tcp_fast_open, expected, "{value}");
+    }
+    for value in [r#""true""#, "[]", "{}"] {
+        let raw = raw_with_sockopt(&format!(r#"{{ "tcpFastOpen": {value} }}"#));
+        assert_parse_error_path(&raw, "$.outbounds[0].streamSettings.sockopt.tcpFastOpen");
+    }
+}
+
+#[test]
+fn sockopt_tproxy_reads_any_other_text_as_off() {
+    for (value, expected) in [
+        ("tproxy", xray_config::TproxyMode::Tproxy),
+        ("REDIRECT", xray_config::TproxyMode::Redirect),
+        ("off", xray_config::TproxyMode::Off),
+        ("anything", xray_config::TproxyMode::Off),
+    ] {
+        let options = parsed_sockopt(&format!(r#"{{ "tproxy": "{value}" }}"#));
+        assert_eq!(options.tproxy, expected, "{value}");
+    }
+}
+
+#[test]
+fn sockopt_refuses_values_go_cannot_decode_with_path() {
+    for (field, value) in [
+        ("mark", r#""1""#),
+        ("mark", "1.5"),
+        ("mark", "2147483648"),
+        ("tcpKeepAliveIdle", "-2147483649"),
+        ("tcpKeepAliveInterval", "true"),
+        ("tcpWindowClamp", "1e3"),
+        ("tcpMaxSeg", "[]"),
+        ("tcpUserTimeout", r#""5""#),
+        ("tcpCongestion", "1"),
+        ("interface", "false"),
+        ("tproxy", "1"),
+        ("tcpMptcp", "1"),
+        ("penetrate", r#""true""#),
+        ("acceptProxyProtocol", "0"),
+        ("v6only", "1"),
+        ("trustedXForwardedFor", r#""10.0.0.1""#),
+        ("customSockopt", "{}"),
+        ("addressPortStrategy", "1"),
+        ("addressPortStrategy", r#""bogus""#),
+    ] {
+        let raw = raw_with_sockopt(&format!(r#"{{ "{field}": {value} }}"#));
+        let error = parse_xray_json(&raw).unwrap_err();
+        let path = format!("$.outbounds[0].streamSettings.sockopt.{field}");
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path.as_deref() == Some(path.as_str())),
+            "{field}: {value}: {:?}",
+            error.diagnostics
+        );
+    }
+}
+
+/// `addressPortStrategy` takes Xray-core's six names, ignoring case, on
+/// every outbound but freedom, which Xray-core refuses it on. A chained
+/// outbound refuses it here, as the address it looks up would have to go to
+/// the proxy; an inlined fragment handler is no chain and keeps it.
+#[test]
+fn address_port_strategy_is_read_as_xray_core_reads_it() {
+    use xray_config::AddressPortStrategy;
+    let vless = |sockopt: serde_json::Value| {
+        serde_json::json!({"outbounds": [{"tag": "proxy", "protocol": "vless",
+            "settings": {"vnext": [{"address": "_xray._tcp.corp.example", "port": 443,
+                "users": [{"id": "27848739-7e62-4138-9fd3-098a63964b6b", "encryption": "none"}]}]},
+            "streamSettings": {"sockopt": sockopt}}]})
+    };
+    let strategy = |raw: serde_json::Value| {
+        parse_xray_json(&raw.to_string()).map(|parsed| {
+            parsed.config.outbounds[0]
+                .stream
+                .socket_options
+                .as_ref()
+                .unwrap()
+                .address_port_strategy
+        })
+    };
+    for (name, expected) in [
+        ("none", AddressPortStrategy::None),
+        ("", AddressPortStrategy::None),
+        ("SrvPortOnly", AddressPortStrategy::SrvPortOnly),
+        ("srvaddressonly", AddressPortStrategy::SrvAddressOnly),
+        ("SRVPORTANDADDRESS", AddressPortStrategy::SrvPortAndAddress),
+        ("TxtPortOnly", AddressPortStrategy::TxtPortOnly),
+        ("txtAddressOnly", AddressPortStrategy::TxtAddressOnly),
+        ("txtportandaddress", AddressPortStrategy::TxtPortAndAddress),
+    ] {
+        let raw = vless(serde_json::json!({ "addressPortStrategy": name }));
+        assert_eq!(strategy(raw).unwrap(), expected, "{name}");
+    }
+    assert_eq!(
+        strategy(vless(serde_json::json!({ "addressPortStrategy": null }))).unwrap(),
+        AddressPortStrategy::None
+    );
+
+    let path = "$.outbounds[0].streamSettings.sockopt.addressPortStrategy";
+    let refused = |raw: serde_json::Value, message: &str| {
+        let error = parse_xray_json(&raw.to_string()).unwrap_err();
+        assert!(
+            error.diagnostics.iter().any(|diagnostic| {
+                diagnostic.path.as_deref() == Some(path) && diagnostic.message.contains(message)
+            }),
+            "{raw}: {:?}",
+            error.diagnostics
+        );
+    };
+    refused(
+        serde_json::json!({"outbounds": [{"protocol": "freedom",
+            "streamSettings": {"sockopt": {"addressPortStrategy": "SrvPortOnly"}}}]}),
+        "freedom outbound does not support \"sockopt.addressPortStrategy\"",
+    );
+    let mut chained =
+        vless(serde_json::json!({"addressPortStrategy": "TxtPortOnly", "dialerProxy": "next"}));
+    chained["outbounds"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!(
+        {"tag": "next", "protocol": "socks", "settings": {"address": "127.0.0.1", "port": 1080}}));
+    refused(
+        chained,
+        "addressPortStrategy is unsupported on a chained outbound",
+    );
+
+    // An inlined fragment handler leaves no chain, and the strategy stays.
+    let mut fragmented =
+        vless(serde_json::json!({"addressPortStrategy": "TxtPortOnly", "dialerProxy": "fragment"}));
+    fragmented["outbounds"][0]["streamSettings"]["security"] = "tls".into();
+    fragmented["outbounds"][0]["streamSettings"]["tlsSettings"] =
+        serde_json::json!({"serverName": "example.com"});
+    fragmented["outbounds"].as_array_mut().unwrap().push(serde_json::json!(
+        {"tag": "fragment", "protocol": "freedom",
+         "settings": {"fragment": {"packets": "tlshello", "length": "100-200", "interval": "1-2"}}}));
+    let parsed =
+        parse_xray_json(&fragmented.to_string()).unwrap_or_else(|error| panic!("{error:?}"));
+    let outbound = &parsed.config.outbounds[0];
+    assert!(outbound.proxy_settings.is_none());
+    assert_eq!(
+        outbound
+            .stream
+            .socket_options
+            .as_ref()
+            .unwrap()
+            .address_port_strategy,
+        AddressPortStrategy::TxtPortOnly
+    );
+
+    // An XHTTP download leg's own sockopt takes one too.
+    let download = serde_json::json!({"outbounds": [{"protocol": "vless",
+        "settings": {"vnext": [{"address": "up.example", "port": 443,
+            "users": [{"id": "27848739-7e62-4138-9fd3-098a63964b6b", "encryption": "none"}]}]},
+        "streamSettings": {"network": "xhttp", "xhttpSettings": {"mode": "packet-up", "path": "/x",
+            "downloadSettings": {"address": "_down._tcp.corp.example", "port": 443, "network": "xhttp",
+                "xhttpSettings": {"path": "/x"}, "sockopt": {"addressPortStrategy": "SrvPortAndAddress"}}}}}]});
+    let parsed = parse_xray_json(&download.to_string()).unwrap_or_else(|error| panic!("{error:?}"));
+    let xray_config::StreamTransport::Xhttp(xhttp) = &parsed.config.outbounds[0].stream.transport
+    else {
+        panic!("xhttp");
+    };
+    assert_eq!(
+        xhttp
+            .download
+            .as_ref()
+            .unwrap()
+            .stream
+            .socket_options
+            .as_ref()
+            .unwrap()
+            .address_port_strategy,
+        AddressPortStrategy::SrvPortAndAddress
+    );
+}
+
+#[test]
+fn sockopt_refuses_custom_entries_go_cannot_decode_with_path() {
+    for (entries, path) in [
+        ("[null]", "customSockopt[0]"),
+        ("[1]", "customSockopt[0]"),
+        (r#"[{"opt": 13}]"#, "customSockopt[0].opt"),
+        (r#"[{}, {"level": true}]"#, "customSockopt[1].level"),
+        (r#"[{"opt": "1", "kind": "int"}]"#, "customSockopt[0].kind"),
+        (r#"[{"opt": "1"}, "x"]"#, "customSockopt[1]"),
+        (r#"{"opt": "1"}"#, "customSockopt"),
+    ] {
+        let raw = raw_with_sockopt(&format!(r#"{{ "customSockopt": {entries} }}"#));
+        let error = parse_xray_json(&raw).unwrap_err();
+        let path = format!("$.outbounds[0].streamSettings.sockopt.{path}");
+        assert!(
+            error
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.path.as_deref() == Some(path.as_str())),
+            "{entries}: {:?}",
+            error.diagnostics
+        );
+    }
+    let raw = raw_with_sockopt(r#"{ "trustedXForwardedFor": ["ok", 1] }"#);
+    assert_parse_error_path(
+        &raw,
+        "$.outbounds[0].streamSettings.sockopt.trustedXForwardedFor[1]",
+    );
 }
 
 #[test]
@@ -4511,10 +4802,10 @@ fn rejects_udp_stream_network_with_path() {
 
 #[test]
 fn rejects_other_stream_network_with_path() {
-    // The example moved off `grpc` when this crate learned to parse it; `kcp`
-    // is still a network xray-core has and xray-rust does not.
+    // The example moved off `grpc`, then `kcp`, as this crate learned to parse
+    // them; `masque` is still a network xray-core has and xray-rust does not.
     let raw = vless_raw_with_network(
-        "kcp",
+        "masque",
         r#""users": [{ "id": "00010203-0405-0607-0809-0a0b0c0d0e0f" }]"#,
         "",
         443,
@@ -5838,10 +6129,7 @@ fn finalmask_empty_masks_are_accepted_but_nonempty_masks_fail_closed() {
                 r#""network": "xhttp", "security": "none",
                    "finalmask": {{"{mask}": [{{"type": "example"}}]}}"#
             )),
-            &format!(
-                "$.outbounds[0].streamSettings.finalmask.{mask}{}",
-                if mask == "udp" { "[0]" } else { "" }
-            ),
+            &format!("$.outbounds[0].streamSettings.finalmask.{mask}[0]"),
         );
     }
 }
@@ -6226,7 +6514,7 @@ fn removed_transports_say_they_were_removed() {
 
 #[test]
 fn transports_xray_still_has_but_we_do_not_say_so() {
-    for network in ["kcp", "mkcp"] {
+    for network in ["masque", "xdrive", "MASQUE"] {
         let error = parse_xray_json(&raw_with_stream_settings(&format!(
             r#""network": "{network}", "security": "none""#
         )))

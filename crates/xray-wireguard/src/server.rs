@@ -730,7 +730,7 @@ mod tests {
             wake,
         );
 
-        let mut buf = vec![0u8; 40];
+        let mut buf = [0u8; 40];
         let mut ip = Ipv4Packet::new_unchecked(&mut buf[..40]);
         ip.set_version(4);
         ip.set_header_len(20);

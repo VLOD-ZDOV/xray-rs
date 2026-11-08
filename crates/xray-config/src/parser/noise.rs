@@ -1,5 +1,5 @@
 use super::*;
-use crate::{FragmentRange, UdpNoiseItem, UdpNoiseSettings};
+use crate::{go_lowercase, FragmentRange, UdpNoiseItem, UdpNoiseSettings};
 use base64::Engine as _;
 
 impl Parser<'_> {
@@ -17,10 +17,12 @@ impl Parser<'_> {
         })?;
         let path = format!("$.outbounds[{index}].streamSettings.finalmask.udp[{i}].settings");
         // Xray applies UDP masks to any UDP dial; here the QUIC carriers hop.
-        if !is_quic || i != 0 {
+        // Xray reverses the list and dials only an outermost udphop, so any
+        // mask after it fails every dial with "incorrect index".
+        if !is_quic || i + 1 != masks.len() {
             self.error(
                 &path,
-                "udphop requires Hysteria or XHTTP with exact h3 ALPN and must be the first UDP mask",
+                "udphop requires Hysteria or XHTTP with exact h3 ALPN and must be the last UDP mask",
             );
         }
         let settings = mask.get("settings").filter(|s| s.is_object());
@@ -94,6 +96,7 @@ impl Parser<'_> {
     pub(super) fn parse_udp_noise(
         &mut self,
         stream: Option<&Value>,
+        network: StreamNetwork,
         index: usize,
     ) -> Option<UdpNoiseSettings> {
         let raw = stream?.get("finalmask")?.get("udp")?;
@@ -108,10 +111,18 @@ impl Parser<'_> {
         let mut noise = None;
         let mut salamander = None;
         let mut hop = None;
-        if masks.len() > 3 {
+        let mut header = None;
+        let mut sudoku = None;
+        // mKCP takes any number of `mkcp-legacy` masks besides these.
+        let legacy = |mask: &Value| {
+            mask.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| go_lowercase(kind) == "mkcp-legacy")
+        };
+        if masks.iter().filter(|mask| !legacy(mask)).count() > 5 {
             self.error(
                 &path,
-                "at most one udphop, one noise and one Salamander mask are supported",
+                "at most one udphop, one noise, one Salamander, one header-custom and one sudoku mask are supported",
             );
             return None;
         }
@@ -121,7 +132,7 @@ impl Parser<'_> {
             match mask
                 .get("type")
                 .and_then(Value::as_str)
-                .map(str::to_ascii_lowercase)
+                .map(go_lowercase)
                 .as_deref()
             {
                 Some("noise") if noise.is_none() => {
@@ -133,9 +144,20 @@ impl Parser<'_> {
                 Some("udphop") if hop.is_none() => {
                     hop = Some(i);
                 }
+                // Read by `parse_udp_header_custom`.
+                Some("header-custom") if header.is_none() => {
+                    header = Some(i);
+                }
+                // Read by `parse_udp_sudoku`.
+                Some("sudoku") if sudoku.is_none() => {
+                    sudoku = Some(i);
+                }
+                // Read by `parse_kcp_masks`.
+                Some("mkcp-legacy") if network == StreamNetwork::Kcp => {}
+                Some("mkcp-legacy") => self.error(&p, "mkcp-legacy requires mKCP"),
                 _ => self.error(
                     &p,
-                    "only one udphop, one noise and one Salamander UDP mask are supported",
+                    "only one udphop, one noise, one Salamander, one header-custom and one sudoku UDP mask are supported",
                 ),
             }
         }
