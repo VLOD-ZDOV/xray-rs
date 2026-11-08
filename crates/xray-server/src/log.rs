@@ -38,10 +38,9 @@ pub fn init(settings: &Settings) -> Result<(), String> {
     let level = match settings.level.to_ascii_lowercase().as_str() {
         "debug" => DEBUG,
         "info" => INFO,
-        "" | "warning" => WARNING,
         "error" => ERROR,
         "none" => NONE,
-        other => return Err(format!("unknown log level {other:?}")),
+        _ => WARNING,
     };
     let debug_override = crate::config::get_env("XRAY_SERVER_DEBUG").is_some();
     LEVEL.store(
@@ -58,8 +57,7 @@ pub fn init(settings: &Settings) -> Result<(), String> {
         Ordering::Relaxed,
     );
     DNS_LOG.store(settings.dns_log, Ordering::Relaxed);
-    let err = open_sink(&settings.error)?;
-    let acc = open_sink(&settings.access)?;
+    let (err, acc) = open_sinks(settings)?;
     *ERROR_SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(err);
     *ACCESS_SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(acc);
     *SETTINGS.write().unwrap_or_else(|e| e.into_inner()) = Some(settings.clone());
@@ -69,12 +67,19 @@ pub fn init(settings: &Settings) -> Result<(), String> {
 pub fn restart() -> Result<(), String> {
     let settings = SETTINGS.read().unwrap_or_else(|e| e.into_inner()).clone();
     if let Some(settings) = settings {
-        let err = open_sink(&settings.error)?;
-        let acc = open_sink(&settings.access)?;
+        let (err, acc) = open_sinks(&settings)?;
         *ERROR_SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(err);
         *ACCESS_SINK.write().unwrap_or_else(|e| e.into_inner()) = Some(acc);
     }
     Ok(())
+}
+
+/// Level `none` turns both logs off, access included.
+fn open_sinks(settings: &Settings) -> Result<(Option<Sink>, Option<Sink>), String> {
+    if settings.level.eq_ignore_ascii_case("none") {
+        return Ok((None, None));
+    }
+    Ok((open_sink(&settings.error)?, open_sink(&settings.access)?))
 }
 
 /// `""` is stdout, `"none"` disables the log, anything else is a file path.
