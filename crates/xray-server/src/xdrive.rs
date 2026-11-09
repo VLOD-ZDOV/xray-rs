@@ -320,6 +320,23 @@ impl LocalStorage {
                 ));
             }
         }
+        // The folder is shared with the peer: a directory swapped for a link
+        // would send reads, writes and deletes outside the root.
+        let mut path = self.root.clone();
+        for part in clean.split('/') {
+            path.push(part);
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("xdrive path contains a link: {name}"),
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                Err(e) => return Err(e),
+            }
+        }
         Ok(self.root.join(clean))
     }
 
@@ -1336,6 +1353,20 @@ pub async fn start_inbound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn local_storage_refuses_paths_through_links() {
+        let base = std::env::temp_dir().join(format!("xdrive-test-{}", rand::random::<u64>()));
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let storage = LocalStorage::new(base.join("root")).unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("root/session")).unwrap();
+        assert!(storage.put("session/s2c/1", b"data").await.is_err());
+        assert!(storage.get("session/s2c/1").await.is_err());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+        storage.put("other/s2c/1", b"data").await.unwrap();
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[tokio::test]
     async fn local_storage_get_rejects_oversized_files() {
