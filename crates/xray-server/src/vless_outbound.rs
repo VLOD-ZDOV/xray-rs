@@ -1097,6 +1097,8 @@ impl VlessConeUdp {
                     }
                 });
                 let mut sessions = self.per_conn_sessions.lock().await;
+                // Drop finished flows so their sockets close.
+                sessions.retain(|a, (_, t)| *a == addr || !t.is_finished());
                 if let Some((existing_link, existing_task)) = sessions.get(&addr) {
                     if !existing_task.is_finished() {
                         task.abort();
