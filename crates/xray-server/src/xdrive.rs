@@ -369,23 +369,24 @@ impl LocalStorage {
     pub async fn get(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
         let full = self.resolve(name)?;
         use tokio::io::AsyncReadExt;
-        // Opening a FIFO would block a blocking-pool thread forever.
-        match tokio::fs::metadata(&full).await {
-            Ok(meta) if !meta.is_file() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "xdrive entry is not a regular file",
-                ));
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        let file = match tokio::fs::File::open(&full).await {
+        // The folder is shared with the peer: O_NONBLOCK keeps a FIFO from
+        // blocking the open, and the type is checked on the opened file itself.
+        let file = match tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&full)
+            .await
+        {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
+        if !file.metadata().await?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "xdrive entry is not a regular file",
+            ));
+        }
         // The folder is shared with the peer, so the file size is untrusted.
         let mut data = Vec::new();
         file.take(MAX_SEGMENT_BYTES as u64 + 1)
