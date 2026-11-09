@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Duration;
 
+const MAX_BUFFER_SIZE: usize = 16 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicySettings {
     pub handshake: Duration,
@@ -68,7 +70,9 @@ impl PolicyManager {
                             .and_then(|b| usize::try_from(b).ok())
                             .filter(|&b| b > 0)
                         {
-                            settings.buffer_size = bytes;
+                            // Each connection allocates this per direction; an absurd
+                            // value would abort the process on allocation failure.
+                            settings.buffer_size = bytes.min(MAX_BUFFER_SIZE);
                         }
                     }
                     if let Some(b) = val.get("statsUserUplink").and_then(Value::as_bool) {
