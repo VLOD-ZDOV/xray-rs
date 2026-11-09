@@ -1735,13 +1735,18 @@ impl Router {
             .collect()
     }
 
-    pub fn add_outbound(&self, tag: String, action: Action) {
-        crate::stats::get().register("outbound", &tag);
+    /// Returns false, leaving the existing entry, when the tag is taken.
+    pub fn add_outbound(&self, tag: String, action: Action) -> bool {
         let mut outbounds = self
             .outbounds
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if outbounds.contains_key(&tag) {
+            return false;
+        }
+        crate::stats::get().register("outbound", &tag);
         outbounds.insert(tag, action);
+        true
     }
 
     pub fn remove_outbound(&self, tag: &str) -> bool {

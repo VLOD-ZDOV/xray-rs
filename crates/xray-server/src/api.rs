@@ -1713,10 +1713,9 @@ async fn handle_handler(
                     &format!("AddOutbound does not support proxy type {proxy_type:?} yet"),
                 );
             };
-            if inbound_manager.router().outbound_tags().contains(&tag) {
+            if !inbound_manager.router().add_outbound(tag.clone(), action) {
                 return status(UNKNOWN, &format!("existing tag found: {tag}"));
             }
-            inbound_manager.router().add_outbound(tag, action);
             reply(&AddOutboundResponse {})
         }
         "RemoveOutbound" => {
