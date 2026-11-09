@@ -483,7 +483,7 @@ pub fn parse_dialer_proxy(outbound: &Value, _tag: &str) -> Result<Option<String>
 }
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, ()> {
-    if !s.len().is_multiple_of(2) {
+    if !s.len().is_multiple_of(2) || !s.is_ascii() {
         return Err(());
     }
     (0..s.len())
