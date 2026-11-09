@@ -728,7 +728,10 @@ impl Handler {
         session
     }
 
+    /// Drops the session from the map and stops its upload task, which would
+    /// otherwise wait on its own sender forever.
     fn remove(&self, id: &str, session: &Arc<Session>) {
+        session.close();
         let mut sessions = lock(&self.sessions);
         if sessions
             .get(id)
