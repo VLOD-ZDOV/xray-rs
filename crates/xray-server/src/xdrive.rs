@@ -369,11 +369,12 @@ impl LocalStorage {
     pub async fn get(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
         let full = self.resolve(name)?;
         use tokio::io::AsyncReadExt;
-        // The folder is shared with the peer: O_NONBLOCK keeps a FIFO from
-        // blocking the open, and the type is checked on the opened file itself.
+        // The folder is shared with the peer: O_NOFOLLOW keeps a planted link
+        // from opening a device, O_NONBLOCK keeps a FIFO from blocking the
+        // open, and the type is checked on the opened file itself.
         let file = match tokio::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
             .open(&full)
             .await
         {
