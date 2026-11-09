@@ -393,7 +393,8 @@ fn parse_range_val(v: &Value) -> Result<(u32, u32), String> {
         Value::Number(n) => {
             let val = n
                 .as_u64()
-                .ok_or_else(|| "number out of range".to_string())? as u32;
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| "number out of range".to_string())?;
             Ok((val, val))
         }
         Value::String(s) => {
@@ -414,8 +415,16 @@ fn parse_range_val(v: &Value) -> Result<(u32, u32), String> {
             }
         }
         Value::Object(obj) => {
-            let from = obj.get("from").and_then(Value::as_u64).unwrap_or(0) as u32;
-            let to = obj.get("to").and_then(Value::as_u64).unwrap_or(from as u64) as u32;
+            let get = |k: &str| -> Result<Option<u32>, String> {
+                match obj.get(k).and_then(Value::as_u64) {
+                    Some(v) => u32::try_from(v)
+                        .map(Some)
+                        .map_err(|_| "number out of range".to_string()),
+                    None => Ok(None),
+                }
+            };
+            let from = get("from")?.unwrap_or(0);
+            let to = get("to")?.unwrap_or(from);
             Ok((from.min(to), from.max(to)))
         }
         Value::Array(arr) if !arr.is_empty() => parse_range_val(&arr[0]),
