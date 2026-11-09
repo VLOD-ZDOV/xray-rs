@@ -354,12 +354,13 @@ pub async fn connect_happy_eyeballs(
     max_concurrent: usize,
     overall_timeout: Duration,
 ) -> io::Result<Box<dyn crate::outbound::Stream>> {
-    use futures_util::stream::{FuturesUnordered, StreamExt};
+    use tokio::task::JoinSet;
     use tokio::time::sleep;
 
     let max_concurrent = max_concurrent.max(1);
     let mut next_idx = 0;
-    let mut in_flight = FuturesUnordered::new();
+    // JoinSet aborts the losing attempts when dropped.
+    let mut in_flight = JoinSet::new();
     let mut last_err = None;
 
     let deadline = tokio::time::Instant::now() + overall_timeout;
@@ -387,7 +388,7 @@ pub async fn connect_happy_eyeballs(
     };
 
     if next_idx < addrs.len() {
-        in_flight.push(tokio::spawn(make_attempt(addrs[next_idx], next_idx)));
+        in_flight.spawn(make_attempt(addrs[next_idx], next_idx));
         next_idx += 1;
     }
 
@@ -411,11 +412,11 @@ pub async fn connect_happy_eyeballs(
                 ));
             }
             _ = &mut delay_sleep, if next_idx < addrs.len() && in_flight.len() < max_concurrent => {
-                in_flight.push(tokio::spawn(make_attempt(addrs[next_idx], next_idx)));
+                in_flight.spawn(make_attempt(addrs[next_idx], next_idx));
                 next_idx += 1;
                 delay_sleep.as_mut().reset(tokio::time::Instant::now() + try_delay);
             }
-            Some(join_res) = in_flight.next() => {
+            Some(join_res) = in_flight.join_next() => {
                 match join_res {
                     Ok((_idx, _addr, Ok(stream))) => {
                         return Ok(stream);
@@ -423,7 +424,7 @@ pub async fn connect_happy_eyeballs(
                     Ok((_idx, _addr, Err(e))) => {
                         last_err = Some(e);
                         if next_idx < addrs.len() && in_flight.len() < max_concurrent {
-                            in_flight.push(tokio::spawn(make_attempt(addrs[next_idx], next_idx)));
+                            in_flight.spawn(make_attempt(addrs[next_idx], next_idx));
                             next_idx += 1;
                             delay_sleep.as_mut().reset(tokio::time::Instant::now() + try_delay);
                         }
@@ -587,7 +588,11 @@ async fn exchange_dns_query(qname: &str, qtype: u16) -> io::Result<Vec<u8>> {
         if let Ok(Ok(len)) =
             tokio::time::timeout(Duration::from_millis(1500), socket.recv(&mut buf)).await
         {
-            if len >= 12 && buf[..2] == id && buf[2] & 0x80 != 0 {
+            if len >= query.len()
+                && buf[..2] == id
+                && buf[2] & 0x80 != 0
+                && buf[12..query.len()].eq_ignore_ascii_case(&query[12..])
+            {
                 return Ok(buf[..len].to_vec());
             }
         }
@@ -697,7 +702,9 @@ fn parse_srv_response(buf: &[u8]) -> io::Result<(String, u16)> {
         offset += 10;
         if rtype == 33 && rdlen >= 6 && offset + rdlen <= buf.len() {
             let port = u16::from_be_bytes([buf[offset + 4], buf[offset + 5]]);
-            let target = read_dns_name(buf, offset + 6).unwrap_or_default();
+            let target = read_dns_name(buf, offset + 6).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid SRV target name")
+            })?;
             return Ok((target, port));
         }
         offset += rdlen;
