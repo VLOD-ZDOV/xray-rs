@@ -105,7 +105,12 @@ impl DnsOutbound {
 
         // If upstream rewriteAddress is configured, forward query directly
         if let Some(host) = &self.address {
-            let upstream_addr = resolve(host, self.port).await?;
+            let upstream_addr =
+                tokio::time::timeout(LOCAL_RESOLVE_TIMEOUT, resolve(host, self.port))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "DNS upstream lookup timed out")
+                    })??;
             let bind_addr: SocketAddr = if upstream_addr.is_ipv4() {
                 ([0, 0, 0, 0], 0).into()
             } else {
@@ -297,6 +302,12 @@ fn parse_dns_question(packet: &[u8]) -> io::Result<(String, u16, usize)> {
         if len == 0 {
             break;
         }
+        if len > 63 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "DNS label too long",
+            ));
+        }
         if offset + len > packet.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -308,6 +319,14 @@ fn parse_dns_question(packet: &[u8]) -> io::Result<(String, u16, usize)> {
         })?;
         labels.push(label.to_owned());
         offset += len;
+    }
+
+    // Wire form is labels plus length bytes plus the root byte: at most 255 octets.
+    if offset - 12 > 255 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DNS name too long",
+        ));
     }
 
     if offset + 4 > packet.len() {
