@@ -9,7 +9,7 @@ use xray_routing::{Network, Target, TargetAddr};
 
 use crate::outbound::Stream;
 use crate::outbound_transport::{PrefixedStream, ServerConnector};
-use crate::vless::Host;
+use crate::vless::{Host, CONNECT_TIMEOUT};
 
 pub struct HttpOutbound {
     pub tag: String,
@@ -117,9 +117,13 @@ impl HttpOutbound {
         let request = encode_connect_request(&target, self.account.as_ref(), &header_refs)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-        let initial_bytes = http_connect(&mut carrier, &request)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
+        let initial_bytes =
+            tokio::time::timeout(CONNECT_TIMEOUT, http_connect(&mut carrier, &request))
+                .await
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::TimedOut, "http proxy CONNECT timed out")
+                })?
+                .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()))?;
 
         if initial_bytes.is_empty() {
             Ok(Box::new(carrier))
