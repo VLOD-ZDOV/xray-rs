@@ -802,6 +802,9 @@ impl RealityServer {
                     return Err("dest closed connection");
                 }
                 s2c_saved.extend_from_slice(&buf[..n]);
+                if s2c_saved.len() > 1 << 20 {
+                    return Err("dest handshake too large");
+                }
 
                 // Check if we have at least record 0 (ServerHello)
                 if s2c_saved.len() < 5 {
