@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     fmt, io,
     io::IoSliceMut,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -84,7 +84,6 @@ pub(crate) struct ServerCarrierSocket {
     password: Arc<Zeroizing<String>>,
     gecko: Option<GeckoPacketSize>,
     last_message: AtomicU32,
-    ready: Mutex<VecDeque<(SocketAddr, Vec<u8>)>>,
     scratch: Mutex<Box<[u8]>>,
     send_buffer: Mutex<Vec<u8>>,
     reassemblies: Mutex<HashMap<SocketAddr, (Reassembly, Instant)>>,
@@ -101,7 +100,6 @@ impl ServerCarrierSocket {
             password,
             gecko,
             last_message: AtomicU32::new(0),
-            ready: Mutex::new(VecDeque::new()),
             scratch: Mutex::new(vec![0u8; 65536].into_boxed_slice()),
             send_buffer: Mutex::new(Vec::with_capacity(2048)),
             reassemblies: Mutex::new(HashMap::new()),
@@ -182,26 +180,6 @@ impl AsyncUdpSocket for ServerCarrierSocket {
         meta: &mut [udp::RecvMeta],
     ) -> Poll<io::Result<usize>> {
         loop {
-            {
-                let mut ready = self.ready.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some((addr, datagram)) = ready.pop_front() {
-                    meta[0] = udp::RecvMeta {
-                        len: datagram.len(),
-                        stride: datagram.len(),
-                        addr,
-                        ecn: None,
-                        dst_ip: None,
-                    };
-                    if datagram.len() <= bufs[0].len() {
-                        bufs[0][..datagram.len()].copy_from_slice(&datagram);
-                    } else {
-                        meta[0].len = 0;
-                        meta[0].stride = 1;
-                    }
-                    return Poll::Ready(Ok(1));
-                }
-            }
-
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             let mut wire = [IoSliceMut::new(&mut scratch)];
             let count = std::task::ready!(self.inner.poll_recv(cx, &mut wire, &mut meta[..1]))?;
@@ -726,7 +704,7 @@ async fn handle_tcp_streams(
                 return;
             }
 
-            eprintln!("[hysteria] connected outbound, relaying");
+            crate::log::debug("[hysteria] connected outbound, relaying");
 
             let traffic = stats::get().traffic(&ctx.tag, &user.email, user.level, &decision.tag);
             let (mut out_r, mut out_w) = tokio::io::split(outbound_stream);
