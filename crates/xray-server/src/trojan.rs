@@ -62,7 +62,7 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
     }
     let user_index = users
         .iter()
-        .position(|u| u.hash.eq_ignore_ascii_case(token))
+        .position(|u| u.hash.as_slice() == token)
         .ok_or(ParseError::Invalid("unknown user"))?;
 
     let mut pos = 58;
