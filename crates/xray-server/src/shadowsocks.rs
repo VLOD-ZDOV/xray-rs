@@ -389,6 +389,7 @@ impl ShadowsocksUdpHandler {
         let session_down = Mutex::new(server_session);
 
         let up = async {
+            let proc_cell = std::sync::OnceLock::new();
             while let Some((target, payload)) = rx.recv().await {
                 activity.touch();
                 let (host, port) = target_to_host_port(&target);
@@ -411,7 +412,7 @@ impl ShadowsocksUdpHandler {
                     attributes: None,
                     local_ip: None,
                     vless_route: None,
-                    process_info: None,
+                    process_info: Some(&proc_cell),
                 };
                 if self.ctx.router.route(&query).await.tag != decision.tag {
                     log::debug(
@@ -559,6 +560,7 @@ impl ShadowsocksUdpHandler {
         }
 
         let up = async {
+            let proc_cell = std::sync::OnceLock::new();
             while let Some((target, payload)) = rx.recv().await {
                 activity.touch();
                 let (host, port) = target_to_host_port(&target);
@@ -581,7 +583,7 @@ impl ShadowsocksUdpHandler {
                     attributes: None,
                     local_ip: None,
                     vless_route: None,
-                    process_info: None,
+                    process_info: Some(&proc_cell),
                 };
                 if self.ctx.router.route(&query).await.tag != decision.tag {
                     log::debug(
