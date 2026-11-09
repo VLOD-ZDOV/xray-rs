@@ -858,7 +858,7 @@ impl ConeUdp {
 impl Drop for ConeUdp {
     fn drop(&mut self) {
         match self {
-            Self::Wireguard { sessions, .. } => {
+            Self::Wireguard { sessions, .. } | Self::Masque { sessions, .. } => {
                 for (_, task) in sessions.get_mut().values() {
                     task.abort();
                 }
