@@ -563,6 +563,16 @@ pub struct StrategyWeight {
     pub regexp: bool,
     pub match_str: String,
     pub value: f64,
+    compiled: Option<CompiledRegex>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledRegex(Regex);
+
+impl PartialEq for CompiledRegex {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_str() == other.0.as_str()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -620,11 +630,7 @@ fn apply_cost(tag: &str, value: Duration, costs: &[StrategyWeight]) -> Duration 
     let mut weight = 1.0f64;
     for w in costs {
         let matched = if w.regexp {
-            if let Ok(re) = Regex::new(&w.match_str) {
-                re.find(tag).is_some()
-            } else {
-                false
-            }
+            w.compiled.as_ref().is_some_and(|re| re.0.is_match(tag))
         } else {
             tag.contains(&w.match_str)
         };
@@ -786,10 +792,16 @@ impl Balancer {
                                 .unwrap_or("")
                                 .to_owned();
                             let value = c.get("value").and_then(Value::as_f64).unwrap_or(0.0);
+                            let compiled = if regexp {
+                                Regex::new(&match_str).ok().map(CompiledRegex)
+                            } else {
+                                None
+                            };
                             costs.push(StrategyWeight {
                                 regexp,
                                 match_str,
                                 value,
+                                compiled,
                             });
                         }
                     }
