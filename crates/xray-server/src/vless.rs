@@ -586,6 +586,9 @@ where
     // VLESS encryption carries Vision too, as Xray's CommonConn does.
     let vision_capable = tls.vision_capable || ctx.vless_encryption.is_some();
     let vision = check_flow(&request, &user, vision_capable, &early)?;
+    if !vision {
+        stream.release_record_alignment();
+    }
     let user_policy = crate::policy::for_level(user.level);
     let _online = stats::get().connect(&user.email, user.level, peer.ip());
     if request.command == Command::Mux {

@@ -1040,6 +1040,12 @@ async fn dispatch(
     original: Option<SocketAddr>,
     handler: InboundHandler,
 ) {
+    let mut stream = stream;
+    // Only Vision's direct copy needs TLS reads cut at record boundaries; that
+    // costs extra syscalls per record, so every other handler drops it.
+    if !matches!(handler, InboundHandler::VlessTcp(_)) {
+        xray_proxy::vless::VisionStreamIo::release_record_alignment(&mut stream);
+    }
     let f: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = match handler {
         InboundHandler::VlessTcp(ctx) => Box::pin(async move {
             let tls = stream.handshake_info();
