@@ -528,8 +528,10 @@ impl MasqueOutbound {
             crate::masque_capsule::encode_varint(0, &mut prefix); // Context ID = 0
 
             while let Some(packet) = to_tunnel_rx.recv().await {
-                let mut dgram = prefix.clone();
-                dgram.extend_from_slice(packet.into_bytes().as_ref());
+                let payload = packet.into_bytes();
+                let mut dgram = Vec::with_capacity(prefix.len() + payload.len());
+                dgram.extend_from_slice(&prefix);
+                dgram.extend_from_slice(payload.as_ref());
                 if dgram_conn_write.send_datagram(Bytes::from(dgram)).is_err() {
                     break;
                 }

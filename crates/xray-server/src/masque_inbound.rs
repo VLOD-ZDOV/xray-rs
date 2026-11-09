@@ -549,6 +549,7 @@ pub async fn start(
                                 h2_conn.accept().await
                             };
                             first = false;
+                            while reqs.try_join_next().is_some() {}
                             let Some(res) = next else { break };
                             let (req, respond) = match res {
                                 Ok(r) => r,
@@ -663,6 +664,7 @@ pub async fn start(
                         let mut reqs = tokio::task::JoinSet::new();
 
                         while let Some(resolver) = h3_conn.accept().await.ok().flatten() {
+                            while reqs.try_join_next().is_some() {}
                             let (req, stream) = match resolver.resolve_request().await {
                                 Ok(pair) => pair,
                                 Err(_) => continue,
@@ -989,7 +991,8 @@ async fn handle_h3_request(
                 Err(broadcast::error::RecvError::Closed) => break,
             };
             if dest == client_ip {
-                let mut dgram = prefix.clone();
+                let mut dgram = Vec::with_capacity(prefix.len() + packet_bytes.len());
+                dgram.extend_from_slice(&prefix);
                 dgram.extend_from_slice(&packet_bytes);
                 if dgram_conn_write.send_datagram(Bytes::from(dgram)).is_err() {
                     break;
@@ -1002,6 +1005,8 @@ async fn handle_h3_request(
     tokio::select! {
         _ = &mut reader_task => {}
         _ = &mut writer_task => {}
+        // The tunnel ends with its request stream, not with the QUIC connection.
+        _ = async { while let Ok(Some(_)) = stream.recv_data().await {} } => {}
     }
     // Both halves end before the address goes back to the pool for another tunnel.
     reader_task.abort();
