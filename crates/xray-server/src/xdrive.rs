@@ -334,11 +334,19 @@ impl LocalStorage {
 
         static COUNTER: AtomicU64 = AtomicU64::new(1);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp_name = format!("{TEMP_PREFIX}{}-{id}", std::process::id());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let tmp_name = format!("{TEMP_PREFIX}{}-{id}-{nanos:x}", std::process::id());
         let tmp_path = dir.join(tmp_name);
 
         let res = async {
-            let mut file = tokio::fs::File::create(&tmp_path).await?;
+            // create_new (O_EXCL) never follows a symlink planted at the temp name.
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)
+                .await?;
             file.write_all(data).await?;
             file.flush().await?;
             file.sync_all().await?;
@@ -361,6 +369,18 @@ impl LocalStorage {
     pub async fn get(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
         let full = self.resolve(name)?;
         use tokio::io::AsyncReadExt;
+        // Opening a FIFO would block a blocking-pool thread forever.
+        match tokio::fs::metadata(&full).await {
+            Ok(meta) if !meta.is_file() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "xdrive entry is not a regular file",
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
         let file = match tokio::fs::File::open(&full).await {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
