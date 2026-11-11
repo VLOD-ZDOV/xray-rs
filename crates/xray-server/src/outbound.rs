@@ -20,6 +20,7 @@ use xray_config::Network;
 use xray_wireguard::UdpSession;
 
 use crate::dns_outbound::DnsUdpSession;
+use crate::log;
 use crate::routing::{
     Action, Decision, FreedomFragmentPackets, FreedomFragmentSetting, FreedomNoiseFamily,
     FreedomNoisePacket, FreedomNoiseSetting, FreedomSettings, FreedomStrategy, Query, Router,
@@ -113,6 +114,39 @@ pub async fn connect(
         }
         Action::Block(_) => Err(blocked(&decision.tag)),
     }
+}
+
+/// Xray's freedom blackhole: the client's bytes are read and dropped until it
+/// closes or the rule's delay runs out, and nothing comes back.
+fn hold_blocked(rule: crate::routing::FinalBlock, addr: SocketAddr) -> Box<dyn Stream> {
+    use crate::routing::FinalLog;
+    let (min, max) = rule.delay;
+    let (low, high) = (min.min(max), min.max(max));
+    let secs = low + rand::random::<u64>() % (high - low + 1);
+    let say = move |message: String| match rule.log {
+        FinalLog::None => {}
+        FinalLog::Debug => log::debug(message),
+        FinalLog::Info => log::info(message),
+        FinalLog::Warning => log::warn(message),
+        FinalLog::Error => log::error(message),
+    };
+    say(format!(
+        "target blocked by a finalrule: tcp:{addr}, blackholing connection for {secs}s"
+    ));
+    let (client, mut server) = tokio::io::duplex(16 * 1024);
+    tokio::spawn(async move {
+        let mut sink = tokio::io::sink();
+        let drain = tokio::io::copy(&mut server, &mut sink);
+        if tokio::time::timeout(Duration::from_secs(secs), drain)
+            .await
+            .is_err()
+        {
+            say(format!(
+                "closed blackholed connection to blocked target: tcp:{addr}"
+            ));
+        }
+    });
+    Box::new(client)
 }
 
 pub fn check_final(
@@ -419,6 +453,14 @@ async fn connect_direct(
     let mut last_error = None;
     let mut addrs = resolve_all(host, port).await?;
     apply_strategy(host, &mut addrs, settings.strategy)?;
+    // Xray blackholes the whole connection when any resolved address is blocked.
+    for &addr in &addrs {
+        if let Action::Block(crate::routing::BlockAction::Hold(rule)) =
+            router.final_action(outbound, Network::Tcp, addr, open_private)
+        {
+            return Ok(hold_blocked(rule, addr));
+        }
+    }
     if let Some(sockopt) = settings.sockopt.as_deref() {
         if let Some(ref he) = sockopt.happy_eyeballs {
             if he.try_delay_ms > 0 && he.max_concurrent_try > 0 && addrs.len() >= 2 {

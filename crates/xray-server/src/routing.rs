@@ -1017,6 +1017,80 @@ pub enum BlockAction {
     #[default]
     Drop,
     Http403,
+    /// freedom's `finalRules` block: the connection is held, its input
+    /// discarded, for a random delay in seconds, then closed.
+    Hold(FinalBlock),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalBlock {
+    pub delay: (u64, u64),
+    pub log: FinalLog,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalLog {
+    None,
+    Debug,
+    Info,
+    Warning,
+    Error,
+}
+
+/// Xray's default private-address and block rules: 30 to 90 s, at warning.
+pub const DEFAULT_FINAL_BLOCK: FinalBlock = FinalBlock {
+    delay: (30, 90),
+    log: FinalLog::Warning,
+};
+
+/// A `finalRules` entry's `delay` (or the deprecated `blockDelay`) and
+/// `logLevel`, which Xray allows on block rules only.
+fn parse_final_block(raw: &Value, block: bool, at: &str) -> Result<FinalBlock, String> {
+    let mut delay = raw.get("delay").filter(|v| !v.is_null());
+    if let Some(old) = raw.get("blockDelay").filter(|v| !v.is_null()) {
+        log::warn(format!(
+            "{at}: finalRules.blockDelay is deprecated, use finalRules.delay"
+        ));
+        delay = Some(old);
+    }
+    let level = str_field(raw, "logLevel");
+    if !block {
+        if delay.is_some() || !level.is_empty() {
+            return Err("delay and logLevel are only supported for block finalRules".into());
+        }
+        return Ok(DEFAULT_FINAL_BLOCK);
+    }
+    let delay = match delay {
+        None => (30, 90),
+        Some(Value::Number(n)) => {
+            let n = n.as_u64().ok_or(format!("{at}: invalid delay {n}"))?;
+            (n, n)
+        }
+        Some(Value::String(text)) => {
+            let parse = |t: &str| {
+                t.trim()
+                    .parse::<u64>()
+                    .map_err(|_| format!("{at}: invalid delay {text:?}"))
+            };
+            match text.split_once('-') {
+                Some((from, to)) => (parse(from)?, parse(to)?),
+                None => {
+                    let n = parse(text)?;
+                    (n, n)
+                }
+            }
+        }
+        Some(other) => return Err(format!("{at}: invalid delay {other}")),
+    };
+    let log = match level.to_ascii_lowercase().as_str() {
+        "" | "info" => FinalLog::Info,
+        "none" => FinalLog::None,
+        "debug" => FinalLog::Debug,
+        "warning" => FinalLog::Warning,
+        "error" => FinalLog::Error,
+        _ => return Err(format!("unknown finalRules.logLevel: {level}")),
+    };
+    Ok(FinalBlock { delay, log })
 }
 
 #[derive(Debug, Clone)]
@@ -1453,9 +1527,15 @@ impl Router {
                         sockopt,
                     };
                     for (index, raw) in array(settings, "finalRules").iter().enumerate() {
+                        let at = format!("outbound {tag:?} finalRules[{index}]");
                         let action = match str_field(raw, "action") {
-                            "allow" => Action::Direct(freedom_settings.clone()),
-                            "block" => Action::Block(BlockAction::Drop),
+                            "allow" => {
+                                parse_final_block(raw, false, &at)?;
+                                Action::Direct(freedom_settings.clone())
+                            }
+                            "block" => {
+                                Action::Block(BlockAction::Hold(parse_final_block(raw, true, &at)?))
+                            }
                             other => {
                                 return Err(format!(
                                 "outbound {tag:?} finalRules[{index}]: unknown action {other:?}"
@@ -1853,7 +1933,7 @@ impl Router {
             })
             .map_or(
                 if !open_private && is_private(ip) {
-                    Action::Block(BlockAction::Drop)
+                    Action::Block(BlockAction::Hold(DEFAULT_FINAL_BLOCK))
                 } else {
                     outbounds
                         .get(outbound)
@@ -2791,11 +2871,14 @@ mod tests {
         );
         assert_eq!(
             r.final_action("direct", Network::Tcp, at("127.0.0.1:22"), false),
-            Action::Block(BlockAction::Drop)
+            Action::Block(BlockAction::Hold(DEFAULT_FINAL_BLOCK))
         );
         assert_eq!(
             r.final_action("direct", Network::Udp, at("1.1.1.1:53"), false),
-            Action::Block(BlockAction::Drop)
+            Action::Block(BlockAction::Hold(FinalBlock {
+                delay: (30, 90),
+                log: FinalLog::Info
+            }))
         );
         assert_eq!(
             r.final_action("plain", Network::Tcp, at("1.1.1.1:53"), false),
@@ -2803,7 +2886,7 @@ mod tests {
         );
         assert_eq!(
             r.final_action("plain", Network::Tcp, at("192.168.1.1:80"), false),
-            Action::Block(BlockAction::Drop)
+            Action::Block(BlockAction::Hold(DEFAULT_FINAL_BLOCK))
         );
     }
 
