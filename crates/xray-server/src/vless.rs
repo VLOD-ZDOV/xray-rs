@@ -648,6 +648,13 @@ where
         sniffing: &ctx.sniffing,
     };
     let Some(decision) = route.allow(&ctx.router, payload).await else {
+        // Xray writes the response header before the link turns out closed.
+        if vision {
+            write_vision_response(&mut stream, request.version).await?;
+        } else {
+            stream.write_all(&[request.version, 0]).await?;
+        }
+        stream.flush().await?;
         return Ok(());
     };
     ctx.sniffing.override_host(payload, &mut request.host);
