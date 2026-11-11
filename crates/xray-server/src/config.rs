@@ -3696,7 +3696,7 @@ mod tests {
     fn reads_sections_and_aliases_like_xray() {
         let raw = r#"{
           "Log": {"loglevel": "warning"},
-          "version": {"min": "26.10", "max": "26.10.31"},
+          "version": {"min": "26.10", "max": "26.11.9"},
           "inbounds": [
             {"tag": "m", "port": 1080, "listen": "127.0.0.1", "protocol": "mixed"},
             {"tag": "t", "port": 1081, "listen": "127.0.0.1", "protocol": "tunnel",
@@ -3708,10 +3708,10 @@ mod tests {
         assert_eq!(config.log.level, "warning");
         assert_eq!(config.inbounds[0].protocol, InboundProtocol::Socks);
         assert_eq!(config.inbounds[1].protocol, InboundProtocol::Dokodemo);
-        let too_new = r#"{"version": {"min": "26.11"}, "inbounds": []}"#;
+        let too_new = r#"{"version": {"min": "26.12"}, "inbounds": []}"#;
         assert_eq!(
             parse(too_new).err().unwrap(),
-            "this config must be run on version 26.11 or higher"
+            "this config must be run on version 26.12 or higher"
         );
         let too_old = r#"{"version": {"max": "26.10.30"}, "inbounds": []}"#;
         assert_eq!(

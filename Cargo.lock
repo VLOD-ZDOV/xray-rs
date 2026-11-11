@@ -3350,7 +3350,7 @@ dependencies = [
 
 [[package]]
 name = "xray-server"
-version = "26.10.31+3"
+version = "26.11.9"
 dependencies = [
  "aes-gcm",
  "async-trait",
