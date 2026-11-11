@@ -85,6 +85,10 @@ pub struct QueryStatsResponse {
 pub struct SysStatsResponse {
     #[prost(uint32, tag = "1")]
     pub num_goroutine: u32,
+    #[prost(uint64, tag = "3")]
+    pub alloc: u64,
+    #[prost(uint64, tag = "5")]
+    pub sys: u64,
     #[prost(uint32, tag = "10")]
     pub uptime: u32,
 }
@@ -1222,8 +1226,17 @@ fn handle_stats(method: &str, message: Bytes) -> Response<Body> {
                 None => status(NOT_FOUND, &format!("{} not found.", r.name)),
             }
         }
+        // No Go runtime here: tasks stand in for goroutines and the process's
+        // anonymous and resident memory for the heap; GC counters stay zero.
         "GetSysStats" => reply(&SysStatsResponse {
-            num_goroutine: 0,
+            num_goroutine: u32::try_from(
+                tokio::runtime::Handle::current()
+                    .metrics()
+                    .num_alive_tasks(),
+            )
+            .unwrap_or(u32::MAX),
+            alloc: proc_status_kib("RssAnon:") * 1024,
+            sys: proc_status_kib("VmRSS:") * 1024,
             uptime: stats.uptime_secs(),
         }),
         "GetUsersStats" => {
@@ -1678,8 +1691,9 @@ async fn handle_handler(
             let Ok(r) = RemoveInboundRequest::decode(message) else {
                 return status(INVALID_ARGUMENT, "bad request");
             };
-            if !inbound_manager.remove(&r.tag) {
-                return missing_handler(&r.tag);
+            // Xray's inbound manager answers an unknown tag with ErrNoClue.
+            if r.tag.is_empty() || !inbound_manager.remove(&r.tag) {
+                return status(UNKNOWN, NO_CLUE);
             }
             inbound_manager.router().set_inbound_protocol(&r.tag, None);
             reply(&RemoveInboundResponse {})
@@ -1726,9 +1740,11 @@ async fn handle_handler(
             let Ok(r) = RemoveOutboundRequest::decode(message) else {
                 return status(INVALID_ARGUMENT, "bad request");
             };
-            if !inbound_manager.router().remove_outbound(&r.tag) {
-                return missing_handler(&r.tag);
+            // Xray's outbound manager removes an unknown tag as a no-op.
+            if r.tag.is_empty() {
+                return status(UNKNOWN, NO_CLUE);
             }
+            inbound_manager.router().remove_outbound(&r.tag);
             reply(&RemoveOutboundResponse {})
         }
         _ => status(UNIMPLEMENTED, "unknown method"),
@@ -1736,6 +1752,20 @@ async fn handle_handler(
 }
 
 // 3x-ui treats "not found" as an already absent handler.
+fn proc_status_kib(field: &str) -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(field))
+                .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+const NO_CLUE: &str = "common: not enough information for making a decision";
+
 fn missing_handler(tag: &str) -> Response<Body> {
     status(
         UNKNOWN,
@@ -2195,14 +2225,14 @@ mod tests {
         .await;
         assert_eq!(resp.status(), 200);
 
-        // Outbound: Remove non-existent outbound returns error
+        // Outbound: removing it again is a no-op, as in Xray
         let resp = handle_handler(
             "RemoveOutbound",
             rm_out_req.encode_to_vec().into(),
             &inbound_manager,
         )
         .await;
-        assert_eq!(resp.headers().get("grpc-status").unwrap(), "2");
+        assert!(resp.headers().get("grpc-status").is_none_or(|s| s == "0"));
 
         // Inbound: AddInbound (bind port 0)
         let receiver = ReceiverConfig {
