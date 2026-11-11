@@ -389,8 +389,8 @@ where
 {
     let mut header_buf = Vec::with_capacity(2048);
     let mut temp = [0u8; 1024];
-    // One deadline for the whole header, like Xray's ReadHeaderTimeout.
-    let deadline = tokio::time::Instant::now() + crate::policy::get().handshake;
+    // One deadline for the whole header: Xray's ReadHeaderTimeout of 4 s.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
 
     let header_end = loop {
         if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -446,6 +446,7 @@ where
     let mut connection_ok = false;
     let mut sec_key = None;
     let mut sec_proto = None;
+    let mut sec_version = None;
     let mut host_hdr = None;
     let mut header_pairs = Vec::new();
 
@@ -457,14 +458,16 @@ where
         let val = val.trim();
         header_pairs.push((key, val));
 
-        if key.eq_ignore_ascii_case("upgrade") && val.to_ascii_lowercase().contains("websocket") {
+        // gorilla/websocket compares comma-separated tokens, not substrings.
+        let has_token = |token: &str| val.split(',').any(|t| t.trim().eq_ignore_ascii_case(token));
+        if key.eq_ignore_ascii_case("upgrade") && has_token("websocket") {
             upgrade_ok = true;
-        } else if key.eq_ignore_ascii_case("connection")
-            && val.to_ascii_lowercase().contains("upgrade")
-        {
+        } else if key.eq_ignore_ascii_case("connection") && has_token("upgrade") {
             connection_ok = true;
         } else if key.eq_ignore_ascii_case("sec-websocket-key") {
             sec_key = Some(val.to_owned());
+        } else if key.eq_ignore_ascii_case("sec-websocket-version") {
+            sec_version = Some(val.to_owned());
         } else if key.eq_ignore_ascii_case("sec-websocket-protocol") {
             sec_proto = Some(val.to_owned());
         } else if key.eq_ignore_ascii_case("host") {
@@ -475,7 +478,7 @@ where
     let peer = crate::sockopt::apply_trusted_x_forwarded_for_raw(header_pairs, trusted_xff, peer);
 
     if let Some(expected_host) = &settings.host {
-        let h = host_hdr.unwrap_or_default();
+        let h = host_hdr.clone().unwrap_or_default();
         if !crate::httpupgrade::is_valid_http_host(&h, expected_host) {
             let _ = stream
                 .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n")
@@ -521,6 +524,25 @@ where
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "missing websocket Upgrade or Connection headers",
+        ));
+    }
+
+    // gorilla/websocket, which Xray uses, refuses a version other than 13 or
+    // a key that is not 16 bytes in base64; Go refuses HTTP/1.1 without Host.
+    let key_ok = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(key.as_bytes())
+            .is_ok_and(|k| k.len() == 16)
+    };
+    let host_ok = host_hdr.is_some() || !req_line.ends_with("HTTP/1.1");
+    if sec_version.as_deref() != Some("13") || !key_ok || !host_ok {
+        let _ = stream
+            .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            .await;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid websocket handshake",
         ));
     }
 
