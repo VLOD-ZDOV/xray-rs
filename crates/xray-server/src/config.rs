@@ -619,6 +619,7 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     // it only sees `dns`.
     let dns = match root.get("dns") {
         Some(section) => {
+            let section = xray_dns_section(section);
             let only_dns = serde_json::json!({ "dns": section }).to_string();
             let parsed = xray_config::parse_xray_json_with_geodata_dirs(&only_dns, &asset_dirs())
                 .map_err(|e| {
@@ -1882,6 +1883,112 @@ fn gecko_packet_size(
         .ok_or_else(|| "gecko: invalid min/max packet size".to_owned())
 }
 
+// `dns` fields as Xray's DNSConfig and NameServerConfig name them, and whether
+// this core implements them. Go's JSON decoding matches keys case-insensitively
+// and drops unknown ones, so Xray starts with fields it does not know.
+const DNS_FIELDS: &[(&str, bool)] = &[
+    ("servers", true),
+    ("hosts", true),
+    ("clientIp", true),
+    ("tag", true),
+    ("queryStrategy", true),
+    ("disableCache", true),
+    ("serveStale", true),
+    ("serveExpiredTTL", true),
+    ("disableFallback", true),
+    ("disableFallbackIfMatch", true),
+    ("enableParallelQuery", true),
+    ("script", false),
+    ("useSystemHosts", false),
+];
+const DNS_SERVER_FIELDS: &[(&str, bool)] = &[
+    ("address", true),
+    ("port", true),
+    ("domains", true),
+    ("expectedIPs", true),
+    ("expectIPs", true),
+    ("unexpectedIPs", true),
+    ("tag", true),
+    ("timeoutMs", true),
+    ("skipFallback", true),
+    ("queryStrategy", true),
+    ("finalQuery", true),
+    ("clientIp", true),
+    ("id", false),
+    ("disableCache", false),
+    ("serveStale", false),
+    ("serveExpiredTTL", false),
+];
+const DNS_QUERY_STRATEGIES: &[&str] = &[
+    "useip",
+    "use_ip",
+    "use-ip",
+    "useip4",
+    "useipv4",
+    "use_ip4",
+    "use_ipv4",
+    "use_ip_v4",
+    "use-ip4",
+    "use-ipv4",
+    "use-ip-v4",
+    "useip6",
+    "useipv6",
+    "use_ip6",
+    "use_ipv6",
+    "use_ip_v6",
+    "use-ip6",
+    "use-ipv6",
+    "use-ip-v6",
+    "usesys",
+    "usesystem",
+    "use_sys",
+    "use_system",
+    "use-sys",
+    "use-system",
+];
+
+/// Reads `dns` as Xray does before the stricter upstream parser sees it:
+/// keys are matched case-insensitively, unknown and unimplemented fields are
+/// dropped with a warning, and an unknown `queryStrategy` becomes UseIP.
+fn xray_dns_section(section: &Value) -> Value {
+    fn keep(object: &Value, fields: &[(&str, bool)], path: &str) -> Value {
+        let Value::Object(map) = object else {
+            return object.clone();
+        };
+        let mut out = serde_json::Map::new();
+        for (key, value) in map {
+            match fields
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(key))
+            {
+                Some((name, true)) => {
+                    out.insert((*name).to_owned(), value.clone());
+                }
+                Some((name, false)) => {
+                    log::warn(format!("{path}.{name} is not supported yet, ignored"));
+                }
+                None => log::warn(format!("unknown field {path}.{key} ignored")),
+            }
+        }
+        if let Some(Value::String(strategy)) = out.get("queryStrategy") {
+            if !DNS_QUERY_STRATEGIES.contains(&strategy.to_ascii_lowercase().as_str()) {
+                log::warn(format!(
+                    "{path}.queryStrategy {strategy:?} is unknown, using UseIP as Xray does"
+                ));
+                out.insert("queryStrategy".to_owned(), Value::from("UseIP"));
+            }
+        }
+        Value::Object(out)
+    }
+    let mut dns = keep(section, DNS_FIELDS, "dns");
+    if let Some(Value::Array(servers)) = dns.get_mut("servers") {
+        for server in servers.iter_mut() {
+            *server = keep(server, DNS_SERVER_FIELDS, "dns.servers[]");
+        }
+    }
+    dns
+}
+
 fn parse_fakedns(
     root: &Value,
     dns: Option<&xray_config::DnsConfig>,
@@ -2613,6 +2720,23 @@ pub(crate) fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dns_section_is_read_as_xray_reads_it() {
+        let dns = xray_dns_section(&serde_json::json!({
+            "QueryStrategy": "IPOnDemand",
+            "queryLog": true,
+            "useSystemHosts": true,
+            "servers": ["1.1.1.1", {"Address": "8.8.8.8", "dialerProxy": "x", "serveStale": true}]
+        }));
+        assert_eq!(
+            dns,
+            serde_json::json!({
+                "queryStrategy": "UseIP",
+                "servers": ["1.1.1.1", {"address": "8.8.8.8"}]
+            })
+        );
+    }
+
     use super::*;
 
     const PANEL_LIKE: &str = r#"{
