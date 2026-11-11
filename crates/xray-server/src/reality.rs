@@ -414,6 +414,9 @@ async fn probe_dest_post_handshake_lens(
         .with_custom_certificate_verifier(Arc::new(NoCertVerifier { provider }))
         .with_no_client_auth();
     client_config.alpn_protocols = alpn_list;
+    // An empty SNI goes out as none, as REALITY's record_detect sends it;
+    // the placeholder name below is then never sent.
+    client_config.enable_sni = !sni.is_empty();
 
     let server_name = ServerName::try_from(sni.to_string())
         .or_else(|_| ServerName::try_from("localhost".to_string()))
