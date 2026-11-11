@@ -1786,22 +1786,21 @@ impl Router {
         }
     }
 
-    /// Xray's freedom `getDefaultFinalRule`: public proxy inbounds may not
-    /// reach private addresses by default, local ones (socks, http, tunnel)
-    /// may. An untagged inbound cannot be told apart, so it stays blocked.
+    /// Xray's freedom `getDefaultFinalRule` blocks private addresses for its
+    /// public proxy inbounds and leaves local ones (socks, http, tunnel)
+    /// free. Only those local ones are opened here, so an untagged inbound or
+    /// a protocol Xray does not list stays blocked.
     fn inbound_opens_private(&self, tag: &str) -> bool {
         let protocols = self
             .inbound_protocols
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(protocol) = protocols.get(tag) else {
-            return false;
-        };
-        let protocol = protocol.to_ascii_lowercase();
-        !(matches!(
-            protocol.as_str(),
-            "vless" | "vmess" | "trojan" | "hysteria" | "hysteria2" | "wireguard"
-        ) || protocol.starts_with("shadowsocks"))
+        protocols.get(tag).is_some_and(|protocol| {
+            matches!(
+                protocol.to_ascii_lowercase().as_str(),
+                "socks" | "http" | "mixed" | "dokodemo-door" | "dokodemo" | "tunnel"
+            )
+        })
     }
 
     /// Freedom's last check on the resolved address: the first matching
@@ -1880,8 +1879,9 @@ impl Router {
                     current_inbound = inbound_tag;
                 }
                 _ => {
+                    // Loopback keeps the original inbound's protocol, as Xray's does.
                     return Decision {
-                        open_private: self.inbound_opens_private(&current_inbound),
+                        open_private: self.inbound_opens_private(query.inbound),
                         ..decision
                     }
                 }
@@ -2911,6 +2911,10 @@ mod tests {
     #[tokio::test]
     async fn loopback_rerouting() {
         let r = router(json!({
+            "inbounds": [
+                {"tag": "client-in", "protocol": "vless"},
+                {"tag": "loop-in", "protocol": "socks"}
+            ],
             "outbounds": [
                 {"tag": "direct", "protocol": "freedom"},
                 {"tag": "to-loop", "protocol": "loopback", "settings": {"inboundTag": "loop-in"}},
@@ -2929,6 +2933,8 @@ mod tests {
         q.inbound = "client-in";
         let decision = r.route(&q).await;
         assert_eq!(decision.tag, "direct");
+        // A VLESS client looped into a socks inbound keeps VLESS's block.
+        assert!(!decision.open_private);
 
         q.port = 443;
         let decision = r.route(&q).await;
