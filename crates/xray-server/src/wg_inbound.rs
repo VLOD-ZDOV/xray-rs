@@ -3,7 +3,7 @@
 use crate::config::Inbound;
 use crate::log;
 use crate::outbound::{self, ConeUdp};
-use crate::routing::{Action, Query, Router};
+use crate::routing::{Query, Router};
 use crate::stats;
 use crate::vless::{copy, relay, Activity, Host};
 use serde_json::Value;
@@ -203,7 +203,8 @@ async fn handle_tcp(tcp: IncomingTcpStream, ctx: Arc<crate::vless::Context>, rou
         process_info: None,
     };
     let decision = router.route(&query).await;
-    let accepted = !matches!(decision.action, Action::Block(_));
+    // Xray's dispatcher logs a routed session as accepted, blackhole or not.
+    let accepted = true;
     log::access(
         tcp.src,
         accepted,
@@ -256,7 +257,8 @@ async fn handle_udp(
         process_info: None,
     };
     let decision = router.route(&query).await;
-    let accepted = !matches!(decision.action, Action::Block(_));
+    // Xray's dispatcher logs a routed session as accepted, blackhole or not.
+    let accepted = true;
     log::access(
         udp.src,
         accepted,

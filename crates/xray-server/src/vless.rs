@@ -820,7 +820,8 @@ impl RouteRequest<'_> {
             host_label(self.host)
         };
         let to = format!("{network}:{}:{}", label, self.port);
-        let accepted = !matches!(decision.action, Action::Block(_));
+        // Xray's dispatcher logs a routed session as accepted, blackhole or not.
+        let accepted = true;
         log::access(
             self.peer,
             accepted,
