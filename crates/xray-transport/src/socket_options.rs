@@ -271,7 +271,9 @@ mod sys {
         let socket = socket2::SockRef::from(&fd);
         let tcp = match get_int(fd, libc::SOL_SOCKET, libc::SO_TYPE).ok()? {
             libc::SOCK_STREAM => true,
-            libc::SOCK_DGRAM => false,
+            // A raw socket, the `xicmp` mask's without `dgram`, takes what a
+            // UDP socket takes: left alone, it went out unbound and unmarked.
+            libc::SOCK_DGRAM | libc::SOCK_RAW => false,
             _ => return None,
         };
         let ipv6 = match socket.local_addr().ok()?.family() as c_int {
@@ -382,10 +384,8 @@ mod sys {
             kind: SocketKind,
             options: &SocketOptions,
         ) -> Result<(), ApplyError> {
-            if options.mark != 0 {
-                set_int(fd, libc::SOL_SOCKET, SO_MARK, options.mark)
-                    .map_err(|error| option_error("failed to set SO_MARK", error))?;
-            }
+            // The interface is bound first: a mark the process may not set, as
+            // on Android, would otherwise leave the socket unbound.
             if !options.interface.is_empty() {
                 set_bytes(
                     fd,
@@ -394,6 +394,10 @@ mod sys {
                     options.interface.as_bytes(),
                 )
                 .map_err(|error| bind_error("failed to set Interface", error))?;
+            }
+            if options.mark != 0 {
+                set_int(fd, libc::SOL_SOCKET, SO_MARK, options.mark)
+                    .map_err(|error| option_error("failed to set SO_MARK", error))?;
             }
             if kind.tcp {
                 let mut tfo = options.parsed_tcp_fast_open();
@@ -477,6 +481,29 @@ mod sys {
             kind: SocketKind,
             options: &SocketOptions,
         ) -> Result<(), ApplyError> {
+            // Bound first: a configured tcpFastOpen stops the options after it.
+            if !options.interface.is_empty() {
+                let index = nix::net::if_::if_nametoindex(options.interface.as_str())
+                    .ok()
+                    .filter(|index| *index != 0)
+                    .ok_or_else(|| {
+                        bind_error(
+                            format_args!("failed to get interface {}", options.interface),
+                            io::Error::new(io::ErrorKind::NotFound, "no such network interface"),
+                        )
+                    })?;
+                let (level, name, what) = if kind.ipv6 {
+                    (
+                        libc::IPPROTO_IPV6,
+                        IPV6_BOUND_IF,
+                        "failed to set IPV6_BOUND_IF",
+                    )
+                } else {
+                    (libc::IPPROTO_IP, IP_BOUND_IF, "failed to set IP_BOUND_IF")
+                };
+                set_int(fd, level, name, index as c_int)
+                    .map_err(|error| bind_error(what, error))?;
+            }
             if kind.tcp {
                 let mut tfo = options.parsed_tcp_fast_open();
                 if tfo > 0 {
@@ -502,28 +529,6 @@ mod sys {
                     set_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE, 0)
                         .map_err(|error| option_error("failed to unset SO_KEEPALIVE", error))?;
                 }
-            }
-            if !options.interface.is_empty() {
-                let index = nix::net::if_::if_nametoindex(options.interface.as_str())
-                    .ok()
-                    .filter(|index| *index != 0)
-                    .ok_or_else(|| {
-                        bind_error(
-                            format_args!("failed to get interface {}", options.interface),
-                            io::Error::new(io::ErrorKind::NotFound, "no such network interface"),
-                        )
-                    })?;
-                let (level, name, what) = if kind.ipv6 {
-                    (
-                        libc::IPPROTO_IPV6,
-                        IPV6_BOUND_IF,
-                        "failed to set IPV6_BOUND_IF",
-                    )
-                } else {
-                    (libc::IPPROTO_IP, IP_BOUND_IF, "failed to set IP_BOUND_IF")
-                };
-                set_int(fd, level, name, index as c_int)
-                    .map_err(|error| bind_error(what, error))?;
             }
             apply_custom(fd, kind, options)
         }

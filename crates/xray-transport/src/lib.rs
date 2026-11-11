@@ -17,20 +17,28 @@ use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
 
+mod chrome_parrot;
 #[cfg(target_os = "macos")]
 mod connected_quic;
 
 mod dialer;
 pub mod fake_dns;
 mod fragment;
-pub use fragment::TcpFragmentConfig;
+pub use fragment::{FragmentPackets, TcpFragmentConfig};
 mod dns;
 mod happy_eyeballs;
 pub mod header_custom;
 pub mod hysteria;
 pub mod kcp;
+pub mod masque;
 mod memory_class;
+mod network_change;
+pub mod realm;
 pub mod sudoku;
+pub mod xdns;
+pub mod xdrive;
+pub mod xicmp;
+pub mod xmc;
 
 /// Validate a TLS DNS/IP verification name without performing network I/O.
 pub fn validate_tls_server_name(server_name: &str) -> Result<(), TransportError> {
@@ -65,6 +73,7 @@ pub use dns::{
 };
 pub use happy_eyeballs::{connect_tcp_dual_stack, connect_tcp_happy_eyeballs, HappyEyeballsConfig};
 pub use memory_class::{memory_class, set_memory_class, MemoryClass};
+pub use network_change::NetworkChanges;
 pub(crate) use penetrating_tls::{CapturedStream, PenetratingTlsStream, ServerReadLog};
 pub use reality_connector::{RealityTlsSession, RealityTlsSessionProvider};
 pub use reality_runtime::{
@@ -80,7 +89,7 @@ pub use socket_options::{
     DEFAULT_TCP_KEEPALIVE_SECS,
 };
 pub use system_records::{is_domain_name, RecordResolver, SrvRecord, SystemRecordResolver};
-pub use tls::{plain_tls_client_hello_bytes, TlsConnector};
+pub use tls::{plain_tls_client_hello_bytes, TlsConnector, WarpTls};
 pub use utls_profiles::draw_modern_fingerprint;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,8 +216,12 @@ pub enum TransportError {
     Grpc(String),
     #[error("xhttp transport error: {0}")]
     Xhttp(String),
+    #[error("xdrive transport error: {0}")]
+    Xdrive(String),
     #[error("mKCP dial failed: {0}")]
     Kcp(std::io::Error),
+    #[error("realm socket failed: {0}")]
+    RealmSocket(std::io::Error),
     #[error(transparent)]
     Http2Connect(#[from] stream::Http2ConnectError),
     #[error("reality handshake failed: {0}")]
@@ -719,4 +732,6 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+mod udp_mask;
+pub use udp_mask::MaskedUdpSocket;
 pub mod udp_noise;

@@ -111,14 +111,7 @@ pub(super) fn build_xhttp_download(
     Ok(Some(XhttpDownloadOutbound {
         server: Target::new(addr, download.port, RoutingNetwork::Tcp),
         connector: carrier::build_connector(&download.stream.security, &download.address),
-        transport: build_xhttp_transport(
-            settings,
-            &download.stream.security,
-            &download.address,
-            download.stream.quic_params.as_ref(),
-            download.stream.udp_noise.as_ref(),
-            download.stream.udp_header_custom.as_ref(),
-        )?,
+        transport: build_xhttp_transport(settings, &download.stream, &download.address)?,
         happy_eyeballs: happy_eyeballs_config(&download.stream),
         socket_options: if penetrate {
             DownloadSocketOptions::Upload
@@ -133,14 +126,19 @@ pub(super) fn build_xhttp_download(
     }))
 }
 
+/// The XHTTP transport `stream` describes: its security, its QUIC
+/// parameters and UDP masks when it selects HTTP/3.
 pub(super) fn build_xhttp_transport(
     settings: &XhttpSettings,
-    security: &StreamSecurity,
+    stream: &xray_config::StreamSettings,
     destination: &TargetAddr,
-    quic_params: Option<&QuicParamsSettings>,
-    noise: Option<&xray_config::UdpNoiseSettings>,
-    header_custom: Option<&xray_config::HeaderCustomUdp>,
 ) -> Result<XhttpTransport, CoreError> {
+    let security = &stream.security;
+    let quic_params = stream.quic_params.as_ref();
+    let noise = stream.udp_noise.as_ref();
+    let header_custom = stream.udp_header_custom.as_ref();
+    let sudoku = stream.udp_sudoku.as_ref();
+    let xdns = stream.udp_xdns.as_ref();
     let http_version = xhttp_http_version(security)?;
     let endpoint = xhttp_endpoint(settings, security, destination)?;
     let config = xhttp_config(settings, matches!(security, StreamSecurity::Reality(_)))?;
@@ -161,8 +159,42 @@ pub(super) fn build_xhttp_transport(
             "a header-custom UDP mask requires XHTTP H3",
         ));
     }
+    if sudoku.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "a sudoku UDP mask requires XHTTP H3",
+        ));
+    }
+    if xdns.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "an xdns UDP mask requires XHTTP H3",
+        ));
+    }
     h3_quic.udp_noise = noise.map(udp_noise_config).transpose()?;
     h3_quic.udp_header_custom = header_custom.map(super::carrier::quic_header_custom);
+    h3_quic.udp_sudoku = sudoku.map(super::carrier::quic_sudoku);
+    h3_quic.udp_xdns = xdns.map(super::carrier::xdns_config);
+    if stream.udp_realm.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "a realm UDP mask requires XHTTP H3",
+        ));
+    }
+    h3_quic.udp_realm = stream.udp_realm.as_ref().map(super::carrier::realm_config);
+    if stream.udp_xicmp.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "an xicmp UDP mask requires XHTTP H3",
+        ));
+    }
+    h3_quic.udp_xicmp = stream.udp_xicmp.as_ref().map(super::carrier::xicmp_config);
+    if stream.udp_salamander.is_some() && http_version != XhttpHttpVersion::Http3 {
+        return Err(invalid_xhttp_configuration(
+            "a Salamander UDP mask requires XHTTP H3",
+        ));
+    }
+    h3_quic.udp_salamander = stream
+        .udp_salamander
+        .as_ref()
+        .map(super::carrier::quic_salamander)
+        .transpose()?;
     XhttpTransport::new_with_h3_quic(config, endpoint, http_version, xmux, h3_quic)
         .map_err(invalid_xhttp_configuration)
 }
@@ -291,18 +323,24 @@ pub(super) fn invalid_xhttp_configuration(error: impl ToString) -> CoreError {
 /// Maps Xray's QUIC surface into the phase-one HTTP/3 engine.
 ///
 /// Defaults remain usable and interoperable, with the engine's diagnostics
-/// naming its fixed-window and Quinn-BBR performance approximations. Explicit
-/// UDP hopping, debug side-effects, adaptive receive-window pairs,
-/// non-standard BBR profiles and Brutal are retained by the parser but
-/// rejected by `H3QuicConfig` (or here) until their runtime implementation
-/// exists.
+/// naming its Quinn-BBR approximation for the `standard` BBR profile. Debug
+/// side-effects and `brutal` over XHTTP are retained by the parser but
+/// rejected by `H3QuicConfig` (or here).
 pub(super) fn xhttp_h3_quic_config(
     settings: Option<&QuicParamsSettings>,
 ) -> Result<H3QuicConfig, CoreError> {
+    // Without quicParams Xray dials with ChromeParrot, as with
+    // `disableChromeParrot: false`.
     let Some(settings) = settings else {
-        return Ok(H3QuicConfig::default());
+        return Ok(H3QuicConfig {
+            chrome_parrot: true,
+            ..H3QuicConfig::default()
+        });
     };
-    let mut config = H3QuicConfig::default();
+    let mut config = H3QuicConfig {
+        chrome_parrot: !settings.disable_chrome_parrot,
+        ..H3QuicConfig::default()
+    };
     config.initial_stream_receive_window = quic_u64_or_default(
         "initStreamReceiveWindow",
         settings.init_stream_receive_window,
@@ -364,6 +402,7 @@ pub(super) fn xhttp_h3_quic_config(
         // The XHTTP transport refuses it: only Hysteria announces rates.
         xray_config::QuicCongestion::Brutal => H3Congestion::Brutal {
             up_bytes_per_second: settings.brutal_up_bytes_per_sec,
+            bbr_profile: h3_bbr_profile(settings.bbr_profile),
         },
         xray_config::QuicCongestion::ForceBrutal => H3Congestion::ForceBrutal {
             bytes_per_second: settings.brutal_up_bytes_per_sec,
@@ -404,12 +443,16 @@ pub(super) fn udp_hop_config(
     }
 }
 
-/// The BBR variant for Xray's `bbrProfile`; only standard is implemented.
-pub(super) const fn bbr_congestion(profile: xray_config::QuicBbrProfile) -> H3Congestion {
+/// The BBR variant for Xray's `bbrProfile`.
+pub(super) fn bbr_congestion(profile: xray_config::QuicBbrProfile) -> H3Congestion {
+    H3Congestion::from_bbr_profile(h3_bbr_profile(profile))
+}
+
+pub(super) const fn h3_bbr_profile(profile: xray_config::QuicBbrProfile) -> H3BbrProfile {
     match profile {
-        xray_config::QuicBbrProfile::Conservative => H3Congestion::BbrConservative,
-        xray_config::QuicBbrProfile::Standard => H3Congestion::BbrStandard,
-        xray_config::QuicBbrProfile::Aggressive => H3Congestion::BbrAggressive,
+        xray_config::QuicBbrProfile::Conservative => H3BbrProfile::Conservative,
+        xray_config::QuicBbrProfile::Standard => H3BbrProfile::Standard,
+        xray_config::QuicBbrProfile::Aggressive => H3BbrProfile::Aggressive,
     }
 }
 
@@ -546,10 +589,19 @@ pub(super) const fn xhttp_uplink_data_placement(
 pub(super) fn udp_noise_config(
     noise: &xray_config::UdpNoiseSettings,
 ) -> Result<xray_transport::udp_noise::UdpNoiseConfig, CoreError> {
-    use xray_transport::udp_noise::{NoiseRange, UdpNoiseConfig, UdpNoiseItem};
+    use xray_transport::udp_noise::{NoiseRange, NoiseSegment, UdpNoiseConfig, UdpNoiseItem};
     let range = |r: xray_config::FragmentRange| NoiseRange {
         from: r.from,
         to: r.to,
+    };
+    let segment = |segment: &xray_config::NoiseSegment| match segment {
+        xray_config::NoiseSegment::Bytes(bytes) => NoiseSegment::Bytes(bytes.clone()),
+        xray_config::NoiseSegment::Random(size) => NoiseSegment::Random(range(*size)),
+        xray_config::NoiseSegment::RandomLetters(size) => NoiseSegment::RandomLetters(range(*size)),
+        xray_config::NoiseSegment::RandomDigits(size) => NoiseSegment::RandomDigits(range(*size)),
+        xray_config::NoiseSegment::Timestamp => NoiseSegment::Timestamp,
+        xray_config::NoiseSegment::Counter => NoiseSegment::Counter,
+        xray_config::NoiseSegment::Nonce => NoiseSegment::Nonce,
     };
     let config = UdpNoiseConfig {
         reset_secs: range(noise.reset_secs),
@@ -562,6 +614,7 @@ pub(super) fn udp_noise_config(
                 random_length: range(i.random_length),
                 random_bytes: range(i.random_bytes),
                 delay_ms: range(i.delay_ms),
+                segments: i.segments.iter().map(segment).collect(),
             })
             .collect(),
     };

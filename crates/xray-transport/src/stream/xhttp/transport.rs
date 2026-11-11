@@ -321,7 +321,8 @@ pub struct XhttpTransport {
     config: Arc<XhttpConfig>,
     endpoint: XhttpEndpoint,
     http_version: XhttpHttpVersion,
-    h3_quic: H3QuicConfig,
+    /// Shared: every H3 dial takes its own copy.
+    h3_quic: Arc<H3QuicConfig>,
     rng: Arc<StdMutex<Box<dyn RngCore + Send>>>,
     xmux: Arc<XmuxManager>,
 }
@@ -391,7 +392,7 @@ impl XhttpTransport {
             config: Arc::new(config),
             endpoint,
             http_version,
-            h3_quic,
+            h3_quic: Arc::new(h3_quic),
             rng,
             xmux,
         })
@@ -587,15 +588,17 @@ impl XhttpTransport {
     ) -> Result<XhttpModeDial, XhttpTransportError> {
         if self.http_version == XhttpHttpVersion::Http3 {
             let material = dialer
-                .h3_dial_material(connector)
+                .h3_dial_material(connector, self.h3_quic.chrome_parrot)
                 .map_err(XhttpTransportError::Dial)?;
             let candidates = candidates.to_vec();
             let happy_eyeballs = happy_eyeballs.copied();
             let quic = self.h3_quic.clone();
+            let realm = quic.udp_realm.as_ref().map(|_| dialer.realm_env());
             let dial: XhttpH3Dial = Arc::new(move || {
                 let candidates = candidates.clone();
                 let material = material.clone();
-                let quic = quic.clone();
+                let quic = H3QuicConfig::clone(&quic);
+                let realm = realm.clone();
                 Box::pin(async move {
                     let remote_addr = candidates
                         .first()
@@ -608,6 +611,8 @@ impl XhttpTransport {
                             tls_config: material.tls_config,
                             socket_protector: material.socket_protector,
                             quic,
+                            realm,
+                            network_changes: Some(material.network_changes),
                         },
                         &candidates,
                         happy_eyeballs.as_ref(),

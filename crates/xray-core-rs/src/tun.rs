@@ -52,8 +52,7 @@ use crate::{
     OutboundRouter, RuntimeLogger, TunAdmissionPolicy, TunRuntimeOptions, TunRuntimeProfile,
 };
 use xray_proxy::vless::{
-    encode_udp_packet, encode_xudp_keep_packet, encode_xudp_new_packet, read_udp_packet,
-    read_xudp_packet,
+    encode_udp_packet, encode_xudp_keep_packet, encode_xudp_new_packet, UdpResponseReader,
 };
 
 const DEFAULT_RANDOM_SEED: u64 = 0x7872_6179_7275_7374;
@@ -2926,7 +2925,8 @@ async fn open_tcp_bridge_stream(
             | TcpOutbound::Shadowsocks2022(_)
             | TcpOutbound::Vless(_)
             | TcpOutbound::Hysteria(_)
-            | TcpOutbound::Wireguard(_) => {}
+            | TcpOutbound::Wireguard(_)
+            | TcpOutbound::Masque(_) => {}
             TcpOutbound::Chained { .. } => {
                 if matches!(
                     outbound.primary(),
@@ -2957,7 +2957,9 @@ async fn open_tcp_bridge_stream(
         | TcpOutbound::Vmess(_)
         | TcpOutbound::Shadowsocks2022(_)
         | TcpOutbound::Vless(_)
-        | TcpOutbound::Hysteria(_) => context.bootstrap_dns_resolver(),
+        | TcpOutbound::Hysteria(_)
+        // MASQUE resolves destinations through its tunnel.
+        | TcpOutbound::Masque(_) => context.bootstrap_dns_resolver(),
         TcpOutbound::Wireguard(_) => context.dns_resolver.as_ref(),
         TcpOutbound::Chained { .. } => unreachable!("primary outbound is never a chain wrapper"),
     };
@@ -3190,7 +3192,25 @@ async fn read_tun_tcp_sniff_payload(
                         .done();
                         return Some((initial_upload, sniffed));
                     }
-                    data = from_stack.recv() => data?,
+                    data = from_stack.recv() => match data {
+                        Some(data) => data,
+                        // The client closed before the sniffer had enough:
+                        // what it sent still goes to the destination, which
+                        // then sees the close. With nothing sent there is
+                        // nothing to carry.
+                        None if initial_upload.is_empty() => return None,
+                        None => {
+                            let sniffed = crate::sniffing::sniff_tcp_initial_payload(
+                                config,
+                                target,
+                                &sniff_buffer,
+                                true,
+                                record_attributes,
+                            )
+                            .done();
+                            return Some((initial_upload, sniffed));
+                        }
+                    },
                 };
         let remaining = TUN_TCP_SNIFF_BUFFER_SIZE.saturating_sub(sniff_buffer.len());
         let inspected = data.data.len().min(remaining);
@@ -3413,6 +3433,9 @@ async fn bridge_tcp_flow_inner(
             TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
                 effective_policy_for_level(&context.config, Some(0)).handshake
             }
+            TcpOutbound::Masque(_) => crate::outbound::masque::open_timeout(
+                effective_policy_for_level(&context.config, Some(0)).handshake,
+            ),
             TcpOutbound::Freedom(_) => context.inbound_policy.handshake,
             TcpOutbound::Trojan(outbound) => {
                 effective_policy_for_level(&context.config, Some(outbound.level())).handshake
@@ -5046,6 +5069,32 @@ async fn bridge_udp_freedom_flow(
             .await;
         return;
     }
+    // Under `finalmask.udp`, every datagram of the flow, the PROXY header
+    // and the noises included, goes through the masks.
+    let masked = tokio::select! {
+        biased;
+        () = wait_for_connection_close(&mut connection_close) => return,
+        result = freedom.udp_socket(socket, target_addr, dialer.socket_protector_arc()) => result,
+    };
+    let socket = match masked {
+        Ok(socket) => socket,
+        Err(_) => {
+            if context.runtime_logger.is_enabled() {
+                crate::debug_log::log_access_rejected(
+                    &context.runtime_logger,
+                    "tun",
+                    &target,
+                    "udp masks failed to open",
+                );
+            }
+            context.tun.record_udp_open_error();
+            let _ = context
+                .stack_tx
+                .send(StackEvent::UdpClosed { key, generation })
+                .await;
+            return;
+        }
+    };
     if let Some(version) = freedom.proxy_protocol() {
         // Xray-core writes the header as a datagram of its own.
         let header = proxy_protocol::header(
@@ -5136,7 +5185,7 @@ async fn bridge_udp_freedom_flow_loop<T>(
     generation: u64,
     target: Target,
     target_addr: SocketAddr,
-    socket: UdpSocket,
+    socket: crate::outbound::FreedomUdpSocket,
     rules: &[xray_config::FreedomFinalRule],
     context: TunRuntimeContext,
     mut from_stack: UdpIngress,
@@ -5456,6 +5505,9 @@ async fn bridge_udp_vless_flow_loop<R, W, T>(
         timing.record_written(first_payload_len);
     }
 
+    // The read below loses to every other branch it is still waiting in;
+    // the bytes it took wait here for the next one.
+    let mut responses = UdpResponseReader::default();
     loop {
         tokio::select! {
             biased;
@@ -5504,7 +5556,7 @@ async fn bridge_udp_vless_flow_loop<R, W, T>(
                 traffic.record_uplink(payload_len as u64);
                 timing.record_written(payload_len);
             }
-            packet = read_vless_udp_response(remote_reader, framing, fallback_source) => {
+            packet = read_vless_udp_response(&mut responses, remote_reader, framing, fallback_source) => {
                 let (source, payload) = match packet {
                     Ok(packet) => packet,
                     Err(error) => {
@@ -5759,6 +5811,7 @@ fn build_udp_packet(source: IpEndpoint, destination: IpEndpoint, payload: &[u8])
 }
 
 async fn read_vless_udp_response<R>(
+    responses: &mut UdpResponseReader,
     reader: &mut R,
     framing: VlessUdpFraming,
     fallback_source: IpEndpoint,
@@ -5768,11 +5821,11 @@ where
 {
     match framing {
         VlessUdpFraming::LengthPrefixed => {
-            let payload = read_udp_packet(reader).await?;
+            let payload = responses.read_udp_packet(reader).await?;
             Ok((fallback_source, payload))
         }
         VlessUdpFraming::Xudp => {
-            let packet = read_xudp_packet(reader).await?;
+            let packet = responses.read_xudp_packet(reader).await?;
             let source = packet
                 .source
                 .as_ref()
@@ -8696,6 +8749,54 @@ mod tests {
             result.protocol,
             Some(crate::sniffing::SniffedProtocol::Quic)
         );
+    }
+
+    /// A client that sends a few bytes and closes before the sniffer has
+    /// seen enough of them: the bytes are kept for the destination rather
+    /// than dropped with the flow. One that closes having sent nothing has
+    /// nothing to carry.
+    #[tokio::test]
+    async fn a_close_during_the_sniff_wait_keeps_what_the_client_sent() {
+        let config = InboundSniffingConfig {
+            enabled: true,
+            dest_override: vec![xray_config::SniffingDestination::Http],
+            ..Default::default()
+        };
+        let (_shutdown_tx, mut shutdown) = watch::channel(false);
+
+        let (to_remote, mut from_stack) = mpsc::channel(4);
+        to_remote
+            .send(stack_to_remote_data(Bytes::from_static(b"QUIT\r\n")))
+            .await
+            .unwrap();
+        drop(to_remote);
+        let (upload, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_tun_tcp_sniff_payload(
+                &mut from_stack,
+                &mut shutdown,
+                &config,
+                &test_tcp443_target(),
+                false,
+            ),
+        )
+        .await
+        .unwrap()
+        .expect("the bytes sent before the close are kept");
+        let sent: Vec<&[u8]> = upload.iter().map(|chunk| chunk.data.as_ref()).collect();
+        assert_eq!(sent, [b"QUIT\r\n"]);
+
+        let (to_remote, mut from_stack) = mpsc::channel::<StackToRemoteData>(4);
+        drop(to_remote);
+        assert!(read_tun_tcp_sniff_payload(
+            &mut from_stack,
+            &mut shutdown,
+            &config,
+            &test_tcp443_target(),
+            false,
+        )
+        .await
+        .is_none());
     }
 
     #[test]

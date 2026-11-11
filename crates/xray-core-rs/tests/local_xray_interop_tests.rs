@@ -29,7 +29,7 @@ use xray_transport::{
 const TEST_UUID: &str = "00010203-0405-0607-0809-0a0b0c0d0e0f";
 const TLS_SERVER_NAME: &str = "vless.test";
 const XRAY_CORE_EXPECTED_REVISION_ENV: &str = "XRAY_CORE_EXPECTED_REVISION";
-const PINNED_XRAY_CORE_REVISION: &str = "a4a3dff5b20c2faae567b742c172c7b95e75c083";
+const PINNED_XRAY_CORE_REVISION: &str = "676eaf66f8f05d4d558ee7a74b4736623d3feeb9";
 // This external-origin legacy suite needs X25519MLKEM support. The hermetic
 // ML-DSA/Vision matrix uses its own local cover origin instead.
 const REALITY_SERVER_NAME: &str = "www.google.com";
@@ -194,6 +194,83 @@ async fn rust_socks_clients_open_parallel_echo_flows_through_local_xray_vless_re
                 "running REALITY Vision burst interop fingerprint={fingerprint} flows={flow_count}"
             );
             run_local_xray_vless_reality_vision_burst_interop(&fingerprint, flow_count).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// VLESS over TLS on the production shaping path, many connections per
+/// fingerprint: each handshake draws its own GREASE values, extension order and
+/// ECH GREASE length, and Xray-core's TLS server must take every hello drawn.
+/// The default names cover Chrome's four ECH lengths, Chrome 120's unpadded
+/// hellos among them; `XRAY_TLS_INTEROP_BURST_FINGERPRINTS` and
+/// `XRAY_TLS_INTEROP_BURST_FLOWS` choose others.
+#[tokio::test]
+#[ignore = "requires local Go toolchain, Xray-core checkout, and loopback process execution"]
+async fn rust_socks_clients_open_parallel_echo_flows_through_local_xray_vless_tls_selected_fingerprints(
+) {
+    timeout(Duration::from_secs(240), async {
+        let flow_count = selected_tls_interop_burst_flow_count();
+        for fingerprint in selected_tls_interop_burst_fingerprints() {
+            eprintln!("running TLS burst interop fingerprint={fingerprint} flows={flow_count}");
+            run_local_xray_vless_shaped_tls_burst_interop(&fingerprint, flow_count).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// Xray-core's TLS inbound held to P-256 (`curvePreferences`), which no
+/// Chrome profile sends a key share for: Go's server answers every shaped
+/// hello with a HelloRetryRequest naming P-256, and refuses a second
+/// ClientHello carrying any share besides that one ("client didn't send one
+/// key share in second ClientHello"). Every flow must get through, Chrome
+/// 120's padded hellos among them.
+#[tokio::test]
+#[ignore = "requires local Go toolchain, Xray-core checkout, and loopback process execution"]
+async fn rust_socks_clients_open_parallel_echo_flows_through_local_xray_vless_tls_after_a_hello_retry_request(
+) {
+    timeout(Duration::from_secs(240), async {
+        for fingerprint in [
+            "chrome",
+            "hellochrome_133",
+            "hellochrome_131",
+            "hellochrome_120",
+        ] {
+            eprintln!("running TLS HelloRetryRequest interop fingerprint={fingerprint}");
+            let xray_checkout = resolve_xray_checkout();
+            let xray = timeout(
+                Duration::from_secs(60),
+                start_xray_vless_server_customized(
+                    &xray_checkout,
+                    XrayVlessServerConfig {
+                        security: XrayInboundSecurity::Tls,
+                        transport: XrayInboundTransport::Raw,
+                        flow: None,
+                    },
+                    |json| {
+                        json["inbounds"][0]["streamSettings"]["tlsSettings"]["curvePreferences"] =
+                            serde_json::json!(["CurveP256"]);
+                    },
+                ),
+            )
+            .await
+            .expect("start xray timeout");
+            let rust_config = rust_core_config_with_security(
+                xray.addr,
+                StreamSecurity::Tls(TlsSettings {
+                    server_name: Some(TLS_SERVER_NAME.to_owned()),
+                    fingerprint: Some(fingerprint.to_owned()),
+                    allow_insecure: true,
+                    pinned_peer_cert_sha256: Vec::new(),
+                    verify_peer_cert_by_name: Vec::new(),
+                    alpn: Vec::new(),
+                }),
+                None,
+            );
+
+            run_local_xray_vless_parallel_interop_scenario(xray, rust_config, 16).await;
         }
     })
     .await
@@ -517,6 +594,7 @@ fn selected_reality_interop_fingerprints() -> Vec<String> {
 
     [
         "chrome",
+        "hellochrome_155",
         "hellochrome_133",
         "hellofirefox_148",
         "hellosafari_26_3",
@@ -540,6 +618,39 @@ fn selected_reality_interop_burst_fingerprints() -> Vec<String> {
     }
 
     vec!["hellofirefox_148".to_owned()]
+}
+
+fn selected_tls_interop_burst_fingerprints() -> Vec<String> {
+    if let Ok(raw) = env::var("XRAY_TLS_INTEROP_BURST_FINGERPRINTS") {
+        return raw
+            .split(',')
+            .map(str::trim)
+            .filter(|fingerprint| !fingerprint.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+    }
+
+    [
+        "chrome",
+        "hellochrome_133",
+        "hellochrome_131",
+        "hellochrome_120",
+    ]
+    .into_iter()
+    .map(ToOwned::to_owned)
+    .collect()
+}
+
+fn selected_tls_interop_burst_flow_count() -> usize {
+    let flow_count = env::var("XRAY_TLS_INTEROP_BURST_FLOWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(64);
+    assert!(
+        (1..=256).contains(&flow_count),
+        "XRAY_TLS_INTEROP_BURST_FLOWS must be between 1 and 256"
+    );
+    flow_count
 }
 
 fn selected_reality_interop_burst_flow_count() -> usize {
@@ -792,6 +903,41 @@ async fn run_local_xray_vless_reality_vision_burst_interop(fingerprint: &str, fl
     )
     .await;
     let rust_config = rust_reality_vision_core_config(xray.addr, fingerprint);
+
+    run_local_xray_vless_parallel_interop_scenario(xray, rust_config, flow_count).await;
+}
+
+/// `flow_count` parallel flows over VLESS with `security: tls` and
+/// `fingerprint`, through the core's own TLS connector rather than a pinned
+/// rustls config, so every flow's handshake is a shaped one. The server's
+/// certificate is generated for the run, hence `allowInsecure`.
+async fn run_local_xray_vless_shaped_tls_burst_interop(fingerprint: &str, flow_count: usize) {
+    let xray_checkout = resolve_xray_checkout();
+    let xray = timeout(
+        Duration::from_secs(60),
+        start_xray_vless_server(
+            &xray_checkout,
+            XrayVlessServerConfig {
+                security: XrayInboundSecurity::Tls,
+                transport: XrayInboundTransport::Raw,
+                flow: None,
+            },
+        ),
+    )
+    .await
+    .expect("start xray timeout");
+    let rust_config = rust_core_config_with_security(
+        xray.addr,
+        StreamSecurity::Tls(TlsSettings {
+            server_name: Some(TLS_SERVER_NAME.to_owned()),
+            fingerprint: Some(fingerprint.to_owned()),
+            allow_insecure: true,
+            pinned_peer_cert_sha256: Vec::new(),
+            verify_peer_cert_by_name: Vec::new(),
+            alpn: Vec::new(),
+        }),
+        None,
+    );
 
     run_local_xray_vless_parallel_interop_scenario(xray, rust_config, flow_count).await;
 }
@@ -1621,6 +1767,18 @@ async fn start_xray_vless_server_customized(
     server_config: XrayVlessServerConfig,
     customize: impl FnOnce(&mut serde_json::Value),
 ) -> XrayServer {
+    start_xray_vless_server_listening(xray_checkout, server_config, customize, true).await
+}
+
+/// [`start_xray_vless_server_customized`], waiting for the UDP listener of
+/// an mKCP or HTTP/3 inbound only when `udp_listener`: under the `xicmp`
+/// mask the inbound reads ICMP and binds no UDP port.
+async fn start_xray_vless_server_listening(
+    xray_checkout: &Path,
+    server_config: XrayVlessServerConfig,
+    customize: impl FnOnce(&mut serde_json::Value),
+    udp_listener: bool,
+) -> XrayServer {
     let temp_dir = create_temp_dir("xray-rust-local-interop");
     let binary = temp_dir
         .path
@@ -1694,8 +1852,10 @@ async fn start_xray_vless_server_customized(
         .expect("start xray process");
 
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    if uses_udp_listener {
+    if uses_udp_listener && udp_listener {
         wait_for_udp_listener(&mut child, addr, &stdout_path, &stderr_path).await;
+    } else if uses_udp_listener {
+        wait_for_xray_startup(&mut child, &stdout_path, &stderr_path).await;
     } else {
         wait_for_tcp_listener(&mut child, addr, &stdout_path, &stderr_path).await;
     }
@@ -1995,6 +2155,11 @@ fn rust_vless_outbound(
             tcp_header_custom: None,
             udp_header_custom: None,
             tcp_sudoku: None,
+            tcp_xmc: None,
+            udp_xdns: None,
+            udp_realm: None,
+            udp_xicmp: None,
+            udp_salamander: None,
             udp_sudoku: None,
             udp_noise: None,
             socket_options: None,
@@ -2010,6 +2175,7 @@ fn rust_vless_outbound(
                 vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
                 pre_connections: 0,
             }],
+            reverse: None,
         }),
     }
 }
@@ -2926,7 +3092,7 @@ async fn run_local_xray_xhttp_interop_with(
     };
     xhttp.uplink_http_method = uplink_http_method.to_owned();
     if noise {
-        let raw = serde_json::json!({"outbounds":[{"protocol":"freedom","streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"example.com","alpn":["h3"]},"finalmask":{"udp":[{"type":"noise","settings":{"noise":[{"type":"str","packet":"synthetic","delay":2},{"rand":"16-24","delay":1}]}}]}}}]});
+        let raw = serde_json::json!({"outbounds":[{"protocol":"freedom","streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"example.com","alpn":["h3"]},"finalmask":{"udp":[{"type":"noise","settings":{"noise":[{"type":"str","packet":"synthetic","delay":2},{"rand":"16-24","delay":1},{"type":"exp","packet":"<b 16 fe ff><t><c><rc 3-5><rd 2><n><r 4-8>","delay":1}]}}]}}}]});
         rust_config.outbounds[0].stream.udp_noise =
             parse_xray_json(&raw.to_string()).unwrap().config.outbounds[0]
                 .stream
@@ -3660,6 +3826,39 @@ mod header_custom;
 #[path = "local_xray_interop_tests/sudoku.rs"]
 mod sudoku;
 
+#[path = "local_xray_interop_tests/salamander.rs"]
+mod salamander;
+
+#[path = "local_xray_interop_tests/direct_udp_masks.rs"]
+mod direct_udp_masks;
+
+#[path = "local_xray_interop_tests/xmc.rs"]
+mod xmc;
+
+#[path = "local_xray_interop_tests/xdns.rs"]
+mod xdns;
+
+#[path = "local_xray_interop_tests/masque.rs"]
+mod masque;
+
+#[path = "local_xray_interop_tests/reverse.rs"]
+mod reverse;
+
+#[path = "../../../tests/support/realm_rendezvous.rs"]
+mod realm_rendezvous;
+
+#[path = "local_xray_interop_tests/realm.rs"]
+mod realm;
+
+#[path = "local_xray_interop_tests/xicmp.rs"]
+mod xicmp;
+
+#[path = "../../../tests/support/chrome_parrot_wire.rs"]
+mod chrome_parrot_wire;
+
+#[path = "local_xray_interop_tests/xdrive.rs"]
+mod xdrive;
+
 /// Record-level observer: it forwards the finalized ClientHello unchanged and
 /// then becomes a byte relay, including Vision's later direct-mode payload.
 async fn fragment_observer(
@@ -3790,6 +3989,156 @@ async fn fragment_finalmask_reality_vision_direct_interop() {
 #[ignore = "requires pinned Xray-core checkout/binary and REALITY cover network"]
 async fn fragment_legacy_dialer_proxy_reality_vision_direct_interop() {
     run_fragmented_xray_interop(true, true, true).await;
+}
+
+/// A relay that records the size of each read in which the client's bytes
+/// arrive, relaying both directions as it goes.
+async fn piece_observer(upstream: SocketAddr) -> (SocketAddr, Arc<std::sync::Mutex<Vec<usize>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&sizes);
+    tokio::spawn(async move {
+        let (client, _) = listener.accept().await.unwrap();
+        let server = TcpStream::connect(upstream).await.unwrap();
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut server_read, mut server_write) = server.into_split();
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut server_read, &mut client_write).await;
+        });
+        let mut buffer = vec![0; 65_536];
+        loop {
+            let read = match client_read.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            recorded.lock().unwrap().push(read);
+            if server_write.write_all(&buffer[..read]).await.is_err() {
+                break;
+            }
+        }
+        let _ = server_write.shutdown().await;
+    });
+    (addr, sizes)
+}
+
+/// VLESS over raw TCP through `fragment` to Xray-core's own server: a short
+/// echo, then a 16 KiB one, whose bytes must come back unchanged. Returns the
+/// sizes of the reads in which the server side received the client's bytes.
+async fn run_cut_writes_interop(
+    security: XrayInboundSecurity,
+    fragment: serde_json::Value,
+) -> Vec<usize> {
+    use serde_json::json;
+    let tls = matches!(security, XrayInboundSecurity::Tls);
+    let xray = timeout(
+        Duration::from_secs(60),
+        start_xray_vless_server(
+            &resolve_xray_checkout(),
+            XrayVlessServerConfig {
+                security,
+                transport: XrayInboundTransport::Raw,
+                flow: None,
+            },
+        ),
+    )
+    .await
+    .unwrap();
+    let (relay, sizes) = piece_observer(xray.addr).await;
+    let mut stream = if tls {
+        json!({"security":"tls","tlsSettings":{"serverName":TLS_SERVER_NAME}})
+    } else {
+        json!({})
+    };
+    stream["finalmask"] = json!({"tcp":[{"type":"fragment","settings":fragment}]});
+    let raw = json!({
+        "inbounds":[{"tag":"socks-in","listen":"127.0.0.1","port":0,"protocol":"socks","settings":{"auth":"noauth"}}],
+        "outbounds":[{"protocol":"vless","tag":"proxy","settings":{"vnext":[{"address":"127.0.0.1","port":relay.port(),
+            "users":[{"id":TEST_UUID,"encryption":"none"}]}]},"streamSettings":stream}]
+    });
+    let config = parse_xray_json(&raw.to_string()).unwrap().config;
+    let mut core = if tls {
+        Core::with_runtime_dependencies(
+            config,
+            Arc::new(SystemDnsResolver),
+            Arc::new(rust_tls_core_config_and_dialer(&xray, None).1),
+        )
+    } else {
+        Core::new(config)
+    }
+    .expect("create rust core");
+    timeout(Duration::from_secs(5), core.start())
+        .await
+        .expect("start rust core timeout")
+        .expect("start rust core");
+    let socks_addr = core
+        .inbound_addr(Some("socks-in"))
+        .expect("bound socks addr");
+    let (echo_addr, echo_handle) = spawn_echo_server().await;
+    let mut client = open_socks_flow(&xray, socks_addr, echo_addr).await;
+    let long: Vec<u8> = (0..16_384u32).map(|i| (i % 251) as u8).collect();
+    for payload in [&b"hello local xray interop"[..], &long] {
+        timeout(Duration::from_secs(20), client.write_all(payload))
+            .await
+            .expect("write payload timeout")
+            .expect("write payload");
+        let mut echoed = vec![0; payload.len()];
+        if let Err(error) = timeout(Duration::from_secs(30), client.read_exact(&mut echoed))
+            .await
+            .map_err(|elapsed| elapsed.to_string())
+            .and_then(|read| read.map_err(|error| error.to_string()))
+        {
+            eprintln!("{}", xray.logs());
+            panic!("echo through the fragment mask failed: {error}");
+        }
+        assert_eq!(echoed, payload);
+    }
+    drop(client);
+    core.stop().await.expect("stop rust core");
+    drop(xray);
+    let _ = timeout(Duration::from_secs(1), echo_handle).await;
+    let sizes = sizes.lock().unwrap().clone();
+    sizes
+}
+
+/// `packets: "1-3"`: the ClientHello and the next two writes go as pieces of
+/// at most 50 bytes, spaced by their delays; later writes go whole.
+#[tokio::test]
+#[ignore = "requires pinned Xray-core checkout/binary"]
+async fn fragment_write_range_tls_interop() {
+    let sizes = run_cut_writes_interop(
+        XrayInboundSecurity::Tls,
+        serde_json::json!({"packets":"1-3","length":"30-50","delay":"2-3"}),
+    )
+    .await;
+    assert!(
+        sizes.len() > 5 && sizes[..5].iter().all(|size| *size <= 50),
+        "the ClientHello must arrive in pieces: {sizes:?}"
+    );
+    assert!(
+        sizes.iter().any(|size| *size > 1000),
+        "writes after the third must go whole: {sizes:?}"
+    );
+}
+
+/// `packets: ""`: every write, the VLESS request header and the echoed data
+/// alike, goes as pieces of at most 200 bytes.
+#[tokio::test]
+#[ignore = "requires pinned Xray-core checkout/binary"]
+async fn fragment_every_write_plaintext_interop() {
+    let sizes = run_cut_writes_interop(
+        XrayInboundSecurity::None,
+        serde_json::json!({"packets":"","length":"100-200","delay":"3-5"}),
+    )
+    .await;
+    assert!(
+        sizes.iter().sum::<usize>() > 16_384,
+        "the long echo must cross the relay: {sizes:?}"
+    );
+    assert!(
+        sizes.iter().all(|size| *size <= 200),
+        "every write must arrive in pieces: {sizes:?}"
+    );
 }
 
 /// A server-side UDP port redirect in front of the Xray QUIC listener. Each
@@ -3924,6 +4273,264 @@ async fn udp_hop_xhttp_h3_keeps_a_flow_across_hops_to_xray() {
     })
     .await
     .expect("bounded XHTTP H3 UDP-hop interop");
+}
+
+/// A change of the OS network, as the host reports it through
+/// `xray_core_rebind_hysteria`: the XHTTP H3 connection takes a fresh socket
+/// towards Xray-core's own server and the flow on it goes on. ChromeParrot
+/// stays on, as by default, so the client's connection ID is the zero-length
+/// one quic-go's server has to migrate without. The relay gives every client
+/// source its own upstream socket, so Xray sees each change as a new path.
+#[tokio::test]
+#[ignore = "requires pinned Xray-core checkout/binary"]
+async fn xhttp_h3_chrome_parrot_keeps_a_flow_across_network_changes() {
+    timeout(Duration::from_secs(90), async {
+        let xray = timeout(
+            Duration::from_secs(60),
+            start_xray_vless_server(
+                &resolve_xray_checkout(),
+                XrayVlessServerConfig {
+                    security: XrayInboundSecurity::Tls,
+                    transport: XrayInboundTransport::Xhttp {
+                        path: XHTTP_PATH,
+                        mode: "stream-one",
+                        tls_alpn: Some("h3"),
+                    },
+                    flow: None,
+                },
+            ),
+        )
+        .await
+        .expect("start XHTTP H3 Xray server timeout");
+        let relay = UdpHopRelay::start(xray.addr).await;
+        let rust_config = rust_xhttp_core_config(
+            relay.address,
+            StreamSecurity::Tls(TlsSettings {
+                server_name: Some(TLS_SERVER_NAME.to_owned()),
+                fingerprint: Some("chrome".to_owned()),
+                allow_insecure: true,
+                pinned_peer_cert_sha256: Vec::new(),
+                verify_peer_cert_by_name: Vec::new(),
+                alpn: vec!["h3".to_owned()],
+            }),
+            XhttpMode::StreamOne,
+        );
+        let mut core = Core::new(rust_config).expect("create Rust XHTTP core");
+        core.start().await.expect("start Rust XHTTP core");
+        let socks_addr = core.inbound_addr(Some("socks-in")).unwrap();
+        let (echo_addr, _echo) = spawn_echo_server().await;
+        let mut client = open_socks_flow(&xray, socks_addr, echo_addr).await;
+
+        // One flow on one QUIC connection: data before any change, then
+        // after each of two.
+        for round in 0_u8..3 {
+            if round > 0 {
+                assert_eq!(
+                    core.rebind_quic(),
+                    1,
+                    "the one XHTTP H3 connection follows the change"
+                );
+                // The connection's own task takes the socket; let it run
+                // before the round's data, which then leaves from the new one.
+                sleep(Duration::from_millis(200)).await;
+            }
+            let payload = bulk_interop_payload(32 * 1024 + usize::from(round));
+            let mut echoed = vec![0; payload.len()];
+            client.write_all(&payload).await.unwrap();
+            if let Err(error) =
+                timeout(Duration::from_secs(15), client.read_exact(&mut echoed)).await
+            {
+                eprintln!("{}", xray.logs());
+                panic!("echo after {round} network changes timed out: {error}");
+            }
+            assert_eq!(echoed, payload, "round {round}");
+            assert_eq!(
+                relay.sources.load(Ordering::SeqCst),
+                usize::from(round) + 1,
+                "each change moves the connection to one fresh socket"
+            );
+        }
+        drop(client);
+        core.stop().await.unwrap();
+    })
+    .await
+    .expect("bounded XHTTP H3 network change interop");
+}
+
+/// Every `bbrProfile` with each congestion mode XHTTP H3 runs, through Xray's
+/// own server: the controller replaces quic-go's startup Reno after the
+/// handshake, and a megabyte echoes back intact.
+#[tokio::test]
+#[ignore = "requires pinned Xray-core checkout/binary"]
+async fn xhttp_h3_bbr_profiles_interop() {
+    timeout(Duration::from_secs(120), async {
+        let xray = timeout(
+            Duration::from_secs(60),
+            start_xray_vless_server(
+                &resolve_xray_checkout(),
+                XrayVlessServerConfig {
+                    security: XrayInboundSecurity::Tls,
+                    transport: XrayInboundTransport::Xhttp {
+                        path: XHTTP_PATH,
+                        mode: "stream-one",
+                        tls_alpn: Some("h3"),
+                    },
+                    flow: None,
+                },
+            ),
+        )
+        .await
+        .expect("start XHTTP H3 Xray server timeout");
+        for quic in [
+            serde_json::json!({"bbrProfile":"conservative"}),
+            serde_json::json!({"congestion":"bbr","bbrProfile":"aggressive"}),
+            serde_json::json!({"bbrProfile":"standard"}),
+            serde_json::json!({"congestion":"force-brutal","brutalUp":"100 mbps","bbrProfile":"aggressive"}),
+            serde_json::json!({"congestion":"reno","bbrProfile":"conservative"}),
+        ] {
+            let mut quic_params = quic.clone();
+            quic_params["disableChromeParrot"] = serde_json::json!(true);
+            let mut rust_config = rust_xhttp_core_config(
+                xray.addr,
+                StreamSecurity::Tls(TlsSettings {
+                    server_name: Some(TLS_SERVER_NAME.to_owned()),
+                    fingerprint: Some("chrome".to_owned()),
+                    allow_insecure: true,
+                    pinned_peer_cert_sha256: Vec::new(),
+                    verify_peer_cert_by_name: Vec::new(),
+                    alpn: vec!["h3".to_owned()],
+                }),
+                XhttpMode::StreamOne,
+            );
+            let raw = serde_json::json!({"outbounds":[{"protocol":"freedom","streamSettings":{
+                "network":"xhttp","security":"tls","tlsSettings":{"serverName":"example.com","alpn":["h3"]},
+                "finalmask":{"quicParams":quic_params}}}]});
+            rust_config.outbounds[0].stream.quic_params = parse_xray_json(&raw.to_string())
+                .unwrap()
+                .config
+                .outbounds[0]
+                .stream
+                .quic_params
+                .clone();
+            assert!(rust_config.outbounds[0].stream.quic_params.is_some());
+
+            let mut core = Core::new(rust_config).expect("create Rust XHTTP core");
+            core.start().await.expect("start Rust XHTTP core");
+            let socks_addr = core.inbound_addr(Some("socks-in")).unwrap();
+            // The echo server takes one connection.
+            let (echo_addr, _echo) = spawn_echo_server().await;
+            let mut client = open_socks_flow(&xray, socks_addr, echo_addr).await;
+            let payload = bulk_interop_payload(1024 * 1024);
+            let mut echoed = vec![0; payload.len()];
+            let started = std::time::Instant::now();
+            let (mut reader, mut writer) = client.split();
+            let (written, read) = tokio::join!(writer.write_all(&payload), async {
+                timeout(Duration::from_secs(30), reader.read_exact(&mut echoed)).await
+            });
+            written.unwrap();
+            if let Err(error) = read.expect("echo deadline") {
+                eprintln!("{}", xray.logs());
+                panic!("{quic}: {error}");
+            }
+            eprintln!("XHTTP H3 {quic}: 1 MiB echoed in {:?}", started.elapsed());
+            assert_eq!(echoed, payload, "{quic}");
+            drop(client);
+            core.stop().await.unwrap();
+        }
+    })
+    .await
+    .expect("bounded XHTTP H3 BBR profile interop");
+}
+
+/// XHTTP over HTTP/3 through Xray's own server with ChromeParrot as Xray
+/// dials by default (no `quicParams`), with `disableChromeParrot: true`, and
+/// with `false` next to a BBR profile: 256 KiB echo back intact, and the
+/// first flight on the wire is ChromeParrot's or the stock one.
+#[tokio::test]
+#[ignore = "requires pinned Xray-core checkout/binary"]
+async fn xhttp_h3_chrome_parrot_interop() {
+    timeout(Duration::from_secs(120), async {
+        let xray = timeout(
+            Duration::from_secs(60),
+            start_xray_vless_server(
+                &resolve_xray_checkout(),
+                XrayVlessServerConfig {
+                    security: XrayInboundSecurity::Tls,
+                    transport: XrayInboundTransport::Xhttp {
+                        path: XHTTP_PATH,
+                        mode: "stream-one",
+                        tls_alpn: Some("h3"),
+                    },
+                    flow: None,
+                },
+            ),
+        )
+        .await
+        .expect("start XHTTP H3 Xray server timeout");
+        let relay = chrome_parrot_wire::RecordingRelay::start(xray.addr).await;
+        for (quic, chrome_parrot) in [
+            (None, true),
+            (Some(serde_json::json!({"disableChromeParrot":true})), false),
+            (
+                Some(serde_json::json!({"disableChromeParrot":false,"bbrProfile":"conservative"})),
+                true,
+            ),
+        ] {
+            let mut rust_config = rust_xhttp_core_config(
+                relay.address,
+                StreamSecurity::Tls(TlsSettings {
+                    server_name: Some(TLS_SERVER_NAME.to_owned()),
+                    fingerprint: Some("chrome".to_owned()),
+                    allow_insecure: true,
+                    pinned_peer_cert_sha256: Vec::new(),
+                    verify_peer_cert_by_name: Vec::new(),
+                    alpn: vec!["h3".to_owned()],
+                }),
+                XhttpMode::StreamOne,
+            );
+            if let Some(quic) = &quic {
+                let raw = serde_json::json!({"outbounds":[{"protocol":"freedom","streamSettings":{
+                    "network":"xhttp","security":"tls","tlsSettings":{"serverName":"example.com","alpn":["h3"]},
+                    "finalmask":{"quicParams":quic}}}]});
+                rust_config.outbounds[0].stream.quic_params = parse_xray_json(&raw.to_string())
+                    .unwrap()
+                    .config
+                    .outbounds[0]
+                    .stream
+                    .quic_params
+                    .clone();
+            }
+
+            let mut core = Core::new(rust_config).expect("create Rust XHTTP core");
+            core.start().await.expect("start Rust XHTTP core");
+            let socks_addr = core.inbound_addr(Some("socks-in")).unwrap();
+            let (echo_addr, _echo) = spawn_echo_server().await;
+            let mut client = open_socks_flow(&xray, socks_addr, echo_addr).await;
+            let payload = bulk_interop_payload(256 * 1024);
+            let mut echoed = vec![0; payload.len()];
+            let (mut reader, mut writer) = client.split();
+            let (written, read) = tokio::join!(writer.write_all(&payload), async {
+                timeout(Duration::from_secs(30), reader.read_exact(&mut echoed)).await
+            });
+            written.unwrap();
+            if let Err(error) = read.expect("echo deadline") {
+                eprintln!("{}", xray.logs());
+                panic!("{quic:?}: {error}");
+            }
+            assert_eq!(echoed, payload, "{quic:?}");
+            drop(client);
+            core.stop().await.unwrap();
+
+            let datagrams = relay.take();
+            if chrome_parrot {
+                chrome_parrot_wire::assert_chrome_first_flight(&datagrams, b"h3");
+            } else {
+                chrome_parrot_wire::assert_stock_first_flight(&datagrams);
+            }
+        }
+    })
+    .await
+    .expect("bounded XHTTP H3 ChromeParrot interop");
 }
 
 /// Xray-core v26.10.31 stopped answering every OPTIONS request as a CORS

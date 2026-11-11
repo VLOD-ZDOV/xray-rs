@@ -131,8 +131,14 @@ impl Handler {
             GrpcProtocol::Trojan(ctx) => {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        trojan::serve(client_r, client_w, &ctx, peer, &Default::default()).await
+                    if let Err(e) = Box::pin(trojan::serve(
+                        client_r,
+                        client_w,
+                        &ctx,
+                        peer,
+                        &Default::default(),
+                    ))
+                    .await
                     {
                         log::info(format!(
                             "trojan-grpc from {} rejected: {e}",

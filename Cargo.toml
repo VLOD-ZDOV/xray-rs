@@ -17,7 +17,10 @@ members = [
     "fuzz",
 ]
 resolver = "2"
-exclude = ["vendor/gotatun", "vendor/smoltcp", "vendor/quinn", "vendor/h2", "vendor/h3"]
+# `.claude` holds agent worktrees, each a checkout with its own workspace.
+# Without it here, cargo resolves their excluded vendor crates to this
+# workspace and fails ("believes it's in a workspace when it's not").
+exclude = ["vendor/gotatun", "vendor/smoltcp", "vendor/quinn", "vendor/h2", "vendor/h3", ".claude"]
 
 [workspace.package]
 version = "0.9.0"
@@ -42,6 +45,7 @@ chacha20 = { version = "0.10.2", default-features = false, features = ["xchacha"
 chacha20poly1305 = "0.11.0"
 crc32fast = "1.5"
 md-5 = { version = "0.11", features = ["zeroize"] }
+num-bigint = { version = "0.4", default-features = false, features = ["std"] }
 sha3 = { version = "0.11", features = ["zeroize"] }
 ctr = { version = "0.10.1", features = ["zeroize"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
@@ -99,4 +103,4 @@ h3 = { path = "vendor/h3" }
 h3-quinn = { path = "vendor/h3-quinn" }
 quinn-proto = { path = "vendor/quinn-proto" }
 h2 = { path = "vendor/h2" }
-rustls = { git = "https://github.com/aimalygin/shaped-rustls", rev = "3a131beaef0183b0cb61e5a9070a703b6be39ed3" }
+rustls = { git = "https://github.com/aimalygin/shaped-rustls", rev = "ca91d48c385f7d16ad3993ecaf26fa9b84882dbc" }

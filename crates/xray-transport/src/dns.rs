@@ -411,10 +411,15 @@ impl InFlightDnsLeader {
             .is_some_and(|current| Arc::ptr_eq(current, &self.lookup));
         if still_leader {
             state.in_flight.remove(&self.key);
+            // One instant for the remaining TTL and the expiry, so that a
+            // cached answer never outlives its upstream TTL by the time
+            // between two clock reads.
+            let now = Instant::now();
             let (ttl, allow_stale) = match &outcome {
-                InFlightDnsOutcome::Resolved(lookup) => {
-                    (lookup.ttl().filter(|ttl| !ttl.is_zero()), true)
-                }
+                InFlightDnsOutcome::Resolved(lookup) => (
+                    lookup.remaining_ttl_at(now).filter(|ttl| !ttl.is_zero()),
+                    true,
+                ),
                 InFlightDnsOutcome::NameError(_, _) | InFlightDnsOutcome::NoData(_, _) => (
                     (!self.negative_ttl.is_zero()).then_some(self.negative_ttl),
                     false,
@@ -422,7 +427,6 @@ impl InFlightDnsLeader {
                 _ => (None, false),
             };
             if let Some(ttl) = ttl {
-                let now = Instant::now();
                 if let Some(expires_at) = now.checked_add(ttl) {
                     let stale_until = if allow_stale {
                         self.stale_ttl
@@ -1036,6 +1040,8 @@ pub async fn exchange_dns_quic_candidates(
             tls_config: Arc::clone(&tls_config),
             socket_protector: socket_protector.clone(),
             quic: crate::stream::H3QuicConfig::default(),
+            realm: None,
+            network_changes: None,
         };
         let (endpoint, connection, _, _) =
             match crate::stream::connect_quic_transport(config, b"doq").await {
@@ -1572,6 +1578,29 @@ impl ConfiguredDnsResolver {
         strategy.intersect(self.system_route_strategy()?)
     }
 
+    /// What a lookup comes to when every selected server was left out. A
+    /// family no server asks for is an empty answer, as in Xray-core. A
+    /// system that routes neither family is not: that is the gap between
+    /// two networks, and an empty answer would stay in a cache in front of
+    /// this resolver for its negative TTL after the routes are back.
+    fn no_compatible_server(
+        &self,
+        selected_servers: &[usize],
+        requested: DnsQueryStrategy,
+    ) -> ConfiguredServersResult {
+        let waits_for_routes = selected_servers
+            .iter()
+            .filter_map(|&index| self.name_servers.get(index))
+            .any(|server| {
+                server.check_system_routes && requested.intersect(server.query_strategy).is_some()
+            });
+        if waits_for_routes && self.system_route_strategy().is_none() {
+            ConfiguredServersResult::Unavailable
+        } else {
+            ConfiguredServersResult::Negative(ConfiguredDnsNegative::NoData)
+        }
+    }
+
     pub fn with_server_timeout(mut self, timeout: Duration) -> Self {
         self.server_timeout = timeout;
         self
@@ -1639,7 +1668,7 @@ impl ConfiguredDnsResolver {
         }
 
         if !saw_compatible_server && saw_incompatible_server {
-            return ConfiguredServersResult::Negative(ConfiguredDnsNegative::NoData);
+            return self.no_compatible_server(selected_servers, query_strategy);
         }
 
         last_negative.map_or(
@@ -1711,7 +1740,7 @@ impl ConfiguredDnsResolver {
         }
 
         if !saw_compatible_server && saw_incompatible_server {
-            return ConfiguredServersResult::Negative(ConfiguredDnsNegative::NoData);
+            return self.no_compatible_server(selected_servers, query_strategy);
         }
         // As in the serial plan, the last negative answer in plan order.
         outcomes
@@ -5065,6 +5094,33 @@ mod tests {
             sent.sort_by_key(|(_, record_type)| *record_type);
             assert_eq!(sent, asked, "{first_strategy:?}");
         }
+    }
+
+    /// A server's `UseSystem` while the system routes neither family, the
+    /// gap between two networks, leaves the lookup unanswered rather than
+    /// empty: a cache in front must not keep that for its negative TTL.
+    #[tokio::test]
+    async fn a_servers_use_system_without_any_route_is_not_cached_as_empty() {
+        let routes = ScriptedRoutes::new(false, false);
+        let mut checking =
+            NameServerPolicy::new(NameServer::Socket(SocketAddr::from(([192, 0, 2, 53], 53))));
+        checking.check_system_routes = true;
+        let transport = Arc::new(ServerFamilyRecordingTransport::default());
+        let configured = ConfiguredDnsResolver::new(
+            DomainHostIndex::default(),
+            Vec::new(),
+            Arc::new(RejectingResolver),
+        )
+        .with_name_server_policies(vec![checking])
+        .with_system_routes(false, routes.clone())
+        .with_query_transport(transport.clone());
+        let resolver = CachingDnsResolver::new(Arc::new(configured));
+
+        assert!(resolver.resolve_all("gap.example", 443).await.is_err());
+        assert!(transport.0.lock().unwrap().is_empty());
+        routes.set(true, true);
+        let lookup = resolver.resolve_all("gap.example", 443).await.unwrap();
+        assert!(!lookup.socket_addrs().is_empty());
     }
 
     /// In front of a cache, the wrapper keys the cache by the routed

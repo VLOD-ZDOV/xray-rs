@@ -3399,4 +3399,137 @@ fn preferred_address() {
     pair.connect();
 }
 
+/// The datagrams of a ChromeParrot client's handshake, as quic-go's
+/// ChromeParrot packs them: one packet in each until the handshake is
+/// confirmed, every Initial datagram padded to the MTU, Initial packet
+/// numbers from 1, and the server's Handshake flight acknowledged in a packet
+/// of its own before the Finished goes out in the next datagram.
+#[test]
+fn chrome_parrot_handshake_packs_one_packet_per_datagram() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    pair.server.capture_inbound_packets = true;
+    let mut transport = TransportConfig::default();
+    transport.chrome_parrot(true).initial_mtu(1250).min_mtu(1250);
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+    pair.connect_with(config);
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Kind {
+        Initial,
+        Handshake,
+        OneRtt,
+    }
+    let mut kinds = Vec::new();
+    for datagram in &pair.client_datagrams {
+        let kind = match datagram[0] {
+            first if first & 0x80 == 0 => Kind::OneRtt,
+            first if first & 0x30 == 0x00 => Kind::Initial,
+            first if first & 0x30 == 0x20 => Kind::Handshake,
+            first => panic!("unexpected first byte {first:#x}"),
+        };
+        if kind != Kind::OneRtt {
+            // A long header packet whose length runs to the datagram's end
+            let mut p = 5;
+            p += 1 + datagram[p] as usize;
+            p += 1 + datagram[p] as usize;
+            let mut rest = &datagram[p..];
+            if kind == Kind::Initial {
+                let token = crate::coding::BufExt::get_var(&mut rest).unwrap() as usize;
+                rest = &rest[token..];
+            }
+            let len = crate::coding::BufExt::get_var(&mut rest).unwrap() as usize;
+            assert_eq!(rest.len(), len, "one packet per datagram: {kinds:?} {kind:?}");
+        }
+        if kind == Kind::Initial {
+            assert_eq!(datagram.len(), 1250, "Initial datagrams fill the MTU");
+        }
+        kinds.push(kind);
+    }
+    let handshake_end = kinds.iter().position(|k| *k == Kind::OneRtt).unwrap();
+    assert_eq!(
+        kinds[..handshake_end],
+        [Kind::Initial, Kind::Initial, Kind::Handshake, Kind::Handshake],
+        "the ClientHello, the Initial ACK, the Handshake ACK and the Finished"
+    );
+
+    // The server decrypted every datagram after the first.
+    fn frames(payload: &[u8]) -> Vec<&'static str> {
+        let mut names: Vec<&'static str> = Vec::new();
+        for frame in frame::Iter::new(Bytes::copy_from_slice(payload)).unwrap() {
+            let name = match frame.unwrap() {
+                Frame::Ack(_) => "ACK",
+                Frame::Padding => "PADDING",
+                Frame::Crypto(_) => "CRYPTO",
+                Frame::Ping => "PING",
+                _ => "OTHER",
+            };
+            if names.last() != Some(&name) || name != "PADDING" {
+                names.push(name);
+            }
+        }
+        names
+    }
+    let decrypted = &pair.server.captured_packets;
+    assert_eq!(frames(&decrypted[0]), ["ACK", "PADDING"], "the Initial ACK");
+    assert_eq!(frames(&decrypted[1]), ["ACK"], "the Handshake ACK alone");
+    assert_eq!(frames(&decrypted[2]), ["CRYPTO"], "the Finished alone");
+}
+
+/// A ChromeParrot client that closes before its handshake is confirmed sends
+/// the close once. One packet per datagram used to stop the close at the
+/// first space that had keys, so the last space never got its frame, the
+/// connection never counted the close as sent, and every poll made another
+/// close packet until the close timer ran out.
+#[test]
+fn chrome_parrot_close_before_the_handshake_is_confirmed_is_sent_once() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let mut transport = TransportConfig::default();
+    transport.chrome_parrot(true).initial_mtu(1250).min_mtu(1250);
+    let mut config = client_config();
+    config.transport_config(Arc::new(transport));
+    let ch = pair.begin_connect(config);
+    // The ClientHello and the server's flight, then the client's Finished:
+    // the client holds Handshake and 1-RTT keys and has not yet seen
+    // HANDSHAKE_DONE.
+    pair.drive_client();
+    pair.drive_server();
+    pair.drive_client();
+
+    let now = pair.time;
+    let client = pair.client_conn_mut(ch);
+    client.close(now, VarInt::from_u32(0), Bytes::new());
+    let mut buf = Vec::with_capacity(2048);
+    let mut datagrams = 0;
+    while datagrams < 16 && client.poll_transmit(now, 10, &mut buf).is_some() {
+        buf.clear();
+        datagrams += 1;
+    }
+    assert!(
+        (1..=2).contains(&datagrams),
+        "{datagrams} close datagrams for one close"
+    );
+}
+
+/// A ChromeParrot client numbers its first Initial packet 1, as quic-go's
+/// ChromeParrot does; a stock one starts at 0.
+#[test]
+fn chrome_parrot_numbers_initial_packets_from_one() {
+    let _guard = subscribe();
+    for (chrome, first) in [(true, 1), (false, 0)] {
+        let mut pair = Pair::default();
+        let mut transport = TransportConfig::default();
+        transport.chrome_parrot(chrome);
+        let mut config = client_config();
+        config.transport_config(Arc::new(transport));
+        let client_ch = pair.begin_connect(config);
+        let initial = |pair: &mut Pair| pair.client_conn_mut(client_ch).next_initial_packet_number();
+        assert_eq!(initial(&mut pair), first);
+        pair.drive_client();
+        assert_eq!(initial(&mut pair), first + 1, "one Initial sent");
+    }
+}
+
 mod congestion_sent;

@@ -1089,7 +1089,7 @@ async fn dispatch(
         InboundHandler::TrojanTcp(ctx) => Box::pin(async move {
             let tls = stream.handshake_info();
             let (r, w) = tokio::io::split(stream);
-            if let Err(e) = trojan::serve(r, w, &ctx, peer, &tls).await {
+            if let Err(e) = Box::pin(trojan::serve(r, w, &ctx, peer, &tls)).await {
                 log::info(format!("trojan from {} rejected: {e}", log::mask(peer)));
             }
         }),
@@ -1097,8 +1097,14 @@ async fn dispatch(
             match ws::accept(stream, &ws_settings, &trusted_xff, peer).await {
                 Ok((ws_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(ws_stream);
-                    if let Err(e) =
-                        trojan::serve(uplink, downlink, &ctx, peer, &Default::default()).await
+                    if let Err(e) = Box::pin(trojan::serve(
+                        uplink,
+                        downlink,
+                        &ctx,
+                        peer,
+                        &Default::default(),
+                    ))
+                    .await
                     {
                         log::info(format!("trojan-ws from {} rejected: {e}", log::mask(peer)));
                     }
@@ -1112,8 +1118,14 @@ async fn dispatch(
             match httpupgrade::accept(stream, &hu_settings, &trusted_xff, peer).await {
                 Ok((prefixed_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
-                    if let Err(e) =
-                        trojan::serve(uplink, downlink, &ctx, peer, &Default::default()).await
+                    if let Err(e) = Box::pin(trojan::serve(
+                        uplink,
+                        downlink,
+                        &ctx,
+                        peer,
+                        &Default::default(),
+                    ))
+                    .await
                     {
                         log::info(format!(
                             "trojan-httpupgrade from {} rejected: {e}",
@@ -1131,7 +1143,7 @@ async fn dispatch(
         }),
         InboundHandler::VmessTcp(ctx) => Box::pin(async move {
             let (r, w) = tokio::io::split(stream);
-            if let Err(e) = vmess::serve(r, w, &ctx, peer).await {
+            if let Err(e) = Box::pin(vmess::serve(r, w, &ctx, peer)).await {
                 log::info(format!("vmess from {} rejected: {e}", log::mask(peer)));
             }
         }),
@@ -1139,7 +1151,7 @@ async fn dispatch(
             match ws::accept(stream, &ws_settings, &trusted_xff, peer).await {
                 Ok((ws_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(ws_stream);
-                    if let Err(e) = vmess::serve(uplink, downlink, &ctx, peer).await {
+                    if let Err(e) = Box::pin(vmess::serve(uplink, downlink, &ctx, peer)).await {
                         log::info(format!("vmess-ws from {} rejected: {e}", log::mask(peer)));
                     }
                 }
@@ -1152,7 +1164,7 @@ async fn dispatch(
             match httpupgrade::accept(stream, &hu_settings, &trusted_xff, peer).await {
                 Ok((prefixed_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
-                    if let Err(e) = vmess::serve(uplink, downlink, &ctx, peer).await {
+                    if let Err(e) = Box::pin(vmess::serve(uplink, downlink, &ctx, peer)).await {
                         log::info(format!(
                             "vmess-httpupgrade from {} rejected: {e}",
                             log::mask(peer)

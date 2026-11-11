@@ -445,7 +445,7 @@ impl ShadowsocksUdpHandler {
                 }
             }
         };
-        crate::vless::relay_policy(up, down, &activity, user_policy).await
+        Box::pin(crate::vless::relay_policy(up, down, &activity, user_policy)).await
     }
 
     async fn run_2017(self) {
@@ -504,9 +504,8 @@ impl ShadowsocksUdpHandler {
 
             let handler = self.clone();
             tokio::spawn(async move {
-                if let Err(e) = handler
-                    .serve_udp_session_2017(peer, user, target, payload, rx)
-                    .await
+                if let Err(e) =
+                    Box::pin(handler.serve_udp_session_2017(peer, user, target, payload, rx)).await
                 {
                     log::debug(format!("shadowsocks udp session {peer} ended: {e}"));
                 }
@@ -613,7 +612,7 @@ impl ShadowsocksUdpHandler {
                 }
             }
         };
-        crate::vless::relay_policy(up, down, &activity, user_policy).await
+        Box::pin(crate::vless::relay_policy(up, down, &activity, user_policy)).await
     }
 }
 

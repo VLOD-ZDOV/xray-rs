@@ -32,17 +32,17 @@
 mod grpc;
 mod h2_bdp;
 mod http2_connect;
-mod http_headers;
+pub(crate) mod http_headers;
 mod httpupgrade;
-mod masquerade;
+pub(crate) mod masquerade;
 mod websocket;
 mod websocket_frame;
-mod xhttp;
+pub(crate) mod xhttp;
 
 pub(crate) use xhttp::{
     configure_quic_datagram_socket, connect_h2, connect_quic_transport,
-    connect_quic_transport_with_datagrams, H3ConnectConfig, H3Error, QuicSendWindow,
-    QUIC_INITIAL_SEND_WINDOW, QUIC_SEND_WINDOW_SAMPLE_BYTES,
+    connect_quic_transport_with_datagrams, move_udp_carrier, CarrierSocket, H3ConnectConfig,
+    H3Error, QuicSendWindow, QUIC_INITIAL_SEND_WINDOW, QUIC_SEND_WINDOW_SAMPLE_BYTES,
 };
 
 /// Test scaffolding, not API: `tests/stream_grpc_tests.rs` imports from here
@@ -71,10 +71,10 @@ pub use xhttp::test_only as xhttp_h1_test_only;
 #[doc(hidden)]
 pub use xhttp::transport_test_only as xhttp_transport_test_only;
 pub use xhttp::{
-    H3Congestion, H3QuicConfig, H3QuicVersion, H3UdpHopConfig, XhttpConfig, XhttpConfigInput,
-    XhttpConnectTarget, XhttpEndpoint, XhttpHttpVersion, XhttpMetadataPlacement, XhttpMode,
-    XhttpModeSelection, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpRange, XhttpScheme,
-    XhttpSessionIdConfig, XhttpTransport, XhttpUplinkDataPlacement, XhttpXmuxPolicy,
+    H3BbrProfile, H3Congestion, H3QuicConfig, H3QuicVersion, H3UdpHopConfig, XhttpConfig,
+    XhttpConfigInput, XhttpConnectTarget, XhttpEndpoint, XhttpHttpVersion, XhttpMetadataPlacement,
+    XhttpMode, XhttpModeSelection, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpRange,
+    XhttpScheme, XhttpSessionIdConfig, XhttpTransport, XhttpUplinkDataPlacement, XhttpXmuxPolicy,
 };
 
 /// The transport layered over the security layer. `Raw` is a no-op.
@@ -100,6 +100,9 @@ pub enum TransportLayer {
     Xhttp(XhttpTransport),
     /// mKCP: its own UDP socket per stream, with TLS on top when configured.
     Kcp(std::sync::Arc<crate::kcp::KcpConfig>),
+    /// XDRIVE: each stream a session in a storage; neither the security
+    /// layer nor the server address applies to the stream itself.
+    Xdrive(crate::xdrive::XdriveTransport),
 }
 
 pub use websocket_frame::{encode_client_frames, FrameDecoder, FrameEvent, MAX_FRAME_PAYLOAD};

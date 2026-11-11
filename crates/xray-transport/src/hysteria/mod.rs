@@ -7,7 +7,7 @@ pub mod gecko;
 mod tcp;
 mod udp;
 
-pub use carrier::{HeaderCustomCarrier, HysteriaCarrierConfig};
+pub use carrier::{HeaderCustomCarrier, HysteriaCarrierConfig, SalamanderCarrier, SudokuCarrier};
 pub use client::{HysteriaClient, HysteriaConfig, HysteriaError, HysteriaLimits};
 pub use gecko::GeckoPacketSize;
 pub use tcp::HysteriaTcpStream;

@@ -952,11 +952,25 @@ pub struct OutboundConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuxSettings {
-    /// Zero is normalized to 8; a negative value disables TCP multiplexing.
+    /// Children a parent carries at once. Zero up to 128 is normalized to
+    /// 128, see [`mux_tcp_concurrency`]; a negative value disables TCP
+    /// multiplexing.
     pub concurrency: i16,
-    /// Zero shares the TCP pool; a negative value uses native UDP.
+    /// Zero shares the TCP pool; a negative value uses native UDP; a
+    /// positive one is a UDP pool's children per parent, taken as it is.
     pub xudp_concurrency: i16,
     pub udp443: MuxUdp443,
+}
+
+/// The TCP `concurrency` Xray-core's outbound handler runs a Mux pool with:
+/// since v26.11.9 every value from zero up to 128 becomes 128, a larger one
+/// stays, and a negative one turns TCP multiplexing off.
+pub fn mux_tcp_concurrency(concurrency: i16) -> i16 {
+    if (0..=128).contains(&concurrency) {
+        128
+    } else {
+        concurrency
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MuxUdp443 {
@@ -1035,9 +1049,13 @@ pub struct FreedomFinalRule {
     pub port_ranges: Option<Vec<RoutingPortRange>>,
     /// The addresses the rule applies to; `None` applies to every address.
     pub ip_matchers: Option<IpMatcherSet>,
-    /// How long a blocked connection is held before it closes. `None` is
-    /// Xray-core's default, 30 to 90 seconds.
+    /// How long a blocked connection is held before it closes, the rule's
+    /// `delay` (or the deprecated `blockDelay`). `None` is Xray-core's
+    /// default, 30 to 90 seconds. Only a block rule has one.
     pub block_delay: Option<FreedomBlockDelay>,
+    /// The rule's `logLevel`. Only a block rule sets one; an allow rule keeps
+    /// the default.
+    pub log_level: FreedomRuleLogLevel,
 }
 
 /// What a matching final rule does.
@@ -1045,6 +1063,22 @@ pub struct FreedomFinalRule {
 pub enum FreedomRuleAction {
     Allow,
     Block,
+}
+
+/// The severity at which Xray-core logs the connections a block rule holds,
+/// its `finalRules.logLevel`. xray-rust writes no log line for a blocked
+/// connection, so the level is read and checked as Xray-core reads it and
+/// changes nothing else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FreedomRuleLogLevel {
+    /// `none`: the rule logs nothing.
+    None,
+    Debug,
+    /// An absent or empty `logLevel`, or `info`.
+    #[default]
+    Info,
+    Warning,
+    Error,
 }
 
 /// A whole number of seconds drawn uniformly from `min_secs..=max_secs`.
@@ -1121,6 +1155,7 @@ pub enum OutboundProtocol {
     Loopback,
     Socks,
     Http,
+    Masque,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1137,6 +1172,7 @@ pub enum OutboundSettings {
     Loopback(LoopbackOutboundSettings),
     Socks(SocksOutboundSettings),
     Http(HttpOutboundSettings),
+    Masque(MasqueOutboundSettings),
 }
 
 impl OutboundSettings {
@@ -1154,7 +1190,226 @@ impl OutboundSettings {
             Self::Loopback(_) => OutboundProtocol::Loopback,
             Self::Socks(_) => OutboundProtocol::Socks,
             Self::Http(_) => OutboundProtocol::Http,
+            Self::Masque(_) => OutboundProtocol::Masque,
         }
+    }
+}
+
+/// Xray `masque` outbound settings, as Xray-core v26.10.31's
+/// `MasqueClientConfig.Build` reads them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MasqueOutboundSettings {
+    pub server: TargetAddr,
+    pub port: u16,
+    /// `remoteDNS`: literal servers asked through the tunnel. Empty takes
+    /// Xray's Cloudflare defaults when the client starts.
+    pub remote_dns: Vec<std::net::IpAddr>,
+}
+
+/// `masqueSettings`, as Xray-core v26.10.31's `MasqueConfig.Build` leaves
+/// them: the path's template variables replaced, `user` and `pass` turned
+/// into an Authorization header and the WARP defaults applied. Its `Debug`
+/// shows header names only: a value can be a credential.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MasqueSettings {
+    /// The request authority. Empty takes the TLS server name, with the
+    /// port unless it is 443.
+    pub host: String,
+    /// The CONNECT-IP request path, starting with `/`.
+    pub path: String,
+    /// Request header fields by name, sorted, Authorization included. The
+    /// values are wiped when dropped.
+    pub headers: Vec<(String, zeroize::Zeroizing<String>)>,
+    pub warp: Option<MasqueWarpSettings>,
+    /// Tunnel reuse, read as XHTTP's `xmux`; an all-zero object takes
+    /// MASQUE's defaults, one tunnel reused for 1800 to 3000 seconds.
+    pub xmux: XhttpXmuxSettings,
+}
+
+impl fmt::Debug for MasqueSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MasqueSettings")
+            .field("host", &self.host)
+            .field("path", &self.path)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>(),
+            )
+            .field("warp", &self.warp)
+            .field("xmux", &self.xmux)
+            .finish()
+    }
+}
+
+/// `masqueSettings.warp`: Cloudflare WARP's MASQUE flavour.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MasqueWarpSettings {
+    /// The device key's ECDSA P-256 private scalar: 32 bytes.
+    pub private_key: zeroize::Zeroizing<Vec<u8>>,
+    /// The endpoint's public key, a DER SubjectPublicKeyInfo.
+    pub public_key: Vec<u8>,
+    /// The tunnel addresses with their prefix lengths, as written: at most
+    /// one per family.
+    pub addresses: Vec<(std::net::IpAddr, u8)>,
+}
+
+impl fmt::Debug for MasqueWarpSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MasqueWarpSettings")
+            .field("private_key", &"<redacted>")
+            .field("public_key", &self.public_key.len())
+            .field("addresses", &self.addresses)
+            .finish()
+    }
+}
+
+/// MASQUE's `xmux` defaults: one tunnel, reusable for 1800 to 3000 seconds.
+pub const MASQUE_DEFAULT_XMUX: XhttpXmuxSettings = XhttpXmuxSettings {
+    max_concurrency: XhttpRange { from: 0, to: 0 },
+    max_connections: XhttpRange { from: 1, to: 1 },
+    c_max_reuse_times: XhttpRange { from: 0, to: 0 },
+    h_max_request_times: XhttpRange { from: 0, to: 0 },
+    h_max_reusable_secs: XhttpRange {
+        from: 1_800,
+        to: 3_000,
+    },
+    h_keep_alive_period_secs: 0,
+};
+
+/// `xdriveSettings`, as Xray-core v26.10.31's `XDriveConfig.Build` leaves
+/// them: the service named, `"Google Drive"` read as `google-drive`, the `s3`
+/// block's `pathStyle` defaulted and an all-zero `xmux` replaced by XDRIVE's
+/// defaults. The tuning numbers stay as written: zero takes Xray-core's
+/// default when the transport starts. Its `Debug` shows how many secrets
+/// there are and how long the template is, never their text: both carry
+/// credentials.
+#[derive(Clone, PartialEq, Eq)]
+pub struct XdriveSettings {
+    pub service: XdriveService,
+    /// `remoteFolder`: the folder of `local`, the folder id of
+    /// `google-drive`, the key prefix of `s3`, `{folder}` in a `template`.
+    pub remote_folder: String,
+    /// `secrets`, in order, wiped when dropped.
+    pub secrets: Vec<zeroize::Zeroizing<String>>,
+    /// `segmentBytes`: zero is 512 KiB, more than 16 MiB is 16 MiB.
+    pub segment_bytes: u32,
+    /// `flushIntervalMs`: zero is 20 ms.
+    pub flush_interval_ms: u32,
+    /// `pollIntervalMs`: zero is 50 ms.
+    pub poll_interval_ms: u32,
+    /// `maxPollIntervalMs`: zero is 500 ms, never below the poll interval.
+    pub max_poll_interval_ms: u32,
+    /// `sessionTtlSeconds`: zero is 300 s.
+    pub session_ttl_seconds: u32,
+    /// `concurrency`: zero is 8, more than 64 is 64.
+    pub concurrency: u32,
+    /// `eagerWindowMs`: zero is 2 s.
+    pub eager_window_ms: u32,
+    /// `holeTimeoutMs`: zero is 30 s.
+    pub hole_timeout_ms: u32,
+    /// `template`, the JSON value as given, `None` when absent. Xray-core
+    /// reads it only when a connection dials.
+    pub template: Option<zeroize::Zeroizing<String>>,
+    pub s3: Option<XdriveS3Settings>,
+    /// Connection reuse, read as XHTTP's `xmux`; an all-zero object takes
+    /// [`xdrive_default_xmux`].
+    pub xmux: XhttpXmuxSettings,
+    /// `streamSettings.address` and `port`: where every connection to an
+    /// HTTP storage goes instead of the host its URL names, which still
+    /// names the TLS server and the `Host`; the port only when nonzero.
+    /// `None` without an address, whatever the port.
+    pub fronting: Option<(TargetAddr, u16)>,
+}
+
+impl fmt::Debug for XdriveSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XdriveSettings")
+            .field("service", &self.service)
+            .field("remote_folder", &self.remote_folder)
+            .field("secrets", &self.secrets.len())
+            .field("segment_bytes", &self.segment_bytes)
+            .field("flush_interval_ms", &self.flush_interval_ms)
+            .field("poll_interval_ms", &self.poll_interval_ms)
+            .field("max_poll_interval_ms", &self.max_poll_interval_ms)
+            .field("session_ttl_seconds", &self.session_ttl_seconds)
+            .field("concurrency", &self.concurrency)
+            .field("eager_window_ms", &self.eager_window_ms)
+            .field("hole_timeout_ms", &self.hole_timeout_ms)
+            .field(
+                "template",
+                &self.template.as_ref().map(|template| template.len()),
+            )
+            .field("s3", &self.s3)
+            .field("xmux", &self.xmux)
+            .field("fronting", &self.fronting)
+            .finish()
+    }
+}
+
+/// The storage an XDRIVE stream lives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdriveService {
+    /// No `xdriveSettings` under `network: "xdrive"`: Xray-core then keeps
+    /// its registered default, whose empty service fails every dial.
+    Unset,
+    /// A folder both ends can reach.
+    Local,
+    /// Google Drive, with an OAuth refresh token.
+    GoogleDrive,
+    /// HTTP requests a JSON `template` describes.
+    Template,
+    /// An S3 bucket, signed with AWS Signature Version 4.
+    S3,
+}
+
+impl XdriveService {
+    /// The name Xray-core's config gives the service.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Unset => "",
+            Self::Local => "local",
+            Self::GoogleDrive => "google-drive",
+            Self::Template => "template",
+            Self::S3 => "s3",
+        }
+    }
+}
+
+/// `xdriveSettings.s3`, checked as Xray-core's `ValidateS3Config` checks it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdriveS3Settings {
+    /// An `http` or `https` URL, its path the prefix of every request.
+    pub endpoint: String,
+    /// The signing region; empty signs for `us-east-1`.
+    pub region: String,
+    pub bucket: String,
+    /// The bucket in the path rather than the host: `true` unless
+    /// `pathStyle` is false.
+    pub path_style: bool,
+}
+
+/// XDRIVE's `xmux` defaults: `connections` connections, reusable for 1800
+/// to 3000 seconds. Xray-core gives Google Drive four over HTTP/1.1 and
+/// HTTP/2, where one connection's window holds back long round trips, and
+/// every other case one.
+pub const fn xdrive_default_xmux(connections: i32) -> XhttpXmuxSettings {
+    XhttpXmuxSettings {
+        max_concurrency: XhttpRange { from: 0, to: 0 },
+        max_connections: XhttpRange {
+            from: connections,
+            to: connections,
+        },
+        c_max_reuse_times: XhttpRange { from: 0, to: 0 },
+        h_max_request_times: XhttpRange { from: 0, to: 0 },
+        h_max_reusable_secs: XhttpRange {
+            from: 1_800,
+            to: 3_000,
+        },
+        h_keep_alive_period_secs: 0,
     }
 }
 
@@ -1284,6 +1539,9 @@ pub enum KcpMask {
     /// The stream's `sudoku` mask, read into `StreamSettings::udp_sudoku`,
     /// at its place in the array.
     Sudoku,
+    /// The stream's `salamander` mask, read into
+    /// `StreamSettings::udp_salamander`, at its place in the array.
+    Salamander,
 }
 
 impl fmt::Debug for KcpMask {
@@ -1295,6 +1553,7 @@ impl fmt::Debug for KcpMask {
             Self::Noise => f.write_str("Noise"),
             Self::HeaderCustom => f.write_str("HeaderCustom"),
             Self::Sudoku => f.write_str("Sudoku"),
+            Self::Salamander => f.write_str("Salamander"),
         }
     }
 }
@@ -1518,6 +1777,24 @@ pub struct VlessOutboundSettings {
     pub server: TargetAddr,
     pub port: u16,
     pub users: Vec<VlessUser>,
+    /// `reverse`, which only the simplified form takes: the outbound is then
+    /// the bridge of Xray-core's VLESS reverse proxy.
+    pub reverse: Option<VlessReverseSettings>,
+}
+
+/// The bridge side of Xray-core v26.10.31's VLESS reverse proxy. The
+/// outbound keeps tunnels open to its server, and the server opens
+/// connections back through them, each routed as if an inbound tagged `tag`
+/// had accepted it. Those connections reach only what routing sends them to,
+/// and a freedom outbound refuses them unless its `finalRules` allow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VlessReverseSettings {
+    /// The inbound tag routing sees on the connections the server opens.
+    pub tag: String,
+    /// The outbound's `email`: the user routing sees on them.
+    pub email: String,
+    /// `sniffing`, as an inbound takes it: `None` unless enabled.
+    pub sniffing: Option<InboundSniffingConfig>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -1591,10 +1868,46 @@ pub struct StreamSettings {
     pub udp_header_custom: Option<HeaderCustomUdp>,
     /// The `sudoku` TCP mask, the outermost of the TCP masks.
     pub tcp_sudoku: Option<SudokuMask>,
-    /// The `sudoku` UDP mask, at its place among mKCP's masks.
-    pub udp_sudoku: Option<SudokuMask>,
+    /// The `sudoku` UDP mask, at its place among mKCP's or a QUIC carrier's
+    /// masks.
+    pub udp_sudoku: Option<UdpSudoku>,
+    /// The `xmc` TCP mask, the outermost of the TCP masks, as `sudoku` is.
+    pub tcp_xmc: Option<XmcMask>,
+    /// The `xdns` UDP mask, the outermost of mKCP's or a QUIC carrier's
+    /// masks: it carries the datagrams in DNS queries.
+    pub udp_xdns: Option<XdnsMask>,
+    /// The `realm` UDP mask, the outermost of mKCP's or a QUIC carrier's
+    /// masks: the carrier's socket meets the server through a rendezvous and
+    /// a punched hole.
+    pub udp_realm: Option<RealmMask>,
+    /// The `xicmp` UDP mask, the outermost of mKCP's or a QUIC carrier's
+    /// masks: it carries the datagrams in ICMP echo messages.
+    pub udp_xicmp: Option<XicmpMask>,
     pub udp_noise: Option<UdpNoiseSettings>,
+    /// The `salamander` UDP mask of mKCP, XHTTP over HTTP/3 or MASQUE over
+    /// HTTP/3, at its place among the other masks; Hysteria keeps its own in
+    /// [`HysteriaSettings`].
+    pub udp_salamander: Option<SalamanderMask>,
     pub socket_options: Option<SocketOptions>,
+}
+
+/// A `salamander` UDP mask: every datagram behind a random salt and XORed
+/// with a key the password and salt derive.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SalamanderMask {
+    pub password: zeroize::Zeroizing<String>,
+    /// `packetSize` when its upper bound is positive, which selects Gecko:
+    /// `1 <= from <= to <= 2048`. Not on mKCP.
+    pub gecko_packet_size: Option<FragmentRange>,
+}
+
+impl fmt::Debug for SalamanderMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SalamanderMask")
+            .field("password", &"<redacted>")
+            .field("gecko_packet_size", &self.gecko_packet_size)
+            .finish()
+    }
 }
 
 /// Bounded FinalMask UDP prelude; ranges are inclusive and delays follow each packet.
@@ -1610,6 +1923,43 @@ pub struct UdpNoiseItem {
     pub random_length: FragmentRange,
     pub random_bytes: FragmentRange,
     pub delay_ms: FragmentRange,
+    /// The segments of an `exp` packet, built anew for every send; `packet`
+    /// is then empty and `random_length` zero.
+    pub segments: Vec<NoiseSegment>,
+}
+
+/// One segment of an `exp` noise packet, as Xray-core reads `<key arg>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NoiseSegment {
+    /// `<b hex>`: these bytes.
+    Bytes(Vec<u8>),
+    /// `<r n>` or `<r from-to>`: that many random bytes.
+    Random(FragmentRange),
+    /// `<rc ...>`: that many random ASCII letters.
+    RandomLetters(FragmentRange),
+    /// `<rd ...>`: that many random decimal digits.
+    RandomDigits(FragmentRange),
+    /// `<t>`: the Unix time in seconds, four big-endian bytes.
+    Timestamp,
+    /// `<c>`: the connection's count of these segments, from one, four
+    /// big-endian bytes.
+    Counter,
+    /// `<n>`: eight random bytes.
+    Nonce,
+}
+
+impl NoiseSegment {
+    /// The most bytes this segment adds to a packet.
+    pub fn max_len(&self) -> usize {
+        match self {
+            Self::Bytes(bytes) => bytes.len(),
+            Self::Random(size) | Self::RandomLetters(size) | Self::RandomDigits(size) => {
+                size.to as usize
+            }
+            Self::Timestamp | Self::Counter => 4,
+            Self::Nonce => 8,
+        }
+    }
 }
 
 /// The `header-custom` TCP mask, as Xray-core v26.10.31's `HeaderCustomTCP`
@@ -1649,6 +1999,180 @@ impl fmt::Debug for SudokuMask {
             .field("padding_max", &self.padding_max)
             .finish()
     }
+}
+
+/// The `sudoku` UDP mask and its place among a QUIC carrier's other masks;
+/// mKCP keeps its own order in `KcpSettings::masks`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UdpSudoku {
+    pub mask: SudokuMask,
+    /// Listed before Salamander, which then obfuscates it.
+    pub before_salamander: bool,
+    /// Listed before noise, whose packets then pass through it.
+    pub before_noise: bool,
+    /// Listed before `header-custom`, whose prefixes it then encodes.
+    pub before_header_custom: bool,
+}
+
+/// The `xdns` mask, as Xray-core v26.10.31's `XDNS.Build` reads it: one
+/// domain per name, with the defaults filled in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XdnsMask {
+    pub domains: Vec<XdnsDomain>,
+    pub resolvers: Vec<XdnsResolver>,
+    /// Polls sent after each packet and each poll, 0 to 3.
+    pub extra_poll: u8,
+}
+
+/// One domain the client tunnels under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdnsDomain {
+    pub name: String,
+    /// The longest query name: 255 when the config gives 0.
+    pub len_limit: i32,
+    /// The longest label carrying data: 63 when the config gives 0.
+    pub label_limit: i32,
+    /// The record types the client asks for, each A (1), CNAME (5), TXT
+    /// (16) or AAAA (28); empty asks for TXT.
+    pub types: Vec<u16>,
+    /// The UDP size the client's OPT record advertises, 0 for none.
+    pub edns0: u16,
+}
+
+/// A resolver the client sends its queries to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XdnsResolver {
+    pub protocol: XdnsProtocol,
+    pub address: std::net::SocketAddr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XdnsProtocol {
+    Udp,
+    Tcp,
+}
+
+/// The `xicmp` mask, as Xray-core v26.10.31's `Xicmp.Build` reads it: the
+/// carrier's datagrams ride in ICMP echo requests to the server and come
+/// back in its echo replies.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct XicmpMask {
+    /// Unprivileged datagram ICMP sockets, rather than raw ones.
+    pub dgram: bool,
+    /// The server addresses to send to, one drawn for each packet; the
+    /// outbound's address when empty.
+    pub ips: Vec<std::net::IpAddr>,
+}
+
+/// The `realm` mask, as Xray-core v26.10.31's `Realm.Build` reads it: the
+/// client finds its public addresses with STUN, asks a rendezvous to
+/// introduce it to the server registered under `id`, punches a hole to the
+/// addresses the server reported, and sends the carrier's datagrams to the
+/// one that answered.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RealmMask {
+    /// `realm://` reaches the rendezvous over HTTPS, `realm+http://` over
+    /// HTTP.
+    pub scheme: RealmScheme,
+    /// The rendezvous host as `url.Hostname` reads it, without brackets.
+    pub host: String,
+    /// The port as the URL spells it, which Go keeps for the `Host` header;
+    /// `443` or `80` when it names none.
+    pub port_text: String,
+    /// The port's value.
+    pub port: u16,
+    /// The URL's user information, unescaped: the rendezvous's bearer token.
+    pub token: zeroize::Zeroizing<String>,
+    /// The URL's path without its leading slash, unescaped.
+    pub id: String,
+    pub stun_servers: Vec<RealmStunServer>,
+    /// `tlsConfig`, for an HTTPS rendezvous.
+    pub tls: Option<TlsSettings>,
+    pub ip_mode: RealmIpMode,
+    /// `portMapping`, which xray-rust reads but does not act on yet.
+    pub port_mapping: Option<RealmPortMapping>,
+}
+
+impl fmt::Debug for RealmMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RealmMask")
+            .field("scheme", &self.scheme)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("token", &"<redacted>")
+            .field("id", &self.id)
+            .field("stun_servers", &self.stun_servers)
+            .field("tls", &self.tls.is_some())
+            .field("ip_mode", &self.ip_mode)
+            .field("port_mapping", &self.port_mapping)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RealmScheme {
+    Https,
+    Http,
+}
+
+/// One `stunServers` entry, split as `net.SplitHostPort` splits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealmStunServer {
+    pub host: String,
+    /// The port as written: Xray-core tells servers apart by it.
+    pub port_text: String,
+    pub port: u16,
+}
+
+/// Which address families the client discovers and punches. Xray-core
+/// reads `dual`, `v4` and `v6`, case-insensitively, and any other value as
+/// `dual`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RealmIpMode {
+    #[default]
+    Dual,
+    V4,
+    V6,
+}
+
+/// `portMapping`: a UDP mapping on the local gateway through UPnP or
+/// NAT-PMP, renewed every half lifetime. Seconds; zero takes Xray-core's
+/// defaults of 10 seconds and 10 minutes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RealmPortMapping {
+    pub enabled: bool,
+    pub timeout: i64,
+    pub lifetime: i64,
+}
+
+/// The `xmc` mask, as Xray-core v26.10.31's `XMC.Build` reads it: a
+/// Minecraft login as one of the profiles, keyed by the password.
+#[derive(Clone, PartialEq, Eq)]
+pub struct XmcMask {
+    /// The handshake's server address; empty sends the server's IP address.
+    pub hostname: String,
+    pub password: zeroize::Zeroizing<String>,
+    pub profiles: Vec<XmcProfile>,
+}
+
+impl fmt::Debug for XmcMask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("XmcMask")
+            .field("hostname", &self.hostname)
+            .field("password", &"<redacted>")
+            .field("profiles", &self.profiles)
+            .finish()
+    }
+}
+
+/// A signed Minecraft profile the `xmc` client logs in as, which its server
+/// must hold too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XmcProfile {
+    pub username: String,
+    pub uuid: [u8; 16],
+    pub textures_value: String,
+    pub textures_signature: String,
 }
 
 /// The `header-custom` UDP mask, as Xray-core v26.10.31's `HeaderCustomUDP`
@@ -1701,12 +2225,32 @@ pub enum HeaderCustomArg {
     Transform(HeaderCustomExpr),
 }
 
-/// Bounded first-ClientHello record fragmentation. Ranges are inclusive.
+/// Bounded TCP fragmentation: the first ClientHello's record, or selected
+/// writes cut into raw pieces. Ranges are inclusive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TcpFragmentSettings {
+    pub packets: FragmentPackets,
     pub lengths: Vec<FragmentRange>,
     pub delays_ms: Vec<FragmentRange>,
     pub max_split: FragmentRange,
+    /// The `finalRules` of the dedicated freedom fragment outbound a
+    /// `dialerProxy` named, when the parser folded that freedom into this
+    /// outbound; `None` for any other fragment mask. A connection from a VLESS
+    /// reverse proxy still meets them, as it meets that freedom in Xray-core.
+    pub folded_final_rules: Option<Vec<FreedomFinalRule>>,
+}
+
+/// The writes a fragment mask cuts, as Xray's `packets` selects them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentPackets {
+    /// `tlshello`: the first write's complete TLS handshake record, sent as
+    /// smaller records with the same handshake bytes.
+    TlsHello,
+    /// Empty or absent: every write, cut into raw pieces.
+    AllWrites,
+    /// `"from-to"` or one number: the writes so numbered, counting from one,
+    /// cut into raw pieces; `from` is at least one and `to` at least `from`.
+    Writes { from: u32, to: u32 },
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1734,6 +2278,10 @@ pub struct QuicParamsSettings {
     pub keep_alive_period_secs: i64,
     pub disable_path_mtu_discovery: bool,
     pub max_incoming_streams: i64,
+    /// `disableChromeParrot`: Xray-core shapes the Hysteria, XHTTP H3 and
+    /// XDRIVE H3 handshakes like Chrome's (quic-go's `ChromeParrot`) unless
+    /// this is true. MASQUE never does.
+    pub disable_chrome_parrot: bool,
     /// quic-go's `Transport.DisableGSO`.
     pub disable_gso: bool,
     /// Only Xray-core's QUIC servers consult it, so it changes nothing here.
@@ -1805,6 +2353,11 @@ pub enum StreamTransport {
     Xhttp(Box<XhttpSettings>),
     /// `kcp` / `mkcp`.
     Kcp(KcpSettings),
+    /// `masque`, for the `masque` outbound only.
+    Masque(Box<MasqueSettings>),
+    /// `xdrive`, for VLESS only: the stream rides files in a storage both
+    /// ends reach.
+    Xdrive(Box<XdriveSettings>),
 }
 
 /// An ordered XHTTP integer range. Xray accepts either a JSON integer or a

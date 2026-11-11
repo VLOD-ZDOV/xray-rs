@@ -45,7 +45,16 @@ impl Parser<'_> {
                 "REALITY only supports RAW, XHTTP and gRPC for now",
             );
         }
+        // MASQUE runs over HTTP/3 unless its ALPN asks for HTTP/2 alone.
+        let masque_h3 = stream_network == StreamNetwork::Masque
+            && matches!(&security, StreamSecurity::Tls(tls) if !super::masque::masque_uses_http2(&tls.alpn));
+        // XDRIVE reaches an HTTP storage over HTTP/3 only when that is the
+        // one protocol its ALPN names.
+        let xdrive_h3 = stream_network == StreamNetwork::Xdrive
+            && matches!(&security, StreamSecurity::Tls(tls) if tls.alpn == ["h3"]);
         let is_quic = stream_network == StreamNetwork::Hysteria
+            || masque_h3
+            || xdrive_h3
             || stream_network == StreamNetwork::Xhttp
                 && matches!(&security, StreamSecurity::Tls(tls) if tls.alpn == ["h3"]);
         let mut quic_params = self.parse_quic_params(stream, stream_network, is_quic, index);
@@ -61,29 +70,35 @@ impl Parser<'_> {
             }
             quic_params.get_or_insert_with(Default::default).udp_hop = hop;
         }
-        let (tcp_fragment, tcp_header_custom, tcp_sudoku) = self.parse_tcp_masks(stream, index);
+        let tcp_masks = self.parse_tcp_masks(stream, index);
+        // Xray-core v26.10.31's REALITY server asserts that its connection
+        // can half-close, which xmc's server connection cannot: every
+        // connection through both panics the server, so no server takes them.
+        if tcp_masks.xmc.is_some() && matches!(security, StreamSecurity::Reality(_)) {
+            self.error(
+                format!("$.outbounds[{index}].streamSettings.security"),
+                "REALITY cannot run over an xmc mask: Xray-core's REALITY server panics on every connection through one",
+            );
+        }
         let udp_noise = self.parse_udp_noise(stream, stream_network, index);
         let udp_header_custom = self.parse_udp_header_custom(stream, index);
         let udp_sudoku = self.parse_udp_sudoku(stream, index);
+        let udp_xdns = self.parse_udp_xdns(stream, index);
+        let udp_realm = self.parse_udp_realm(stream, index);
+        let udp_xicmp = self.parse_udp_xicmp(stream, index);
         let socket_options = self.parse_socket_options(stream, index);
         if let Some(stream) = stream {
             self.validate_stream_settings_compatibility(stream, index);
         }
         self.validate_unconsumed_transport_settings(stream, stream_network, index);
-        let transport = self.parse_stream_transport(stream, stream_network, index)?;
-        let chrome_parrot =
-            stream.and_then(|s| s.pointer("/finalmask/quicParams/disableChromeParrot"));
-        if is_quic && chrome_parrot != Some(&Value::Bool(true)) {
-            self.warning(format!("$.outbounds[{index}].streamSettings.finalmask.quicParams.disableChromeParrot"),
-                "QUIC uses native Quinn TLS, without Xray ChromeParrot fingerprint shaping; set disableChromeParrot=true to acknowledge this compatibility limit");
+        let mut transport =
+            self.parse_stream_transport(stream, stream_network, xdrive_h3, index)?;
+        let fronting = self.parse_stream_fronting(stream, stream_network, index)?;
+        if let StreamTransport::Xdrive(settings) = &mut transport {
+            settings.fronting = fronting;
         }
-        if !is_quic && chrome_parrot.is_some() {
-            self.error(
-                format!(
-                    "$.outbounds[{index}].streamSettings.finalmask.quicParams.disableChromeParrot"
-                ),
-                "disableChromeParrot requires Hysteria or XHTTP with exact h3 ALPN",
-            );
+        if xdrive_h3 {
+            self.validate_xdrive_h3_stream(stream, &transport, quic_params.as_ref(), index);
         }
         if let StreamTransport::Xhttp(xhttp) = &transport {
             if let Some(download) = &xhttp.download {
@@ -98,7 +113,21 @@ impl Parser<'_> {
             }
         }
 
+        // Freedom's flows and WireGuard's socket carry plain datagrams,
+        // which Xray-core's `FinalMask.DialUDP` masks as it masks a QUIC
+        // carrier's.
+        let direct_udp = matches!(
+            outbound
+                .get("protocol")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("freedom" | "direct" | "wireguard")
+        );
         let udp_carrier = matches!(stream_network, StreamNetwork::Hysteria | StreamNetwork::Kcp)
+            || masque_h3
+            || xdrive_h3
+            || direct_udp
             || stream_network == StreamNetwork::Xhttp
                 && matches!(&security, StreamSecurity::Tls(tls) if tls.alpn == ["h3"]);
         if udp_noise.is_some() && !udp_carrier {
@@ -107,12 +136,10 @@ impl Parser<'_> {
                 "UDP noise requires Hysteria, mKCP or XHTTP with exact h3 ALPN",
             );
         }
-        // Sudoku inflates every datagram at least fourfold: QUIC's packets
-        // would need the system to fragment them, which its sockets forbid.
-        if udp_sudoku.is_some() && stream_network != StreamNetwork::Kcp {
+        if udp_sudoku.is_some() && !udp_carrier {
             self.error(
                 format!("$.outbounds[{index}].streamSettings.finalmask.udp"),
-                "a sudoku UDP mask requires mKCP here",
+                "a sudoku UDP mask requires mKCP, Hysteria or XHTTP with exact h3 ALPN",
             );
         }
         if udp_header_custom.is_some() && !udp_carrier {
@@ -120,6 +147,149 @@ impl Parser<'_> {
                 format!("$.outbounds[{index}].streamSettings.finalmask.udp"),
                 "a header-custom UDP mask requires mKCP, Hysteria or XHTTP with exact h3 ALPN",
             );
+        }
+        if udp_xdns.is_some() {
+            let has = |kind: &str| {
+                stream
+                    .and_then(|s| s.pointer("/finalmask/udp"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|masks| {
+                        masks.iter().any(|mask| {
+                            mask.get("type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| crate::go_lowercase(t) == kind)
+                        })
+                    })
+            };
+            let path = format!("$.outbounds[{index}].streamSettings.finalmask.udp");
+            if !udp_carrier {
+                self.error(
+                    &path,
+                    "an xdns UDP mask requires mKCP, Hysteria or XHTTP with exact h3 ALPN",
+                );
+            }
+            // Both must be the last mask; under xdns, Xray-core opens the
+            // hopping socket and never uses it.
+            if has("udphop") {
+                self.error(&path, "an xdns UDP mask cannot be combined with udphop");
+            }
+            // One xdns packet takes 4096 bytes; sudoku's datagram is four
+            // times a QUIC packet of at least 1200, or a WireGuard packet.
+            if is_quic && udp_sudoku.is_some() {
+                self.error(
+                    &path,
+                    "a sudoku UDP mask cannot run under xdns on QUIC: its datagrams exceed the 4096 bytes an xdns packet takes",
+                );
+            }
+            if direct_udp && udp_sudoku.is_some() {
+                self.error(
+                    &path,
+                    "a sudoku UDP mask cannot run under xdns on freedom or WireGuard: its datagrams exceed the 4096 bytes an xdns packet takes",
+                );
+            }
+        }
+        if udp_realm.is_some() {
+            let has = |kind: &str| {
+                stream
+                    .and_then(|s| s.pointer("/finalmask/udp"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|masks| {
+                        masks.iter().any(|mask| {
+                            mask.get("type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| crate::go_lowercase(t) == kind)
+                        })
+                    })
+            };
+            let path = format!("$.outbounds[{index}].streamSettings.finalmask.udp");
+            if !udp_carrier {
+                self.error(
+                    &path,
+                    "a realm UDP mask requires mKCP, Hysteria or XHTTP with exact h3 ALPN",
+                );
+            }
+            // Its rendezvous introduces the socket first, which only the
+            // QUIC carriers and mKCP do here.
+            if direct_udp {
+                self.error(
+                    &path,
+                    "a realm UDP mask is not supported on freedom or WireGuard yet",
+                );
+            }
+            // Each must be the last mask, and each sends somewhere else than
+            // the other expects: udphop to the server's ports, xdns to its
+            // resolvers.
+            for other in ["udphop", "xdns"] {
+                if has(other) {
+                    self.error(
+                        &path,
+                        format!("a realm UDP mask cannot be combined with {other}"),
+                    );
+                }
+            }
+            // Xray-core writes to the server's address under realm but reads
+            // from the punched peer's, so a header-custom mask's state never
+            // matches, as under udphop.
+            if udp_header_custom.is_some() {
+                self.error(
+                    &path,
+                    "a header-custom UDP mask cannot be combined with realm",
+                );
+            }
+        }
+        if udp_xicmp.is_some() {
+            let has = |kind: &str| {
+                stream
+                    .and_then(|s| s.pointer("/finalmask/udp"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|masks| {
+                        masks.iter().any(|mask| {
+                            mask.get("type")
+                                .and_then(Value::as_str)
+                                .is_some_and(|t| crate::go_lowercase(t) == kind)
+                        })
+                    })
+            };
+            let path = format!("$.outbounds[{index}].streamSettings.finalmask.udp");
+            if !udp_carrier {
+                self.error(
+                    &path,
+                    "an xicmp UDP mask requires mKCP, Hysteria or XHTTP with exact h3 ALPN",
+                );
+            }
+            // Each must be the last mask: udphop and xicmp both open their
+            // own sockets, xdns sends to resolvers and realm punches.
+            for other in ["udphop", "xdns", "realm"] {
+                if has(other) {
+                    self.error(
+                        &path,
+                        format!("an xicmp UDP mask cannot be combined with {other}"),
+                    );
+                }
+            }
+            // Xray-core writes to the server's address and port under xicmp
+            // but reads from the replying address without one, so a
+            // header-custom mask's state never matches.
+            if udp_header_custom.is_some() {
+                self.error(
+                    &path,
+                    "a header-custom UDP mask cannot be combined with xicmp",
+                );
+            }
+            // An echo carries at most 4080 bytes; sudoku's datagram is four
+            // times a QUIC packet of at least 1200, or a WireGuard packet.
+            if is_quic && udp_sudoku.is_some() {
+                self.error(
+                    &path,
+                    "a sudoku UDP mask cannot run under xicmp on QUIC: its datagrams exceed the 4080 bytes an echo carries",
+                );
+            }
+            if direct_udp && udp_sudoku.is_some() {
+                self.error(
+                    &path,
+                    "a sudoku UDP mask cannot run under xicmp on freedom or WireGuard: its datagrams exceed the 4080 bytes an echo carries",
+                );
+            }
         }
         // Xray-core writes to 0.0.0.0:0 under udphop but reads from the hop's
         // address, so its standalone reply never completes and prefix
@@ -141,23 +311,31 @@ impl Parser<'_> {
                 "a header-custom UDP mask cannot be combined with udphop",
             );
         }
-        if stream_network != StreamNetwork::Hysteria
-            && stream
-                .and_then(|s| s.pointer("/finalmask/udp"))
-                .and_then(Value::as_array)
-                .is_some_and(|m| {
-                    m.iter().any(|v| {
-                        v.get("type")
-                            .and_then(Value::as_str)
-                            .is_some_and(|s| s.eq_ignore_ascii_case("salamander"))
-                    })
-                })
-        {
-            self.error(
-                format!("$.outbounds[{index}].streamSettings.finalmask.udp"),
-                "Salamander requires Hysteria",
-            );
-        }
+        // Hysteria reads its own Salamander mask; the other UDP carriers take
+        // one here, at its place among their masks.
+        let udp_salamander = if stream_network == StreamNetwork::Hysteria {
+            None
+        } else {
+            let salamander = self.parse_udp_salamander(stream, index);
+            let path = format!("$.outbounds[{index}].streamSettings.finalmask.udp");
+            if salamander.is_some() && !udp_carrier {
+                self.error(
+                    &path,
+                    "Salamander requires Hysteria, mKCP, XHTTP with exact h3 ALPN, MASQUE over HTTP/3, XDRIVE with exact h3 ALPN, freedom or WireGuard",
+                );
+            }
+            if stream_network == StreamNetwork::Kcp
+                && salamander
+                    .as_ref()
+                    .is_some_and(|salamander| salamander.gecko_packet_size.is_some())
+            {
+                self.error(
+                    &path,
+                    "Gecko, Salamander's packetSize, is not supported on mKCP yet",
+                );
+            }
+            salamander
+        };
         Some(StreamSettings {
             // Native Hysteria owns a UDP carrier; other transports retain
             // their existing TCP classification (XHTTP selects H3 later).
@@ -169,12 +347,17 @@ impl Parser<'_> {
             transport,
             security,
             quic_params,
-            tcp_fragment,
-            tcp_header_custom,
+            tcp_fragment: tcp_masks.fragment,
+            tcp_header_custom: tcp_masks.header,
             udp_header_custom,
-            tcp_sudoku,
+            tcp_sudoku: tcp_masks.sudoku,
             udp_sudoku,
+            tcp_xmc: tcp_masks.xmc,
+            udp_xdns,
+            udp_realm,
+            udp_xicmp,
             udp_noise,
+            udp_salamander,
             socket_options,
         })
     }
@@ -183,6 +366,7 @@ impl Parser<'_> {
         &mut self,
         stream: Option<&Value>,
         network: StreamNetwork,
+        xdrive_h3: bool,
         index: usize,
     ) -> Option<StreamTransport> {
         match network {
@@ -208,6 +392,14 @@ impl Parser<'_> {
                 self.parse_kcp_settings(stream, index)
                     .map(|kcp| StreamTransport::Kcp(KcpSettings { masks, ..kcp }))
             }
+            StreamNetwork::Masque => self
+                .parse_masque_transport(stream, index)
+                .map(Box::new)
+                .map(StreamTransport::Masque),
+            StreamNetwork::Xdrive => self
+                .parse_xdrive_transport(stream, index, xdrive_h3)
+                .map(Box::new)
+                .map(StreamTransport::Xdrive),
         }
     }
 
@@ -240,6 +432,8 @@ impl Parser<'_> {
             StreamNetwork::Grpc => &["grpcSettings"],
             StreamNetwork::Xhttp => &["xhttpSettings", "splithttpSettings"],
             StreamNetwork::Kcp => &["kcpSettings"],
+            StreamNetwork::Masque => &["masqueSettings"],
+            StreamNetwork::Xdrive => &["xdriveSettings"],
         };
 
         for key in [
@@ -252,6 +446,8 @@ impl Parser<'_> {
             "xhttpSettings",
             "splithttpSettings",
             "kcpSettings",
+            "masqueSettings",
+            "xdriveSettings",
         ] {
             let value = stream.get(key);
             let null_xhttp_pointer = matches!(key, "xhttpSettings" | "splithttpSettings")
@@ -290,6 +486,15 @@ impl Parser<'_> {
                 }
                 "kcpSettings" => {
                     let _ = self.parse_kcp_settings(Some(stream), index);
+                }
+                // Xray-core builds it under any network.
+                "masqueSettings" => {
+                    let _ = self.parse_masque_transport(Some(stream), index);
+                }
+                // So it does this one, as over HTTP/1.1 and HTTP/2: its h3
+                // flag needs the xdrive network.
+                "xdriveSettings" => {
+                    let _ = self.parse_xdrive_transport(Some(stream), index, false);
                 }
                 // `xhttpSettings` has priority over the legacy spelling, so
                 // the lower-priority block is inert when both are present.
@@ -602,19 +807,15 @@ impl Parser<'_> {
             return None;
         }
         self.reject_unknown_fields(quic, &quic_path, &surface::QUIC_PARAMS);
-        if let Some(value) = quic.get("disableChromeParrot") {
-            if value != &Value::Bool(true) {
-                self.error(format!("{quic_path}.disableChromeParrot"),
-                    "only disableChromeParrot=true is supported; ChromeParrot fingerprint shaping is unavailable");
-            }
-        }
 
         // Go's encoding/json treats null for scalar struct fields as their
         // existing zero value. The nullable helpers below preserve that rule.
-        let congestion = match self
-            .nullable_string_at(quic, "congestion", format!("{quic_path}.congestion"))?
-            .to_lowercase()
-            .as_str()
+        let congestion = match crate::go_lowercase(self.nullable_string_at(
+            quic,
+            "congestion",
+            format!("{quic_path}.congestion"),
+        )?)
+        .as_ref()
         {
             "" => QuicCongestion::Default,
             "brutal" => QuicCongestion::Brutal,
@@ -629,10 +830,14 @@ impl Parser<'_> {
                 return None;
             }
         };
-        let bbr_profile = match self
-            .nullable_string_at(quic, "bbrProfile", format!("{quic_path}.bbrProfile"))?
-            .to_lowercase()
-            .as_str()
+        // Xray-core accepts every profile wherever quicParams goes; its
+        // Hysteria and XHTTP H3 dialers run them all.
+        let bbr_profile = match crate::go_lowercase(self.nullable_string_at(
+            quic,
+            "bbrProfile",
+            format!("{quic_path}.bbrProfile"),
+        )?)
+        .as_ref()
         {
             "" | "standard" => QuicBbrProfile::Standard,
             "conservative" => QuicBbrProfile::Conservative,
@@ -664,19 +869,6 @@ impl Parser<'_> {
             self.error(
                 format!("{quic_path}.congestion"),
                 "force-brutal requires nonzero brutalUp",
-            );
-        }
-        // Fail closed where Xray would run what this runtime lacks.
-        let uses_bbr_profile = match congestion {
-            QuicCongestion::Default | QuicCongestion::Bbr => true,
-            // Hysteria falls back to BBR unless both sides announce a rate.
-            QuicCongestion::Brutal => network == StreamNetwork::Hysteria,
-            QuicCongestion::Reno | QuicCongestion::ForceBrutal => false,
-        };
-        if is_quic && uses_bbr_profile && bbr_profile != QuicBbrProfile::Standard {
-            self.error(
-                format!("{quic_path}.bbrProfile"),
-                "only the standard BBR profile is implemented; conservative and aggressive need Xray's own BBR sender",
             );
         }
         if is_quic && network == StreamNetwork::Xhttp && congestion == QuicCongestion::Brutal {
@@ -752,6 +944,7 @@ impl Parser<'_> {
                 &quic_path,
             )?,
             max_incoming_streams,
+            disable_chrome_parrot: self.quic_bool_at(quic, "disableChromeParrot", &quic_path)?,
             disable_gso: self.quic_bool_at(quic, "disableGSO", &quic_path)?,
             disable_stateless_reset: self.quic_bool_at(
                 quic,
@@ -1047,7 +1240,7 @@ impl Parser<'_> {
 
     /// A Go `int32` field: absent and null are zero, and only an integer
     /// literal within range decodes, as `encoding/json` decodes one.
-    fn go_int32_at(&mut self, value: &Value, key: &str, path: String) -> Option<i32> {
+    pub(super) fn go_int32_at(&mut self, value: &Value, key: &str, path: String) -> Option<i32> {
         match value.get(key) {
             None | Some(Value::Null) => Some(0),
             Some(raw) => match raw.as_i64().and_then(|value| i32::try_from(value).ok()) {
@@ -1064,7 +1257,7 @@ impl Parser<'_> {
     }
 
     /// A Go `bool` field: absent and null are false.
-    fn go_bool_at(&mut self, value: &Value, key: &str, path: String) -> Option<bool> {
+    pub(super) fn go_bool_at(&mut self, value: &Value, key: &str, path: String) -> Option<bool> {
         match value.get(key) {
             None | Some(Value::Null) => Some(false),
             Some(Value::Bool(value)) => Some(*value),
@@ -1077,7 +1270,12 @@ impl Parser<'_> {
 
     /// A Go `[]string` field: absent and null are empty, and a null element
     /// is an empty string.
-    fn go_string_list_at(&mut self, value: &Value, key: &str, path: String) -> Option<Vec<String>> {
+    pub(super) fn go_string_list_at(
+        &mut self,
+        value: &Value,
+        key: &str,
+        path: String,
+    ) -> Option<Vec<String>> {
         match value.get(key) {
             None | Some(Value::Null) => Some(Vec::new()),
             Some(Value::Array(items)) => {
@@ -1314,13 +1512,8 @@ impl Parser<'_> {
                 None
             }
             "kcp" | "mkcp" => Some(StreamNetwork::Kcp),
-            network @ ("masque" | "xdrive") => {
-                self.error(
-                    network_path,
-                    format!("stream network `{network}` is not supported by xray-rust"),
-                );
-                None
-            }
+            "masque" => Some(StreamNetwork::Masque),
+            "xdrive" => Some(StreamNetwork::Xdrive),
             network => {
                 self.error(
                     network_path,
@@ -1355,71 +1548,10 @@ impl Parser<'_> {
             "" | "none" => Some(StreamSecurity::None),
             "tls" => {
                 let tls_settings = stream.and_then(|stream| stream.get("tlsSettings"));
-                self.validate_tls_settings(tls_settings, index);
-                let allow_insecure_path =
-                    format!("$.outbounds[{index}].streamSettings.tlsSettings.allowInsecure");
-                let allow_insecure = match tls_settings
-                    .and_then(|settings| settings.get("allowInsecure"))
-                {
-                    None | Some(Value::Null) | Some(Value::Bool(false)) => false,
-                    Some(Value::Bool(true)) => {
-                        self.error(
-                            allow_insecure_path,
-                            "allowInsecure=true was removed by Xray; use pinnedPeerCertSha256 instead",
-                        );
-                        // Never let a rejected canonical config carry an
-                        // insecure verifier into a partially built model.
-                        false
-                    }
-                    Some(_) => {
-                        self.error(
-                            allow_insecure_path,
-                            "field `allowInsecure` must be a boolean or null",
-                        );
-                        false
-                    }
-                };
-                let pinned_peer_cert_sha256 =
-                    self.parse_tls_pinned_peer_cert_sha256(tls_settings, index);
-                let verify_peer_cert_by_name =
-                    self.parse_tls_verify_peer_cert_by_name(tls_settings, index);
-                // An absent fingerprint normalizes to chrome, matching Xray's
-                // GetFingerprint(""): shaping is the default, not an opt-in.
-                let raw_fingerprint = tls_settings
-                    .and_then(|settings| self.string_at(settings, "fingerprint"))
-                    .unwrap_or_default();
-                let fingerprint = match xray_utls::normalize_tls_fingerprint(raw_fingerprint) {
-                    Some(fingerprint) => Some(fingerprint.to_owned()),
-                    None => {
-                        self.error(
-                            format!("$.outbounds[{index}].streamSettings.tlsSettings.fingerprint"),
-                            format!("unsupported tls fingerprint `{raw_fingerprint}`"),
-                        );
-                        None
-                    }
-                };
-                let alpn = tls_settings
-                    .and_then(|settings| settings.get("alpn"))
-                    .and_then(Value::as_array)
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                Some(StreamSecurity::Tls(TlsSettings {
-                    server_name: tls_settings
-                        .and_then(|settings| self.string_at(settings, "serverName"))
-                        .map(ToOwned::to_owned),
-                    fingerprint,
-                    pinned_peer_cert_sha256,
-                    verify_peer_cert_by_name,
-                    allow_insecure,
-                    alpn,
-                }))
+                let path = format!("$.outbounds[{index}].streamSettings.tlsSettings");
+                Some(StreamSecurity::Tls(
+                    self.parse_tls_object(tls_settings, &path),
+                ))
             }
             "reality" => self
                 .parse_reality_settings(stream, index)
@@ -1443,6 +1575,75 @@ impl Parser<'_> {
         }
     }
 
+    /// A TLS settings object at `path`, as Xray-core's `TLSConfig` reads it:
+    /// `streamSettings.tlsSettings`, or a mask's `tlsConfig`.
+    pub(super) fn parse_tls_object(
+        &mut self,
+        tls_settings: Option<&Value>,
+        path: &str,
+    ) -> TlsSettings {
+        self.validate_tls_settings(tls_settings, path);
+        let allow_insecure_path = format!("{path}.allowInsecure");
+        let allow_insecure = match tls_settings.and_then(|settings| settings.get("allowInsecure")) {
+            None | Some(Value::Null) | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => {
+                self.error(
+                    allow_insecure_path,
+                    "allowInsecure=true was removed by Xray; use pinnedPeerCertSha256 instead",
+                );
+                // Never let a rejected canonical config carry an
+                // insecure verifier into a partially built model.
+                false
+            }
+            Some(_) => {
+                self.error(
+                    allow_insecure_path,
+                    "field `allowInsecure` must be a boolean or null",
+                );
+                false
+            }
+        };
+        let pinned_peer_cert_sha256 = self.parse_tls_pinned_peer_cert_sha256(tls_settings, path);
+        let verify_peer_cert_by_name = self.parse_tls_verify_peer_cert_by_name(tls_settings, path);
+        // An absent fingerprint normalizes to chrome, matching Xray's
+        // GetFingerprint(""): shaping is the default, not an opt-in.
+        let raw_fingerprint = tls_settings
+            .and_then(|settings| self.string_at(settings, "fingerprint"))
+            .unwrap_or_default();
+        let fingerprint = match xray_utls::normalize_tls_fingerprint(raw_fingerprint) {
+            Some(fingerprint) => Some(fingerprint.to_owned()),
+            None => {
+                self.error(
+                    format!("{path}.fingerprint"),
+                    format!("unsupported tls fingerprint `{raw_fingerprint}`"),
+                );
+                None
+            }
+        };
+        let alpn = tls_settings
+            .and_then(|settings| settings.get("alpn"))
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        TlsSettings {
+            server_name: tls_settings
+                .and_then(|settings| self.string_at(settings, "serverName"))
+                .map(ToOwned::to_owned),
+            fingerprint,
+            pinned_peer_cert_sha256,
+            verify_peer_cert_by_name,
+            allow_insecure,
+            alpn,
+        }
+    }
+
     pub(super) fn validate_stream_settings_compatibility(&mut self, stream: &Value, index: usize) {
         let stream_path = format!("$.outbounds[{index}].streamSettings");
         if !stream.is_object() {
@@ -1455,11 +1656,11 @@ impl Parser<'_> {
         self.validate_tcp_settings(stream, "rawSettings", index);
     }
 
-    pub(super) fn validate_tls_settings(&mut self, settings: Option<&Value>, index: usize) {
+    pub(super) fn validate_tls_settings(&mut self, settings: Option<&Value>, path: &str) {
         let Some(settings) = settings else {
             return;
         };
-        let settings_path = format!("$.outbounds[{index}].streamSettings.tlsSettings");
+        let settings_path = path.to_owned();
         if !settings.is_object() {
             self.error(settings_path, "tlsSettings must be an object");
             return;
@@ -1547,9 +1748,9 @@ impl Parser<'_> {
     pub(super) fn parse_tls_pinned_peer_cert_sha256(
         &mut self,
         settings: Option<&Value>,
-        index: usize,
+        path: &str,
     ) -> Vec<[u8; 32]> {
-        let path = format!("$.outbounds[{index}].streamSettings.tlsSettings.pinnedPeerCertSha256");
+        let path = format!("{path}.pinnedPeerCertSha256");
         let Some(value) = settings.and_then(|settings| settings.get("pinnedPeerCertSha256")) else {
             return Vec::new();
         };
@@ -1597,9 +1798,9 @@ impl Parser<'_> {
     pub(super) fn parse_tls_verify_peer_cert_by_name(
         &mut self,
         settings: Option<&Value>,
-        index: usize,
+        path: &str,
     ) -> Vec<String> {
-        let path = format!("$.outbounds[{index}].streamSettings.tlsSettings.verifyPeerCertByName");
+        let path = format!("{path}.verifyPeerCertByName");
         let Some(value) = settings.and_then(|settings| settings.get("verifyPeerCertByName")) else {
             return Vec::new();
         };

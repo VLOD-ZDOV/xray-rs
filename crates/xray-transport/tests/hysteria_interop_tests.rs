@@ -229,6 +229,7 @@ async fn pinned_reference_brutal_paces_both_directions_at_the_negotiated_rate() 
     };
     let brutal = H3Congestion::Brutal {
         up_bytes_per_second: 100 << 17,
+        bbr_profile: xray_transport::stream::H3BbrProfile::Standard,
     };
 
     // Upload: Brutal at the server's announced 8 Mbps, not our 100 Mbps.
@@ -271,3 +272,27 @@ mod carrier;
 
 #[path = "hysteria/header_custom.rs"]
 mod header_custom;
+
+#[path = "hysteria/sudoku.rs"]
+mod sudoku;
+
+#[path = "../../../tests/support/realm_rendezvous.rs"]
+mod realm_rendezvous;
+
+#[path = "hysteria/realm.rs"]
+mod realm;
+
+#[path = "hysteria/xicmp.rs"]
+mod xicmp;
+
+#[path = "hysteria/xdns.rs"]
+mod xdns;
+
+#[path = "hysteria/bbr_profiles.rs"]
+mod bbr_profiles;
+
+#[path = "../../../tests/support/chrome_parrot_wire.rs"]
+mod chrome_parrot_wire;
+
+#[path = "hysteria/chrome_parrot.rs"]
+mod chrome_parrot;

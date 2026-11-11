@@ -28,7 +28,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep_until, Instant};
 
-use crate::quic_congestion::{BrutalDecision, BrutalFactory, BrutalRate, NegotiatedBrutalFactory};
+use crate::quic_congestion::{
+    bbr_for_profile, quinn_bbr, BbrProfile, BrutalRate, ControllerSwitch, Installed,
+    SwitchedFactory, STANDARD_RUNS_XRAY_BBR,
+};
 use crate::{
     canonicalize_socket_addr, memory_class, HappyEyeballsConfig, MemoryClass, SocketHandle,
     SocketProtector, TransportError,
@@ -48,7 +51,6 @@ const XRAY_MAX_CONNECTION_RECEIVE_WINDOW: u64 = 15 * 1024 * 1024;
 /// quic-go keeps a connection window of at least 1.5 stream windows
 /// (`ConnectionFlowControlMultiplier`).
 const CONNECTION_FLOW_CONTROL_MULTIPLIER: f64 = 1.5;
-const XRAY_BBR_INITIAL_WINDOW: u64 = 32 * 1280;
 /// Datagrams an XHTTP H3 or DoQ endpoint reads per receive call.
 ///
 /// Every XHTTP H3 request owns a QUIC connection and its own endpoint, and
@@ -80,26 +82,115 @@ pub enum H3QuicVersion {
     V2,
 }
 
+/// Xray's `quicParams.bbrProfile`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum H3BbrProfile {
+    Conservative,
+    #[default]
+    Standard,
+    Aggressive,
+}
+
+impl H3BbrProfile {
+    fn sender_profile(self) -> BbrProfile {
+        match self {
+            Self::Conservative => BbrProfile::Conservative,
+            Self::Standard => BbrProfile::Standard,
+            Self::Aggressive => BbrProfile::Aggressive,
+        }
+    }
+}
+
 /// Congestion-control choices understood by XHTTP and Hysteria configuration.
+///
+/// Except for [`Self::Reno`] and, while it runs quinn's BBR,
+/// [`Self::BbrStandard`], which run from the first packet, a connection
+/// starts with NewReno, quic-go's default sender, and switches when Xray's
+/// dialer installs its controller: after the handshake on XHTTP, after
+/// authentication on Hysteria.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum H3Congestion {
-    /// Quinn's BBR implementation with Xray's standard initial window.
+    /// The `standard` profile: quinn's BBR implementation with Xray's
+    /// standard initial window, unless the port of Xray's sender is chosen
+    /// for it.
     BbrStandard,
     Reno,
-    /// Xray's conservative BBR profile; not implemented, so rejected.
+    /// Xray's BBR sender with its conservative profile.
     BbrConservative,
-    /// Xray's aggressive BBR profile; not implemented, so rejected.
+    /// Xray's BBR sender with its aggressive profile.
     BbrAggressive,
-    /// Hysteria's default: BBR, or Brutal at the lower of this rate and the
-    /// receive rate the server announces once both are nonzero. Only a
-    /// Hysteria connection can negotiate it; XHTTP rejects it.
+    /// Hysteria's default: Brutal at the lower of this rate and the receive
+    /// rate the server announces once both are nonzero, otherwise BBR with
+    /// `bbr_profile`. Only a Hysteria connection can negotiate it; XHTTP
+    /// rejects it.
     Brutal {
         up_bytes_per_second: u64,
+        bbr_profile: H3BbrProfile,
     },
     /// Brutal at this fixed rate, whatever the peer announces.
     ForceBrutal {
         bytes_per_second: u64,
     },
+}
+
+impl H3Congestion {
+    /// The BBR this choice runs, if it is one.
+    pub fn from_bbr_profile(profile: H3BbrProfile) -> Self {
+        match profile {
+            H3BbrProfile::Conservative => Self::BbrConservative,
+            H3BbrProfile::Standard => Self::BbrStandard,
+            H3BbrProfile::Aggressive => Self::BbrAggressive,
+        }
+    }
+
+    /// Whether the connection starts with quic-go's default sender and
+    /// switches once up.
+    fn switches(self) -> bool {
+        match self {
+            Self::BbrStandard => STANDARD_RUNS_XRAY_BBR,
+            Self::Reno => false,
+            Self::BbrConservative
+            | Self::BbrAggressive
+            | Self::Brutal { .. }
+            | Self::ForceBrutal { .. } => true,
+        }
+    }
+}
+
+impl H3QuicConfig {
+    /// What Xray's dialer installs once the connection is up, given the
+    /// receive rate a Hysteria server announced, if any. `None` keeps the
+    /// controller the connection started with.
+    pub(crate) fn installed_controller(
+        &self,
+        server_receive_rate: Option<u64>,
+    ) -> Option<Installed> {
+        let brutal = |bytes_per_second| {
+            Installed::Brutal(BrutalRate {
+                bytes_per_second,
+                disable_loss_compensation: self.brutal_disable_loss_compensation,
+            })
+        };
+        match self.congestion {
+            H3Congestion::Reno => None,
+            H3Congestion::BbrStandard => {
+                STANDARD_RUNS_XRAY_BBR.then(|| bbr_for_profile(BbrProfile::Standard))
+            }
+            H3Congestion::BbrConservative => Some(bbr_for_profile(BbrProfile::Conservative)),
+            H3Congestion::BbrAggressive => Some(bbr_for_profile(BbrProfile::Aggressive)),
+            H3Congestion::ForceBrutal { bytes_per_second } => Some(brutal(bytes_per_second)),
+            // Xray: Brutal at min(brutalUp, server rate) once both are known.
+            H3Congestion::Brutal {
+                up_bytes_per_second,
+                bbr_profile,
+            } => Some(match server_receive_rate.unwrap_or(0) {
+                rate if up_bytes_per_second > 0 && rate > 0 => {
+                    brutal(up_bytes_per_second.min(rate))
+                }
+                _ => bbr_for_profile(bbr_profile.sender_profile()),
+            }),
+        }
+    }
 }
 
 /// UDP-hop policy for the QUIC carrier, Xray's `udphop` finalmask.
@@ -166,7 +257,40 @@ pub struct H3QuicConfig {
     pub udp_noise: Option<crate::udp_noise::UdpNoiseConfig>,
     /// A `header-custom` UDP mask, at its place among the noise mask.
     pub udp_header_custom: Option<crate::hysteria::HeaderCustomCarrier>,
+    /// A `sudoku` UDP mask, at its place among the other masks.
+    pub udp_sudoku: Option<crate::hysteria::SudokuCarrier>,
+    /// The `xdns` UDP mask, outside the others, carrying every datagram.
+    pub udp_xdns: Option<Arc<crate::xdns::XdnsConfig>>,
+    /// The `realm` UDP mask, outside the others: each connection's socket is
+    /// introduced to the server first.
+    pub udp_realm: Option<Arc<crate::realm::RealmConfig>>,
+    /// The `xicmp` UDP mask, outside the others, carrying every datagram in
+    /// ICMP echoes.
+    pub udp_xicmp: Option<Arc<crate::xicmp::XicmpConfig>>,
+    /// The `salamander` UDP mask, Gecko's fragments with it, at its place
+    /// among the noise, `header-custom` and `sudoku` masks.
+    pub udp_salamander: Option<crate::hysteria::SalamanderCarrier>,
     pub debug: bool,
+    /// quic-go's `InitialPacketSize`: the first packets' size, never
+    /// lowered by black-hole detection. `None` keeps Quinn's 1200.
+    pub initial_packet_size: Option<u16>,
+    /// The length of the connection IDs this end issues, as quic-go's
+    /// `Transport.ConnectionIDLength`. `None` keeps the carrier's default.
+    pub connection_id_len: Option<u8>,
+    /// Xray-core's ChromeParrot: shape the handshake like Chrome's, as Xray's
+    /// Hysteria, XHTTP H3 and XDRIVE H3 dialers do unless
+    /// `quicParams.disableChromeParrot` is true.
+    ///
+    /// It pins quic-go's values: a 30 s idle timeout, 6 MiB stream and 15 MiB
+    /// connection windows (ceilings never below them), 100 bidirectional and
+    /// 103 unidirectional streams and 1250-byte Initial datagrams. It sends
+    /// from zero-length connection IDs to an 8-byte first destination ID,
+    /// turns on quinn-proto's `TransportConfig::chrome_parrot` packet shape,
+    /// and wants the TLS configuration from
+    /// `TlsConnector::h3_client_config_for` with the same flag, which carries
+    /// uTLS's Chrome QUIC ClientHello. Off by default here: the core sets it
+    /// from `disableChromeParrot`.
+    pub chrome_parrot: bool,
 }
 
 impl Default for H3QuicConfig {
@@ -191,7 +315,15 @@ impl Default for H3QuicConfig {
             udp_hop: H3UdpHopConfig::default(),
             udp_noise: None,
             udp_header_custom: None,
+            udp_sudoku: None,
+            udp_xdns: None,
+            udp_realm: None,
+            udp_xicmp: None,
+            udp_salamander: None,
             debug: false,
+            initial_packet_size: None,
+            connection_id_len: None,
+            chrome_parrot: false,
         }
     }
 }
@@ -219,11 +351,43 @@ impl H3QuicConfig {
         if let Some(noise) = &self.udp_noise {
             noise.validate().map_err(H3Error::UdpSocket)?;
         }
+        if self.udp_sudoku.is_some() {
+            self.hop_carrier().validate().map_err(|_| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an invalid sudoku UDP mask",
+                ))
+            })?;
+        }
         if self.udp_header_custom.is_some() {
             self.hop_carrier().validate().map_err(|_| {
                 H3Error::UdpSocket(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "an invalid header-custom UDP mask, or one with udphop",
+                ))
+            })?;
+        }
+        if self.udp_xdns.is_some() {
+            self.hop_carrier().validate().map_err(|_| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an invalid xdns UDP mask, or one with udphop or sudoku",
+                ))
+            })?;
+        }
+        if self.udp_xicmp.is_some() {
+            self.hop_carrier().validate().map_err(|_| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an xicmp UDP mask with udphop, xdns, realm, header-custom or sudoku",
+                ))
+            })?;
+        }
+        if self.udp_realm.is_some() {
+            self.hop_carrier().validate().map_err(|_| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an invalid realm UDP mask, or one with udphop, xdns or header-custom",
                 ))
             })?;
         }
@@ -260,7 +424,10 @@ impl H3QuicConfig {
         }
 
         let congestion = match self.congestion {
+            H3Congestion::BbrStandard if STANDARD_RUNS_XRAY_BBR => "xray-bbr-standard",
             H3Congestion::BbrStandard => "quinn-bbr-standard-approximation",
+            H3Congestion::BbrConservative => "xray-bbr-conservative",
+            H3Congestion::BbrAggressive => "xray-bbr-aggressive",
             H3Congestion::Reno => "new-reno",
             H3Congestion::ForceBrutal { bytes_per_second } if bytes_per_second > 0 => "brutal",
             H3Congestion::Brutal { .. } => "brutal-if-negotiated",
@@ -289,14 +456,53 @@ impl H3QuicConfig {
         })
     }
 
+    /// The configuration a connection runs: with ChromeParrot, quic-go's
+    /// `populateConfig` replaces the idle timeout, the starting windows, the
+    /// incoming stream limit and the initial packet size with Chrome's, and
+    /// raises configured window ceilings to at least the starting windows.
+    pub(crate) fn populated(&self) -> std::borrow::Cow<'_, Self> {
+        use crate::chrome_parrot::{
+            INITIAL_CONNECTION_RECEIVE_WINDOW, INITIAL_PACKET_SIZE, INITIAL_STREAM_RECEIVE_WINDOW,
+            MAX_IDLE_TIMEOUT, MAX_INCOMING_STREAMS,
+        };
+        if !self.chrome_parrot {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        let mut config = self.clone();
+        config.max_idle_timeout = MAX_IDLE_TIMEOUT;
+        config.initial_stream_receive_window = INITIAL_STREAM_RECEIVE_WINDOW;
+        config.initial_connection_receive_window = INITIAL_CONNECTION_RECEIVE_WINDOW;
+        config.max_stream_receive_window = config
+            .max_stream_receive_window
+            .map(|maximum| maximum.max(INITIAL_STREAM_RECEIVE_WINDOW));
+        config.max_connection_receive_window = config
+            .max_connection_receive_window
+            .map(|maximum| maximum.max(INITIAL_CONNECTION_RECEIVE_WINDOW));
+        config.max_incoming_bidirectional_streams = MAX_INCOMING_STREAMS;
+        config.initial_packet_size = Some(INITIAL_PACKET_SIZE);
+        std::borrow::Cow::Owned(config)
+    }
+
     /// The carrier transforms this XHTTP connection applies itself: UDP hop,
-    /// noise and a custom header. Hysteria passes its own carrier instead.
-    fn hop_carrier(&self) -> crate::hysteria::HysteriaCarrierConfig {
+    /// Salamander, noise, a custom header and sudoku. Hysteria passes its own
+    /// carrier instead.
+    pub(crate) fn hop_carrier(&self) -> crate::hysteria::HysteriaCarrierConfig {
         crate::hysteria::HysteriaCarrierConfig {
+            salamander_password: self
+                .udp_salamander
+                .as_ref()
+                .map(|salamander| salamander.password.clone()),
+            gecko: self
+                .udp_salamander
+                .as_ref()
+                .and_then(|salamander| salamander.gecko),
             udp_hop: self.udp_hop.clone(),
             noise: self.udp_noise.clone(),
             header_custom: self.udp_header_custom.clone(),
-            ..Default::default()
+            sudoku: self.udp_sudoku.clone(),
+            xdns: self.udp_xdns.clone(),
+            realm: self.udp_realm.clone(),
+            xicmp: self.udp_xicmp.clone(),
         }
     }
 
@@ -334,6 +540,11 @@ pub struct H3ConnectConfig {
     pub tls_config: Arc<rustls::ClientConfig>,
     pub socket_protector: Option<Arc<dyn SocketProtector>>,
     pub quic: H3QuicConfig,
+    /// What a `realm` mask's introduction takes from the dial.
+    pub realm: Option<crate::realm::RealmEnv>,
+    /// The connection takes a fresh socket whenever these report that the
+    /// OS network changed, for the callers that keep it for long.
+    pub network_changes: Option<crate::NetworkChanges>,
 }
 
 impl fmt::Debug for H3ConnectConfig {
@@ -345,6 +556,8 @@ impl fmt::Debug for H3ConnectConfig {
             .field("alpn_protocols", &self.tls_config.alpn_protocols)
             .field("socket_protector", &self.socket_protector.is_some())
             .field("quic", &self.quic)
+            .field("realm", &self.realm.is_some())
+            .field("network_changes", &self.network_changes.is_some())
             .finish()
     }
 }
@@ -892,6 +1105,12 @@ impl Drop for H3ConnectionDriver {
 }
 
 impl H3Client {
+    /// A handle that opens request streams on the connection, for callers
+    /// that read every status themselves, such as XDRIVE's storages.
+    pub(crate) fn request_sender(&self) -> H3SendRequest {
+        self.send_request.clone()
+    }
+
     /// Whether the HTTP/3 driver and underlying QUIC connection are live.
     pub fn is_live(&self) -> bool {
         !self.driver.task.is_finished() && self.driver.connection.close_reason().is_none()
@@ -903,6 +1122,14 @@ impl H3Client {
 
     pub fn diagnostics(&self) -> &H3Diagnostics {
         &self.diagnostics
+    }
+
+    /// The congestion controller the connection runs now: `new-reno`,
+    /// `quinn-bbr`, `xray-bbr-<profile>` or `brutal`. For diagnostics and
+    /// tests.
+    #[doc(hidden)]
+    pub fn congestion_controller(&self) -> &'static str {
+        crate::quic_congestion::controller_name(self.driver.connection.congestion_state())
     }
 
     /// Sends a fixed body and validates its response while upload can progress.
@@ -1004,21 +1231,22 @@ impl H3Client {
 /// Connects one protected UDP destination and starts its HTTP/3 driver.
 pub async fn connect_h3(config: H3ConnectConfig) -> Result<H3Client, H3Error> {
     let class = memory_class();
-    let receive_window = config.quic.receive_window(class);
+    let receive_window = config.quic.populated().receive_window(class);
     let carrier = config.quic.hop_carrier();
     let protector = config.socket_protector.clone();
+    let network_changes = config.network_changes.clone();
     let (endpoint, connection, diagnostics, wire_peer) =
         connect_quic_transport(config, b"h3").await?;
     let send_window = XhttpSendWindow::new(&connection, class);
-    let hop = diagnostics.udp_hop.then(|| {
-        tokio::spawn(hop_udp_carrier(
-            endpoint.clone(),
-            connection.clone(),
-            carrier,
-            protector,
-            wire_peer,
-        ))
-    });
+    let hop = move_udp_carrier(
+        &endpoint,
+        &connection,
+        carrier,
+        protector,
+        wire_peer,
+        CarrierSocket::Streams,
+        network_changes.as_ref(),
+    );
     // quic-go's http3 client, which Xray's XHTTP H3 dial uses, opens its
     // control stream with SETTINGS_MAX_FIELD_SECTION_SIZE = 10 MiB alone
     // (`http3/client.go`, `defaultMaxResponseHeaderBytes`); h3 used to
@@ -1048,6 +1276,49 @@ pub async fn connect_h3(config: H3ConnectConfig) -> Result<H3Client, H3Error> {
     })
 }
 
+/// What a connection's socket is set up for, at dial and at every rebind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CarrierSocket {
+    /// Streams alone, XHTTP's: the receive batch every XHTTP endpoint has.
+    Streams,
+    /// QUIC datagrams as well, MASQUE's: the datagram socket buffers.
+    Datagrams,
+}
+
+/// Starts the task that moves one connection's carrier to a fresh socket:
+/// at every `udphop` interval, and whenever `network_changes` report that
+/// the OS network changed. `None` when the connection does neither. The
+/// task holds the connection, so its owner aborts it.
+pub(crate) fn move_udp_carrier(
+    endpoint: &Endpoint,
+    connection: &quinn::Connection,
+    carrier: crate::hysteria::HysteriaCarrierConfig,
+    protector: Option<Arc<dyn SocketProtector>>,
+    wire_peer: SocketAddr,
+    socket: CarrierSocket,
+    network_changes: Option<&crate::NetworkChanges>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    // A realm socket was introduced to the server and a new one needs a new
+    // introduction; xdns and xicmp carry nothing over the UDP socket. The
+    // next dial takes the new network.
+    let fixed = carrier.realm.is_some() || carrier.xdns.is_some() || carrier.xicmp.is_some();
+    let network = network_changes
+        .filter(|_| !fixed)
+        .map(crate::NetworkChanges::follow);
+    if carrier.next_interval().is_none() && network.is_none() {
+        return None;
+    }
+    Some(tokio::spawn(follow_udp_carrier(
+        endpoint.clone(),
+        connection.clone(),
+        carrier,
+        protector,
+        wire_peer,
+        socket,
+        network,
+    )))
+}
+
 /// Hops one connection's carrier as Xray's `udphop` finalmask does for any
 /// UDP transport, with these deliberate differences: the timer starts once
 /// the connection exists rather than at dial, every remote hop changes the
@@ -1055,31 +1326,64 @@ pub async fn connect_h3(config: H3ConnectConfig) -> Result<H3Client, H3Error> {
 /// previous socket until the new path authenticates, and the task ends with
 /// the connection. A failed hop keeps the current protected path until the
 /// next interval, as in Xray.
-async fn hop_udp_carrier(
+///
+/// A change of the OS network takes a fresh socket towards the same peer,
+/// which Xray-core does not do: the old socket's network is gone, and the
+/// connection would otherwise sit out its idle timeout before a redial.
+async fn follow_udp_carrier(
     endpoint: Endpoint,
     connection: quinn::Connection,
     carrier: crate::hysteria::HysteriaCarrierConfig,
     protector: Option<Arc<dyn SocketProtector>>,
     mut wire_peer: SocketAddr,
+    socket: CarrierSocket,
+    mut network: Option<tokio::sync::watch::Receiver<u64>>,
 ) {
     let logical_peer = connection.remote_address();
-    while let Some(delay) = carrier.next_interval() {
-        tokio::select! {
-            _ = connection.closed() => return,
-            () = tokio::time::sleep(delay) => {}
+    loop {
+        let hop = carrier.next_interval();
+        if hop.is_none() && network.is_none() {
+            return;
         }
-        let next = carrier.next_hop_peer(logical_peer, wire_peer);
+        let next = tokio::select! {
+            _ = connection.closed() => return,
+            () = sleep_for(hop) => carrier.next_hop_peer(logical_peer, wire_peer),
+            changed = network_changed(&mut network) => {
+                if !changed {
+                    // The signal's owner is gone: only the hops are left.
+                    network = None;
+                    continue;
+                }
+                wire_peer
+            }
+        };
         if rebind_carrier(
             &endpoint,
             logical_peer,
             next,
             &carrier,
             protector.as_deref(),
+            socket,
         )
         .is_ok()
         {
             wire_peer = next;
         }
+    }
+}
+
+async fn sleep_for(delay: Option<std::time::Duration>) {
+    match delay {
+        Some(delay) => tokio::time::sleep(delay).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether the network changed; `false` once nothing can report it.
+async fn network_changed(network: &mut Option<tokio::sync::watch::Receiver<u64>>) -> bool {
+    match network {
+        Some(network) => network.changed().await.is_ok(),
+        None => std::future::pending().await,
     }
 }
 
@@ -1089,22 +1393,49 @@ fn rebind_carrier(
     wire_peer: SocketAddr,
     carrier: &crate::hysteria::HysteriaCarrierConfig,
     protector: Option<&dyn SocketProtector>,
+    kind: CarrierSocket,
 ) -> io::Result<()> {
     let socket = StdUdpSocket::bind(unspecified_bind_addr(logical_peer))?;
+    if kind == CarrierSocket::Datagrams {
+        configure_quic_datagram_socket(&socket);
+    }
     crate::protect_std_udp_socket(&socket, protector).map_err(io::Error::other)?;
     socket.set_nonblocking(true)?;
-    let socket = crate::hysteria::carrier::wrap(
-        socket,
-        logical_peer,
-        wire_peer,
-        carrier,
-        &Default::default(),
-    )?;
-    // Keep the receive batch every XHTTP endpoint starts with.
-    endpoint.rebind_abstract(crate::quic_receive_batch::cap(
-        socket,
-        xhttp_receive_batch(memory_class()),
-    ))
+    let socket = if carrier.enabled() {
+        crate::hysteria::carrier::wrap(
+            socket,
+            logical_peer,
+            wire_peer,
+            carrier,
+            &Default::default(),
+        )?
+    } else {
+        direct_socket(socket, logical_peer)?
+    };
+    endpoint.rebind_abstract(match kind {
+        // Keep the receive batch every XHTTP endpoint starts with.
+        CarrierSocket::Streams => {
+            crate::quic_receive_batch::cap(socket, xhttp_receive_batch(memory_class()))
+        }
+        CarrierSocket::Datagrams => socket,
+    })
+}
+
+/// The socket of a connection without a carrier, as the dial makes it.
+fn direct_socket(
+    socket: StdUdpSocket,
+    remote: SocketAddr,
+) -> io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::connected_quic::wrap(socket, remote)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use quinn::Runtime as _;
+        let _ = remote;
+        quinn::TokioRuntime.wrap_udp_socket(socket)
+    }
 }
 
 fn unspecified_bind_addr(remote: SocketAddr) -> SocketAddr {
@@ -1133,17 +1464,25 @@ pub(crate) async fn connect_quic_transport(
 
 /// Optional receive/send byte budgets and advertised frame-size cap for QUIC datagrams.
 /// `None` preserves the existing XHTTP/DoQ transport configuration.
-/// `negotiation` settles Hysteria's [`H3Congestion::Brutal`] after
-/// authentication; without it that mode is rejected.
+///
+/// A congestion choice that switches once the connection is up does so with
+/// `switch` when the caller passes one, as Hysteria does after
+/// authentication; otherwise right after the handshake, as Xray's XHTTP
+/// dialer does after `DialEarly`. Hysteria's [`H3Congestion::Brutal`] needs
+/// the caller's switch.
 pub(crate) async fn connect_quic_transport_with_datagrams(
     config: H3ConnectConfig,
     expected_alpn: &'static [u8],
     datagram_buffers: Option<(usize, usize, u16)>,
     carrier: Option<&crate::hysteria::HysteriaCarrierConfig>,
     session: crate::hysteria::carrier::CarrierSession,
-    negotiation: Option<&Arc<BrutalDecision>>,
+    switch: Option<&Arc<ControllerSwitch>>,
 ) -> Result<(Endpoint, quinn::Connection, H3Diagnostics, SocketAddr), H3Error> {
     drop(crate::tls::parse_tls_server_name(&config.server_name)?);
+    let mut config = config;
+    if config.quic.chrome_parrot {
+        config.quic = config.quic.populated().into_owned();
+    }
     let diagnostics = config.quic.diagnostics()?;
     if config.tls_config.alpn_protocols.len() != 1
         || config.tls_config.alpn_protocols[0].as_slice() != expected_alpn
@@ -1154,27 +1493,72 @@ pub(crate) async fn connect_quic_transport_with_datagrams(
 
     let own_carrier = config.quic.hop_carrier();
     let carrier = carrier.or_else(|| own_carrier.enabled().then_some(&own_carrier));
+    if matches!(config.quic.congestion, H3Congestion::Brutal { .. }) && switch.is_none() {
+        return Err(H3Error::BrutalNeedsHysteria);
+    }
+    // Without the caller's switch, this connection installs its controller
+    // itself once the handshake completes.
+    let own_switch = (switch.is_none() && config.quic.congestion.switches())
+        .then(|| Arc::new(ControllerSwitch::default()));
     let (endpoint_config, client_config) = build_quinn_config(
         &config,
         datagram_buffers,
         carrier.map_or(0, |c| c.wire_overhead()),
-        negotiation,
+        switch.or(own_switch.as_ref()),
     )?;
     let remote_addr = canonicalize_socket_addr(config.remote_addr);
-    let bind_addr = unspecified_bind_addr(remote_addr);
-    let socket = StdUdpSocket::bind(bind_addr).map_err(|source| H3Error::UdpBind {
-        addr: bind_addr,
-        source,
-    })?;
-    if datagram_buffers.is_some() {
-        configure_quic_datagram_socket(&socket);
-    }
-    protect_quic_socket(&socket, config.socket_protector.as_deref())?;
-    socket.set_nonblocking(true).map_err(H3Error::UdpSocket)?;
+    let realm = carrier.and_then(|carrier| carrier.realm.as_ref());
+    let (socket, realm_peer) = match realm {
+        // The realm mask introduces its own socket to the server first.
+        Some(realm) => {
+            let env = config.realm.as_ref().ok_or_else(|| {
+                H3Error::UdpSocket(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "a realm UDP mask needs the dial's resolver",
+                ))
+            })?;
+            let udp =
+                crate::realm::RealmUdp::open(realm.family, config.socket_protector.as_deref())?;
+            // Boxed: the introduction would otherwise grow every dial's
+            // future.
+            let peer = Box::pin(crate::realm::establish(&udp, realm, env))
+                .await
+                .map_err(|error| H3Error::UdpSocket(io::Error::other(error)))?;
+            let socket = udp.into_std().map_err(H3Error::UdpSocket)?;
+            if datagram_buffers.is_some() {
+                configure_quic_datagram_socket(&socket);
+            }
+            (socket, Some(peer))
+        }
+        None => {
+            let bind_addr = unspecified_bind_addr(remote_addr);
+            let socket = StdUdpSocket::bind(bind_addr).map_err(|source| H3Error::UdpBind {
+                addr: bind_addr,
+                source,
+            })?;
+            if datagram_buffers.is_some() {
+                configure_quic_datagram_socket(&socket);
+            }
+            protect_quic_socket(&socket, config.socket_protector.as_deref())?;
+            socket.set_nonblocking(true).map_err(H3Error::UdpSocket)?;
+            (socket, None)
+        }
+    };
 
     let mut wire_peer = remote_addr;
+    let mut session = session;
     let socket = if let Some(carrier) = carrier.filter(|c| c.enabled()) {
-        wire_peer = carrier.next_peer(remote_addr);
+        // An xdns client opens with the connection, unless the caller's
+        // session brought one.
+        session
+            .open_xdns(carrier, config.socket_protector.clone())
+            .await
+            .map_err(H3Error::UdpSocket)?;
+        session
+            .open_xicmp(carrier, remote_addr.ip(), config.socket_protector.clone())
+            .await
+            .map_err(H3Error::UdpSocket)?;
+        wire_peer = realm_peer.unwrap_or_else(|| carrier.next_peer(remote_addr));
         crate::hysteria::carrier::wrap(socket, remote_addr, wire_peer, carrier, &session)
             .map_err(H3Error::UdpSocket)?
     } else {
@@ -1212,6 +1596,11 @@ pub(crate) async fn connect_quic_transport_with_datagrams(
         .connect_with(client_config, remote_addr, &config.server_name)
         .map_err(H3Error::ConnectStart)?;
     let connection = connecting.await.map_err(H3Error::Connect)?;
+    if let Some(own_switch) = own_switch {
+        if let Some(installed) = config.quic.installed_controller(None) {
+            own_switch.install(installed);
+        }
+    }
     Ok((endpoint, connection, diagnostics, wire_peer))
 }
 
@@ -1231,9 +1620,14 @@ pub async fn connect_h3_candidates(
         .first()
         .copied()
         .ok_or(H3Error::NoResolvedCandidate)?;
-    let Some(happy_eyeballs) =
-        happy_eyeballs.filter(|policy| !policy.try_delay.is_zero() && candidates.len() >= 2)
-    else {
+    // A realm socket goes to the punched peer whatever the address: racing
+    // candidates would introduce several sockets for one connection.
+    let Some(happy_eyeballs) = happy_eyeballs.filter(|policy| {
+        !policy.try_delay.is_zero()
+            && candidates.len() >= 2
+            && config.quic.udp_realm.is_none()
+            && config.quic.udp_xicmp.is_none()
+    }) else {
         let mut config = config;
         config.remote_addr = first;
         return connect_h3(config).await;
@@ -1335,11 +1729,19 @@ fn build_quinn_config(
     config: &H3ConnectConfig,
     datagram_buffers: Option<(usize, usize, u16)>,
     wire_overhead: usize,
-    negotiation: Option<&Arc<BrutalDecision>>,
+    switch: Option<&Arc<ControllerSwitch>>,
 ) -> Result<(EndpointConfig, ClientConfig), H3Error> {
     let mut endpoint = EndpointConfig::default();
     endpoint.supported_versions(vec![QUIC_V1]);
-    if datagram_buffers.is_some() {
+    if config.quic.chrome_parrot {
+        // Xray gives a ChromeParrot dial's Transport quic-go's
+        // ZeroLengthConnectionIDGenerator.
+        endpoint.cid_generator(|| Box::new(EmptyConnectionId));
+    } else if let Some(len) = config.quic.connection_id_len {
+        let len = usize::from(len);
+        endpoint
+            .cid_generator(move || Box::new(quinn_proto::RandomConnectionIdGenerator::new(len)));
+    } else if datagram_buffers.is_some() {
         // Hysteria owns one connection per endpoint and keeps a fixed server
         // address, so incoming packets need no connection ID for demultiplexing.
         // This saves eight bytes per server packet. Local socket rebinds still
@@ -1387,41 +1789,48 @@ fn build_quinn_config(
         mtu.upper_bound(budget as u16);
         transport.mtu_discovery_config(Some(mtu));
     }
+    if let Some(size) = config.quic.initial_packet_size {
+        transport.initial_mtu(size).min_mtu(size);
+    }
     if config.quic.disable_path_mtu_discovery {
         transport.mtu_discovery_config(None);
     }
     // quic-go's `Transport.DisableGSO`.
     transport.enable_segmentation_offload(!config.quic.disable_gso);
-    let standard_bbr = || {
-        let mut bbr = quinn::congestion::BbrConfig::default();
-        bbr.initial_window(XRAY_BBR_INITIAL_WINDOW);
-        Arc::new(bbr)
-    };
-    let disable_loss_compensation = config.quic.brutal_disable_loss_compensation;
+    if config.quic.chrome_parrot {
+        transport
+            .chrome_parrot(true)
+            .max_concurrent_uni_streams(varint(crate::chrome_parrot::MAX_INCOMING_UNI_STREAMS));
+    }
     match config.quic.congestion {
-        H3Congestion::BbrStandard => {
-            transport.congestion_controller_factory(standard_bbr());
+        H3Congestion::BbrStandard if !STANDARD_RUNS_XRAY_BBR => {
+            transport.congestion_controller_factory(quinn_bbr());
         }
         H3Congestion::Reno => {
             transport.congestion_controller_factory(Arc::new(
                 quinn::congestion::NewRenoConfig::default(),
             ));
         }
-        H3Congestion::ForceBrutal { bytes_per_second } if bytes_per_second > 0 => {
-            transport.congestion_controller_factory(Arc::new(BrutalFactory(BrutalRate {
-                bytes_per_second,
-                disable_loss_compensation,
-            })));
+        H3Congestion::ForceBrutal {
+            bytes_per_second: 0,
+        } => {
+            return Err(H3Error::UnsupportedCongestion {
+                requested: config.quic.congestion,
+            });
         }
-        H3Congestion::Brutal { .. } => {
-            let decision = negotiation.ok_or(H3Error::BrutalNeedsHysteria)?;
-            transport.congestion_controller_factory(Arc::new(NegotiatedBrutalFactory {
-                bbr: standard_bbr(),
-                disable_loss_compensation,
-                decision: Arc::clone(decision),
-            }));
+        H3Congestion::BbrStandard
+        | H3Congestion::BbrConservative
+        | H3Congestion::BbrAggressive
+        | H3Congestion::Brutal { .. }
+        | H3Congestion::ForceBrutal { .. } => {
+            let Some(switch) = switch else {
+                return Err(match config.quic.congestion {
+                    H3Congestion::Brutal { .. } => H3Error::BrutalNeedsHysteria,
+                    requested => H3Error::UnsupportedCongestion { requested },
+                });
+            };
+            transport.congestion_controller_factory(Arc::new(SwitchedFactory(Arc::clone(switch))));
         }
-        requested => return Err(H3Error::UnsupportedCongestion { requested }),
     }
 
     let crypto = QuicClientConfig::try_from(Arc::clone(&config.tls_config))
@@ -1430,6 +1839,15 @@ fn build_quinn_config(
     client
         .version(QUIC_V1)
         .transport_config(Arc::new(transport));
+    if config.quic.chrome_parrot {
+        client.initial_dst_cid_provider(Arc::new(|| {
+            quinn::ConnectionIdGenerator::generate_cid(
+                &mut quinn_proto::RandomConnectionIdGenerator::new(
+                    crate::chrome_parrot::INITIAL_CONNECTION_ID_LEN,
+                ),
+            )
+        }));
+    }
     Ok((endpoint, client))
 }
 

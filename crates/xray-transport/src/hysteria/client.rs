@@ -15,10 +15,10 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use zeroize::Zeroizing;
 
-use crate::quic_congestion::BrutalDecision;
+use crate::quic_congestion::ControllerSwitch;
 use crate::stream::{
-    configure_quic_datagram_socket, connect_quic_transport_with_datagrams, H3Congestion,
-    H3ConnectConfig, H3Error, H3QuicConfig, QuicSendWindow, QUIC_INITIAL_SEND_WINDOW,
+    configure_quic_datagram_socket, connect_quic_transport_with_datagrams, H3ConnectConfig,
+    H3Error, H3QuicConfig, QuicSendWindow, QUIC_INITIAL_SEND_WINDOW,
 };
 use crate::{TlsClientConfig, TlsConnector, TransportError};
 
@@ -88,6 +88,8 @@ pub struct HysteriaConfig {
     /// `Hysteria-CC-RX`. A server with its own Brutal rate sends at the lower
     /// of the two; zero leaves it on BBR.
     pub receive_bytes_per_second: u64,
+    /// What a `realm` mask in `carrier` takes from the dial.
+    pub realm: Option<crate::realm::RealmEnv>,
 }
 
 impl HysteriaConfig {
@@ -103,6 +105,7 @@ impl HysteriaConfig {
                 ..H3QuicConfig::default()
             },
             receive_bytes_per_second: 0,
+            realm: None,
         }
     }
 }
@@ -278,6 +281,11 @@ impl Shared {
         if !self.is_live() {
             return Err(HysteriaError::Closed);
         }
+        // The server's NAT opened for the realm socket alone; a new socket
+        // needs a new introduction, so the next dial makes one.
+        if self.carrier.realm.is_some() {
+            return Err(HysteriaError::Connect);
+        }
         let socket = UdpSocket::bind(self.bind_addr).map_err(|_| HysteriaError::Connect)?;
         configure_quic_datagram_socket(&socket);
         crate::protect_std_udp_socket(&socket, self.protector.as_deref())
@@ -376,7 +384,13 @@ impl HysteriaClient {
         let mut auth = HeaderValue::from_bytes(config.auth.as_bytes())
             .map_err(|_| HysteriaError::Configuration)?;
         auth.set_sensitive(true);
-        let deadline = config.limits.operation_timeout;
+        // A realm introduction comes before the QUIC handshake.
+        let deadline = config.limits.operation_timeout
+            + if config.carrier.realm.is_some() {
+                crate::realm::ESTABLISH_BUDGET
+            } else {
+                Duration::ZERO
+            };
         timeout(deadline, Self::connect_inner(config, tls, auth))
             .await
             .map_err(|_| HysteriaError::Timeout)?
@@ -388,17 +402,28 @@ impl HysteriaClient {
         auth: HeaderValue,
     ) -> Result<Self, HysteriaError> {
         let tls_config = tls
-            .quic_client_config_for(&config.tls, b"h3")
+            .h3_client_config_for(&config.tls, b"h3", config.quic.chrome_parrot)
             .map_err(|_| HysteriaError::TlsConfiguration)?;
-        let session = super::carrier::CarrierSession::new(&config.carrier)
+        let mut session = super::carrier::CarrierSession::new(&config.carrier)
             .map_err(|_| HysteriaError::Configuration)?;
-        // Hysteria's default mode picks Brutal or BBR from the server's reply.
-        let negotiation = match config.quic.congestion {
-            H3Congestion::Brutal {
-                up_bytes_per_second,
-            } => Some((up_bytes_per_second, Arc::new(BrutalDecision::default()))),
-            _ => None,
-        };
+        session
+            .open_xdns(&config.carrier, tls.socket_protector_arc())
+            .await
+            .map_err(|_| HysteriaError::Connect)?;
+        // Opened with the session, so a rebind keeps the id the server
+        // knows.
+        session
+            .open_xicmp(
+                &config.carrier,
+                crate::canonicalize_socket_addr(config.remote_addr).ip(),
+                tls.socket_protector_arc(),
+            )
+            .await
+            .map_err(|_| HysteriaError::Connect)?;
+        // Xray's Hysteria dialer installs its controller after
+        // authentication: Brutal or BBR, in its default mode by the server's
+        // reply.
+        let switch = Arc::new(ControllerSwitch::default());
         let (endpoint, connection, _, wire_peer) = connect_quic_transport_with_datagrams(
             H3ConnectConfig {
                 remote_addr: config.remote_addr,
@@ -406,6 +431,9 @@ impl HysteriaClient {
                 tls_config,
                 socket_protector: tls.socket_protector_arc(),
                 quic: config.quic.clone(),
+                realm: config.realm.clone(),
+                // The client rebinds its own endpoint.
+                network_changes: None,
             },
             b"h3",
             Some((
@@ -415,7 +443,7 @@ impl HysteriaClient {
             )),
             Some(&config.carrier),
             session.clone(),
-            negotiation.as_ref().map(|(_, decision)| decision),
+            Some(&switch),
         )
         .await
         .map_err(|error| match error {
@@ -465,11 +493,8 @@ impl HysteriaClient {
             return Err(HysteriaError::Authentication);
         }
         let (udp_enabled, server_receive_rate) = parse_auth_headers(response.headers())?;
-        if let Some((up, decision)) = &negotiation {
-            // Xray: Brutal at min(brutalUp, server rate) once both are known.
-            decision.decide(
-                (*up > 0 && server_receive_rate > 0).then(|| (*up).min(server_receive_rate)),
-            );
+        if let Some(installed) = config.quic.installed_controller(Some(server_receive_rate)) {
+            switch.install(installed);
         }
         stream.stop_sending(h3::error::Code::H3_REQUEST_CANCELLED);
         drop(stream);
@@ -575,6 +600,16 @@ impl HysteriaClient {
     }
     pub fn active_udp_sessions(&self) -> usize {
         self.shared.udp.len()
+    }
+    /// The congestion controller the connection runs now: `new-reno`,
+    /// `quinn-bbr`, `xray-bbr-<profile>` or `brutal`. For diagnostics and
+    /// tests.
+    #[doc(hidden)]
+    pub fn congestion_controller(&self) -> Option<&'static str> {
+        let connection = self.shared.connection().ok()?;
+        Some(crate::quic_congestion::controller_name(
+            connection.congestion_state(),
+        ))
     }
 }
 

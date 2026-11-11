@@ -3266,6 +3266,9 @@ async fn open_raw_dns_tcp_candidate(
         TcpOutbound::Hysteria(_) | TcpOutbound::Wireguard(_) => {
             effective_policy_for_level(&context.config, Some(0)).handshake
         }
+        TcpOutbound::Masque(_) => crate::outbound::masque::open_timeout(
+            effective_policy_for_level(&context.config, Some(0)).handshake,
+        ),
         TcpOutbound::Freedom(_) => context.inbound_policy.handshake,
         TcpOutbound::Trojan(outbound) => {
             effective_policy_for_level(&context.config, Some(outbound.level())).handshake
@@ -3527,7 +3530,8 @@ async fn proxy_udp_payload(
                     | UdpOutbound::Shadowsocks2022(_)
                     | UdpOutbound::Vless(_)
                     | UdpOutbound::Hysteria(_)
-                    | UdpOutbound::Wireguard(_) => DNS_PROXY_VLESS_ATTEMPT_TIMEOUT,
+                    | UdpOutbound::Wireguard(_)
+                    | UdpOutbound::Masque(_) => DNS_PROXY_VLESS_ATTEMPT_TIMEOUT,
                 };
                 let outbound_label = crate::debug_log::udp_outbound_label(&outbound);
                 let attempt = timeout(
@@ -4143,10 +4147,21 @@ async fn exchange_udp_freedom(
     // The socket takes freedom's socket options, as Xray-core's does.
     let dialer = freedom.dialer(&context.transport_dialer);
     protect_udp_socket(&socket, dialer.socket_protector())?;
-    socket.connect(upstream).await?;
+    // Under `finalmask.udp` the query goes through the masks, as every UDP
+    // flow through freedom does.
+    let socket = if freedom.has_udp_masks() {
+        ProxiedQuerySocket::Freedom(
+            freedom
+                .udp_socket(socket, upstream, dialer.socket_protector_arc())
+                .await?,
+        )
+    } else {
+        socket.connect(upstream).await?;
+        ProxiedQuerySocket::Connected(socket)
+    };
     context.tun.record_udp_remote_open(false);
     *failure_phase = DnsUdpFailurePhase::Write;
-    let written = socket.send(query).await?;
+    let written = socket.send(query, upstream).await?;
     if written != query.len() {
         return Err(
             std::io::Error::new(std::io::ErrorKind::WriteZero, "short DNS UDP write").into(),
@@ -4174,6 +4189,29 @@ async fn exchange_udp_freedom(
         return Ok(DnsUpstreamResponse::Payload(Bytes::copy_from_slice(
             &buffer[..read],
         )));
+    }
+}
+
+/// The socket a query proxied through freedom goes out on: connected to the
+/// upstream, or freedom's under its masks.
+enum ProxiedQuerySocket {
+    Connected(UdpSocket),
+    Freedom(crate::outbound::FreedomUdpSocket),
+}
+
+impl ProxiedQuerySocket {
+    async fn send(&self, query: &[u8], upstream: SocketAddr) -> std::io::Result<usize> {
+        match self {
+            Self::Connected(socket) => socket.send(query).await,
+            Self::Freedom(socket) => socket.send_to(query, upstream).await,
+        }
+    }
+
+    async fn recv(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Connected(socket) => socket.recv(buffer).await,
+            Self::Freedom(socket) => socket.recv_from(buffer).await.map(|(read, _)| read),
+        }
     }
 }
 

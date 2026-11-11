@@ -482,7 +482,15 @@ where
 {
     /// Parses and validates a status-200 response, retaining bytes read past
     /// the header terminator for the body decoder.
-    pub async fn open(mut self) -> Result<H1ResponseBody<R>, H1Error> {
+    pub async fn open(self) -> Result<H1ResponseBody<R>, H1Error> {
+        match self.open_with_status().await? {
+            (200, body) => Ok(body),
+            (status, _) => Err(H1Error::UnexpectedStatus { status }),
+        }
+    }
+
+    /// The final response's status and body, whatever the status.
+    pub(crate) async fn open_with_status(mut self) -> Result<(u16, H1ResponseBody<R>), H1Error> {
         let mut received = Vec::with_capacity(1024);
         let mut consumed_head_bytes = 0usize;
         loop {
@@ -503,20 +511,18 @@ where
                     received.drain(..head_bytes);
                     continue;
                 }
-                if parsed.status != 200 {
-                    return Err(H1Error::UnexpectedStatus {
-                        status: parsed.status,
-                    });
-                }
-
                 let body = received.split_off(head_bytes);
-                return Ok(H1ResponseBody::new(
+                let mut body = H1ResponseBody::new(
                     self.reader,
                     body,
                     parsed.framing,
                     parsed.reusable && self.request_allows_reuse,
                     parsed.content_encoding,
-                ));
+                );
+                if parsed.service != ServiceHeaders::default() {
+                    body.service = Some(Box::new(parsed.service));
+                }
+                return Ok((parsed.status, body));
             }
             if consumed_head_bytes
                 .checked_add(received.len())
@@ -545,6 +551,15 @@ struct ParsedResponseHead {
     framing: ResponseFraming,
     reusable: bool,
     content_encoding: Option<Vec<u8>>,
+    service: ServiceHeaders,
+}
+
+/// The first `Retry-After` and `Location` of a response, which only XDRIVE's
+/// storage clients read.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ServiceHeaders {
+    retry_after: Option<Vec<u8>>,
+    location: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,6 +595,8 @@ pub struct H1ResponseBody<R> {
     state: BodyState,
     reusable_when_framed: bool,
     content_encoding: Option<Vec<u8>>,
+    /// Boxed: most responses carry neither header.
+    service: Option<Box<ServiceHeaders>>,
 }
 
 impl<R> H1ResponseBody<R> {
@@ -606,6 +623,7 @@ impl<R> H1ResponseBody<R> {
             state,
             reusable_when_framed,
             content_encoding,
+            service: None,
         }
     }
 
@@ -616,6 +634,18 @@ impl<R> H1ResponseBody<R> {
     /// reader so decoding cannot accidentally expose or reuse the raw socket.
     pub(crate) fn content_encoding(&self) -> Option<&[u8]> {
         self.content_encoding.as_deref()
+    }
+
+    /// The final response's first `Retry-After` value, if present, which
+    /// XDRIVE's S3 client honours as Go's `Header.Get` reads it.
+    pub(crate) fn retry_after(&self) -> Option<&[u8]> {
+        self.service.as_ref()?.retry_after.as_deref()
+    }
+
+    /// The final response's first `Location` value, if present, which
+    /// XDRIVE's storage clients follow as Go's `http.Client` does.
+    pub(crate) fn location(&self) -> Option<&[u8]> {
+        self.service.as_ref()?.location.as_deref()
     }
 
     pub fn is_complete(&self) -> bool {
@@ -953,6 +983,7 @@ fn parse_response_head(head: &[u8], response_to_head: bool) -> Result<ParsedResp
     let mut transfer_encodings: Vec<Vec<u8>> = Vec::new();
     let mut connection_values: Vec<Vec<u8>> = Vec::new();
     let mut content_encoding: Option<Vec<u8>> = None;
+    let mut service = ServiceHeaders::default();
     let mut current_header: Option<(Vec<u8>, Vec<u8>)> = None;
 
     for line in lines {
@@ -985,6 +1016,7 @@ fn parse_response_head(head: &[u8], response_to_head: bool) -> Result<ParsedResp
                 &mut transfer_encodings,
                 &mut connection_values,
                 &mut content_encoding,
+                &mut service,
             );
         }
         current_header = Some(parse_header_line(line)?);
@@ -998,6 +1030,7 @@ fn parse_response_head(head: &[u8], response_to_head: bool) -> Result<ParsedResp
             &mut transfer_encodings,
             &mut connection_values,
             &mut content_encoding,
+            &mut service,
         );
     }
 
@@ -1014,15 +1047,17 @@ fn parse_response_head(head: &[u8], response_to_head: bool) -> Result<ParsedResp
         true
     };
 
-    let framing = if response_to_head || (100..=199).contains(&status) {
-        ResponseFraming::ContentLength(0)
-    } else if chunked {
-        ResponseFraming::Chunked
-    } else if let Some(length) = content_length {
-        ResponseFraming::ContentLength(length)
-    } else {
-        ResponseFraming::CloseDelimited
-    };
+    // Go's `bodyAllowedForStatus`: 1xx, 204 and 304 carry no body.
+    let framing =
+        if response_to_head || (100..=199).contains(&status) || matches!(status, 204 | 304) {
+            ResponseFraming::ContentLength(0)
+        } else if chunked {
+            ResponseFraming::Chunked
+        } else if let Some(length) = content_length {
+            ResponseFraming::ContentLength(length)
+        } else {
+            ResponseFraming::CloseDelimited
+        };
 
     let has_close = header_values_contain_token(&connection_values, b"close");
     let has_keep_alive = header_values_contain_token(&connection_values, b"keep-alive");
@@ -1035,6 +1070,7 @@ fn parse_response_head(head: &[u8], response_to_head: bool) -> Result<ParsedResp
         framing,
         reusable,
         content_encoding,
+        service,
     })
 }
 
@@ -1099,7 +1135,14 @@ fn collect_framing_header(
     transfer_encodings: &mut Vec<Vec<u8>>,
     connection_values: &mut Vec<Vec<u8>>,
     content_encoding: &mut Option<Vec<u8>>,
+    service: &mut ServiceHeaders,
 ) {
+    if name.eq_ignore_ascii_case(b"Retry-After") && service.retry_after.is_none() {
+        service.retry_after = Some(trim_ascii_whitespace(value).to_vec());
+    }
+    if name.eq_ignore_ascii_case(b"Location") && service.location.is_none() {
+        service.location = Some(trim_ascii_whitespace(value).to_vec());
+    }
     if name.eq_ignore_ascii_case(b"Content-Length") {
         content_lengths.push(trim_ascii_whitespace(value).to_vec());
     } else if name.eq_ignore_ascii_case(b"Transfer-Encoding") {

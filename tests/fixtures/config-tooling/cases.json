@@ -1781,6 +1781,189 @@
       }
     },
     {
+      "name": "masque",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "masque",
+            "settings": {
+              "address": "masque.example",
+              "port": 443,
+              "remoteDNS": [
+                "192.0.2.53"
+              ]
+            },
+            "streamSettings": {
+              "network": "masque",
+              "security": "tls",
+              "tlsSettings": {
+                "serverName": "masque.example",
+                "alpn": [
+                  "h3"
+                ]
+              },
+              "masqueSettings": {
+                "host": "masque.example",
+                "path": "/masque/{target}/{ipproto}/",
+                "user": "synthetic-user",
+                "pass": "synthetic-masque-pass",
+                "headers": {
+                  "X-Synthetic": "1"
+                },
+                "xmux": {
+                  "maxConcurrency": "4-8",
+                  "hKeepAlivePeriod": 20
+                }
+              },
+              "finalmask": {
+                "quicParams": {
+                  "congestion": "bbr",
+                  "disableChromeParrot": true
+                }
+              }
+            }
+          }
+        ]
+      },
+      "objects": {
+        "MASQUE": "/outbounds/0/settings",
+        "MASQUE_TRANSPORT": "/outbounds/0/streamSettings/masqueSettings"
+      }
+    },
+    {
+      "name": "masque-path-variable",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.masqueSettings.path",
+      "base": "masque",
+      "set": {
+        "/outbounds/0/streamSettings/masqueSettings/path": "/masque/{other}"
+      }
+    },
+    {
+      "name": "masque-without-tls",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.security",
+      "base": "masque",
+      "set": {
+        "/outbounds/0/streamSettings/security": "none"
+      }
+    },
+    {
+      "name": "masque-transport-on-vless",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.network",
+      "base": "masque",
+      "set": {
+        "/outbounds/0/protocol": "vless",
+        "/outbounds/0/settings": {
+          "vnext": [
+            {
+              "address": "masque.example",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "masque-warp",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "masque",
+            "settings": {
+              "address": "masque.example",
+              "port": 443,
+              "remoteDNS": [
+                "192.0.2.53"
+              ]
+            },
+            "streamSettings": {
+              "network": "masque",
+              "security": "tls",
+              "tlsSettings": {
+                "serverName": "masque.example",
+                "alpn": [
+                  "h3"
+                ]
+              },
+              "masqueSettings": {
+                "host": "masque.example",
+                "path": "/masque/{target}/{ipproto}/",
+                "headers": {
+                  "X-Synthetic": "1"
+                },
+                "xmux": {
+                  "maxConcurrency": "4-8",
+                  "hKeepAlivePeriod": 20
+                },
+                "warp": {
+                  "privateKey": "MDECAQEEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABoAoGCCqGSM49AwEH",
+                  "publicKey": "MCowBQYDK2VwAyEAU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1NTU1M=",
+                  "address": [
+                    "172.16.0.2/32",
+                    "fd00::2/128"
+                  ]
+                }
+              },
+              "finalmask": {
+                "quicParams": {
+                  "congestion": "bbr",
+                  "disableChromeParrot": true
+                }
+              }
+            }
+          }
+        ]
+      },
+      "objects": {
+        "MASQUE_WARP": "/outbounds/0/streamSettings/masqueSettings/warp"
+      }
+    },
+    {
+      "name": "masque-warp-with-user",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.masqueSettings.warp",
+      "base": "masque-warp",
+      "set": {
+        "/outbounds/0/streamSettings/masqueSettings/user": "synthetic-user"
+      }
+    },
+    {
       "name": "header-custom-tcp",
       "accepted": true,
       "config": {
@@ -3191,13 +3374,56 @@
           "port": 443,
           "id": "my-short-id",
           "encryption": "none",
+          "email": "bridge",
           "reverse": {
-            "tag": "portal"
+            "tag": "portal",
+            "sniffing": {
+              "enabled": true,
+              "destOverride": [
+                "http",
+                "tls"
+              ]
+            }
+          }
+        }
+      },
+      "objects": {
+        "VLESS_REVERSE": "/outbounds/0/settings/reverse"
+      },
+      "accepted": true
+    },
+    {
+      "name": "vless-simplified-reverse-empty-tag",
+      "base": "raw-tls-happy-eyeballs",
+      "set": {
+        "/outbounds/0/settings": {
+          "address": "server.example",
+          "port": 443,
+          "id": "my-short-id",
+          "encryption": "none",
+          "reverse": {
+            "tag": ""
           }
         }
       },
       "accepted": false,
-      "errorPath": "$.outbounds[0].settings.reverse"
+      "errorPath": "$.outbounds[0].settings.reverse.tag"
+    },
+    {
+      "name": "legacy-root-reverse",
+      "base": "raw-tls-happy-eyeballs",
+      "set": {
+        "/reverse": {
+          "bridges": [
+            {
+              "tag": "bridge",
+              "domain": "reverse.example"
+            }
+          ]
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.reverse"
     },
     {
       "name": "vless-testpre",
@@ -3692,14 +3918,64 @@
           "finalmask": {
             "udp": [
               {
-                "type": "noise"
+                "type": "noise",
+                "settings": {
+                  "noise": [
+                    {
+                      "type": "str",
+                      "packet": "synthetic"
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      },
+      "accepted": true
+    },
+    {
+      "name": "wireguard-finalmask-tcp",
+      "base": "wireguard",
+      "set": {
+        "/outbounds/0/streamSettings": {
+          "finalmask": {
+            "tcp": [
+              {
+                "type": "sudoku",
+                "settings": {
+                  "password": "synthetic"
+                }
               }
             ]
           }
         }
       },
       "accepted": false,
-      "errorPath": "$.outbounds[0].streamSettings.finalmask"
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp"
+    },
+    {
+      "name": "wireguard-finalmask-realm",
+      "base": "wireguard",
+      "set": {
+        "/outbounds/0/streamSettings": {
+          "finalmask": {
+            "udp": [
+              {
+                "type": "realm",
+                "settings": {
+                  "url": "realm://public@realm.example.com/name",
+                  "stunServers": [
+                    "stun.example.com:3478"
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp"
     },
     {
       "name": "wireguard-dialer-proxy",
@@ -3724,12 +4000,21 @@
       "warningPath": "$.outbounds[0].settings.domainStrategy"
     },
     {
-      "name": "quic-unsupported-disableChromeParrot",
+      "name": "quic-chrome-parrot-on",
       "base": "udp-hop-mask-261021",
       "set": {
         "/outbounds/0/streamSettings/finalmask/quicParams/disableChromeParrot": false
       },
-      "accepted": false
+      "accepted": true
+    },
+    {
+      "name": "quic-disableChromeParrot-string",
+      "base": "udp-hop-mask-261021",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/quicParams/disableChromeParrot": "true"
+      },
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.quicParams.disableChromeParrot"
     },
     {
       "name": "quic-disableGSO",
@@ -3758,10 +4043,18 @@
       "accepted": true
     },
     {
-      "name": "quic-unsupported-bbrProfile",
+      "name": "quic-bbrProfile-conservative",
       "base": "udp-hop-mask-261021",
       "set": {
         "/outbounds/0/streamSettings/finalmask/quicParams/bbrProfile": "conservative"
+      },
+      "accepted": true
+    },
+    {
+      "name": "quic-unknown-bbrProfile",
+      "base": "udp-hop-mask-261021",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/quicParams/bbrProfile": "turbo"
       },
       "accepted": false,
       "errorPath": "$.outbounds[0].streamSettings.finalmask.quicParams.bbrProfile"
@@ -4893,6 +5186,27 @@
       }
     },
     {
+      "name": "sudoku-udp-hysteria",
+      "accepted": true,
+      "base": "hysteria2",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp": [
+          {
+            "type": "salamander",
+            "settings": {
+              "password": "synthetic-contract-password"
+            }
+          },
+          {
+            "type": "sudoku",
+            "settings": {
+              "password": "synthetic-sudoku-password"
+            }
+          }
+        ]
+      }
+    },
+    {
       "name": "sudoku-bad-ascii",
       "accepted": false,
       "base": "sudoku-tcp",
@@ -4921,6 +5235,591 @@
         "/outbounds/0/streamSettings/finalmask/tcp/0/settings/seed": 1
       },
       "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.seed"
+    },
+    {
+      "name": "xmc-tcp",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+              "vnext": [
+                {
+                  "address": "server.example",
+                  "port": 443,
+                  "users": [
+                    {
+                      "encryption": "none",
+                      "id": "00010203-0405-0607-0809-0a0b0c0d0e0f"
+                    }
+                  ]
+                }
+              ]
+            },
+            "streamSettings": {
+              "network": "raw",
+              "security": "tls",
+              "tlsSettings": {
+                "serverName": "server.example"
+              },
+              "finalmask": {
+                "tcp": [
+                  {
+                    "type": "xmc",
+                    "settings": {
+                      "hostname": "mc.example.com",
+                      "password": "synthetic-xmc-password",
+                      "profiles": [
+                        {
+                          "username": "Steve",
+                          "uuid": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+                          "texturesValue": "dGV4dHVyZXM=",
+                          "texturesSignature": "c2lnbmF0dXJl"
+                        }
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "objects": {
+        "XMC_MASK": "/outbounds/0/streamSettings/finalmask/tcp/0/settings",
+        "XMC_PROFILE": "/outbounds/0/streamSettings/finalmask/tcp/0/settings/profiles/0"
+      }
+    },
+    {
+      "name": "xmc-no-profiles",
+      "accepted": false,
+      "base": "xmc-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/profiles": null
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.profiles"
+    },
+    {
+      "name": "xmc-bad-username",
+      "accepted": false,
+      "base": "xmc-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/profiles/0/username": "Steve!"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.profiles[0].username"
+    },
+    {
+      "name": "xmc-bad-uuid",
+      "accepted": false,
+      "base": "xmc-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/profiles/0/uuid": "my-short-id"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.profiles[0].uuid"
+    },
+    {
+      "name": "xmc-long-password",
+      "accepted": false,
+      "base": "xmc-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/password": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.password"
+    },
+    {
+      "name": "xmc-not-last",
+      "accepted": false,
+      "base": "xmc-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp": [
+          {
+            "type": "xmc",
+            "settings": {
+              "hostname": "mc.example.com",
+              "password": "synthetic-xmc-password",
+              "profiles": [
+                {
+                  "username": "Steve",
+                  "uuid": "00010203-0405-0607-0809-0a0b0c0d0e0f",
+                  "texturesValue": "dGV4dHVyZXM=",
+                  "texturesSignature": "c2lnbmF0dXJl"
+                }
+              ]
+            }
+          },
+          {
+            "type": "header-custom",
+            "settings": {
+              "clients": [
+                [
+                  {
+                    "type": "str",
+                    "packet": "HELLO"
+                  }
+                ]
+              ]
+            }
+          }
+        ]
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[1]"
+    },
+    {
+      "name": "xmc-unknown-field",
+      "accepted": false,
+      "base": "xmc-tcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/tcp/0/settings/seed": 1
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.tcp[0].settings.seed"
+    },
+    {
+      "name": "xdns-udp-kcp",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+              "vnext": [
+                {
+                  "address": "server.example",
+                  "port": 443,
+                  "users": [
+                    {
+                      "encryption": "none",
+                      "id": "00010203-0405-0607-0809-0a0b0c0d0e0f"
+                    }
+                  ]
+                }
+              ]
+            },
+            "streamSettings": {
+              "network": "kcp",
+              "finalmask": {
+                "udp": [
+                  {
+                    "type": "mkcp-legacy",
+                    "settings": {
+                      "value": "synthetic-seed"
+                    }
+                  },
+                  {
+                    "type": "xdns",
+                    "settings": {
+                      "domains": [
+                        {
+                          "names": [
+                            "t.example.com"
+                          ],
+                          "lenLimit": 200,
+                          "labelLimit": 40,
+                          "types": [
+                            16,
+                            1
+                          ],
+                          "edns0": 1232
+                        }
+                      ],
+                      "resolvers": [
+                        {
+                          "addrs": [
+                            "192.0.2.53",
+                            "tcp://198.51.100.53:53"
+                          ],
+                          "worker": 0
+                        }
+                      ],
+                      "extraPoll": 1
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "objects": {
+        "XDNS_MASK": "/outbounds/0/streamSettings/finalmask/udp/1/settings",
+        "XDNS_DOMAIN": "/outbounds/0/streamSettings/finalmask/udp/1/settings/domains/0",
+        "XDNS_RESOLVER": "/outbounds/0/streamSettings/finalmask/udp/1/settings/resolvers/0"
+      }
+    },
+    {
+      "name": "xdns-bad-label",
+      "accepted": false,
+      "base": "xdns-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/domains/0/names/0": "t.example.com."
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.domains[0].names[0]"
+    },
+    {
+      "name": "xdns-resolver-name",
+      "accepted": false,
+      "base": "xdns-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/resolvers/0/addrs/0": "dns.example"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.resolvers[0].addrs[0]"
+    },
+    {
+      "name": "xdns-extra-poll",
+      "accepted": false,
+      "base": "xdns-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/extraPoll": 4
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.extraPoll"
+    },
+    {
+      "name": "xdns-unknown-field",
+      "accepted": false,
+      "base": "xdns-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/seed": 1
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.seed"
+    },
+    {
+      "name": "realm-udp-kcp",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+              "vnext": [
+                {
+                  "address": "server.example",
+                  "port": 443,
+                  "users": [
+                    {
+                      "encryption": "none",
+                      "id": "00010203-0405-0607-0809-0a0b0c0d0e0f"
+                    }
+                  ]
+                }
+              ]
+            },
+            "streamSettings": {
+              "network": "kcp",
+              "finalmask": {
+                "udp": [
+                  {
+                    "type": "mkcp-legacy",
+                    "settings": {
+                      "value": "synthetic-seed"
+                    }
+                  },
+                  {
+                    "type": "realm",
+                    "settings": {
+                      "url": "realm://synthetic-token@rendezvous.example/synthetic-realm",
+                      "stunServers": [
+                        "stun.example.net:3478",
+                        "192.0.2.10:3478"
+                      ],
+                      "tlsConfig": {
+                        "serverName": "rendezvous.example"
+                      },
+                      "ipMode": "v4",
+                      "portMapping": {
+                        "enabled": true,
+                        "timeout": 5,
+                        "lifetime": 600
+                      }
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "objects": {
+        "REALM_MASK": "/outbounds/0/streamSettings/finalmask/udp/1/settings",
+        "REALM_PORT_MAPPING": "/outbounds/0/streamSettings/finalmask/udp/1/settings/portMapping"
+      }
+    },
+    {
+      "name": "realm-bad-scheme",
+      "accepted": false,
+      "base": "realm-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/url": "https://synthetic-token@rendezvous.example/synthetic-realm"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.url"
+    },
+    {
+      "name": "realm-no-token",
+      "accepted": false,
+      "base": "realm-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/url": "realm://rendezvous.example/synthetic-realm"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.url"
+    },
+    {
+      "name": "realm-no-name",
+      "accepted": false,
+      "base": "realm-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/url": "realm://synthetic-token@rendezvous.example"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.url"
+    },
+    {
+      "name": "realm-no-stun",
+      "accepted": false,
+      "base": "realm-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/stunServers": []
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.stunServers"
+    },
+    {
+      "name": "realm-stun-without-port",
+      "accepted": false,
+      "base": "realm-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/stunServers": [
+          "stun.example.net"
+        ]
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.stunServers[0]"
+    },
+    {
+      "name": "realm-port-mapping-type",
+      "accepted": false,
+      "base": "realm-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/portMapping/timeout": "5"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.portMapping.timeout"
+    },
+    {
+      "name": "realm-unknown-field",
+      "accepted": false,
+      "base": "realm-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/seed": 1
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.seed"
+    },
+    {
+      "name": "xicmp-udp-kcp",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+              "vnext": [
+                {
+                  "address": "server.example",
+                  "port": 443,
+                  "users": [
+                    {
+                      "encryption": "none",
+                      "id": "00010203-0405-0607-0809-0a0b0c0d0e0f"
+                    }
+                  ]
+                }
+              ]
+            },
+            "streamSettings": {
+              "network": "kcp",
+              "finalmask": {
+                "udp": [
+                  {
+                    "type": "mkcp-legacy",
+                    "settings": {
+                      "value": "synthetic-seed"
+                    }
+                  },
+                  {
+                    "type": "xicmp",
+                    "settings": {
+                      "dgram": true,
+                      "ips": [
+                        "192.0.2.10",
+                        "2001:db8::10"
+                      ]
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "objects": {
+        "XICMP_MASK": "/outbounds/0/streamSettings/finalmask/udp/1/settings"
+      }
+    },
+    {
+      "name": "xicmp-bad-ip",
+      "accepted": false,
+      "base": "xicmp-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/ips/0": "192.0.2.010"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.ips[0]"
+    },
+    {
+      "name": "xicmp-dgram-type",
+      "accepted": false,
+      "base": "xicmp-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/dgram": "true"
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.dgram"
+    },
+    {
+      "name": "xicmp-unknown-field",
+      "accepted": false,
+      "base": "xicmp-udp-kcp",
+      "set": {
+        "/outbounds/0/streamSettings/finalmask/udp/1/settings/seed": 1
+      },
+      "errorPath": "$.outbounds[0].streamSettings.finalmask.udp[1].settings.seed"
+    },
+    {
+      "name": "xdrive",
+      "accepted": true,
+      "config": {
+        "inbounds": [
+          {
+            "tag": "socks-in",
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": 1080,
+            "settings": {
+              "auth": "noauth",
+              "udp": true
+            }
+          }
+        ],
+        "outbounds": [
+          {
+            "tag": "proxy",
+            "protocol": "vless",
+            "settings": {
+              "address": "127.0.0.1",
+              "port": 443,
+              "id": "27848739-7e62-4138-9fd3-098a63964b6b",
+              "encryption": "mlkem768x25519plus.native.0rtt.XKbaq1BuzJKKKPxZbwgRpn-gYQbnhrYketgezASCL1I"
+            },
+            "streamSettings": {
+              "network": "xdrive",
+              "xdriveSettings": {
+                "service": "s3",
+                "remoteFolder": "xdrive",
+                "secrets": [
+                  "AKIDEXAMPLE",
+                  "synthetic-secret-key"
+                ],
+                "segmentBytes": 65536,
+                "flushIntervalMs": 20,
+                "pollIntervalMs": 50,
+                "maxPollIntervalMs": 500,
+                "sessionTtlSeconds": 300,
+                "concurrency": 8,
+                "eagerWindowMs": 2000,
+                "holeTimeoutMs": 30000,
+                "s3": {
+                  "endpoint": "https://s3.example",
+                  "region": "us-west-2",
+                  "bucket": "xdrive-bucket",
+                  "pathStyle": true
+                },
+                "xmux": {
+                  "maxConnections": 2
+                }
+              }
+            },
+            "mux": {
+              "enabled": true
+            }
+          }
+        ]
+      },
+      "objects": {
+        "XDRIVE": "/outbounds/0/streamSettings/xdriveSettings",
+        "XDRIVE_S3": "/outbounds/0/streamSettings/xdriveSettings/s3"
+      }
+    },
+    {
+      "name": "xdrive-s3-endpoint",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].streamSettings.xdriveSettings",
+      "base": "xdrive",
+      "set": {
+        "/outbounds/0/streamSettings/xdriveSettings/s3/endpoint": "ftp://s3.example"
+      }
+    },
+    {
+      "name": "xdrive-without-mux",
+      "accepted": false,
+      "errorPath": "$.outbounds[0].mux",
+      "base": "xdrive",
+      "set": {
+        "/outbounds/0/mux/enabled": false
+      }
     }
   ]
 }

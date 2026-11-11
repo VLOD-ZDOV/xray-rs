@@ -1,9 +1,12 @@
 //! XHTTP wire engines.
 
 mod config;
-mod h1;
+pub(crate) mod h1;
 mod h2;
 mod h3;
+// XDRIVE's storages over HTTP/3 take XHTTP's connections and send their own
+// requests on them.
+pub(crate) use h3::{connect_h3_candidates, H3Client};
 mod padding;
 mod request;
 mod session;
@@ -20,10 +23,10 @@ pub(crate) use h2::{
 };
 pub(crate) use h3::{
     configure_quic_datagram_socket, connect_quic_transport, connect_quic_transport_with_datagrams,
-    H3ConnectConfig, H3Error, QuicSendWindow, QUIC_INITIAL_SEND_WINDOW,
-    QUIC_SEND_WINDOW_SAMPLE_BYTES,
+    move_udp_carrier, CarrierSocket, H3ConnectConfig, H3Error, QuicSendWindow,
+    QUIC_INITIAL_SEND_WINDOW, QUIC_SEND_WINDOW_SAMPLE_BYTES,
 };
-pub use h3::{H3Congestion, H3QuicConfig, H3QuicVersion, H3UdpHopConfig};
+pub use h3::{H3BbrProfile, H3Congestion, H3QuicConfig, H3QuicVersion, H3UdpHopConfig};
 pub use transport::{XhttpConnectTarget, XhttpHttpVersion, XhttpTransport, XhttpXmuxPolicy};
 
 /// Internal HTTP/1.1 engine surface used by XHTTP orchestration and focused
@@ -51,9 +54,9 @@ pub mod h2_test_only {
 #[doc(hidden)]
 pub mod h3_test_only {
     pub use super::h3::{
-        connect_h3, connect_h3_candidates, H3Client, H3Congestion, H3ConnectConfig, H3Diagnostics,
-        H3Error, H3PendingResponse, H3QuicConfig, H3QuicVersion, H3ResponseBody, H3UdpHopConfig,
-        H3Upload,
+        connect_h3, connect_h3_candidates, H3BbrProfile, H3Client, H3Congestion, H3ConnectConfig,
+        H3Diagnostics, H3Error, H3PendingResponse, H3QuicConfig, H3QuicVersion, H3ResponseBody,
+        H3UdpHopConfig, H3Upload,
     };
 }
 

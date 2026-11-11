@@ -25,10 +25,15 @@ pub(super) struct StreamCarrier {
     pub(super) download: Option<XhttpDownloadOutbound>,
     pub(super) happy_eyeballs: Option<HappyEyeballsConfig>,
     pub(super) fragment: Option<Arc<xray_transport::TcpFragmentConfig>>,
+    /// The final rules of a freedom fragment outbound folded into this one,
+    /// which a connection from a VLESS reverse proxy meets.
+    pub(super) folded_fragment_rules: Option<Arc<[xray_config::FreedomFinalRule]>>,
     /// The `header-custom` TCP mask, run on every TCP carrier it opens.
     pub(super) header_custom: Option<Arc<xray_transport::header_custom::HeaderCustomTcpConfig>>,
     /// The `sudoku` TCP mask, outermost on every TCP carrier it opens.
     pub(super) sudoku: Option<Arc<xray_transport::sudoku::SudokuConfig>>,
+    /// The `xmc` TCP mask, outermost on every TCP carrier it opens.
+    pub(super) xmc: Option<Arc<xray_transport::xmc::XmcConfig>>,
     /// `sockopt`, for every socket the carrier opens.
     pub(super) socket_options: Option<Arc<xray_transport::SocketOptions>>,
     /// `sockopt.addressPortStrategy`, for the server's address and port.
@@ -53,19 +58,26 @@ impl StreamCarrier {
             .tcp_sudoku
             .as_ref()
             .map(|mask| Arc::new(sudoku_config(mask)));
+        let xmc = stream.tcp_xmc.as_ref().map(xmc_config).transpose()?;
         let transport = build_connector(&stream.security, server);
         let transport_layer = build_transport_layer(stream, server, port, &transport, paths)?;
         // Only TCP carriers take TCP masks; a split XHTTP download keeps its
         // own dialer, which does not run the handshake.
-        if (header_custom.is_some() || sudoku.is_some())
+        if (header_custom.is_some() || sudoku.is_some() || xmc.is_some())
             && (matches!(&transport_layer, TransportLayer::Xhttp(xhttp) if xhttp.http_version() == XhttpHttpVersion::Http3)
                 || matches!(transport_layer, TransportLayer::Kcp(_))
                 || matches!(&stream.transport, StreamTransport::Xhttp(xhttp) if xhttp.download.is_some()))
         {
             return Err(CoreError::UnsupportedOutboundNetwork);
         }
+        // `tlshello` needs a TLS record to split; raw pieces go on any TCP
+        // carrier.
+        let tls_hello = stream
+            .tcp_fragment
+            .as_ref()
+            .is_some_and(|fragment| fragment.packets == xray_config::FragmentPackets::TlsHello);
         if fragment.is_some()
-            && (matches!(transport, ConnectorConfig::Tcp)
+            && (tls_hello && matches!(transport, ConnectorConfig::Tcp)
                 || matches!(&transport_layer, TransportLayer::Xhttp(xhttp) if xhttp.http_version() == XhttpHttpVersion::Http3)
                 || matches!(transport_layer, TransportLayer::Kcp(_))
                 || matches!(&stream.transport, StreamTransport::Xhttp(xhttp) if xhttp.download.is_some()))
@@ -80,8 +92,14 @@ impl StreamCarrier {
             server: Target::new(addr, port, RoutingNetwork::Tcp),
             transport_layer,
             fragment,
+            folded_fragment_rules: stream
+                .tcp_fragment
+                .as_ref()
+                .and_then(|fragment| fragment.folded_final_rules.as_deref())
+                .map(Arc::from),
             header_custom,
             sudoku,
+            xmc,
             transport,
             download: build_xhttp_download(stream, unencrypted_payload)?,
             happy_eyeballs: happy_eyeballs_config(stream),
@@ -101,18 +119,42 @@ impl StreamCarrier {
             Some(header) => Cow::Owned(dialer.into_owned().with_tcp_header_custom(header.clone())),
             None => dialer,
         };
-        match &self.sudoku {
+        let dialer = match &self.sudoku {
             Some(sudoku) => Cow::Owned(dialer.into_owned().with_tcp_sudoku(sudoku.clone())),
+            None => dialer,
+        };
+        match &self.xmc {
+            Some(xmc) => Cow::Owned(dialer.into_owned().with_tcp_xmc(xmc.clone())),
             None => dialer,
         }
     }
+    /// Whether every stream this carrier opens is a connection of its own.
+    /// gRPC's and XHTTP's streams share the connections their transport
+    /// keeps.
+    pub(super) fn opens_a_connection_per_stream(&self) -> bool {
+        !matches!(
+            self.transport_layer,
+            TransportLayer::Grpc(_) | TransportLayer::Xhttp(_)
+        )
+    }
+
+    /// Whether the streams share an XHTTP transport's connections.
+    pub(super) fn is_xhttp(&self) -> bool {
+        matches!(self.transport_layer, TransportLayer::Xhttp(_))
+    }
+
     /// The server's candidates, after its `addressPortStrategy`.
-    pub(super) fn resolve_server<'a>(
-        &'a self,
-        resolver: &'a dyn DnsResolver,
-        dialer: &'a TransportDialer,
-    ) -> impl Future<Output = Result<Vec<SocketAddr>, CoreError>> + 'a {
-        address_port::resolve_server(&self.server, self.address_port, resolver, dialer)
+    pub(super) async fn resolve_server(
+        &self,
+        resolver: &dyn DnsResolver,
+        dialer: &TransportDialer,
+    ) -> Result<Vec<SocketAddr>, CoreError> {
+        // An XDRIVE session meets its server in the storage: Xray-core's dial
+        // never looks the server address up.
+        if matches!(self.transport_layer, TransportLayer::Xdrive(_)) {
+            return Ok(Vec::new());
+        }
+        address_port::resolve_server(&self.server, self.address_port, resolver, dialer).await
     }
 
     /// The XHTTP download server's candidates, after its leg's
@@ -244,6 +286,7 @@ fn build_transport_layer(
     connector: &ConnectorConfig,
     paths: ServerConfigPaths,
 ) -> Result<TransportLayer, CoreError> {
+    check_xicmp_server(stream, server)?;
     let host_fallback = || match connector {
         ConnectorConfig::Tls(tls) if !tls.server_name.is_empty() => tls.server_name.clone(),
         ConnectorConfig::Reality(reality) if !reality.server_name.is_empty() => {
@@ -257,7 +300,12 @@ fn build_transport_layer(
 
     Ok(match &stream.transport {
         StreamTransport::Raw => TransportLayer::Raw,
-        StreamTransport::Hysteria(_) => return Err(CoreError::UnsupportedOutboundNetwork),
+        StreamTransport::Hysteria(_) | StreamTransport::Masque(_) => {
+            return Err(CoreError::UnsupportedOutboundNetwork)
+        }
+        StreamTransport::Xdrive(xdrive) => {
+            TransportLayer::Xdrive(super::xdrive::build_xdrive_transport(xdrive, stream)?)
+        }
         StreamTransport::WebSocket(websocket) => TransportLayer::WebSocket(WebSocketConfig {
             path: websocket.path.clone(),
             host: websocket.host.clone().unwrap_or_else(host_fallback),
@@ -286,14 +334,9 @@ fn build_transport_layer(
             permit_without_stream: grpc.permit_without_stream,
             initial_windows_size: grpc.initial_windows_size,
         })),
-        StreamTransport::Xhttp(xhttp) => TransportLayer::Xhttp(build_xhttp_transport(
-            xhttp,
-            &stream.security,
-            server,
-            stream.quic_params.as_ref(),
-            stream.udp_noise.as_ref(),
-            stream.udp_header_custom.as_ref(),
-        )?),
+        StreamTransport::Xhttp(xhttp) => {
+            TransportLayer::Xhttp(build_xhttp_transport(xhttp, stream, server)?)
+        }
         StreamTransport::Kcp(kcp) => TransportLayer::Kcp(Arc::new(kcp_config(kcp, stream)?)),
     })
 }
@@ -325,7 +368,17 @@ fn kcp_config(
                         .udp_sudoku
                         .as_ref()
                         .ok_or(CoreError::UnsupportedOutboundNetwork)?;
-                    Mask::Sudoku(Arc::new(sudoku_config(sudoku)))
+                    Mask::Sudoku(Arc::new(sudoku_config(&sudoku.mask)))
+                }
+                // A header mask beside mkcp-legacy's; Gecko's fragments are
+                // not built for mKCP.
+                KcpMask::Salamander => {
+                    let salamander = stream
+                        .udp_salamander
+                        .as_ref()
+                        .filter(|salamander| salamander.gecko_packet_size.is_none())
+                        .ok_or(CoreError::UnsupportedOutboundNetwork)?;
+                    Mask::Salamander(salamander.password.clone())
                 }
                 KcpMask::Header(header) => Mask::Header(match header {
                     KcpHeader::Dns(domain) => Header::Dns(domain.clone()),
@@ -351,6 +404,9 @@ fn kcp_config(
             .as_ref()
             .map(super::xhttp::udp_noise_config)
             .transpose()?,
+        xdns: stream.udp_xdns.as_ref().map(xdns_config),
+        realm: stream.udp_realm.as_ref().map(realm_config),
+        xicmp: stream.udp_xicmp.as_ref().map(xicmp_config),
     })
 }
 
@@ -577,6 +633,26 @@ pub(super) fn header_custom_config(
     })
 }
 
+/// The `xmc` mask's settings, with the key its password derives, once per
+/// outbound.
+pub(super) fn xmc_config(
+    mask: &xray_config::XmcMask,
+) -> Result<Arc<xray_transport::xmc::XmcConfig>, CoreError> {
+    let profiles = mask
+        .profiles
+        .iter()
+        .map(|profile| xray_transport::xmc::XmcProfile {
+            username: profile.username.clone(),
+            uuid: profile.uuid,
+            textures_value: profile.textures_value.clone(),
+            textures_signature: profile.textures_signature.clone(),
+        })
+        .collect();
+    xray_transport::xmc::XmcConfig::new(mask.hostname.clone(), profiles, mask.password.as_str())
+        .map(Arc::new)
+        .map_err(|_| CoreError::UnsupportedOutboundNetwork)
+}
+
 /// The `sudoku` mask's settings, for either network.
 pub(super) fn sudoku_config(
     mask: &xray_config::SudokuMask,
@@ -600,6 +676,125 @@ fn udp_header_config(
         client: custom_items(&header.client),
         server: custom_items(&header.server),
     })
+}
+
+/// The `xdns` mask's client settings.
+pub(super) fn xdns_config(xdns: &xray_config::XdnsMask) -> Arc<xray_transport::xdns::XdnsConfig> {
+    use xray_transport::xdns::{XdnsDomain, XdnsResolver};
+    Arc::new(xray_transport::xdns::XdnsConfig {
+        domains: xdns
+            .domains
+            .iter()
+            .map(|domain| XdnsDomain {
+                name: domain.name.clone(),
+                len_limit: domain.len_limit,
+                label_limit: domain.label_limit,
+                types: domain.types.clone(),
+                edns0: domain.edns0,
+            })
+            .collect(),
+        resolvers: xdns
+            .resolvers
+            .iter()
+            .map(|resolver| match resolver.protocol {
+                xray_config::XdnsProtocol::Udp => XdnsResolver::Udp(vec![resolver.address]),
+                xray_config::XdnsProtocol::Tcp => XdnsResolver::Tcp(vec![resolver.address]),
+            })
+            .collect(),
+        extra_poll: xdns.extra_poll,
+    })
+}
+
+/// The `realm` mask's client settings. Its rendezvous's TLS names the
+/// rendezvous host unless `tlsConfig` names a server, as Go's HTTP client
+/// does, and never shapes its hello: Xray-core's client uses Go's own TLS.
+pub(super) fn realm_config(
+    realm: &xray_config::RealmMask,
+) -> Arc<xray_transport::realm::RealmConfig> {
+    use xray_transport::realm::{RealmConfig, RealmFamily, RealmScheme, RealmStunServer};
+    let scheme = match realm.scheme {
+        xray_config::RealmScheme::Https => RealmScheme::Https,
+        xray_config::RealmScheme::Http => RealmScheme::Http,
+    };
+    let tls = (scheme == RealmScheme::Https).then(|| {
+        let settings = realm.tls.as_ref();
+        TlsClientConfig {
+            server_name: settings
+                .and_then(|tls| tls.server_name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| realm.host.clone()),
+            allow_insecure: false,
+            pinned_peer_cert_sha256: settings
+                .map(|tls| tls.pinned_peer_cert_sha256.clone())
+                .unwrap_or_default(),
+            verify_peer_cert_by_name: settings
+                .map(|tls| tls.verify_peer_cert_by_name.clone())
+                .unwrap_or_default(),
+            custom_roots: Vec::new(),
+            alpn: Vec::new(),
+            fingerprint: None,
+        }
+    });
+    Arc::new(RealmConfig {
+        scheme,
+        host: realm.host.clone(),
+        port_text: realm.port_text.clone(),
+        port: realm.port,
+        token: Arc::new(realm.token.clone()),
+        id: realm.id.clone(),
+        stun_servers: realm
+            .stun_servers
+            .iter()
+            .map(|server| RealmStunServer {
+                host: server.host.clone(),
+                port_text: server.port_text.clone(),
+                port: server.port,
+            })
+            .collect(),
+        tls,
+        family: match realm.ip_mode {
+            xray_config::RealmIpMode::Dual => RealmFamily::Dual,
+            xray_config::RealmIpMode::V4 => RealmFamily::V4,
+            xray_config::RealmIpMode::V6 => RealmFamily::V6,
+        },
+    })
+}
+
+/// The `xicmp` mask's client settings.
+pub(super) fn xicmp_config(
+    xicmp: &xray_config::XicmpMask,
+) -> Arc<xray_transport::xicmp::XicmpConfig> {
+    Arc::new(xray_transport::xicmp::XicmpConfig {
+        dgram: xicmp.dgram,
+        ips: xicmp.ips.clone(),
+    })
+}
+
+/// Xray-core's xicmp client sends to its `ips`, else to the outbound's
+/// address, which it never resolves: a name there fails every dial.
+pub(super) fn check_xicmp_server(
+    stream: &StreamSettings,
+    server: &TargetAddr,
+) -> Result<(), CoreError> {
+    match (&stream.udp_xicmp, server) {
+        (Some(xicmp), TargetAddr::Domain(_)) if xicmp.ips.is_empty() => {
+            Err(CoreError::UnsupportedOutboundNetwork)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// A QUIC carrier's `sudoku` UDP mask, at its place among the carrier's
+/// other masks.
+pub(super) fn quic_sudoku(
+    sudoku: &xray_config::UdpSudoku,
+) -> xray_transport::hysteria::SudokuCarrier {
+    xray_transport::hysteria::SudokuCarrier {
+        config: Arc::new(sudoku_config(&sudoku.mask)),
+        before_salamander: sudoku.before_salamander,
+        before_noise: sudoku.before_noise,
+        before_header_custom: sudoku.before_header_custom,
+    }
 }
 
 /// A QUIC carrier's `header-custom` UDP mask, at its place among the
@@ -652,6 +847,77 @@ fn custom_items(
         .collect()
 }
 
+/// The Salamander mask of a QUIC carrier other than Hysteria, with Gecko's
+/// fragment sizes when its `packetSize` selects Gecko.
+pub(super) fn quic_salamander(
+    mask: &xray_config::SalamanderMask,
+) -> Result<xray_transport::hysteria::SalamanderCarrier, CoreError> {
+    if !(4..=4096).contains(&mask.password.len()) {
+        return Err(CoreError::UnsupportedOutboundNetwork);
+    }
+    let gecko = mask
+        .gecko_packet_size
+        .map(|size| {
+            let bound = |value: u32| u16::try_from(value).ok();
+            bound(size.from)
+                .zip(bound(size.to))
+                .and_then(|(min, max)| xray_transport::hysteria::GeckoPacketSize::new(min, max))
+                .ok_or(CoreError::UnsupportedOutboundNetwork)
+        })
+        .transpose()?;
+    Ok(xray_transport::hysteria::SalamanderCarrier {
+        password: Arc::new(mask.password.clone()),
+        gecko,
+    })
+}
+
+/// The UDP masks of a socket that carries plain datagrams, freedom's flows
+/// and WireGuard's, as Xray-core's `FinalMask.DialUDP` wraps it: `None`
+/// without masks. udphop and realm need a QUIC carrier.
+pub(crate) fn direct_udp_masks(
+    stream: &StreamSettings,
+) -> Result<Option<Arc<xray_transport::hysteria::HysteriaCarrierConfig>>, CoreError> {
+    if stream.udp_noise.is_none()
+        && stream.udp_header_custom.is_none()
+        && stream.udp_sudoku.is_none()
+        && stream.udp_xdns.is_none()
+        && stream.udp_realm.is_none()
+        && stream.udp_xicmp.is_none()
+        && stream.udp_salamander.is_none()
+    {
+        return Ok(None);
+    }
+    if stream.udp_realm.is_some()
+        || stream.quic_params.as_ref().is_some_and(|quic| {
+            quic.udp_hop.local || quic.udp_hop.remote || quic.udp_hop.remote_once
+        })
+    {
+        return Err(CoreError::UnsupportedOutboundNetwork);
+    }
+    let salamander = stream
+        .udp_salamander
+        .as_ref()
+        .map(quic_salamander)
+        .transpose()?;
+    let masks = xray_transport::hysteria::HysteriaCarrierConfig {
+        salamander_password: salamander.as_ref().map(|s| s.password.clone()),
+        gecko: salamander.and_then(|s| s.gecko),
+        noise: stream
+            .udp_noise
+            .as_ref()
+            .map(super::xhttp::udp_noise_config)
+            .transpose()?,
+        header_custom: stream.udp_header_custom.as_ref().map(quic_header_custom),
+        sudoku: stream.udp_sudoku.as_ref().map(quic_sudoku),
+        xdns: stream.udp_xdns.as_ref().map(xdns_config),
+        xicmp: stream.udp_xicmp.as_ref().map(xicmp_config),
+        ..Default::default()
+    };
+    xray_transport::MaskedUdpSocket::validate(&masks)
+        .map_err(|_| CoreError::UnsupportedOutboundNetwork)?;
+    Ok(Some(Arc::new(masks)))
+}
+
 pub(super) fn fragment_config(
     stream: &StreamSettings,
 ) -> Result<Option<Arc<xray_transport::TcpFragmentConfig>>, CoreError> {
@@ -659,11 +925,21 @@ pub(super) fn fragment_config(
         .tcp_fragment
         .as_ref()
         .map(|settings| {
+            let packets = match settings.packets {
+                xray_config::FragmentPackets::TlsHello => xray_transport::FragmentPackets::TlsHello,
+                xray_config::FragmentPackets::AllWrites => {
+                    xray_transport::FragmentPackets::AllWrites
+                }
+                xray_config::FragmentPackets::Writes { from, to } => {
+                    xray_transport::FragmentPackets::Writes(u64::from(from)..=u64::from(to))
+                }
+            };
             xray_transport::TcpFragmentConfig::new(
                 settings.lengths.iter().map(|r| r.from..=r.to).collect(),
                 settings.delays_ms.iter().map(|r| r.from..=r.to).collect(),
                 settings.max_split.from..=settings.max_split.to,
             )
+            .and_then(|config| config.with_packets(packets))
             .map(Arc::new)
             .map_err(|_| CoreError::UnsupportedOutboundNetwork)
         })

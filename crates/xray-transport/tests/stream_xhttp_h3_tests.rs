@@ -24,8 +24,8 @@ use xray_transport::stream::xhttp_composer_test_only::{
     XhttpScheme,
 };
 use xray_transport::stream::xhttp_h3_test_only::{
-    connect_h3, H3Client, H3Congestion, H3ConnectConfig, H3Error, H3QuicConfig, H3QuicVersion,
-    H3UdpHopConfig,
+    connect_h3, H3BbrProfile, H3Client, H3Congestion, H3ConnectConfig, H3Error, H3QuicConfig,
+    H3QuicVersion, H3UdpHopConfig,
 };
 use xray_transport::stream::xhttp_transport_test_only::{
     XhttpClock, XhttpH3Dial, XhttpHttpVersion, XhttpTransport, XhttpXmuxPolicy,
@@ -107,6 +107,8 @@ async fn pair_with_options(
         tls_config: client_tls,
         socket_protector,
         quic: H3QuicConfig::default(),
+        realm: None,
+        network_changes: None,
     })
     .await
     .expect("connect HTTP/3 client");
@@ -325,6 +327,8 @@ fn h3_network_dial(
                 tls_config: client_tls,
                 socket_protector: None,
                 quic: H3QuicConfig::default(),
+                realm: None,
+                network_changes: None,
             })
             .await
         })
@@ -342,6 +346,54 @@ async fn serve_clean_exchange(server: &TestServer) -> (Method, String, Vec<u8>) 
         .expect("response headers");
     stream.finish().await.expect("response finish");
     (method, path, body)
+}
+
+/// Xray's XHTTP dialer installs its controller right after `DialEarly`:
+/// quinn's BBR and NewReno run from the start, the rest replace NewReno
+/// once the handshake is done.
+#[tokio::test]
+async fn each_congestion_choice_runs_its_controller_after_the_handshake() {
+    for (congestion, expected) in [
+        (H3Congestion::BbrStandard, "quinn-bbr"),
+        (H3Congestion::Reno, "new-reno"),
+        (H3Congestion::BbrConservative, "xray-bbr-conservative"),
+        (H3Congestion::BbrAggressive, "xray-bbr-aggressive"),
+        (
+            H3Congestion::ForceBrutal {
+                bytes_per_second: 10 << 20,
+            },
+            "brutal",
+        ),
+    ] {
+        let (client_tls, server_addr, server) = server_with_options(None).await;
+        let client = connect_h3(H3ConnectConfig {
+            remote_addr: server_addr,
+            server_name: "localhost".to_owned(),
+            tls_config: client_tls,
+            socket_protector: None,
+            quic: H3QuicConfig {
+                congestion,
+                ..H3QuicConfig::default()
+            },
+            realm: None,
+            network_changes: None,
+        })
+        .await
+        .expect("connect HTTP/3 client");
+        let handler = tokio::spawn({
+            let server = server.clone();
+            async move { serve_clean_exchange(&server).await }
+        });
+        let payload = Bytes::from(vec![0x5a; 256 * 1024]);
+        let mut body = client
+            .send_fixed(request(Method::POST, "/congestion"), payload.clone())
+            .await
+            .expect("status 200");
+        body.read_to_end(&mut Vec::new()).await.unwrap();
+        let (_, _, received) = handler.await.unwrap();
+        assert_eq!(received, payload, "{congestion:?}");
+        assert_eq!(client.congestion_controller(), expected, "{congestion:?}");
+    }
 }
 
 #[tokio::test]
@@ -708,6 +760,8 @@ async fn slow_path_uploads_buffer_only_their_share_of_the_send_budget() {
         tls_config: Arc::clone(&client_tls),
         socket_protector: None,
         quic: H3QuicConfig::default(),
+        realm: None,
+        network_changes: None,
     })
     .await
     .expect("connect HTTP/3 client through the delay relay");
@@ -775,6 +829,8 @@ async fn slow_path_uploads_buffer_only_their_share_of_the_send_budget() {
                 tls_config: client_tls,
                 socket_protector: None,
                 quic: H3QuicConfig::default(),
+                realm: None,
+                network_changes: None,
             })
             .await
             .expect("connect HTTP/3 client through its delay relay");
@@ -865,6 +921,8 @@ async fn credit_after_a_fast_download(quic: H3QuicConfig) -> usize {
         tls_config: client_tls,
         socket_protector: None,
         quic,
+        realm: None,
+        network_changes: None,
     })
     .await
     .expect("connect HTTP/3 client through the delay relay");
@@ -1025,6 +1083,8 @@ async fn credit_ahead_of_readers(reader: BudgetReader) -> usize {
             tls_config: Arc::clone(&client_tls),
             socket_protector: None,
             quic: H3QuicConfig::default(),
+            realm: None,
+            network_changes: None,
         })
     }))
     .await;
@@ -1104,6 +1164,8 @@ async fn small_data_frames_wait_in_the_stream_window() {
             max_connection_receive_window: Some(2 * WINDOW),
             ..H3QuicConfig::default()
         },
+        realm: None,
+        network_changes: None,
     })
     .await
     .expect("connect HTTP/3 client");
@@ -2398,6 +2460,8 @@ async fn xhttp_h3_hops_to_a_different_port_each_interval_on_one_connection() {
                 },
                 ..H3QuicConfig::default()
             },
+            realm: None,
+            network_changes: None,
         })
         .await
         .expect("connect through a hop port");
@@ -2486,6 +2550,8 @@ async fn xhttp_h3_local_hop_keeps_the_servers_address() {
                 },
                 ..H3QuicConfig::default()
             },
+            realm: None,
+            network_changes: None,
         })
         .await
         .expect("connect to the server's address");
@@ -2506,6 +2572,64 @@ async fn xhttp_h3_local_hop_keeps_the_servers_address() {
     })
     .await
     .expect("bounded local hop scenario");
+}
+
+/// A change of the OS network: the connection takes a fresh protected
+/// socket towards the same server and its requests go on, with no mask and
+/// no hop configured. Without the signal it never moves.
+#[tokio::test]
+async fn xhttp_h3_takes_a_fresh_socket_when_the_network_changes() {
+    timeout(Duration::from_secs(30), async {
+        let (client_tls, server_addr, server) = server_with_options(None).await;
+        let front = HopRelay::start(server_addr).await;
+        let protector = Arc::new(RecordingProtector::default());
+        let protector_dyn: Arc<dyn SocketProtector> = protector.clone();
+        let changes = xray_transport::NetworkChanges::default();
+        assert_eq!(changes.notify(), 0, "nothing follows the changes yet");
+        let client = connect_h3(H3ConnectConfig {
+            remote_addr: front.address,
+            server_name: "localhost".to_owned(),
+            tls_config: client_tls,
+            socket_protector: Some(protector_dyn),
+            quic: H3QuicConfig::default(),
+            realm: None,
+            network_changes: Some(changes.clone()),
+        })
+        .await
+        .expect("connect to the server");
+        hop_exchange(&client, &server, 0).await;
+        let before = client.local_addr().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            client.local_addr().unwrap(),
+            before,
+            "no hop without a change"
+        );
+
+        assert_eq!(changes.notify(), 1);
+        timeout(Duration::from_secs(8), async {
+            while client.local_addr().unwrap() == before {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the change moves the carrier to a fresh socket");
+        hop_exchange(&client, &server, 1).await;
+        assert!(client.is_live());
+        assert_eq!(front.sources.load(Ordering::SeqCst), 2);
+        assert_eq!(protector.calls.load(Ordering::SeqCst), 2);
+
+        drop(client);
+        timeout(Duration::from_secs(5), async {
+            while changes.notify() != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a dropped connection stops following the changes");
+    })
+    .await
+    .expect("bounded network change scenario");
 }
 
 /// Xray's `perConnRemote` alone: the connection goes to a random one of the
@@ -2538,6 +2662,8 @@ async fn xhttp_h3_per_connection_remote_draws_once_and_never_hops() {
                 },
                 ..H3QuicConfig::default()
             },
+            realm: None,
+            network_changes: None,
         })
         .await
         .expect("connect through a drawn port");
@@ -2708,6 +2834,8 @@ async fn invalid_sni_precedes_socket_protection_and_protection_failure_stops_can
         tls_config: Arc::clone(&client_tls),
         socket_protector: Some(recording.clone()),
         quic: H3QuicConfig::default(),
+        realm: None,
+        network_changes: None,
     })
     .await
     .expect_err("invalid SNI must fail before UDP bind/protection");
@@ -2733,6 +2861,8 @@ async fn invalid_sni_precedes_socket_protection_and_protection_failure_stops_can
             tls_config: client_tls,
             socket_protector: Some(failing.clone()),
             quic: H3QuicConfig::default(),
+            realm: None,
+            network_changes: None,
         },
         &[server_addr, server_addr],
         Some(&policy),
@@ -2799,12 +2929,12 @@ fn unsupported_quic_parity_modes_fail_closed() {
     ));
 
     config.max_stream_receive_window = None;
-    for requested in [H3Congestion::BbrConservative, H3Congestion::BbrAggressive] {
+    for (requested, name) in [
+        (H3Congestion::BbrConservative, "xray-bbr-conservative"),
+        (H3Congestion::BbrAggressive, "xray-bbr-aggressive"),
+    ] {
         config.congestion = requested;
-        assert!(matches!(
-            config.diagnostics(),
-            Err(H3Error::UnsupportedCongestion { requested: actual }) if actual == requested
-        ));
+        assert_eq!(config.diagnostics().unwrap().congestion, name);
     }
     config.congestion = H3Congestion::ForceBrutal {
         bytes_per_second: 0,
@@ -2821,6 +2951,7 @@ fn unsupported_quic_parity_modes_fail_closed() {
     // bandwidth exchange, so an XHTTP transport refuses it up front.
     config.congestion = H3Congestion::Brutal {
         up_bytes_per_second: 65_536,
+        bbr_profile: H3BbrProfile::Standard,
     };
     assert!(config.diagnostics().is_ok());
     let (xhttp, endpoint) = xhttp_config(XhttpModeSelection::StreamOne, 4);

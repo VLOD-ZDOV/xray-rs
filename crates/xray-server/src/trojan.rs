@@ -367,7 +367,7 @@ where
                 Ok::<(), io::Error>(())
             };
 
-            crate::vless::relay_policy(up, down, &activity, user_policy).await
+            Box::pin(crate::vless::relay_policy(up, down, &activity, user_policy)).await
         }
     }
 }

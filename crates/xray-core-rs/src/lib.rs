@@ -34,6 +34,7 @@ mod http;
 mod http_forward;
 mod outbound;
 mod policy;
+mod reverse;
 mod runtime_log;
 mod runtime_stats_log;
 mod sniffing;
@@ -351,6 +352,8 @@ pub enum CoreError {
     Hysteria(#[from] xray_transport::hysteria::HysteriaError),
     #[error(transparent)]
     Wireguard(#[from] xray_wireguard::Error),
+    #[error(transparent)]
+    Masque(#[from] xray_transport::masque::MasqueError),
     #[error("TUN MTU {0} is outside {min}..={max}", min = TunMtu::MIN, max = TunMtu::MAX)]
     InvalidTunMtu(u32),
     #[error("core is already running")]
@@ -492,6 +495,8 @@ pub enum CoreError {
     /// the selected HTTP engine without silently changing its behavior.
     #[error("invalid or unsupported XHTTP configuration: {0:?}")]
     InvalidXhttpConfiguration(String),
+    #[error("invalid or unsupported XDRIVE configuration: {0}")]
+    InvalidXdriveConfiguration(String),
     #[error("XTLS rejected UDP/443 traffic")]
     VisionUdp443Rejected,
     #[error("transport error: {0}")]
@@ -739,6 +744,15 @@ impl Core {
                     .with_socket_options(Arc::new(xray_transport::SocketOptions::default())),
             )
         };
+        // A realm mask's STUN servers and rendezvous are resolved like an
+        // outbound's server.
+        let transport_dialer = Arc::new(
+            transport_dialer.as_ref().clone().with_realm_resolver(
+                dns.bootstrap
+                    .clone()
+                    .unwrap_or_else(|| Arc::clone(&dns.destination)),
+            ),
+        );
         dns.rules
             .route_probe
             .get_or_insert_with(|| transport_dialer.route_probe());
@@ -760,26 +774,44 @@ impl Core {
         }
         ensure_effective_dns_tag(&mut config);
         for outbound in &config.outbounds {
-            outbound::validate_udp_noise(&outbound.stream)?;
+            // Freedom's flows and WireGuard's socket carry plain datagrams,
+            // which their UDP masks shape directly, as Xray-core's
+            // `FinalMask.DialUDP` wraps those sockets; WireGuard checks its
+            // own as it is built below.
+            if matches!(
+                outbound.settings,
+                xray_config::OutboundSettings::Freedom(_)
+                    | xray_config::OutboundSettings::Wireguard(_)
+            ) {
+                outbound::direct_udp_masks(&outbound.stream)?;
+            } else {
+                outbound::validate_udp_noise(&outbound.stream)?;
+            }
             if (outbound.stream.udp_noise.is_some()
                 || outbound.stream.udp_header_custom.is_some()
-                || outbound.stream.udp_sudoku.is_some())
+                || outbound.stream.udp_sudoku.is_some()
+                || outbound.stream.udp_xdns.is_some()
+                || outbound.stream.udp_realm.is_some()
+                || outbound.stream.udp_xicmp.is_some()
+                || outbound.stream.udp_salamander.is_some())
                 && matches!(
                     outbound.settings,
-                    xray_config::OutboundSettings::Freedom(_)
-                        | xray_config::OutboundSettings::Blackhole(_)
+                    xray_config::OutboundSettings::Blackhole(_)
                         | xray_config::OutboundSettings::Dns(_)
-                        | xray_config::OutboundSettings::Wireguard(_)
                 )
             {
                 return Err(CoreError::UnsupportedOutboundNetwork);
             }
             if let Some(fragment) = &outbound.stream.tcp_fragment {
+                // `tlshello` needs a TLS record to split; raw pieces go on
+                // any TCP carrier.
+                let tls_hello = fragment.packets == xray_config::FragmentPackets::TlsHello;
                 if outbound.stream.network != xray_config::Network::Tcp
                     || matches!(outbound.settings, xray_config::OutboundSettings::Freedom(_))
                         && (outbound.stream.security != xray_config::StreamSecurity::None
                             || outbound.stream.transport != xray_config::StreamTransport::Raw)
-                    || !matches!(outbound.settings, xray_config::OutboundSettings::Freedom(_))
+                    || tls_hello
+                        && !matches!(outbound.settings, xray_config::OutboundSettings::Freedom(_))
                         && outbound.stream.security == xray_config::StreamSecurity::None
                     || matches!(&outbound.stream.transport, xray_config::StreamTransport::Xhttp(xhttp) if xhttp.download.is_some() || matches!(&outbound.stream.security, xray_config::StreamSecurity::Tls(tls) if tls.alpn == ["h3"]))
                     || matches!(
@@ -792,21 +824,19 @@ impl Core {
                             | xray_config::OutboundSettings::Hysteria(_)
                             | xray_config::OutboundSettings::Wireguard(_)
                             | xray_config::OutboundSettings::Blackhole(_)
+                            | xray_config::OutboundSettings::Loopback(_)
                     )
                 {
                     return Err(CoreError::UnsupportedOutboundNetwork);
                 }
-                xray_transport::TcpFragmentConfig::new(
-                    fragment.lengths.iter().map(|r| r.from..=r.to).collect(),
-                    fragment.delays_ms.iter().map(|r| r.from..=r.to).collect(),
-                    fragment.max_split.from..=fragment.max_split.to,
-                )
-                .map_err(|_| CoreError::UnsupportedOutboundNetwork)?;
+                outbound::tcp_fragment_config(&outbound.stream)?;
             }
-            // `header-custom` and `sudoku` run on the TCP carriers of the
-            // outbounds that proxy over a stream transport, not on direct or
-            // DNS dials.
-            if (outbound.stream.tcp_header_custom.is_some() || outbound.stream.tcp_sudoku.is_some())
+            // `header-custom`, `sudoku` and `xmc` run on the TCP carriers of
+            // the outbounds that proxy over a stream transport, MASQUE's over
+            // HTTP/2 among them, not on direct or DNS dials.
+            if (outbound.stream.tcp_header_custom.is_some()
+                || outbound.stream.tcp_sudoku.is_some()
+                || outbound.stream.tcp_xmc.is_some())
                 && !matches!(
                     outbound.settings,
                     xray_config::OutboundSettings::Vless(_)
@@ -816,6 +846,7 @@ impl Core {
                         | xray_config::OutboundSettings::Socks(_)
                         | xray_config::OutboundSettings::Http(_)
                 )
+                && !outbound::masque::over_http2(outbound)
             {
                 return Err(CoreError::UnsupportedOutboundNetwork);
             }
@@ -834,6 +865,15 @@ impl Core {
             ) {
                 outbound::HysteriaOutbound::new(outbound)?;
             }
+            // Built for each flow's first use; its refusals belong to the
+            // start, as Hysteria's and WireGuard's.
+            if matches!(outbound.settings, xray_config::OutboundSettings::Masque(_)) {
+                outbound::MasqueOutbound::new(outbound)?;
+            }
+            // So is an XDRIVE storage.
+            if let xray_config::StreamTransport::Xdrive(xdrive) = &outbound.stream.transport {
+                outbound::xdrive::build_xdrive_transport(xdrive, &outbound.stream)?;
+            }
         }
         let config = Arc::new(config);
         // Before any outbound exists: transports read it as they connect.
@@ -845,6 +885,13 @@ impl Core {
             tun_runtime_options.hysteria_stream_limits,
         ));
         let outbound_router = Arc::new(OutboundRouter::from_factory(outbound_factory));
+        // A bridge's outbound is dialed from the start, so its refusals
+        // belong to the start too.
+        for (index, _, _) in reverse::bridges(&config) {
+            if let Some(node) = outbound_router.graph().nodes().get(index) {
+                outbound_router.factory().cached_tcp_outbound(node.id())?;
+            }
+        }
         let shutdown = Shutdown::new();
         let tun_queue_options = tun_runtime_options.tun_queue_options();
         let tun = Arc::new(TunEndpoint::new_with_queue_depths(
@@ -986,6 +1033,15 @@ impl Core {
     /// Retains QUIC state and endpoints; count denotes acceptance, not recovery.
     pub fn rebind_hysteria(&self) -> u64 {
         self.outbound_factory().rebind_hysteria()
+    }
+
+    /// Asks the live QUIC connections that are not Hysteria's for a fresh
+    /// protected socket after an OS network change: XHTTP, MASQUE and
+    /// XDRIVE's storages over HTTP/3. Streams and tunnels are kept; a
+    /// connection behind a `realm`, `xdns` or `xicmp` mask stays as it is.
+    /// The count is of connections asked, not of paths validated.
+    pub fn rebind_quic(&self) -> u64 {
+        self.transport_dialer.network_changes().notify()
     }
 
     /// Rebinds live WireGuard carrier transports after an OS network change.
@@ -1322,7 +1378,13 @@ impl Core {
             ));
         }
 
-        if bound_listeners.is_empty() && tun_inbounds.is_empty() && tproxy_inbounds.is_empty() {
+        // A VLESS reverse proxy's bridge takes connections as an inbound does.
+        let bridges = reverse::bridges(&self.config);
+        if bound_listeners.is_empty()
+            && tun_inbounds.is_empty()
+            && tproxy_inbounds.is_empty()
+            && bridges.is_empty()
+        {
             return Err(CoreError::NoSupportedInbound);
         }
 
@@ -1394,6 +1456,24 @@ impl Core {
                 context,
                 self.shutdown.subscribe(),
             )));
+        }
+        for (index, settings, level) in bridges {
+            if let Some(context) = reverse::context(
+                index,
+                settings,
+                level,
+                Arc::clone(&config),
+                Arc::clone(&outbound_router),
+                runtime_dns_resolvers.clone(),
+                Arc::clone(&self.transport_dialer),
+                self.runtime_logger.clone(),
+                Arc::clone(&self.connection_registry),
+            ) {
+                tasks.push(tokio::spawn(reverse::run_bridge(
+                    context,
+                    self.shutdown.subscribe(),
+                )));
+            }
         }
         if has_tun_inbound {
             let tun_inbound_tag = tun_inbounds.first().and_then(|(tag, _, _)| tag.clone());

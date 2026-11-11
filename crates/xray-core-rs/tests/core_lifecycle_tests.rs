@@ -40,6 +40,11 @@ fn runtime_config() -> CoreConfig {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
@@ -55,6 +60,7 @@ fn runtime_config() -> CoreConfig {
                     vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
                     pre_connections: 0,
                 }],
+                reverse: None,
             }),
         }],
         default_outbound_tag: None,
@@ -125,6 +131,11 @@ async fn core_selector_override_is_available_before_and_during_runtime() {
             tcp_header_custom: None,
             udp_header_custom: None,
             tcp_sudoku: None,
+            tcp_xmc: None,
+            udp_xdns: None,
+            udp_realm: None,
+            udp_xicmp: None,
+            udp_salamander: None,
             udp_sudoku: None,
             udp_noise: None,
             socket_options: None,
@@ -417,4 +428,280 @@ async fn core_stop_closes_idle_accepted_socks_connections() {
         .unwrap()
         .unwrap();
     assert_eq!(read, 0);
+}
+
+/// Every VLESS reverse proxy configuration the parser takes builds a core,
+/// except where a case records the core's refusal.
+#[tokio::test]
+async fn reverse_profiles_xray_accepts_build_a_core() {
+    use serde_json::Value;
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/reverse/config-verdicts.json"
+    ))
+    .unwrap();
+    let mut mismatches = Vec::new();
+    let mut built = 0;
+    for case in corpus["cases"].as_array().unwrap() {
+        let Ok(parsed) = xray_config::parse_xray_json(&case["config"].to_string()) else {
+            continue;
+        };
+        let refusal = case.get("core").and_then(Value::as_str);
+        match (Core::new(parsed.config), refusal) {
+            (Ok(_), None) => built += 1,
+            (Err(error), Some(expected)) if error.to_string().contains(expected) => {}
+            (Ok(_), Some(expected)) => mismatches.push(format!(
+                "{}: built, expected the core to refuse with {expected:?}",
+                case["name"]
+            )),
+            (Err(error), _) => mismatches.push(format!("{}: {error}", case["name"])),
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    assert!(built >= 20, "only {built} cases built a core");
+}
+
+/// Every MASQUE profile the configuration takes, as `xray run -test` does,
+/// also builds a core, except where a case records the core's refusal:
+/// the verdicts below the configuration are Xray-core's too.
+#[tokio::test]
+async fn masque_profiles_xray_accepts_build_a_core() {
+    use serde_json::{json, Value};
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/masque/config-verdicts.json"
+    ))
+    .unwrap();
+    let mut mismatches = Vec::new();
+    let mut built = 0;
+    for case in corpus["cases"].as_array().unwrap() {
+        let mut outbounds = vec![case["outbound"].clone()];
+        if let Some(extra) = case["extraOutbounds"].as_array() {
+            outbounds.extend(extra.iter().cloned());
+        }
+        let raw = json!({"outbounds": outbounds}).to_string();
+        let Ok(parsed) = xray_config::parse_xray_json(&raw) else {
+            continue;
+        };
+        let refusal = case.get("core").and_then(Value::as_str);
+        match (Core::new(parsed.config), refusal) {
+            (Ok(_), None) => built += 1,
+            (Err(error), Some(expected)) if error.to_string().contains(expected) => {}
+            (Ok(_), Some(expected)) => mismatches.push(format!(
+                "{}: built, expected the core to refuse with {expected:?}",
+                case["name"]
+            )),
+            (Err(error), _) => mismatches.push(format!("{}: {error}", case["name"])),
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    assert!(built > 50, "only {built} cases built a core");
+}
+
+/// Every FinalMask filter case the configuration takes builds a core, on
+/// every carrier that takes masks and every outbound that dials none:
+/// `tests/fixtures/filter/config-verdicts.json`.
+#[tokio::test]
+async fn filter_cases_the_parser_takes_build_a_core() {
+    use serde_json::{json, Value};
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/filter/config-verdicts.json"
+    ))
+    .unwrap();
+    let mut mismatches = Vec::new();
+    let mut built = 0;
+    for case in corpus["cases"].as_array().unwrap() {
+        let raw = json!({"outbounds": [case["outbound"]]}).to_string();
+        let Ok(parsed) = xray_config::parse_xray_json(&raw) else {
+            continue;
+        };
+        let refusal = case.get("core").and_then(Value::as_str);
+        match (Core::new(parsed.config), refusal) {
+            (Ok(_), None) => built += 1,
+            (Err(error), Some(expected)) if error.to_string().contains(expected) => {}
+            (Ok(_), Some(expected)) => mismatches.push(format!(
+                "{}: built, expected the core to refuse with {expected:?}",
+                case["name"]
+            )),
+            (Err(error), _) => mismatches.push(format!("{}: {error}", case["name"])),
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    assert!(built >= 50, "only {built} cases built a core");
+}
+
+/// Every `disableChromeParrot` case Xray-core accepts builds a core here too,
+/// with ChromeParrot on or off: `tests/fixtures/chrome-parrot/config-verdicts.json`.
+#[tokio::test]
+async fn chrome_parrot_cases_xray_accepts_build_a_core() {
+    use serde_json::{json, Value};
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/chrome-parrot/config-verdicts.json"
+    ))
+    .unwrap();
+    let mut built = 0;
+    for case in corpus["cases"].as_array().unwrap() {
+        if case["xray"] != "ok" {
+            continue;
+        }
+        let raw = json!({"outbounds": [case["outbound"]]}).to_string();
+        let parsed = xray_config::parse_xray_json(&raw)
+            .unwrap_or_else(|error| panic!("{}: {error:?}", case["name"]));
+        Core::new(parsed.config).unwrap_or_else(|error| panic!("{}: {error}", case["name"]));
+        built += 1;
+    }
+    assert!(built >= 20, "only {built} cases built a core");
+}
+
+/// An XDRIVE outbound never looks its server address up, as Xray-core's
+/// dial never does: its sessions meet the server in the storage. A flow
+/// through the SOCKS inbound announces a session and stores the VLESS
+/// request in its uplink, with no server there to answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn xdrive_flows_announce_sessions_without_resolving_the_server() {
+    use serde_json::json;
+    use xray_transport::{DnsResolver, TransportError};
+
+    struct Refuses;
+    #[async_trait::async_trait]
+    impl DnsResolver for Refuses {
+        async fn resolve(
+            &self,
+            domain: &str,
+            _port: u16,
+        ) -> Result<std::net::SocketAddr, TransportError> {
+            panic!("an XDRIVE outbound looked up {domain}");
+        }
+    }
+
+    let folder = std::env::temp_dir().join(format!("xray-rust-xdrive-core-{}", Uuid::new_v4()));
+    let config = json!({
+        "inbounds": [{"protocol": "socks", "tag": "socks-in", "listen": "127.0.0.1", "port": 0}],
+        "outbounds": [{"protocol": "vless",
+            "settings": {"address": "xdrive.invalid", "port": 443,
+                "id": "27848739-7e62-4138-9fd3-098a63964b6b",
+                "encryption": "mlkem768x25519plus.native.0rtt.XKbaq1BuzJKKKPxZbwgRpn-gYQbnhrYketgezASCL1I"},
+            "streamSettings": {"network": "xdrive", "xdriveSettings": {"service": "local",
+                "remoteFolder": folder.to_str().unwrap(), "flushIntervalMs": 5}},
+            "mux": {"enabled": true}}]
+    });
+    let parsed = xray_config::parse_xray_json(&config.to_string()).unwrap();
+    let mut core = Core::with_runtime_dependencies(
+        parsed.config,
+        Arc::new(Refuses),
+        Arc::new(TransportDialer::system().unwrap()),
+    )
+    .unwrap();
+    core.start().await.unwrap();
+    let proxy = core.inbound_addr(Some("socks-in")).unwrap();
+    let mut client = TcpStream::connect(proxy).await.unwrap();
+    client.write_all(&[5, 1, 0]).await.unwrap();
+    let mut greeting = [0; 2];
+    client.read_exact(&mut greeting).await.unwrap();
+    client
+        .write_all(&[5, 1, 0, 1, 192, 0, 2, 1, 0, 80])
+        .await
+        .unwrap();
+    let _ = client.write_all(b"GET / HTTP/1.1\r\n\r\n").await;
+    let uplink_segments = || -> usize {
+        let Ok(sessions) = std::fs::read_dir(folder.join("streams")) else {
+            return 0;
+        };
+        sessions
+            .filter_map(Result::ok)
+            .filter_map(|session| std::fs::read_dir(session.path().join("c2s")).ok())
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".seg"))
+            .count()
+    };
+    timeout(Duration::from_secs(10), async {
+        while uplink_segments() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the flow stored its request");
+    let announced = std::fs::read_dir(folder.join("sessions")).unwrap().count();
+    assert_eq!(announced, 1);
+    drop(client);
+    core.stop().await.unwrap();
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// Every XDRIVE profile Xray-core accepts builds a core, except the
+/// refusals the corpus records: the services not reached yet, and what
+/// Xray-core accepts only to fail every dial.
+#[tokio::test(flavor = "multi_thread")]
+async fn xdrive_profiles_xray_accepts_build_a_core() {
+    use serde_json::{json, Value};
+    let corpus: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/xdrive/config-verdicts.json"
+    ))
+    .unwrap();
+    let mut mismatches = Vec::new();
+    let mut built = 0;
+    for case in corpus["cases"].as_array().unwrap() {
+        let mut outbounds = vec![case["outbound"].clone()];
+        if let Some(extra) = case["extraOutbounds"].as_array() {
+            outbounds.extend(extra.iter().cloned());
+        }
+        let raw = json!({"outbounds": outbounds}).to_string();
+        let Ok(parsed) = xray_config::parse_xray_json(&raw) else {
+            continue;
+        };
+        let refusal = case.get("core").and_then(Value::as_str);
+        match (Core::new(parsed.config), refusal) {
+            (Ok(_), None) => built += 1,
+            (Err(error), Some(expected)) if error.to_string().contains(expected) => {}
+            (Ok(_), Some(expected)) => mismatches.push(format!(
+                "{}: built, expected the core to refuse with {expected:?}",
+                case["name"]
+            )),
+            (Err(error), _) => mismatches.push(format!("{}: {error}", case["name"])),
+        }
+    }
+    assert!(mismatches.is_empty(), "{mismatches:#?}");
+    assert!(built >= 75, "only {built} cases built a core");
+}
+
+/// Freedom and WireGuard take UDP masks, as Xray-core's `FinalMask.DialUDP`
+/// wraps their sockets. WireGuard's take one peer: a second fails the start.
+#[test]
+fn freedom_and_one_peer_wireguard_build_a_core_under_udp_masks() {
+    use serde_json::json;
+    let masks = json!([
+        {"type": "noise", "settings": {"noise": [{"type": "str", "packet": "synthetic"}]}},
+        {"type": "salamander", "settings": {"password": "synthetic-salamander"}}
+    ]);
+    let peer = |public: &str, port: u16| {
+        json!({"publicKey": public, "endpoint": format!("127.0.0.1:{port}"),
+            "allowedIPs": ["0.0.0.0/0"]})
+    };
+    let wireguard = |peers: serde_json::Value| {
+        json!({"outbounds": [{"protocol": "wireguard", "tag": "proxy",
+            "settings": {"secretKey": "42".repeat(32), "address": ["10.44.0.2/32"],
+                "mtu": 1420, "peers": peers},
+            "streamSettings": {"finalmask": {"udp": masks}}}]})
+    };
+    let core = |config: serde_json::Value| {
+        xray_core_rs::Core::new(
+            xray_config::parse_xray_json(&config.to_string())
+                .unwrap()
+                .config,
+        )
+    };
+    let freedom = json!({"outbounds": [{"protocol": "freedom", "tag": "direct",
+        "streamSettings": {"finalmask": {"udp": masks}}}]});
+    assert!(core(freedom).is_ok());
+    let one = json!([peer(&"53".repeat(32), 51820)]);
+    assert!(core(wireguard(one)).is_ok());
+    let two = json!([peer(&"53".repeat(32), 51820), peer(&"54".repeat(32), 51821)]);
+    let mut unmasked = wireguard(two.clone());
+    unmasked["outbounds"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("streamSettings");
+    assert!(core(unmasked).is_ok(), "two peers build without masks");
+    assert!(matches!(
+        core(wireguard(two)),
+        Err(xray_core_rs::CoreError::UnsupportedOutboundNetwork)
+    ));
 }

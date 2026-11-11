@@ -87,6 +87,7 @@ impl Server {
             protection_failed: Arc::new(AtomicBool::new(false)),
             stop: stop.clone(),
             carrier: watch::channel(None).0,
+            masks: None,
             reserved: config.reserved,
             listen_addr: Some(config.listen_addr),
         };

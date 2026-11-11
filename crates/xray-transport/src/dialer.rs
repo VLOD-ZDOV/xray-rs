@@ -12,7 +12,7 @@ use crate::{
     ConnectorConfig, HappyEyeballsConfig, RealityRuntimeEngine, RealityTlsEngine, RecordResolver,
     ResolvedTcpConnector, RouteProbe, RustlsRealityTlsSessionProvider, SocketOptions,
     SocketOptionsProtector, SocketOptionsReport, SocketProtector, SystemRecordResolver,
-    SystemRouteProbe, TlsConnector, TransportError,
+    SystemRouteProbe, TlsClientConfig, TlsConnector, TransportError,
 };
 use xray_routing::{Target, TargetAddr};
 
@@ -32,18 +32,22 @@ pub struct TransportDialer {
     /// What most dialers leave unset, behind one pointer: every open future
     /// holds dialers.
     replaced: Option<Arc<Replaced>>,
+    network_changes: crate::NetworkChanges,
 }
 
 /// What [`TransportDialer::with_route_probe`],
 /// [`TransportDialer::with_record_resolver`],
-/// [`TransportDialer::with_tcp_header_custom`] and
-/// [`TransportDialer::with_tcp_sudoku`] set.
+/// [`TransportDialer::with_tcp_header_custom`],
+/// [`TransportDialer::with_tcp_sudoku`] and [`TransportDialer::with_tcp_xmc`]
+/// set.
 #[derive(Clone, Default)]
 struct Replaced {
     route_probe: Option<Arc<dyn RouteProbe>>,
     record_resolver: Option<Arc<dyn RecordResolver>>,
     tcp_header_custom: Option<Arc<crate::header_custom::HeaderCustomTcpConfig>>,
     tcp_sudoku: Option<Arc<crate::sudoku::SudokuConfig>>,
+    tcp_xmc: Option<Arc<crate::xmc::XmcConfig>>,
+    realm_resolver: Option<Arc<dyn crate::DnsResolver>>,
 }
 
 #[derive(Clone)]
@@ -51,6 +55,7 @@ pub(crate) struct H3DialMaterial {
     pub(crate) server_name: String,
     pub(crate) tls_config: Arc<rustls::ClientConfig>,
     pub(crate) socket_protector: Option<Arc<dyn SocketProtector>>,
+    pub(crate) network_changes: crate::NetworkChanges,
 }
 
 impl fmt::Debug for TransportDialer {
@@ -111,6 +116,7 @@ impl TransportDialer {
             resolved_tcp_connector: None,
             tcp_fragment: None,
             replaced: None,
+            network_changes: crate::NetworkChanges::default(),
         })
     }
 
@@ -126,6 +132,7 @@ impl TransportDialer {
             resolved_tcp_connector: None,
             tcp_fragment: None,
             replaced: None,
+            network_changes: crate::NetworkChanges::default(),
         }
     }
 
@@ -138,8 +145,10 @@ impl TransportDialer {
     }
 
     /// The resolver for `addressPortStrategy` lookups: the one set with
-    /// [`Self::with_record_resolver`], else Go's behind the platform's
-    /// protector.
+    /// [`Self::with_record_resolver`], else Go's behind this dialer's
+    /// protector, the outbound's `sockopt` included: a `mark` or an
+    /// `interface` that keeps the outbound out of a tunnel keeps its lookup
+    /// out of it too.
     pub fn record_resolver(&self) -> Arc<dyn RecordResolver> {
         match self
             .replaced
@@ -147,8 +156,40 @@ impl TransportDialer {
             .and_then(|replaced| replaced.record_resolver.as_ref())
         {
             Some(resolver) => Arc::clone(resolver),
-            None => Arc::new(SystemRecordResolver::new(self.platform_protector.clone())),
+            None => Arc::new(SystemRecordResolver::new(self.socket_protector.clone())),
         }
+    }
+
+    /// Resolves the STUN servers' and rendezvous's names of a `realm`
+    /// mask, as the outbound's server name is resolved.
+    pub fn with_realm_resolver(mut self, resolver: Arc<dyn crate::DnsResolver>) -> Self {
+        Arc::make_mut(self.replaced.get_or_insert_with(Default::default)).realm_resolver =
+            Some(resolver);
+        self
+    }
+
+    /// What a `realm` mask's introduction takes from this dialer: the
+    /// resolver set with [`Self::with_realm_resolver`], else the platform's,
+    /// and this dialer's socket protection, the outbound's `sockopt`
+    /// included, which its connection to the rendezvous goes through as the
+    /// punched socket does.
+    pub fn realm_env(&self) -> crate::realm::RealmEnv {
+        crate::realm::RealmEnv {
+            resolver: self
+                .replaced
+                .as_ref()
+                .and_then(|replaced| replaced.realm_resolver.clone())
+                .unwrap_or_else(|| Arc::new(crate::SystemDnsResolver)),
+            tls: self.tls.clone(),
+            protector: self.socket_protector.clone(),
+        }
+    }
+
+    /// The signal this dialer's QUIC connections follow to a fresh socket
+    /// when the OS network changes. Every dialer made from this one shares
+    /// it, so one [`crate::NetworkChanges::notify`] reaches them all.
+    pub fn network_changes(&self) -> &crate::NetworkChanges {
+        &self.network_changes
     }
 
     pub fn with_reality_engine(mut self, reality: Arc<dyn RealityTlsEngine>) -> Self {
@@ -242,18 +283,47 @@ impl TransportDialer {
             .and_then(|replaced| replaced.tcp_sudoku.as_deref())
     }
 
-    /// A connected carrier in the masks the TCP mask list puts outside the
-    /// `header-custom` handshake: `sudoku`, when it is set.
-    fn sudoku_carrier(
+    /// Logs every TCP carrier in through the `xmc` mask as soon as it
+    /// connects, outside the `header-custom` handshake, the fragment mask,
+    /// TLS and REALITY.
+    pub fn with_tcp_xmc(mut self, config: Arc<crate::xmc::XmcConfig>) -> Self {
+        Arc::make_mut(self.replaced.get_or_insert_with(Default::default)).tcp_xmc = Some(config);
+        self
+    }
+
+    fn tcp_xmc(&self) -> Option<&crate::xmc::XmcConfig> {
+        self.replaced
+            .as_ref()
+            .and_then(|replaced| replaced.tcp_xmc.as_deref())
+    }
+
+    /// Whether a mask that transforms every byte, `sudoku` or `xmc`, sits
+    /// outermost on the wire.
+    fn has_wire_mask(&self) -> bool {
+        self.tcp_sudoku().is_some() || self.tcp_xmc().is_some()
+    }
+
+    /// A connected carrier, whose remote end is `remote`, in the mask the
+    /// TCP mask list puts outside the `header-custom` handshake: `sudoku` or
+    /// `xmc`, when one is set.
+    async fn wire_carrier(
         &self,
         stream: BoxedTransportStream,
+        remote: SocketAddr,
     ) -> Result<BoxedTransportStream, TransportError> {
-        match self.tcp_sudoku() {
-            Some(config) => Ok(Box::new(
+        if let Some(config) = self.tcp_sudoku() {
+            return Ok(Box::new(
                 crate::sudoku::SudokuStream::new(stream, config).map_err(TransportError::Tcp)?,
-            )),
-            None => Ok(stream),
+            ));
         }
+        if let Some(config) = self.tcp_xmc() {
+            return Ok(Box::new(
+                crate::xmc::connect(stream, config, remote)
+                    .await
+                    .map_err(TransportError::Tcp)?,
+            ));
+        }
+        Ok(stream)
     }
 
     /// This dialer with its own sockets instead of the outbound that
@@ -303,9 +373,12 @@ impl TransportDialer {
         self.socket_protector.clone()
     }
 
+    /// The TLS material of an HTTP/3 dial, with Xray's ChromeParrot
+    /// ClientHello when `chrome_parrot` is set.
     pub(crate) fn h3_dial_material(
         &self,
         config: &ConnectorConfig,
+        chrome_parrot: bool,
     ) -> Result<H3DialMaterial, TransportError> {
         if self.tcp_fragment.is_some() {
             return Err(TransportError::UnsupportedConnectorConfig(
@@ -318,8 +391,9 @@ impl TransportDialer {
         match config {
             ConnectorConfig::Tls(tls) => Ok(H3DialMaterial {
                 server_name: tls.server_name.clone(),
-                tls_config: self.tls.http3_client_config_for(tls)?,
+                tls_config: self.tls.h3_client_config_for(tls, b"h3", chrome_parrot)?,
                 socket_protector: self.socket_protector.clone(),
+                network_changes: self.network_changes.clone(),
             }),
             ConnectorConfig::Tcp => Err(TransportError::UnsupportedHttp3Security("TCP")),
             ConnectorConfig::Reality(_) => Err(TransportError::UnsupportedHttp3Security("REALITY")),
@@ -422,6 +496,7 @@ impl TransportDialer {
                 self.connect_kcp(config, kcp, original_target, candidates)
                     .await
             }
+            TransportLayer::Xdrive(xdrive) => xdrive.open_stream(self).await,
         }
     }
 
@@ -450,8 +525,16 @@ impl TransportDialer {
         if candidates.is_empty() {
             return Err(no_resolved_candidates_error(original_target));
         }
-        let stream: BoxedTransportStream =
-            Box::new(crate::kcp::connect(candidates, self.socket_protector(), kcp).await?);
+        let realm = kcp.realm.as_ref().map(|_| self.realm_env());
+        let stream: BoxedTransportStream = Box::new(
+            crate::kcp::connect(
+                candidates,
+                self.socket_protector.clone(),
+                kcp,
+                realm.as_ref(),
+            )
+            .await?,
+        );
         match prepared {
             None => Ok(stream),
             Some(prepared) => {
@@ -626,7 +709,7 @@ impl TransportDialer {
                     let (stream, peer) = self
                         .connect_candidates(candidates, first, race_config)
                         .await?;
-                    if self.tcp_sudoku().is_some() {
+                    if self.has_wire_mask() {
                         let stream = self.masked_direct_carrier(stream, peer).await?;
                         let stream = crate::fragment::FragmentStream::new(stream, fragment.clone());
                         return prepared.complete_over_stream(Box::new(stream)).await;
@@ -652,6 +735,9 @@ impl TransportDialer {
                     if self.tcp_sudoku().is_some() {
                         return Err(TransportError::UnsupportedConnectorConfig("REALITY sudoku"));
                     }
+                    if self.tcp_xmc().is_some() {
+                        return Err(TransportError::UnsupportedConnectorConfig("REALITY xmc"));
+                    }
                     // Legacy engines remain usable. They may override
                     // `connect_socket_addr` to preserve scoped IPv6 metadata.
                     return reality
@@ -661,7 +747,7 @@ impl TransportDialer {
                 let (stream, peer) = self
                     .connect_candidates(candidates, first, race_config)
                     .await?;
-                if self.tcp_sudoku().is_some() {
+                if self.has_wire_mask() {
                     let stream = self.masked_direct_carrier(stream, peer).await?;
                     return prepared.complete_over_stream(stream).await;
                 }
@@ -672,6 +758,44 @@ impl TransportDialer {
                 prepared.complete(stream).await
             }
         }
+    }
+
+    /// A connection to an HTTP service, such as an XDRIVE storage: TCP to
+    /// `candidates`, through this dialer's masks, chain and protection, then
+    /// with `tls` a session offering the HTTP client's ALPN, as Xray-core's
+    /// service client dials one. Returns the protocol the server picked.
+    pub(crate) async fn connect_http_service(
+        &self,
+        tls: Option<&TlsClientConfig>,
+        original_target: &Target,
+        candidates: &[SocketAddr],
+    ) -> Result<(BoxedTransportStream, Option<Vec<u8>>), TransportError> {
+        let Some(tls) = tls else {
+            let stream = self
+                .connect_tcp_carrier(original_target, candidates, None)
+                .await?;
+            return Ok((stream, None));
+        };
+        let prepared = self.tls.prepare_stream(tls, TlsAlpnPolicy::HttpClient)?;
+        let stream = self
+            .connect_tcp_carrier(original_target, candidates, None)
+            .await?;
+        self.tls
+            .connect_prepared_stream_with_alpn(stream, prepared)
+            .await
+    }
+
+    /// Whether this dialer reaches its servers through another outbound,
+    /// which resolves their names at its far end.
+    pub(crate) fn is_chained(&self) -> bool {
+        self.resolved_tcp_connector.is_some()
+    }
+
+    /// The resolver names a dial needs beyond the outbound's server go
+    /// through: the core's, as a `realm` rendezvous uses, else the
+    /// platform's.
+    pub(crate) fn service_resolver(&self) -> Arc<dyn crate::DnsResolver> {
+        self.realm_env().resolver
     }
 
     async fn connect_tcp_carrier(
@@ -703,9 +827,9 @@ impl TransportDialer {
             let stream = connector
                 .connect_resolved(original_target, candidates, happy_eyeballs)
                 .await?;
-            let mut stream = self.sudoku_carrier(stream)?;
             // Xray's chained connection says 0.0.0.0:0 for both of its ends.
             let unspecified = SocketAddr::from(([0, 0, 0, 0], 0));
+            let mut stream = self.wire_carrier(stream, unspecified).await?;
             self.header_custom_handshake(&mut stream, unspecified, unspecified)
                 .await?;
             return Ok(stream);
@@ -717,20 +841,20 @@ impl TransportDialer {
         self.masked_direct_carrier(stream, peer).await
     }
 
-    /// A direct carrier in `sudoku`, then past the `header-custom`
+    /// A direct carrier in `sudoku` or `xmc`, then past the `header-custom`
     /// handshake, which reads the socket's own addresses.
     async fn masked_direct_carrier(
         &self,
         mut stream: tokio::net::TcpStream,
         peer: SocketAddr,
     ) -> Result<BoxedTransportStream, TransportError> {
-        if self.tcp_sudoku().is_none() {
+        if !self.has_wire_mask() {
             self.direct_header_custom_handshake(&mut stream, peer)
                 .await?;
             return Ok(Box::new(stream));
         }
         let local = stream.local_addr().map_err(TransportError::Tcp)?;
-        let mut stream = self.sudoku_carrier(Box::new(stream))?;
+        let mut stream = self.wire_carrier(Box::new(stream), peer).await?;
         self.header_custom_handshake(&mut stream, local, peer)
             .await?;
         Ok(stream)
@@ -820,5 +944,32 @@ fn no_resolved_candidates_error(target: &Target) -> TransportError {
             io::ErrorKind::InvalidInput,
             format!("no resolved TCP candidates for {ip}:{}", target.port),
         )),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// The socket of a `realm` mask's rendezvous takes the outbound's
+    /// `sockopt`, as the socket it dials over does: here an interface that
+    /// cannot be bound fails it. The record lookups take the same protector.
+    #[test]
+    fn a_realm_rendezvous_takes_the_outbounds_socket_options() {
+        let plain = TransportDialer::system().unwrap();
+        assert!(plain.realm_env().protector.is_none());
+
+        let options = SocketOptions {
+            interface: "xray-missing0".to_owned(),
+            ..SocketOptions::default()
+        };
+        let dialer = plain.with_socket_options(Arc::new(options));
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let protector = dialer.realm_env().protector;
+        let error = crate::protect_std_udp_socket(&socket, protector.as_deref()).unwrap_err();
+        assert!(
+            error.to_string().contains("failed to bind to interface"),
+            "{error}"
+        );
     }
 }

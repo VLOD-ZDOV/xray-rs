@@ -11,12 +11,12 @@ use xray_config::{
     XhttpSettings,
 };
 use xray_transport::stream::{
-    H3Congestion, H3QuicConfig, H3UdpHopConfig, HeaderMap, TransportLayer, XhttpConfig,
-    XhttpConfigInput, XhttpEndpoint, XhttpHttpVersion, XhttpMetadataPlacement, XhttpModeSelection,
-    XhttpPaddingMethod, XhttpPaddingPlacement, XhttpRange, XhttpScheme, XhttpTransport,
-    XhttpUplinkDataPlacement, XhttpXmuxPolicy,
+    H3BbrProfile, H3Congestion, H3QuicConfig, H3UdpHopConfig, HeaderMap, TransportLayer,
+    XhttpConfig, XhttpConfigInput, XhttpEndpoint, XhttpHttpVersion, XhttpMetadataPlacement,
+    XhttpModeSelection, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpRange, XhttpScheme,
+    XhttpTransport, XhttpUplinkDataPlacement, XhttpXmuxPolicy,
 };
-use xray_transport::udp_noise::{NoiseRange, UdpNoiseConfig, UdpNoiseItem};
+use xray_transport::udp_noise::{NoiseRange, NoiseSegment, UdpNoiseConfig, UdpNoiseItem};
 use xray_transport::ConnectorConfig;
 
 use crate::vless::Host;
@@ -417,6 +417,11 @@ pub fn xhttp_h3_quic_config(settings: Option<&QuicParamsSettings>) -> Result<H3Q
         QuicCongestion::Reno => H3Congestion::Reno,
         QuicCongestion::Brutal => H3Congestion::Brutal {
             up_bytes_per_second: settings.brutal_up_bytes_per_sec,
+            bbr_profile: match settings.bbr_profile {
+                xray_config::QuicBbrProfile::Conservative => H3BbrProfile::Conservative,
+                xray_config::QuicBbrProfile::Standard => H3BbrProfile::Standard,
+                xray_config::QuicBbrProfile::Aggressive => H3BbrProfile::Aggressive,
+            },
         },
         QuicCongestion::ForceBrutal => H3Congestion::ForceBrutal {
             bytes_per_second: settings.brutal_up_bytes_per_sec,
@@ -438,6 +443,15 @@ pub fn udp_noise_config(noise: &UdpNoiseSettings) -> Result<UdpNoiseConfig, Stri
         from: r.from,
         to: r.to,
     };
+    let segment = |segment: &xray_config::NoiseSegment| match segment {
+        xray_config::NoiseSegment::Bytes(bytes) => NoiseSegment::Bytes(bytes.clone()),
+        xray_config::NoiseSegment::Random(size) => NoiseSegment::Random(range(*size)),
+        xray_config::NoiseSegment::RandomLetters(size) => NoiseSegment::RandomLetters(range(*size)),
+        xray_config::NoiseSegment::RandomDigits(size) => NoiseSegment::RandomDigits(range(*size)),
+        xray_config::NoiseSegment::Timestamp => NoiseSegment::Timestamp,
+        xray_config::NoiseSegment::Counter => NoiseSegment::Counter,
+        xray_config::NoiseSegment::Nonce => NoiseSegment::Nonce,
+    };
     let config = UdpNoiseConfig {
         reset_secs: range(noise.reset_secs),
         before_salamander: noise.before_salamander,
@@ -449,6 +463,7 @@ pub fn udp_noise_config(noise: &UdpNoiseSettings) -> Result<UdpNoiseConfig, Stri
                 random_length: range(i.random_length),
                 random_bytes: range(i.random_bytes),
                 delay_ms: range(i.delay_ms),
+                segments: i.segments.iter().map(segment).collect(),
             })
             .collect(),
     };

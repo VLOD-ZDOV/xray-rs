@@ -23,6 +23,8 @@ pub(crate) mod hysteria;
 pub use hysteria::HysteriaOutbound;
 pub(crate) mod wireguard;
 pub use wireguard::WireguardOutbound;
+pub(crate) mod masque;
+pub use masque::MasqueOutbound;
 mod address_port;
 mod carrier;
 pub(crate) mod datagram;
@@ -34,9 +36,13 @@ mod mux;
 mod preconnect;
 mod routing;
 pub(crate) mod socket_options;
+pub(crate) mod xdrive;
 mod xhttp;
 mod xudp;
+pub(crate) use carrier::direct_udp_masks;
 use carrier::StreamCarrier;
+mod freedom_udp;
+pub(crate) use freedom_udp::FreedomUdpSocket;
 
 use xhttp::*;
 
@@ -69,11 +75,11 @@ use xray_proxy::vless::{
 };
 use xray_routing::{Network as RoutingNetwork, Target, TargetAddr as RoutingTargetAddr};
 use xray_transport::stream::{
-    resolve_user_agent, Authority, GrpcConfig, GrpcTransport, H3Congestion, H3QuicConfig,
-    H3UdpHopConfig, HeaderMap, HeaderValue, HttpUpgradeConfig, TransportLayer, WebSocketConfig,
-    XhttpConfig, XhttpConfigInput, XhttpEndpoint, XhttpHttpVersion, XhttpMetadataPlacement,
-    XhttpModeSelection, XhttpPaddingMethod, XhttpPaddingPlacement, XhttpRange, XhttpScheme,
-    XhttpTransport, XhttpUplinkDataPlacement, XhttpXmuxPolicy,
+    resolve_user_agent, Authority, GrpcConfig, GrpcTransport, H3BbrProfile, H3Congestion,
+    H3QuicConfig, H3UdpHopConfig, HeaderMap, HeaderValue, HttpUpgradeConfig, TransportLayer,
+    WebSocketConfig, XhttpConfig, XhttpConfigInput, XhttpEndpoint, XhttpHttpVersion,
+    XhttpMetadataPlacement, XhttpModeSelection, XhttpPaddingMethod, XhttpPaddingPlacement,
+    XhttpRange, XhttpScheme, XhttpTransport, XhttpUplinkDataPlacement, XhttpXmuxPolicy,
 };
 use xray_transport::{
     BoxedTransportStream, ConnectorConfig, DnsResolver, HappyEyeballsConfig, RealityClientConfig,
@@ -377,6 +383,9 @@ pub struct FreedomOutbound {
     final_rules: Option<Arc<[FreedomFinalRule]>>,
     /// Present only when there are noises.
     noises: Option<Arc<[xray_config::FreedomNoise]>>,
+    /// `finalmask.udp`, over every UDP flow's socket; present only when
+    /// there are masks.
+    udp_masks: Option<Arc<xray_transport::hysteria::HysteriaCarrierConfig>>,
 }
 
 #[derive(Debug, Clone)]
@@ -390,6 +399,7 @@ pub enum TcpOutbound {
     Shadowsocks2022(Shadowsocks2022Outbound),
     Hysteria(HysteriaOutbound),
     Wireguard(WireguardOutbound),
+    Masque(MasqueOutbound),
     Chained {
         outbound: Box<TcpOutbound>,
         proxy: Box<TcpOutbound>,
@@ -412,6 +422,41 @@ pub enum UdpOutbound {
     Shadowsocks2022(Shadowsocks2022Outbound),
     Hysteria(HysteriaOutbound),
     Wireguard(WireguardOutbound),
+    Masque(MasqueOutbound),
+}
+
+impl UdpOutbound {
+    /// Whether a UDP flow from a VLESS reverse proxy to `target` is refused
+    /// before it dials, because a freedom fragment outbound is folded into
+    /// this one and its final rules do not allow the server, as Xray-core's
+    /// freedom refuses the dial carrying the flow. A flow riding a Mux.Cool
+    /// connection is left as Xray-core leaves it.
+    pub(crate) async fn reverse_refused(
+        &self,
+        target: &Target,
+        resolver: &dyn DnsResolver,
+        dialer: &TransportDialer,
+    ) -> Result<bool, CoreError> {
+        let (carrier, network) = match self {
+            Self::Vless(vless) if !vless.udp_uses_mux(target) => (vless.carrier(), Network::Tcp),
+            Self::Trojan(trojan) if !trojan.udp_uses_mux(target) => {
+                (trojan.carrier(), Network::Tcp)
+            }
+            Self::Vmess(vmess) if !vmess.udp_uses_mux(target) => (vmess.carrier(), Network::Tcp),
+            // Shadowsocks sends its datagrams to the server over UDP.
+            Self::Shadowsocks2022(shadowsocks) if !shadowsocks.udp_uses_mux(target) => {
+                (shadowsocks.carrier(), Network::Udp)
+            }
+            // SOCKS dials its control connection.
+            Self::Socks(socks) => (socks.carrier(), Network::Tcp),
+            _ => return Ok(false),
+        };
+        let Some(rules) = &carrier.folded_fragment_rules else {
+            return Ok(false);
+        };
+        let candidates = carrier.resolve_server(resolver, dialer).await?;
+        Ok(reverse_block(rules, network, candidates).is_some())
+    }
 }
 
 /// One configured handler selected for a TCP session. DNS remains a message
@@ -697,6 +742,12 @@ impl VlessTcpOutbound {
             .map_or(Ok(None), |mux| mux.pool(target))
     }
 
+    /// Whether TCP flows ride pooled Mux.Cool or `testpre` connections.
+    fn pools_tcp_flows(&self) -> bool {
+        self.payload.pre_connections.is_some()
+            || self.payload.mux.as_ref().is_some_and(|mux| mux.pools_tcp())
+    }
+
     /// True when Xray's Mux layer rather than the VLESS UDP command owns this
     /// UDP flow: a pooled XUDP child, or a `xudpProxyUDP443: reject` refusal.
     /// Xray's outbound handler applies both before VLESS sees the flow, so the
@@ -770,13 +821,16 @@ impl FreedomOutbound {
         Ok(Self {
             fragment: carrier::fragment_config(stream)?,
             happy_eyeballs: happy_eyeballs_config(stream),
-            ..Self::for_udp(settings, stream)
+            ..Self::for_udp(settings, stream)?
         })
     }
 
     /// UDP reads neither the fragment mask nor Happy Eyeballs.
-    fn for_udp(settings: &FreedomOutboundSettings, stream: &StreamSettings) -> Self {
-        Self {
+    fn for_udp(
+        settings: &FreedomOutboundSettings,
+        stream: &StreamSettings,
+    ) -> Result<Self, CoreError> {
+        Ok(Self {
             fragment: None,
             happy_eyeballs: None,
             socket_options: socket_options::compile(stream),
@@ -787,7 +841,32 @@ impl FreedomOutbound {
             final_rules: (!settings.final_rules.is_empty())
                 .then(|| settings.final_rules.as_slice().into()),
             noises: (!settings.noises.is_empty()).then(|| settings.noises.as_slice().into()),
-        }
+            udp_masks: carrier::direct_udp_masks(stream)?,
+        })
+    }
+
+    /// The socket of a UDP flow to `target`: `socket`, bound and protected,
+    /// under `finalmask.udp` when there are masks, as Xray-core's freedom
+    /// dials every flow through `FinalMask.DialUDP`. The xdns and xicmp
+    /// clients the masks name open through `protector`.
+    pub(crate) async fn udp_socket(
+        &self,
+        socket: tokio::net::UdpSocket,
+        target: SocketAddr,
+        protector: Option<Arc<dyn xray_transport::SocketProtector>>,
+    ) -> io::Result<FreedomUdpSocket> {
+        let Some(masks) = &self.udp_masks else {
+            return Ok(FreedomUdpSocket::Plain(socket));
+        };
+        let socket = socket.into_std()?;
+        xray_transport::MaskedUdpSocket::connect(socket, target, masks, protector)
+            .await
+            .map(FreedomUdpSocket::Masked)
+    }
+
+    /// Whether `finalmask.udp` shapes this outbound's UDP flows.
+    pub(crate) fn has_udp_masks(&self) -> bool {
+        self.udp_masks.is_some()
     }
 
     /// Sends `noises` before a UDP flow's first datagram, as Xray-core's
@@ -797,7 +876,7 @@ impl FreedomOutbound {
     /// to port 53, as there. Returns the bytes sent.
     pub(crate) async fn send_udp_noises(
         &self,
-        socket: &tokio::net::UdpSocket,
+        socket: &FreedomUdpSocket,
         target: SocketAddr,
     ) -> io::Result<u64> {
         let Some(noises) = self.noises.as_deref() else {
@@ -837,6 +916,33 @@ impl FreedomOutbound {
     /// `finalRules`, in order.
     pub(crate) fn final_rules(&self) -> &[FreedomFinalRule] {
         self.final_rules.as_deref().unwrap_or_default()
+    }
+
+    /// This freedom as the sessions the portal of a VLESS reverse proxy
+    /// opens meet it: after its own final rules, one that blocks every
+    /// destination, as Xray-core's freedom treats connections from
+    /// `vless-reverse` (`getDefaultFinalRule`).
+    pub(crate) fn for_reverse(&self) -> Self {
+        let mut rules = self.final_rules().to_vec();
+        rules.push(Self::reverse_rule());
+        Self {
+            final_rules: Some(rules.into()),
+            ..self.clone()
+        }
+    }
+
+    /// Xray-core's `defaultBlockAllRule`, which follows freedom's own final
+    /// rules for connections from a VLESS reverse proxy and, since v26.11.9,
+    /// logs at warning.
+    fn reverse_rule() -> FreedomFinalRule {
+        FreedomFinalRule {
+            action: xray_config::FreedomRuleAction::Block,
+            networks: None,
+            port_ranges: None,
+            ip_matchers: None,
+            block_delay: None,
+            log_level: xray_config::FreedomRuleLogLevel::Warning,
+        }
     }
 
     /// `proxyProtocol`, the header freedom writes before the payload.
@@ -994,6 +1100,122 @@ impl TcpOutbound {
         }
     }
 
+    /// The outbound a TCP session from the portal of a VLESS reverse proxy,
+    /// or a tunnel of its bridge, meets. Xray-core's freedom refuses what its
+    /// final rules do not allow whenever its dial carries such a session,
+    /// and every link of a `dialerProxy` chain dials with the session's
+    /// context: so a freedom that dials for itself refuses it at the end of
+    /// a chain too. A freedom that dials through `dialerProxy` applies no
+    /// rule, as there.
+    ///
+    /// Under a link whose flows share connections, Mux.Cool's, `testpre`'s,
+    /// gRPC's or XHTTP's, the chain is left as it is: Xray-core opens Mux,
+    /// `testpre` and gRPC connections without the session's context, and a
+    /// connection refused here would stall the other flows on it.
+    pub(crate) fn for_reverse(self) -> Self {
+        match self {
+            Self::Freedom(freedom) => Self::Freedom(freedom.for_reverse()),
+            Self::Chained { outbound, proxy } if outbound.opens_a_connection_per_flow() => {
+                Self::Chained {
+                    outbound,
+                    proxy: Box::new(proxy.for_reverse()),
+                }
+            }
+            outbound => outbound,
+        }
+    }
+
+    /// Whether each TCP flow this outbound carries rides a connection opened
+    /// for it alone, so that refusing the connection reaches no other flow.
+    /// An HTTP outbound keeps an HTTP/2 connection only once a tunnel opened
+    /// on it, and reusing it dials nothing.
+    fn opens_a_connection_per_flow(&self) -> bool {
+        match self.primary() {
+            Self::Freedom(_) => true,
+            outbound => {
+                !outbound.pools_tcp_flows()
+                    && outbound
+                        .stream_carrier()
+                        .is_some_and(StreamCarrier::opens_a_connection_per_stream)
+            }
+        }
+    }
+
+    /// Whether TCP flows share an XHTTP carrier's connections, and no
+    /// Mux.Cool or `testpre` connection.
+    fn rides_xhttp(&self) -> bool {
+        !self.pools_tcp_flows() && self.stream_carrier().is_some_and(StreamCarrier::is_xhttp)
+    }
+
+    /// Whether TCP flows ride pooled Mux.Cool or `testpre` connections.
+    fn pools_tcp_flows(&self) -> bool {
+        match self.primary() {
+            Self::Vless(vless) => vless.pools_tcp_flows(),
+            Self::Trojan(trojan) => trojan.pools_tcp_flows(),
+            Self::Vmess(vmess) => vmess.pools_tcp_flows(),
+            Self::Shadowsocks2022(shadowsocks) => shadowsocks.pools_tcp_flows(),
+            _ => false,
+        }
+    }
+
+    /// The carrier of an outbound that reaches its server over a stream
+    /// transport; `None` for freedom and the outbounds with tunnels of
+    /// their own.
+    fn stream_carrier(&self) -> Option<&StreamCarrier> {
+        match self.primary() {
+            Self::Vless(vless) => Some(vless.carrier()),
+            Self::Trojan(trojan) => Some(trojan.carrier()),
+            Self::Vmess(vmess) => Some(vmess.carrier()),
+            Self::Shadowsocks2022(shadowsocks) => Some(shadowsocks.carrier()),
+            Self::Socks(socks) => Some(socks.carrier()),
+            Self::Http(http) => Some(http.carrier()),
+            _ => None,
+        }
+    }
+
+    /// Refuses a TCP flow from a VLESS reverse proxy before anything is
+    /// dialed, where the per-connection rule of [`Self::for_reverse`] cannot
+    /// reach without refusing a connection other flows share: under an XHTTP
+    /// link, the freedom its `dialerProxy` chain ends on decides for the
+    /// link's server; a freedom fragment outbound folded into an outbound
+    /// decides for that outbound's server. Each refuses what its final rules
+    /// do not allow, always, where Xray-core refuses only on the dials that
+    /// carry the flow. Mux.Cool, `testpre` and gRPC are left as Xray-core
+    /// leaves them. Returns how long to hold the refused flow.
+    pub(crate) fn reverse_refusal<'a>(
+        &'a self,
+        resolver: &'a dyn DnsResolver,
+        dialer: &'a TransportDialer,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<Duration>, CoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            let own = self.opens_a_connection_per_flow();
+            let xhttp = self.rides_xhttp();
+            if !own && !xhttp {
+                return Ok(None);
+            }
+            if let Some(carrier) = self.stream_carrier() {
+                if let Some(rules) = &carrier.folded_fragment_rules {
+                    let candidates = carrier.resolve_server(resolver, dialer).await?;
+                    if let Some(delay) = reverse_block(rules, Network::Tcp, candidates) {
+                        return Ok(Some(delay));
+                    }
+                }
+            }
+            let Self::Chained { proxy, .. } = self else {
+                return Ok(None);
+            };
+            if !xhttp {
+                // The chain dials for this flow alone, so a refusal further
+                // down still applies.
+                return proxy.reverse_refusal(resolver, dialer).await;
+            }
+            let Some(carrier) = self.stream_carrier() else {
+                return Ok(None);
+            };
+            chain_end_refusal(proxy, carrier.server.clone(), resolver).await
+        })
+    }
+
     /// Lets connections this outbound keeps for later flows close: an HTTP
     /// outbound's shared HTTP/2 connection.
     pub(crate) fn close_shared_connections(&self) {
@@ -1031,7 +1253,8 @@ impl TcpOutbound {
             | Self::Http(_)
             | Self::Shadowsocks2022(_)
             | Self::Hysteria(_)
-            | Self::Wireguard(_) => None,
+            | Self::Wireguard(_)
+            | Self::Masque(_) => None,
             Self::Chained { .. } => unreachable!("primary outbound is never a chain wrapper"),
         }
     }
@@ -1090,6 +1313,9 @@ impl ResolvedTcpConnector for OutboundProxyTcpConnector {
             }
             TcpOutbound::Wireguard(_) => Err(TransportError::ChainedOutbound(
                 "WireGuard chaining is unsupported".into(),
+            )),
+            TcpOutbound::Masque(_) => Err(TransportError::ChainedOutbound(
+                "MASQUE chaining is unsupported".into(),
             )),
             TcpOutbound::Hysteria(_) => Err(TransportError::ChainedOutbound(
                 "Hysteria chaining is unsupported".into(),
@@ -1216,6 +1442,9 @@ fn prepare_outbound_proxy_dialer<'a>(
             TcpOutbound::Wireguard(_) => {
                 return Err(CoreError::UnsupportedOutboundProxyNetwork("WireGuard"));
             }
+            TcpOutbound::Masque(_) => {
+                return Err(CoreError::UnsupportedOutboundProxyNetwork("MASQUE"));
+            }
             TcpOutbound::Hysteria(_) => {
                 return Err(CoreError::UnsupportedOutboundProxyNetwork("Hysteria"))
             }
@@ -1256,7 +1485,8 @@ fn proxy_chain_requires_local_resolution(proxy: &TcpOutbound) -> bool {
         | TcpOutbound::Vmess(_)
         | TcpOutbound::Shadowsocks2022(_)
         | TcpOutbound::Hysteria(_)
-        | TcpOutbound::Wireguard(_) => false,
+        | TcpOutbound::Wireguard(_)
+        | TcpOutbound::Masque(_) => false,
         TcpOutbound::Freedom(freedom) => match proxy {
             TcpOutbound::Chained { proxy, .. } => proxy_chain_requires_local_resolution(proxy),
             // The redirect address replaces the next hop's server.
@@ -1352,6 +1582,7 @@ struct CachedOutboundEntry {
     shadowsocks: OnceLock<Result<Shadowsocks2022Outbound, CachedOutboundError>>,
     hysteria: OnceLock<Result<HysteriaOutbound, CachedOutboundError>>,
     wireguard: OnceLock<Result<WireguardOutbound, CachedOutboundError>>,
+    masque: OnceLock<Result<MasqueOutbound, CachedOutboundError>>,
 }
 
 /// Opaque identity of one configured node in one immutable outbound graph.
@@ -1368,6 +1599,7 @@ pub struct OutboundNodeId {
 pub enum OutboundNodeKind {
     Hysteria,
     Wireguard,
+    Masque,
     Freedom,
     Vless,
     Trojan,
@@ -1589,6 +1821,7 @@ impl OutboundGraph {
                     OutboundSettings::Shadowsocks2022(_) => OutboundNodeKind::Shadowsocks2022,
                     OutboundSettings::Hysteria(_) => OutboundNodeKind::Hysteria,
                     OutboundSettings::Wireguard(_) => OutboundNodeKind::Wireguard,
+                    OutboundSettings::Masque(_) => OutboundNodeKind::Masque,
                     OutboundSettings::Dns(_) => OutboundNodeKind::Dns,
                     OutboundSettings::Blackhole(_) => OutboundNodeKind::Blackhole,
                     OutboundSettings::Loopback(_) => OutboundNodeKind::Loopback,
@@ -3641,6 +3874,33 @@ impl OutboundFactory {
         result
     }
 
+    fn cached_masque_outbound(
+        &self,
+        node: OutboundNodeId,
+    ) -> Result<MasqueOutbound, CachedOutboundError> {
+        if self.sessions_closed.load(Ordering::Acquire) {
+            return Err(CachedOutboundError::NoSupportedOutbound);
+        }
+        let configured = self
+            .graph
+            .configured_outbound(node)
+            .ok_or(CachedOutboundError::NoSupportedOutbound)?;
+        let result = self
+            .entry(node)?
+            .masque
+            .get_or_init(|| {
+                MasqueOutbound::new(configured).map_err(CachedOutboundError::from_core_error)
+            })
+            .clone();
+        if self.sessions_closed.load(Ordering::Acquire) {
+            if let Ok(outbound) = &result {
+                outbound.close();
+            }
+            return Err(CachedOutboundError::NoSupportedOutbound);
+        }
+        result
+    }
+
     pub(crate) fn close_sessions(&self) {
         self.sessions_closed.store(true, Ordering::Release);
         for entry in &self.entries {
@@ -3660,6 +3920,9 @@ impl OutboundFactory {
                 outbound.close();
             }
             if let Some(Ok(outbound)) = entry.wireguard.get() {
+                outbound.close();
+            }
+            if let Some(Ok(outbound)) = entry.masque.get() {
                 outbound.close();
             }
             if let Some(Ok(outbound)) = entry.hysteria.get() {
@@ -3746,6 +4009,9 @@ impl OutboundFactory {
             OutboundSettings::Wireguard(_) => self
                 .cached_wireguard_outbound(node)
                 .map(TcpOutbound::Wireguard),
+            OutboundSettings::Masque(_) => {
+                self.cached_masque_outbound(node).map(TcpOutbound::Masque)
+            }
             OutboundSettings::Trojan(_) => {
                 self.cached_trojan_outbound(node).map(TcpOutbound::Trojan)
             }
@@ -3834,6 +4100,9 @@ impl OutboundFactory {
             OutboundSettings::Wireguard(_) => self
                 .cached_wireguard_outbound(node)
                 .map(UdpOutbound::Wireguard),
+            OutboundSettings::Masque(_) => {
+                self.cached_masque_outbound(node).map(UdpOutbound::Masque)
+            }
             OutboundSettings::Trojan(_) => {
                 self.cached_trojan_outbound(node).map(UdpOutbound::Trojan)
             }
@@ -3855,10 +4124,9 @@ impl OutboundFactory {
                 if outbound.stream.security != StreamSecurity::None {
                     return Err(CachedOutboundError::UnsupportedOutboundSecurity);
                 }
-                Ok(UdpOutbound::Freedom(FreedomOutbound::for_udp(
-                    settings,
-                    &outbound.stream,
-                )))
+                FreedomOutbound::for_udp(settings, &outbound.stream)
+                    .map(UdpOutbound::Freedom)
+                    .map_err(|_| CachedOutboundError::UnsupportedOutboundNetwork)
             }
             OutboundSettings::Vless(_) => {
                 if outbound.stream.network != Network::Tcp {
@@ -3910,6 +4178,7 @@ impl OutboundFactory {
             | OutboundSettings::Vmess(_)
             | OutboundSettings::Shadowsocks2022(_)
             | OutboundSettings::Wireguard(_)
+            | OutboundSettings::Masque(_)
             | OutboundSettings::Socks(_)
             | OutboundSettings::Http(_) => Err(CachedOutboundError::NoSupportedOutbound),
         }
@@ -3949,6 +4218,7 @@ fn build_tcp_outbound(outbound: &OutboundConfig) -> Result<TcpOutbound, CoreErro
         OutboundSettings::Wireguard(_) => {
             WireguardOutbound::new(outbound).map(TcpOutbound::Wireguard)
         }
+        OutboundSettings::Masque(_) => MasqueOutbound::new(outbound).map(TcpOutbound::Masque),
         OutboundSettings::Trojan(_) => TrojanOutbound::new(outbound).map(TcpOutbound::Trojan),
         OutboundSettings::Vmess(_) => VmessOutbound::new(outbound).map(TcpOutbound::Vmess),
         OutboundSettings::Shadowsocks2022(_) => {
@@ -3980,6 +4250,7 @@ fn build_udp_outbound(outbound: &OutboundConfig) -> Result<UdpOutbound, CoreErro
         OutboundSettings::Wireguard(_) => {
             WireguardOutbound::new(outbound).map(UdpOutbound::Wireguard)
         }
+        OutboundSettings::Masque(_) => MasqueOutbound::new(outbound).map(UdpOutbound::Masque),
         OutboundSettings::Trojan(_) => TrojanOutbound::new(outbound).map(UdpOutbound::Trojan),
         OutboundSettings::Vmess(_) => VmessOutbound::new(outbound).map(UdpOutbound::Vmess),
         OutboundSettings::Shadowsocks2022(_) => {
@@ -3997,10 +4268,7 @@ fn build_udp_outbound(outbound: &OutboundConfig) -> Result<UdpOutbound, CoreErro
             if outbound.stream.security != StreamSecurity::None {
                 return Err(CoreError::UnsupportedOutboundSecurity);
             }
-            Ok(UdpOutbound::Freedom(FreedomOutbound::for_udp(
-                settings,
-                &outbound.stream,
-            )))
+            FreedomOutbound::for_udp(settings, &outbound.stream).map(UdpOutbound::Freedom)
         }
         OutboundSettings::Vless(_) => {
             if outbound.stream.network != Network::Tcp {
@@ -4475,6 +4743,10 @@ async fn open_plain_tcp_stream_with_resolvers_and_dialer(
             ))
             .await
         }
+        // Destination domains resolve through the tunnel.
+        TcpOutbound::Masque(outbound) => {
+            Box::pin(outbound.open_tcp(target, bootstrap_resolver, transport_dialer)).await
+        }
         TcpOutbound::Hysteria(outbound) => {
             Box::pin(outbound.open_tcp(target, bootstrap_resolver, transport_dialer)).await
         }
@@ -4591,9 +4863,21 @@ async fn open_vless_tcp_stream_with_resolved_server_and_dialer(
         .open_carrier(resolved_server, resolved_download, transport_dialer)
         .await?;
     let stream = encryption::wrap(stream, outbound.encryption(), flow.uses_vision()).await?;
+    held_request_stream(outbound, flow, stream, VlessCommand::Tcp, target)
+}
+
+/// The request on `stream`, its header held until the first payload, as
+/// Xray-core's VLESS outbound sends a TCP or reverse request.
+fn held_request_stream(
+    outbound: &VlessTcpOutbound,
+    flow: VisionFlow,
+    stream: BoxedTransportStream,
+    command: VlessCommand,
+    target: &Target,
+) -> Result<BoxedTransportStream, CoreError> {
     let request = VlessRequest {
         user_id: outbound.user().id,
-        command: VlessCommand::Tcp,
+        command,
         target: target.clone(),
         flow: flow.request_flow(),
     };
@@ -4751,6 +5035,209 @@ async fn open_vless_mux_parent(
     .await
 }
 
+/// The attempts Xray-core makes to dial a VLESS server, waiting 0, 200,
+/// 400, 600 and then 800 ms after each failure (`retry.ExponentialBackoff`).
+const REVERSE_DIAL_ATTEMPTS: u32 = 5;
+const REVERSE_DIAL_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Opens a tunnel of a VLESS reverse proxy's bridge, as Xray-core's
+/// `Reverse.monitor` hands `v1.rvs.cool` to its outbound: the reverse
+/// command, which names no address, over the outbound's whole carrier, a
+/// `dialerProxy` chain included, and Mux.Cool after it. The header waits for
+/// a first payload, as any VLESS request's does; none comes before the
+/// portal speaks, so it goes alone after 500 ms, Vision padding an empty
+/// frame. The carrier is dialed as often as Xray-core dials it.
+///
+/// The dial carries the bridge's reverse context there, so a freedom the
+/// chain ends on refuses the tunnel unless its final rules allow the
+/// portal. The outbound's `mux` and `testpre` never carry a tunnel; a gRPC
+/// or XHTTP carrier's connections are shared, and its chain is left as it
+/// is, as [`TcpOutbound::for_reverse`] leaves it.
+pub(crate) async fn open_vless_reverse_tunnel(
+    outbound: &TcpOutbound,
+    bootstrap_resolver: &dyn DnsResolver,
+    transport_dialer: &TransportDialer,
+) -> Result<BoxedTransportStream, CoreError> {
+    let (vless, proxy) = match outbound {
+        TcpOutbound::Vless(vless) => (vless.as_ref(), None),
+        TcpOutbound::Chained { outbound, proxy } => match outbound.as_ref() {
+            TcpOutbound::Vless(vless) => (vless.as_ref(), Some(proxy.as_ref())),
+            _ => return Err(CoreError::UnsupportedOutboundNetwork),
+        },
+        _ => return Err(CoreError::UnsupportedOutboundNetwork),
+    };
+    let flow = validate_outbound_flow(vless)?;
+    let refusal =
+        reverse_tunnel_refusal(vless, proxy, bootstrap_resolver, transport_dialer).await?;
+    let reverse_proxy = proxy.and_then(|proxy| reverse_tunnel_proxy(vless, proxy));
+    let proxy = reverse_proxy.as_ref().or(proxy);
+    let mut failures = 0;
+    let stream = loop {
+        // A refused tunnel is held as a blocked connection is.
+        if let Some(delay) = refusal {
+            break Box::new(final_rules::BlockedStream::new(delay)) as BoxedTransportStream;
+        }
+        match open_reverse_carrier(vless, proxy, bootstrap_resolver, transport_dialer).await {
+            Ok(stream) => break stream,
+            Err(error) => {
+                tokio::time::sleep(REVERSE_DIAL_BACKOFF * failures).await;
+                failures += 1;
+                if failures == REVERSE_DIAL_ATTEMPTS {
+                    return Err(error);
+                }
+            }
+        }
+    };
+    let stream = encryption::wrap(stream, vless.encryption(), flow.uses_vision()).await?;
+    held_request_stream(
+        vless,
+        flow,
+        stream,
+        VlessCommand::Reverse,
+        &Target::new(
+            RoutingTargetAddr::Domain("v1.rvs.cool".into()),
+            0,
+            RoutingNetwork::Tcp,
+        ),
+    )
+}
+
+/// The freedom a `dialerProxy` chain `proxy` ends on, and the address it
+/// dials when the link above it dials `address`: a freedom that dials through
+/// `dialerProxy` passes its destination on, redirected; any other link passes
+/// its own server. `None` when the chain ends on another outbound, or passes a
+/// link whose connections are shared, which Xray-core dials without the flow.
+fn chain_end(proxy: &TcpOutbound, address: Target) -> Option<(&FreedomOutbound, Target)> {
+    match proxy {
+        TcpOutbound::Freedom(freedom) => {
+            let address = freedom.redirect(&address).unwrap_or(address);
+            Some((freedom, address))
+        }
+        TcpOutbound::Chained { outbound, proxy } => {
+            let address = match outbound.as_ref() {
+                TcpOutbound::Freedom(freedom) => freedom.redirect(&address).unwrap_or(address),
+                link if link.opens_a_connection_per_flow() => link.stream_carrier()?.server.clone(),
+                _ => return None,
+            };
+            chain_end(proxy, address)
+        }
+        _ => None,
+    }
+}
+
+/// Whether the freedom the chain `proxy` ends on refuses a connection from a
+/// VLESS reverse proxy to `address`, looked up with that freedom's domain
+/// strategy, and how long to hold it then.
+async fn chain_end_refusal(
+    proxy: &TcpOutbound,
+    address: Target,
+    resolver: &dyn DnsResolver,
+) -> Result<Option<Duration>, CoreError> {
+    let Some((freedom, address)) = chain_end(proxy, address) else {
+        return Ok(None);
+    };
+    let resolver = DomainStrategyResolver::new(resolver, freedom.domain_strategy());
+    let candidates = resolve_server_candidates(&address, &resolver).await?;
+    Ok(reverse_block(
+        freedom.final_rules(),
+        Network::Tcp,
+        candidates,
+    ))
+}
+
+/// The hold of a connection from a VLESS reverse proxy that `rules`, and the
+/// rule refusing every address after them, block at one of `candidates`.
+fn reverse_block(
+    rules: &[FreedomFinalRule],
+    network: Network,
+    candidates: Vec<SocketAddr>,
+) -> Option<Duration> {
+    let mut rules = rules.to_vec();
+    rules.push(FreedomOutbound::reverse_rule());
+    final_rules::blocking_rule(&rules, network, candidates).map(final_rules::block_delay)
+}
+
+/// The refusal a reverse tunnel meets before it dials, as a session does
+/// (see [`TcpOutbound::reverse_refusal`]): a freedom fragment outbound folded
+/// into the bridge's outbound, or over an XHTTP carrier, the freedom its
+/// `dialerProxy` chain ends on, each for the portal's address.
+async fn reverse_tunnel_refusal(
+    vless: &VlessTcpOutbound,
+    proxy: Option<&TcpOutbound>,
+    resolver: &dyn DnsResolver,
+    dialer: &TransportDialer,
+) -> Result<Option<Duration>, CoreError> {
+    let carrier = vless.carrier();
+    if let Some(rules) = &carrier.folded_fragment_rules {
+        let candidates = carrier.resolve_server(resolver, dialer).await?;
+        if let Some(delay) = reverse_block(rules, Network::Tcp, candidates) {
+            return Ok(Some(delay));
+        }
+    }
+    match proxy {
+        Some(proxy) if carrier.is_xhttp() => {
+            chain_end_refusal(proxy, carrier.server.clone(), resolver).await
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The chain a reverse tunnel dials through, as a session would meet it,
+/// or `None` to keep it: a gRPC or XHTTP carrier's connections are shared.
+/// The outbound's `mux` and `testpre` do not count, as they carry no tunnel.
+fn reverse_tunnel_proxy(vless: &VlessTcpOutbound, proxy: &TcpOutbound) -> Option<TcpOutbound> {
+    vless
+        .carrier()
+        .opens_a_connection_per_stream()
+        .then(|| proxy.clone().for_reverse())
+}
+
+/// One dial of a reverse tunnel's carrier, through `proxy` when the outbound
+/// dials through `dialerProxy`.
+async fn open_reverse_carrier(
+    vless: &VlessTcpOutbound,
+    proxy: Option<&TcpOutbound>,
+    bootstrap_resolver: &dyn DnsResolver,
+    transport_dialer: &TransportDialer,
+) -> Result<BoxedTransportStream, CoreError> {
+    let Some(proxy) = proxy else {
+        let server = vless
+            .carrier()
+            .resolve_server(bootstrap_resolver, transport_dialer)
+            .await?;
+        let download = vless
+            .carrier()
+            .resolve_download(bootstrap_resolver, transport_dialer)
+            .await?;
+        return vless
+            .open_carrier(&server, &download, transport_dialer)
+            .await;
+    };
+    let proxy_dialer =
+        prepare_outbound_proxy_dialer(proxy, bootstrap_resolver, transport_dialer, None).await?;
+    // A freedom hop resolves the server with its own domain strategy.
+    let strategy = match proxy.primary() {
+        TcpOutbound::Freedom(freedom) => freedom.domain_strategy(),
+        _ => DomainStrategy::AsIs,
+    };
+    let bootstrap = DomainStrategyResolver::new(bootstrap_resolver, strategy);
+    let (server, download) = if proxy_chain_requires_local_resolution(proxy) {
+        (
+            vless
+                .carrier()
+                .resolve_server(&bootstrap, &proxy_dialer)
+                .await?,
+            vless
+                .carrier()
+                .resolve_download(&bootstrap, &proxy_dialer)
+                .await?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    vless.open_carrier(&server, &download, &proxy_dialer).await
+}
+
 /// Writes the request header for a UDP or Mux command. Unlike a TCP request,
 /// Vision queues no empty padding frame: an XUDP or Mux frame always follows.
 async fn open_vless_command_stream(
@@ -4808,19 +5295,34 @@ pub async fn open_vless_tcp_stream(
     open_vless_tcp_stream_with_resolver(outbound, target, &SystemDnsResolver).await
 }
 
-/// UDP masks, noise and `header-custom`, need a UDP carrier: Hysteria, mKCP
-/// or XHTTP with exact `h3` ALPN.
+/// UDP masks, noise, `header-custom`, `sudoku`, `xdns`, `realm` and
+/// `xicmp`, need a UDP carrier: Hysteria, mKCP or XHTTP with exact `h3`
+/// ALPN.
+/// The fragment mask the stream sets, as its carriers apply it.
+pub(crate) fn tcp_fragment_config(
+    stream: &StreamSettings,
+) -> Result<Option<Arc<xray_transport::TcpFragmentConfig>>, CoreError> {
+    carrier::fragment_config(stream)
+}
+
 pub(crate) fn validate_udp_noise(stream: &StreamSettings) -> Result<(), CoreError> {
     let udp_carrier = matches!(
         stream.transport,
         StreamTransport::Hysteria(_) | StreamTransport::Kcp(_)
     ) || matches!(stream.transport, StreamTransport::Xhttp(_))
-        && matches!(&stream.security, StreamSecurity::Tls(tls) if tls.alpn == ["h3"]);
-    if (stream.udp_noise.is_some() || stream.udp_header_custom.is_some()) && !udp_carrier {
-        return Err(CoreError::UnsupportedOutboundNetwork);
-    }
-    // Sudoku's fourfold datagrams need fragments that QUIC's sockets forbid.
-    if stream.udp_sudoku.is_some() && !matches!(stream.transport, StreamTransport::Kcp(_)) {
+        && matches!(&stream.security, StreamSecurity::Tls(tls) if tls.alpn == ["h3"])
+        || matches!(stream.transport, StreamTransport::Masque(_))
+            && matches!(&stream.security, StreamSecurity::Tls(tls) if !masque::uses_http2(&tls.alpn))
+        || xdrive::is_xdrive_h3(stream);
+    if (stream.udp_noise.is_some()
+        || stream.udp_header_custom.is_some()
+        || stream.udp_sudoku.is_some()
+        || stream.udp_xdns.is_some()
+        || stream.udp_realm.is_some()
+        || stream.udp_xicmp.is_some()
+        || stream.udp_salamander.is_some())
+        && !udp_carrier
+    {
         return Err(CoreError::UnsupportedOutboundNetwork);
     }
     if let Some(noise) = &stream.udp_noise {
@@ -4919,6 +5421,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
@@ -4941,6 +5448,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
@@ -4956,6 +5468,7 @@ mod tests {
                     vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
                     pre_connections: 0,
                 }],
+                reverse: None,
             }),
         }
     }
@@ -4974,6 +5487,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
@@ -5298,6 +5816,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
@@ -5345,6 +5868,11 @@ mod tests {
                     tcp_header_custom: None,
                     udp_header_custom: None,
                     tcp_sudoku: None,
+                    tcp_xmc: None,
+                    udp_xdns: None,
+                    udp_realm: None,
+                    udp_xicmp: None,
+                    udp_salamander: None,
                     udp_sudoku: None,
                     udp_noise: None,
                     socket_options: None,
@@ -5387,6 +5915,11 @@ mod tests {
             tcp_header_custom: None,
             udp_header_custom: None,
             tcp_sudoku: None,
+            tcp_xmc: None,
+            udp_xdns: None,
+            udp_realm: None,
+            udp_xicmp: None,
+            udp_salamander: None,
             udp_sudoku: None,
             udp_noise: None,
             socket_options: None,
@@ -5425,6 +5958,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
@@ -5506,6 +6044,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
@@ -5548,6 +6091,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: Some(SocketOptions {
@@ -5596,6 +6144,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
@@ -5619,6 +6172,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: Some(SocketOptions {
@@ -5648,6 +6206,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
@@ -5674,6 +6237,11 @@ mod tests {
                 tcp_header_custom: None,
                 udp_header_custom: None,
                 tcp_sudoku: None,
+                tcp_xmc: None,
+                udp_xdns: None,
+                udp_realm: None,
+                udp_xicmp: None,
+                udp_salamander: None,
                 udp_sudoku: None,
                 udp_noise: None,
                 socket_options: None,
@@ -6196,8 +6764,10 @@ mod tests {
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    folded_fragment_rules: None,
                     header_custom: None,
                     sudoku: None,
+                    xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
                     download: None,
@@ -6840,9 +7410,11 @@ mod tests {
         let sink = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
-        let socket = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
+        let socket = FreedomUdpSocket::Plain(
+            tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap(),
+        );
         let target = sink.local_addr().unwrap();
 
         let sent = freedom(FreedomRedirect::default())
@@ -8367,6 +8939,54 @@ mod tests {
         );
     }
 
+    /// `tests/fixtures/chrome-parrot/config-verdicts.json`: every case Xray
+    /// accepts reaches the Hysteria and XHTTP H3 dials with ChromeParrot on
+    /// unless `disableChromeParrot` is true, as Xray dials them.
+    #[test]
+    fn chrome_parrot_verdict_cases_reach_the_quic_dial() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/chrome-parrot/config-verdicts.json"
+        ))
+        .unwrap();
+        let mut checked = 0;
+        for case in fixture["cases"].as_array().unwrap() {
+            let name = case["name"].as_str().unwrap();
+            let Some(expected) = case["chromeParrot"].as_bool() else {
+                continue;
+            };
+            let raw = serde_json::json!({"outbounds":[case["outbound"]]}).to_string();
+            let parsed =
+                xray_config::parse_xray_json(&raw).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let outbound = &parsed.config.outbounds[0];
+            let chrome_parrot = match &outbound.stream.transport {
+                xray_config::StreamTransport::Hysteria(_) => {
+                    hysteria::hysteria_quic_config(outbound.stream.quic_params.as_ref())
+                        .unwrap()
+                        .0
+                        .chrome_parrot
+                }
+                xray_config::StreamTransport::Xhttp(_) => {
+                    built_xhttp_transport(outbound)
+                        .h3_quic_config()
+                        .chrome_parrot
+                }
+                xray_config::StreamTransport::Xdrive(xdrive) => {
+                    xdrive::http_config(xdrive, &outbound.stream)
+                        .unwrap()
+                        .h3
+                        .expect("XDRIVE over exactly h3")
+                        .chrome_parrot
+                }
+                // outbound::masque's own tests check MASQUE.
+                xray_config::StreamTransport::Masque(_) => continue,
+                other => panic!("{name}: {other:?}"),
+            };
+            assert_eq!(chrome_parrot, expected, "{name}");
+            checked += 1;
+        }
+        assert!(checked >= 15, "{checked}");
+    }
+
     #[test]
     fn every_supported_quic_parameter_reaches_the_h3_engine() {
         let mut outbound = xhttp_vless(
@@ -8400,6 +9020,7 @@ mod tests {
             keep_alive_period_secs: 11,
             disable_path_mtu_discovery: true,
             max_incoming_streams: 16,
+            disable_chrome_parrot: true,
             disable_gso: true,
             disable_stateless_reset: true,
             brutal_disable_loss_compensation: true,
@@ -8408,6 +9029,7 @@ mod tests {
 
         let built = built_xhttp_transport(&outbound);
         let quic = built.h3_quic_config();
+        assert!(!quic.chrome_parrot, "disableChromeParrot turns it off");
         assert!(quic.disable_gso);
         assert!(quic.brutal_disable_loss_compensation);
         assert_eq!(quic.initial_stream_receive_window, 2_100_000);
@@ -8467,14 +9089,28 @@ mod tests {
         build_vless_tcp_outbound(&h2)
             .expect("Xray does not consult QUIC-only settings on the H2 branch");
 
+        // Every BBR profile runs on H3.
+        for bbr_profile in [
+            xray_config::QuicBbrProfile::Conservative,
+            xray_config::QuicBbrProfile::Aggressive,
+        ] {
+            let mut profiled = xhttp_vless(
+                XhttpSettings::default(),
+                tls_security(Some("sni.example"), &["h3"]),
+                TargetAddr::Domain("origin.example".to_owned()),
+                443,
+            );
+            profiled.stream.quic_params = Some(QuicParamsSettings {
+                congestion: xray_config::QuicCongestion::Bbr,
+                bbr_profile,
+                ..QuicParamsSettings::default()
+            });
+            build_vless_tcp_outbound(&profiled).expect("H3 runs Xray's BBR profiles");
+        }
+
         for invalid in [
             QuicParamsSettings {
                 debug: true,
-                ..QuicParamsSettings::default()
-            },
-            QuicParamsSettings {
-                congestion: xray_config::QuicCongestion::Bbr,
-                bbr_profile: xray_config::QuicBbrProfile::Conservative,
                 ..QuicParamsSettings::default()
             },
             // A maximum below its initial window; distinct maxima above it
@@ -9464,8 +10100,10 @@ mod tests {
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    folded_fragment_rules: None,
                     header_custom: None,
                     sudoku: None,
+                    xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
                     download: None,
@@ -9508,8 +10146,10 @@ mod tests {
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    folded_fragment_rules: None,
                     header_custom: None,
                     sudoku: None,
+                    xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
                     download: None,
@@ -9570,8 +10210,10 @@ mod tests {
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    folded_fragment_rules: None,
                     header_custom: None,
                     sudoku: None,
+                    xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
                     download: None,
@@ -9657,8 +10299,10 @@ mod tests {
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    folded_fragment_rules: None,
                     header_custom: None,
                     sudoku: None,
+                    xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
                     download: None,
@@ -9739,8 +10383,10 @@ mod tests {
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    folded_fragment_rules: None,
                     header_custom: None,
                     sudoku: None,
+                    xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
                     download: None,
@@ -9808,8 +10454,10 @@ mod tests {
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    folded_fragment_rules: None,
                     header_custom: None,
                     sudoku: None,
+                    xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
                     download: None,
@@ -9887,8 +10535,10 @@ mod tests {
                 encryption: None,
                 carrier: StreamCarrier {
                     fragment: None,
+                    folded_fragment_rules: None,
                     header_custom: None,
                     sudoku: None,
+                    xmc: None,
                     socket_options: None,
                     address_port: Default::default(),
                     download: None,
@@ -11325,10 +11975,33 @@ mod kcp_tests {
     /// as on XHTTP's HTTP/3.
     #[test]
     fn tcp_masks_are_refused_on_mkcp() {
-        let outbound = vless(json!({"network": "kcp", "security": "tls",
-            "tlsSettings": {"serverName": "kcp.example"},
-            "finalmask": {"tcp": [{"type": "fragment", "settings": {"packets": "tlshello",
-                "length": "100-200", "delay": "10-20"}}]}}));
+        let tls = json!({"security": "tls", "tlsSettings": {"serverName": "kcp.example"}});
+        let mask = json!({"tcp": [{"type": "fragment", "settings": {"packets": "tlshello",
+            "length": "100-200", "delay": "10-20"}}]});
+        // The parser refuses the mask on mKCP...
+        let mut stream = tls.clone();
+        stream["network"] = json!("kcp");
+        stream["finalmask"] = mask.clone();
+        let refused = xray_config::parse_xray_json(
+            &json!({"outbounds": [{"protocol": "vless", "settings": {"vnext": [{
+                "address": "10.0.0.1", "port": 443, "users": [{"id": ID, "encryption": "none"}]}]},
+                "streamSettings": stream}]})
+            .to_string(),
+        )
+        .unwrap_err();
+        assert!(refused
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("fragmentation requires")));
+        // ...and so does the carrier, should one reach it.
+        let mut over_raw = tls.clone();
+        over_raw["finalmask"] = mask;
+        let fragment = vless(over_raw).stream.tcp_fragment;
+        assert!(fragment.is_some());
+        let mut kcp = tls;
+        kcp["network"] = json!("kcp");
+        let mut outbound = vless(kcp);
+        outbound.stream.tcp_fragment = fragment;
         assert!(matches!(
             build_vless_tcp_outbound(&outbound),
             Err(CoreError::UnsupportedOutboundNetwork)
@@ -11354,5 +12027,574 @@ mod kcp_tests {
             router.select_tcp_outbound_direct(Some("proxy")),
             Err(CoreError::UnsupportedOutboundProxyNetwork("mKCP"))
         ));
+    }
+}
+
+#[cfg(test)]
+mod reverse_chain_tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// The first outbound of `outbounds`, compiled, with a `link` freedom
+    /// and a `hop` freedom that dials through it.
+    fn compile(first: Value) -> TcpOutbound {
+        let config = json!({"outbounds": [first,
+            {"tag": "hop", "protocol": "freedom",
+             "streamSettings": {"sockopt": {"dialerProxy": "link"}}},
+            {"tag": "link", "protocol": "freedom"}]});
+        let config = xray_config::parse_xray_json(&config.to_string())
+            .unwrap_or_else(|error| panic!("{:?}", error.diagnostics))
+            .config;
+        OutboundRouter::new(Arc::new(config))
+            .select_tcp_outbound()
+            .expect("compile the chain")
+    }
+
+    /// Whether the freedom a chain ends on refuses everything after its own
+    /// rules, which the `link` here has none of.
+    fn ends_on_a_refusing_freedom(outbound: &TcpOutbound) -> bool {
+        match outbound {
+            TcpOutbound::Chained { proxy, .. } => ends_on_a_refusing_freedom(proxy),
+            TcpOutbound::Freedom(freedom) => !freedom.final_rules().is_empty(),
+            _ => false,
+        }
+    }
+
+    fn vless(stream: Value) -> Value {
+        json!({"tag": "via", "protocol": "vless",
+            "settings": {"address": "127.0.0.1", "port": 443,
+                "id": "27848739-7e62-4138-9fd3-098a63964b6b", "encryption": "none"},
+            "streamSettings": stream})
+    }
+
+    fn through(proxy: &str, mut stream: Value) -> Value {
+        stream["sockopt"] = json!({"dialerProxy": proxy});
+        stream
+    }
+
+    #[test]
+    fn a_reverse_session_meets_the_chains_freedom_only_on_a_connection_of_its_own() {
+        let raw = json!({"network": "raw"});
+        let mut testpre = vless(through("link", raw.clone()));
+        testpre["settings"]["testpre"] = 2.into();
+        let with_mux = |concurrency: i32| {
+            let mut outbound = vless(through("link", raw.clone()));
+            outbound["mux"] = json!({"enabled": true, "concurrency": concurrency});
+            outbound
+        };
+        let cases = [
+            ("raw", vless(through("link", raw.clone())), true),
+            (
+                "WebSocket",
+                vless(through("link", json!({"network": "ws"}))),
+                true,
+            ),
+            (
+                "HTTPUpgrade",
+                vless(through("link", json!({"network": "httpupgrade"}))),
+                true,
+            ),
+            ("two freedoms", vless(through("hop", raw.clone())), true),
+            ("Mux without TCP pooling", with_mux(-1), true),
+            (
+                "SOCKS",
+                json!({"protocol": "socks",
+                    "settings": {"address": "127.0.0.1", "port": 1080},
+                    "streamSettings": through("link", raw.clone())}),
+                true,
+            ),
+            (
+                "a freedom through a freedom",
+                json!({"protocol": "freedom", "streamSettings": through("link", raw.clone())}),
+                true,
+            ),
+            (
+                "HTTP",
+                json!({"protocol": "http",
+                    "settings": {"address": "127.0.0.1", "port": 8080},
+                    "streamSettings": through("link", raw.clone())}),
+                true,
+            ),
+            (
+                "VMess",
+                json!({"protocol": "vmess",
+                    "settings": {"address": "127.0.0.1", "port": 443,
+                        "id": "27848739-7e62-4138-9fd3-098a63964b6b"},
+                    "streamSettings": through("link", raw.clone())}),
+                true,
+            ),
+            (
+                "VMess with Mux",
+                json!({"protocol": "vmess",
+                    "settings": {"address": "127.0.0.1", "port": 443,
+                        "id": "27848739-7e62-4138-9fd3-098a63964b6b"},
+                    "streamSettings": through("link", raw.clone()),
+                    "mux": {"enabled": true, "concurrency": 8}}),
+                false,
+            ),
+            (
+                "Shadowsocks",
+                json!({"protocol": "shadowsocks",
+                    "settings": {"address": "127.0.0.1", "port": 8388,
+                        "method": "aes-128-gcm", "password": "secret"},
+                    "streamSettings": through("link", raw.clone())}),
+                true,
+            ),
+            (
+                "Shadowsocks with Mux",
+                json!({"protocol": "shadowsocks",
+                    "settings": {"address": "127.0.0.1", "port": 8388,
+                        "method": "aes-128-gcm", "password": "secret"},
+                    "streamSettings": through("link", raw.clone()),
+                    "mux": {"enabled": true, "concurrency": 8}}),
+                false,
+            ),
+            (
+                "gRPC",
+                vless(through(
+                    "link",
+                    json!({"network": "grpc", "grpcSettings": {"serviceName": "relay"}}),
+                )),
+                false,
+            ),
+            (
+                "XHTTP",
+                vless(through(
+                    "link",
+                    json!({"network": "xhttp", "xhttpSettings": {"path": "/relay"}}),
+                )),
+                false,
+            ),
+            ("Mux", with_mux(8), false),
+            ("testpre", testpre, false),
+            (
+                "Trojan with Mux",
+                json!({"protocol": "trojan",
+                    "settings": {"address": "127.0.0.1", "port": 443, "password": "secret"},
+                    "streamSettings": through("link", json!({"network": "raw", "security": "tls"})),
+                    "mux": {"enabled": true, "concurrency": 8}}),
+                false,
+            ),
+        ];
+        for (name, first, refused) in cases {
+            let outbound = compile(first);
+            assert!(
+                !ends_on_a_refusing_freedom(&outbound),
+                "{name}: as compiled"
+            );
+            assert_eq!(
+                ends_on_a_refusing_freedom(&outbound.for_reverse()),
+                refused,
+                "{name}"
+            );
+        }
+    }
+
+    /// `outbounds`, the first of them compiled for TCP and, unless it
+    /// chains, which UDP does not, for UDP.
+    fn compile_all(outbounds: Value) -> (TcpOutbound, Option<UdpOutbound>) {
+        let config = json!({"outbounds": outbounds});
+        let config = xray_config::parse_xray_json(&config.to_string())
+            .unwrap_or_else(|error| panic!("{:?}", error.diagnostics))
+            .config;
+        let router = OutboundRouter::new(Arc::new(config));
+        let udp = router
+            .select_udp_outbound_for_session(None, &udp_target())
+            .ok();
+        (router.select_tcp_outbound().expect("compile for TCP"), udp)
+    }
+
+    fn udp_target() -> Target {
+        Target::new(
+            RoutingTargetAddr::Ip(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53))),
+            53,
+            RoutingNetwork::Udp,
+        )
+    }
+
+    /// A freedom allowing the servers here, 127.0.0.1:443, or refusing
+    /// nothing of its own.
+    fn freedom(tag: &str, allowing: bool, stream: Value) -> Value {
+        let settings = if allowing {
+            json!({"finalRules": [{"action": "allow", "ip": ["127.0.0.1"], "port": "443"}]})
+        } else {
+            json!({})
+        };
+        json!({"tag": tag, "protocol": "freedom", "settings": settings, "streamSettings": stream})
+    }
+
+    /// A dedicated freedom fragment outbound, which `dialerProxy` folds into
+    /// the outbound naming it.
+    fn fragment(allowing: bool) -> Value {
+        let mut outbound = freedom("frag", allowing, json!({}));
+        outbound["settings"]["fragment"] =
+            json!({"packets": "1-1", "length": "100-200", "interval": "1-2"});
+        outbound
+    }
+
+    /// A freedom sending what it dials to 127.0.0.1:8443, which only it
+    /// allows.
+    fn redirecting(tag: &str, stream: Value) -> Value {
+        let mut outbound = allowing_8443(tag);
+        outbound["settings"]["redirect"] = "127.0.0.1:8443".into();
+        outbound["streamSettings"] = stream;
+        outbound
+    }
+
+    fn allowing_8443(tag: &str) -> Value {
+        json!({"tag": tag, "protocol": "freedom", "settings": {"finalRules": [
+            {"action": "allow", "ip": ["127.0.0.1"], "port": "8443"}]}})
+    }
+
+    fn xhttp_testpre() -> Value {
+        let mut outbound = vless(xhttp("link"));
+        outbound["settings"]["testpre"] = 2.into();
+        outbound
+    }
+
+    /// A VLESS outbound at 127.0.0.1:8443, dialing through `link`.
+    fn second(stream: Value) -> Value {
+        let mut outbound = vless(through("link", stream));
+        outbound["tag"] = "second".into();
+        outbound["settings"]["port"] = 8443.into();
+        outbound
+    }
+
+    fn xhttp(proxy: &str) -> Value {
+        through(
+            proxy,
+            json!({"network": "xhttp", "xhttpSettings": {"path": "/relay"}}),
+        )
+    }
+
+    async fn refused(outbound: &TcpOutbound) -> bool {
+        outbound
+            .reverse_refusal(&SystemDnsResolver, &TransportDialer::system().unwrap())
+            .await
+            .expect("check")
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn a_reverse_flow_is_refused_before_an_xhttp_link_or_a_folded_fragment() {
+        let hop = freedom("hop", false, json!({"sockopt": {"dialerProxy": "link"}}));
+        let mut with_mux = vless(through("frag", json!({"network": "raw"})));
+        with_mux["mux"] = json!({"enabled": true, "concurrency": 8, "xudpConcurrency": 8});
+        let mut inner = vless(xhttp("link"));
+        inner["tag"] = "inner".into();
+        let cases = [
+            (
+                "XHTTP through a freedom",
+                vec![vless(xhttp("link")), freedom("link", false, json!({}))],
+                true,
+            ),
+            (
+                "XHTTP through a freedom allowing it",
+                vec![vless(xhttp("link")), freedom("link", true, json!({}))],
+                false,
+            ),
+            (
+                "XHTTP through two freedoms",
+                vec![
+                    vless(xhttp("hop")),
+                    hop.clone(),
+                    freedom("link", false, json!({})),
+                ],
+                true,
+            ),
+            (
+                "XHTTP through two freedoms, the last allowing it",
+                vec![vless(xhttp("hop")), hop, freedom("link", true, json!({}))],
+                false,
+            ),
+            (
+                "raw through XHTTP through a freedom",
+                vec![
+                    vless(through("inner", json!({"network": "raw"}))),
+                    inner,
+                    freedom("link", false, json!({})),
+                ],
+                true,
+            ),
+            (
+                "gRPC through a freedom",
+                vec![
+                    vless(through(
+                        "link",
+                        json!({"network": "grpc", "grpcSettings": {"serviceName": "relay"}}),
+                    )),
+                    freedom("link", false, json!({})),
+                ],
+                false,
+            ),
+            (
+                "raw through a freedom, refused as it dials",
+                vec![
+                    vless(through("link", json!({"network": "raw"}))),
+                    freedom("link", false, json!({})),
+                ],
+                false,
+            ),
+            (
+                "a folded fragment",
+                vec![
+                    vless(through("frag", json!({"network": "raw"}))),
+                    fragment(false),
+                ],
+                true,
+            ),
+            (
+                "a folded fragment allowing it",
+                vec![
+                    vless(through("frag", json!({"network": "raw"}))),
+                    fragment(true),
+                ],
+                false,
+            ),
+            (
+                "a folded fragment under Mux",
+                vec![with_mux, fragment(false)],
+                false,
+            ),
+            (
+                "XHTTP through a freedom redirecting where it allows",
+                vec![vless(xhttp("link")), redirecting("link", json!({}))],
+                false,
+            ),
+            (
+                "XHTTP through a redirecting freedom through a freedom allowing it",
+                vec![
+                    vless(xhttp("hop")),
+                    redirecting("hop", json!({"sockopt": {"dialerProxy": "link"}})),
+                    allowing_8443("link"),
+                ],
+                false,
+            ),
+            (
+                "XHTTP through VLESS through a freedom allowing that server",
+                vec![
+                    vless(xhttp("second")),
+                    second(json!({"network": "raw"})),
+                    allowing_8443("link"),
+                ],
+                false,
+            ),
+            (
+                "XHTTP with testpre through a freedom",
+                vec![xhttp_testpre(), freedom("link", false, json!({}))],
+                false,
+            ),
+            (
+                "XHTTP through gRPC through a freedom",
+                vec![
+                    vless(xhttp("second")),
+                    second(json!({"network": "grpc", "grpcSettings": {"serviceName": "relay"}})),
+                    freedom("link", false, json!({})),
+                ],
+                false,
+            ),
+        ];
+        for (name, outbounds, expected) in cases {
+            let (outbound, udp) = compile_all(Value::Array(outbounds));
+            assert_eq!(refused(&outbound).await, expected, "{name}");
+            // UDP meets only the folded fragment, chains carrying no UDP.
+            let udp_refused = match udp {
+                Some(udp) => udp
+                    .reverse_refused(
+                        &udp_target(),
+                        &SystemDnsResolver,
+                        &TransportDialer::system().unwrap(),
+                    )
+                    .await
+                    .expect("check UDP"),
+                None => false,
+            };
+            assert_eq!(udp_refused, name == "a folded fragment", "{name}: UDP");
+        }
+    }
+
+    /// Each protocol carrying UDP meets a folded fragment, with the network of
+    /// the dial that freedom sees: Shadowsocks sends its datagrams over UDP.
+    #[tokio::test]
+    async fn a_reverse_udp_flow_meets_a_folded_fragment_on_every_protocol() {
+        let raw = || through("frag", json!({"network": "raw"}));
+        let tcp_only = || {
+            let mut outbound = fragment(false);
+            outbound["settings"]["finalRules"] = json!([{"action": "allow", "network": "tcp",
+                "ip": ["127.0.0.1"], "port": "443"}]);
+            outbound
+        };
+        let protocols = [
+            (
+                "Trojan",
+                json!({"protocol": "trojan", "settings": {"address": "127.0.0.1",
+                "port": 443, "password": "secret"}, "streamSettings": raw()}),
+                false,
+            ),
+            (
+                "VMess",
+                json!({"protocol": "vmess", "settings": {"address": "127.0.0.1",
+                "port": 443, "id": "27848739-7e62-4138-9fd3-098a63964b6b"},
+                "streamSettings": raw()}),
+                false,
+            ),
+            (
+                "SOCKS",
+                json!({"protocol": "socks", "settings": {"address": "127.0.0.1",
+                "port": 443}, "streamSettings": raw()}),
+                false,
+            ),
+            (
+                "Shadowsocks",
+                json!({"protocol": "shadowsocks", "settings": {
+                "address": "127.0.0.1", "port": 443, "method": "aes-128-gcm",
+                "password": "secret"}, "streamSettings": raw()}),
+                true,
+            ),
+        ];
+        for (name, outbound, over_udp) in protocols {
+            for (link, expected) in [
+                (fragment(false), true),
+                (fragment(true), false),
+                // Allowing TCP only: Shadowsocks' datagrams stay refused.
+                (tcp_only(), over_udp),
+            ] {
+                let (_, udp) = compile_all(json!([outbound.clone(), link]));
+                let refused = udp
+                    .expect("a UDP outbound")
+                    .reverse_refused(
+                        &udp_target(),
+                        &SystemDnsResolver,
+                        &TransportDialer::system().unwrap(),
+                    )
+                    .await
+                    .expect("check UDP");
+                assert_eq!(refused, expected, "{name}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_is_refused_before_xhttp_or_a_folded_fragment() {
+        let bridge = |stream: Value| {
+            let mut outbound = vless(stream);
+            outbound["settings"]["reverse"] = json!({"tag": "r-in"});
+            outbound
+        };
+        let cases = [
+            (
+                "XHTTP through a freedom",
+                vec![bridge(xhttp("link")), freedom("link", false, json!({}))],
+                true,
+            ),
+            (
+                "XHTTP through a freedom allowing it",
+                vec![bridge(xhttp("link")), freedom("link", true, json!({}))],
+                false,
+            ),
+            (
+                "gRPC through a freedom",
+                vec![
+                    bridge(through(
+                        "link",
+                        json!({"network": "grpc", "grpcSettings": {"serviceName": "rvs"}}),
+                    )),
+                    freedom("link", false, json!({})),
+                ],
+                false,
+            ),
+            (
+                "a folded fragment",
+                vec![
+                    bridge(through("frag", json!({"network": "raw"}))),
+                    fragment(false),
+                ],
+                true,
+            ),
+            (
+                "a folded fragment allowing it",
+                vec![
+                    bridge(through("frag", json!({"network": "raw"}))),
+                    fragment(true),
+                ],
+                false,
+            ),
+        ];
+        for (name, outbounds, expected) in cases {
+            let config = json!({"outbounds": outbounds});
+            let config = xray_config::parse_xray_json(&config.to_string())
+                .unwrap_or_else(|error| panic!("{:?}", error.diagnostics))
+                .config;
+            let outbound = OutboundRouter::new(Arc::new(config))
+                .select_tcp_outbound()
+                .expect("compile the bridge");
+            let (vless, proxy) = match &outbound {
+                TcpOutbound::Vless(vless) => (vless.as_ref(), None),
+                TcpOutbound::Chained { outbound, proxy } => match outbound.as_ref() {
+                    TcpOutbound::Vless(vless) => (vless.as_ref(), Some(proxy.as_ref())),
+                    _ => panic!("{name}: a VLESS bridge"),
+                },
+                _ => panic!("{name}: a VLESS bridge"),
+            };
+            let refusal = reverse_tunnel_refusal(
+                vless,
+                proxy,
+                &SystemDnsResolver,
+                &TransportDialer::system().unwrap(),
+            )
+            .await
+            .expect("check");
+            assert_eq!(refusal.is_some(), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_tunnel_meets_the_chains_freedom_unless_its_carrier_is_shared() {
+        let bridge = |stream: Value, mux: bool| {
+            let mut outbound = vless(through("link", stream));
+            outbound["settings"]["reverse"] = json!({"tag": "r-in"});
+            if mux {
+                outbound["mux"] = json!({"enabled": true, "concurrency": 8});
+            }
+            outbound
+        };
+        let cases = [
+            ("raw", bridge(json!({"network": "raw"}), false), true),
+            // The outbound's Mux carries no tunnel.
+            (
+                "raw with Mux",
+                bridge(json!({"network": "raw"}), true),
+                true,
+            ),
+            (
+                "gRPC",
+                bridge(
+                    json!({"network": "grpc", "grpcSettings": {"serviceName": "rvs"}}),
+                    false,
+                ),
+                false,
+            ),
+            (
+                "XHTTP",
+                bridge(
+                    json!({"network": "xhttp", "xhttpSettings": {"path": "/rvs"}}),
+                    false,
+                ),
+                false,
+            ),
+        ];
+        for (name, first, refused) in cases {
+            let TcpOutbound::Chained { outbound, proxy } = compile(first) else {
+                panic!("{name}: a chain");
+            };
+            let TcpOutbound::Vless(vless) = outbound.as_ref() else {
+                panic!("{name}: a VLESS bridge");
+            };
+            let chain = reverse_tunnel_proxy(vless, &proxy);
+            assert_eq!(chain.is_some(), refused, "{name}");
+            if let Some(chain) = chain {
+                assert!(ends_on_a_refusing_freedom(&chain), "{name}");
+            }
+        }
     }
 }

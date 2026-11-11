@@ -62,6 +62,14 @@ enum QuicClientConfigKey {
     Pinned {
         alpn: Vec<u8>,
     },
+    /// Xray's ChromeParrot ClientHello, on the same trust policy as `System`
+    Chrome {
+        allow_insecure: bool,
+        pinned_peer_cert_sha256: Vec<[u8; 32]>,
+        verify_peer_cert_by_name: Vec<String>,
+        custom_roots: Vec<CertificateDer<'static>>,
+        alpn: Vec<u8>,
+    },
 }
 
 /// Where a connector's rustls configs come from. The two kinds are mutually
@@ -163,12 +171,14 @@ impl TlsConnector {
         self.client_config_for_policy(config, TlsAlpnPolicy::Raw)
     }
 
-    /// Builds the stock TLS configuration used by XHTTP HTTP/3.
+    /// Builds the stock TLS configuration XHTTP HTTP/3 uses with
+    /// `disableChromeParrot`.
     ///
     /// Xray's H3 path hands its ordinary Go TLS config directly to QUIC; its
     /// uTLS TCP dial callback is not used. Accordingly this path ignores both
     /// the fingerprint and configured ALPN, always advertises exactly `h3`,
     /// and never installs a ClientHello customizer.
+    #[cfg(test)]
     pub(crate) fn http3_client_config_for(
         &self,
         config: &TlsClientConfig,
@@ -222,6 +232,67 @@ impl TlsConnector {
         };
         client_config.alpn_protocols = vec![alpn.to_vec()];
         client_config.client_hello_customizer = None;
+        validate_quic_client_config(&client_config)?;
+        let client_config = Arc::new(client_config);
+        configs.insert(key, Arc::clone(&client_config));
+        Ok(client_config)
+    }
+
+    /// The QUIC TLS configuration of a Hysteria or HTTP/3 dial: Xray's
+    /// ChromeParrot ClientHello when `chrome_parrot` is set, as Xray sends it
+    /// unless `quicParams.disableChromeParrot`, else the unshaped one.
+    pub(crate) fn h3_client_config_for(
+        &self,
+        config: &TlsClientConfig,
+        alpn: &[u8],
+        chrome_parrot: bool,
+    ) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+        if chrome_parrot {
+            self.chrome_quic_client_config_for(config, alpn)
+        } else {
+            self.quic_client_config_for(config, alpn)
+        }
+    }
+
+    /// Builds the TLS 1.3 configuration of a ChromeParrot QUIC client for one
+    /// application protocol: uTLS's Chrome QUIC ClientHello
+    /// ([`crate::chrome_parrot::ChromeQuicHello`]) on the connector's trust
+    /// policy, without resumption or 0-RTT.
+    ///
+    /// Xray turns the shape on for every Hysteria, XHTTP H3 and XDRIVE H3
+    /// dial unless `disableChromeParrot` is set; its fingerprint setting and
+    /// configured ALPN do not reach QUIC either way. A prebuilt config keeps
+    /// its own ClientHello, as it does under a fingerprint.
+    pub(crate) fn chrome_quic_client_config_for(
+        &self,
+        config: &TlsClientConfig,
+        alpn: &[u8],
+    ) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+        if matches!(&*self.source, ConfigSource::Pinned(_)) {
+            return self.quic_client_config_for(config, alpn);
+        }
+        let key = QuicClientConfigKey::Chrome {
+            allow_insecure: config.allow_insecure,
+            pinned_peer_cert_sha256: config.pinned_peer_cert_sha256.clone(),
+            verify_peer_cert_by_name: config.verify_peer_cert_by_name.clone(),
+            custom_roots: config.custom_roots.clone(),
+            alpn: alpn.to_vec(),
+        };
+        let mut configs = self
+            .quic_configs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = configs.get(&key) {
+            return Ok(Arc::clone(cached));
+        }
+        let client_config = chrome_quic_rustls_config(
+            config.allow_insecure,
+            &config.pinned_peer_cert_sha256,
+            &config.verify_peer_cert_by_name,
+            &config.custom_roots,
+            alpn,
+            crate::chrome_parrot::ChromeQuicHello::default(),
+        )?;
         validate_quic_client_config(&client_config)?;
         let client_config = Arc::new(client_config);
         configs.insert(key, Arc::clone(&client_config));
@@ -311,6 +382,54 @@ impl TlsConnector {
             .map_err(TransportError::Tls)?;
 
         Ok(Box::new(stream))
+    }
+
+    /// [`connect_prepared_stream`](Self::connect_prepared_stream), with the
+    /// application protocol the server picked, as an HTTP client that
+    /// speaks what the server chose needs it.
+    pub(crate) async fn connect_prepared_stream_with_alpn(
+        &self,
+        stream: BoxedTransportStream,
+        prepared: PreparedTlsStream,
+    ) -> Result<(BoxedTransportStream, Option<Vec<u8>>), TransportError> {
+        let stream = TokioTlsConnector::from(prepared.client_config)
+            .connect(prepared.server_name, stream)
+            .await
+            .map_err(TransportError::Tls)?;
+        let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        Ok((Box::new(stream), alpn))
+    }
+
+    /// The QUIC TLS configuration for a WARP dial: the connector's own for
+    /// `config` and `alpn`, with the device's certificate and the endpoint
+    /// check of [`WarpTls`].
+    pub(crate) fn warp_quic_client_config(
+        &self,
+        config: &TlsClientConfig,
+        alpn: &[u8],
+        warp: &WarpTls,
+    ) -> Result<Arc<rustls::ClientConfig>, TransportError> {
+        let mut client = (*self.quic_client_config_for(config, alpn)?).clone();
+        warp.apply(&mut client, config);
+        Ok(Arc::new(client))
+    }
+
+    /// Completes a WARP TLS handshake on a TCP carrier, shaped as `config`
+    /// asks, and returns the stream with the protocol its ALPN picked.
+    pub async fn connect_warp_stream(
+        &self,
+        stream: BoxedTransportStream,
+        config: &TlsClientConfig,
+        warp: &WarpTls,
+    ) -> Result<(BoxedTransportStream, Option<Vec<u8>>), TransportError> {
+        let mut client = (*self.client_config_for_policy(config, TlsAlpnPolicy::Raw)?).clone();
+        warp.apply(&mut client, config);
+        let stream = TokioTlsConnector::from(Arc::new(client))
+            .connect(tls_server_name(config)?, stream)
+            .await
+            .map_err(TransportError::Tls)?;
+        let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+        Ok((Box::new(stream), alpn))
     }
 
     /// Completes the handshake on a carrier that Vision may unwrap.
@@ -470,6 +589,137 @@ impl TransportStream for tokio_rustls::client::TlsStream<BoxedTransportStream> {
 #[derive(Debug)]
 struct NoCertificateVerification {
     provider: Arc<crypto::CryptoProvider>,
+}
+
+/// Cloudflare WARP's side of one TLS handshake, as Xray-core's `useWarp`
+/// sets it up: the device's certificate for any request, and the endpoint's
+/// key to find in its certificate.
+pub struct WarpTls {
+    certified: Arc<rustls::sign::CertifiedKey>,
+    endpoint_spki: Vec<u8>,
+}
+
+impl std::fmt::Debug for WarpTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WarpTls").finish_non_exhaustive()
+    }
+}
+
+impl WarpTls {
+    pub(crate) fn new(certified: Arc<rustls::sign::CertifiedKey>, endpoint_spki: Vec<u8>) -> Self {
+        Self {
+            certified,
+            endpoint_spki,
+        }
+    }
+
+    /// Xray's `useWarp` on a TLS configuration: the certificate always
+    /// goes out, and unless pins, verification names or allowInsecure
+    /// already replace verification, the endpoint is checked by its key
+    /// alone. A WARP session is never resumed: its client certificate is
+    /// part of it.
+    fn apply(&self, client: &mut rustls::ClientConfig, config: &TlsClientConfig) {
+        client.client_auth_cert_resolver =
+            Arc::new(WarpClientCertificate(Arc::clone(&self.certified)));
+        client.resumption = rustls::client::Resumption::disabled();
+        if !config.allow_insecure
+            && config.pinned_peer_cert_sha256.is_empty()
+            && config.verify_peer_cert_by_name.is_empty()
+        {
+            let provider = Arc::clone(client.crypto_provider());
+            client
+                .dangerous()
+                .set_certificate_verifier(Arc::new(WarpEndpointVerification {
+                    provider,
+                    spki: self.endpoint_spki.clone(),
+                }));
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WarpClientCertificate(Arc<rustls::sign::CertifiedKey>);
+
+impl rustls::client::ResolvesClientCert for WarpClientCertificate {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        Some(Arc::clone(&self.0))
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
+/// Xray's WARP `VerifyPeerCertificate`: the leaf must carry the configured
+/// key; chain, name and dates are not looked at. The handshake signatures
+/// are still checked against that key.
+#[derive(Debug)]
+struct WarpEndpointVerification {
+    provider: Arc<crypto::CryptoProvider>,
+    spki: Vec<u8>,
+}
+
+impl ServerCertVerifier for WarpEndpointVerification {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, RustlsError> {
+        let (rest, leaf) = X509Certificate::from_der(end_entity.as_ref())
+            .map_err(|_| RustlsError::InvalidCertificate(CertificateError::BadEncoding))?;
+        if !rest.is_empty() {
+            return Err(RustlsError::InvalidCertificate(
+                CertificateError::BadEncoding,
+            ));
+        }
+        if leaf.public_key().raw != self.spki.as_slice() {
+            return Err(RustlsError::General(
+                "the WARP endpoint's key doesn't match \"publicKey\"".to_owned(),
+            ));
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// Xray-compatible verifier for `pinnedPeerCertSha256` and
@@ -975,6 +1225,34 @@ fn custom_verification_rustls_client_config(
                 .with_custom_certificate_verifier(verifier)
                 .with_no_client_auth()
         })
+}
+
+/// The rustls configuration of a ChromeParrot QUIC client: TLS 1.3 alone on
+/// the shaping provider, which has the X25519MLKEM768 key share the hello
+/// plans, brotli as the only certificate compression it offers, no
+/// resumption and no early data, and `hello` shaping the ClientHello.
+pub(crate) fn chrome_quic_rustls_config(
+    allow_insecure: bool,
+    pinned_peer_cert_sha256: &[[u8; 32]],
+    verify_peer_cert_by_name: &[String],
+    custom_roots: &[CertificateDer<'static>],
+    alpn: &[u8],
+    hello: crate::chrome_parrot::ChromeQuicHello,
+) -> Result<rustls::ClientConfig, TransportError> {
+    let mut client_config = client_config_with_provider(
+        Arc::new(shaping_crypto_provider()),
+        allow_insecure,
+        pinned_peer_cert_sha256,
+        verify_peer_cert_by_name,
+        custom_roots,
+        &[&rustls::version::TLS13],
+    )?;
+    client_config.alpn_protocols = vec![alpn.to_vec()];
+    client_config.resumption = rustls::client::Resumption::disabled();
+    client_config.enable_early_data = false;
+    crate::chrome_parrot::retain_brotli(&mut client_config.cert_decompressors);
+    client_config.client_hello_customizer = Some(Arc::new(hello));
+    Ok(client_config)
 }
 
 /// The provider every uTLS-shaped handshake runs on.

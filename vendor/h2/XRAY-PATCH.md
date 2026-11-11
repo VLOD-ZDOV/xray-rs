@@ -1,4 +1,4 @@
-# h2 0.4.20: Go's stream WINDOW_UPDATE policy
+# h2 0.4.20: Go's stream WINDOW_UPDATE policy, Xray's MASQUE client and Go's request headers
 
 Source: the complete unchanged-version crates.io `h2` **0.4.20** archive,
 SHA256 `7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118`.
@@ -26,6 +26,45 @@ Connection-level updates, the server, and every caller that leaves the option
 unset keep upstream behavior. Unit tests in
 `proto/streams/flow_control.rs` cover the threshold, the doubling rule and the
 unchanged default.
+
+## Waiting for the server's SETTINGS
+
+`client::SendRequest::poll_remote_settings` is ready once the server's first
+SETTINGS frame has been applied, or fails once the connection did first.
+Xray-core's MASQUE HTTP/2 client sends its extended CONNECT only after that
+frame and refuses a server that did not enable the protocol in it; before
+it, `is_extended_connect_protocol_enabled` reports `false` for any server.
+A waiting task is woken by that frame, a connection error, GOAWAY or EOF.
+
+## Xray-core's MASQUE request header block
+
+Two `client::Builder` options let the MASQUE client write the header block
+Xray-core v26.10.31's own HTTP/2 client writes:
+
+- `send_header_table_size_limit(size)` caps the HPACK encoder's dynamic table
+  below what the server allows, announcing the smaller table in the first
+  header block, as Go's `hpack.Encoder.SetMaxDynamicTableSizeLimit`. Xray
+  sets zero: a size update, then every field without indexing.
+- `authority_after_method(true)` writes `:authority` right after `:method`,
+  before `:scheme` and `:path`, the order of Chrome and of Go's writers.
+
+Callers that leave them unset keep upstream behavior. Unit tests in
+`hpack/encoder.rs` and `frame/headers.rs` cover both.
+
+## Go's `net/http` request header block
+
+XDRIVE reaches an HTTP storage the way Xray-core v26.10.31 does, through Go's
+`net/http` HTTP/2 client, which writes a request's pseudo-headers as
+`:authority`, `:method`, `:path`, `:scheme` (`internal/httpcommon`
+`encodeHeaders`). `go_request_pseudo_order(true)` writes that order; it takes
+precedence over `authority_after_method`. `go_hpack_choices(true)` now also
+indexes as Go's `hpack.Encoder` does: a field goes into the dynamic table
+whenever it fits, where upstream never indexes `:path`, `authorization`,
+`content-length` and a few other names, nor a field larger than three quarters
+of the table. With both, the block is the one Go's encoder writes; with a table
+of size zero, as the MASQUE client sets, nothing is indexed either way. Callers
+that leave them unset keep upstream behavior; unit tests in `frame/headers.rs`
+and `hpack/encoder.rs` cover them.
 
 ## Fuzzing build
 

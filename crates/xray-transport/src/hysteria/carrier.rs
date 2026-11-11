@@ -43,6 +43,48 @@ pub struct HysteriaCarrierConfig {
     pub udp_hop: H3UdpHopConfig,
     pub noise: Option<crate::udp_noise::UdpNoiseConfig>,
     pub header_custom: Option<HeaderCustomCarrier>,
+    pub sudoku: Option<SudokuCarrier>,
+    /// The `xdns` mask, the outermost: the datagrams go to its resolvers,
+    /// never to the server's address.
+    pub xdns: Option<Arc<crate::xdns::XdnsConfig>>,
+    /// The `realm` mask, the outermost: the socket is introduced to the
+    /// server through a rendezvous, and the datagrams go to the address that
+    /// answered its punch.
+    pub realm: Option<Arc<crate::realm::RealmConfig>>,
+    /// The `xicmp` mask, the outermost: the datagrams go out in ICMP echo
+    /// requests, never in UDP.
+    pub xicmp: Option<Arc<crate::xicmp::XicmpConfig>>,
+}
+
+/// A `salamander` UDP mask outside Hysteria, which keeps its own in
+/// [`HysteriaCarrierConfig`]: its place among the other masks is theirs to
+/// record, as they are listed before or after it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SalamanderCarrier {
+    pub password: Arc<Zeroizing<String>>,
+    /// Gecko's fragment sizes, Salamander's `packetSize` in Xray.
+    pub gecko: Option<GeckoPacketSize>,
+}
+
+impl fmt::Debug for SalamanderCarrier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SalamanderCarrier")
+            .field("password", &"<redacted>")
+            .field("gecko", &self.gecko)
+            .finish()
+    }
+}
+
+/// A `sudoku` UDP mask and its place among the carrier's masks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SudokuCarrier {
+    pub config: Arc<crate::sudoku::SudokuConfig>,
+    /// Listed before Salamander, which then obfuscates it.
+    pub before_salamander: bool,
+    /// Listed before noise, whose packets then pass through it.
+    pub before_noise: bool,
+    /// Listed before `header-custom`, whose prefixes it then encodes.
+    pub before_header_custom: bool,
 }
 
 /// A `header-custom` UDP mask and its place among the carrier's masks.
@@ -62,6 +104,10 @@ impl fmt::Debug for HysteriaCarrierConfig {
             .field("gecko", &self.gecko)
             .field("udp_hop", &self.udp_hop)
             .field("header_custom", &self.header_custom.is_some())
+            .field("sudoku", &self.sudoku.is_some())
+            .field("xdns", &self.xdns.is_some())
+            .field("realm", &self.realm.is_some())
+            .field("xicmp", &self.xicmp.is_some())
             .finish()
     }
 }
@@ -72,6 +118,7 @@ enum Mask {
     Noise,
     Salamander,
     Header,
+    Sudoku,
 }
 
 /// One QUIC connection's mask state, which its rebound sockets keep:
@@ -80,6 +127,12 @@ enum Mask {
 pub(crate) struct CarrierSession {
     pub(crate) noise: Option<Arc<UdpNoiseState>>,
     pub(crate) header: Option<Arc<HeaderCustomState>>,
+    /// The xdns client, whose id the server knows the connection by, so
+    /// every rebound socket goes through it.
+    pub(crate) xdns: Option<Arc<crate::xdns::XdnsClient>>,
+    /// The xicmp client, whose id the server knows the connection by, as
+    /// the xdns client's.
+    pub(crate) xicmp: Option<Arc<crate::xicmp::XicmpClient>>,
 }
 
 impl fmt::Debug for CarrierSession {
@@ -87,6 +140,8 @@ impl fmt::Debug for CarrierSession {
         f.debug_struct("CarrierSession")
             .field("noise", &self.noise.is_some())
             .field("header", &self.header.is_some())
+            .field("xdns", &self.xdns.is_some())
+            .field("xicmp", &self.xicmp.is_some())
             .finish()
     }
 }
@@ -105,7 +160,42 @@ impl CarrierSession {
                 .as_ref()
                 .map(|header| HeaderCustomState::new(header.config.clone()))
                 .transpose()?,
+            xdns: None,
+            xicmp: None,
         })
+    }
+
+    /// Opens the xdns client `config` asks for, unless there is one. A
+    /// resolver that does not open fails the dial, as in Xray-core.
+    pub(crate) async fn open_xdns(
+        &mut self,
+        config: &HysteriaCarrierConfig,
+        protector: Option<Arc<dyn crate::SocketProtector>>,
+    ) -> io::Result<()> {
+        if let (Some(xdns), None) = (&config.xdns, &self.xdns) {
+            let client = crate::xdns::XdnsClient::connect(xdns, protector)
+                .await
+                .map_err(io::Error::other)?;
+            self.xdns = Some(Arc::new(client));
+        }
+        Ok(())
+    }
+
+    /// Opens the xicmp client `config` asks for, to `server` when its
+    /// addresses are empty, unless there is one.
+    pub(crate) async fn open_xicmp(
+        &mut self,
+        config: &HysteriaCarrierConfig,
+        server: IpAddr,
+        protector: Option<Arc<dyn crate::SocketProtector>>,
+    ) -> io::Result<()> {
+        if let (Some(xicmp), None) = (&config.xicmp, &self.xicmp) {
+            let client = crate::xicmp::XicmpClient::connect(xicmp, server, protector)
+                .await
+                .map_err(io::Error::other)?;
+            self.xicmp = Some(Arc::new(client));
+        }
+        Ok(())
     }
 }
 
@@ -121,6 +211,47 @@ impl HysteriaCarrierConfig {
                 return Err(HysteriaError::Configuration);
             }
             UdpHeader::new(header.config.clone()).map_err(|_| HysteriaError::Configuration)?;
+        }
+        if let Some(sudoku) = &self.sudoku {
+            sudoku
+                .config
+                .tables()
+                .map_err(|_| HysteriaError::Configuration)?;
+        }
+        if let Some(xdns) = &self.xdns {
+            // Neither hops: xdns has no socket to the server, and Xray-core
+            // ignores the udphop socket under it. Sudoku's datagrams are
+            // four times a QUIC packet, past what one xdns packet takes.
+            xdns.validate().map_err(|_| HysteriaError::Configuration)?;
+            if self.udp_hop.is_active() || self.sudoku.is_some() {
+                return Err(HysteriaError::Configuration);
+            }
+        }
+        if self.xicmp.is_some()
+            && (self.udp_hop.is_active()
+                || self.xdns.is_some()
+                || self.header_custom.is_some()
+                || self.sudoku.is_some())
+        {
+            // Each of udphop and xdns sends elsewhere, as realm does, which
+            // refuses xicmp below; header-custom would key the server's port
+            // while replies come without one; sudoku's datagrams exceed what
+            // an echo carries.
+            return Err(HysteriaError::Configuration);
+        }
+        if let Some(realm) = &self.realm {
+            // Its socket goes to the punched peer, never hops, and is no
+            // resolver's; header-custom's state would key the server's
+            // address while replies come from the peer's.
+            if self.udp_hop.is_active()
+                || self.xdns.is_some()
+                || self.xicmp.is_some()
+                || self.header_custom.is_some()
+                || realm.stun_servers.is_empty()
+                || (realm.scheme == crate::realm::RealmScheme::Https && realm.tls.is_none())
+            {
+                return Err(HysteriaError::Configuration);
+            }
         }
         if self
             .salamander_password
@@ -170,6 +301,10 @@ impl HysteriaCarrierConfig {
             || self.udp_hop.is_active()
             || self.noise.is_some()
             || self.header_custom.is_some()
+            || self.sudoku.is_some()
+            || self.xdns.is_some()
+            || self.realm.is_some()
+            || self.xicmp.is_some()
     }
 
     /// What the masks add to every QUIC datagram: Salamander's salt and a
@@ -188,34 +323,50 @@ impl HysteriaCarrierConfig {
         salt + prefix
     }
 
-    /// The masks from the innermost. Salamander ranks 4 and the others go
-    /// either side of it; a custom header on noise's side sits next to it.
+    /// The masks from the innermost, as `finalmask.udp` lists them: each
+    /// after as many of the others as are listed before it.
     fn mask_order(&self) -> Vec<Mask> {
-        let side = |before: bool| if before { 2 } else { 6 };
         let mut masks = Vec::new();
         if self.salamander_password.is_some() {
-            masks.push((4, Mask::Salamander));
+            masks.push(Mask::Salamander);
         }
-        if let Some(noise) = &self.noise {
-            masks.push((side(noise.before_salamander), Mask::Noise));
+        if self.noise.is_some() {
+            masks.push(Mask::Noise);
         }
-        if let Some(header) = &self.header_custom {
-            let mut rank = side(header.before_salamander);
-            if self
-                .noise
-                .as_ref()
-                .is_some_and(|noise| noise.before_salamander == header.before_salamander)
-            {
-                rank = if header.before_noise {
-                    rank - 1
-                } else {
-                    rank + 1
-                };
-            }
-            masks.push((rank, Mask::Header));
+        if self.header_custom.is_some() {
+            masks.push(Mask::Header);
         }
-        masks.sort_by_key(|(rank, _)| *rank);
-        masks.into_iter().map(|(_, mask)| mask).collect()
+        if self.sudoku.is_some() {
+            masks.push(Mask::Sudoku);
+        }
+        let rank = |mask: Mask| {
+            masks
+                .iter()
+                .filter(|&&other| other != mask && self.listed_before(other, mask))
+                .count()
+        };
+        let mut ranked: Vec<(usize, Mask)> = masks.iter().map(|&mask| (rank(mask), mask)).collect();
+        ranked.sort_by_key(|(rank, _)| *rank);
+        ranked.into_iter().map(|(_, mask)| mask).collect()
+    }
+
+    /// Whether `first` is listed before `second`.
+    fn listed_before(&self, first: Mask, second: Mask) -> bool {
+        let noise = self.noise.as_ref();
+        let header = self.header_custom.as_ref();
+        let sudoku = self.sudoku.as_ref();
+        let before = |first: Mask, second: Mask| match (first, second) {
+            (Mask::Noise, Mask::Salamander) => noise.map(|noise| noise.before_salamander),
+            (Mask::Header, Mask::Salamander) => header.map(|header| header.before_salamander),
+            (Mask::Header, Mask::Noise) => header.map(|header| header.before_noise),
+            (Mask::Sudoku, Mask::Salamander) => sudoku.map(|sudoku| sudoku.before_salamander),
+            (Mask::Sudoku, Mask::Noise) => sudoku.map(|sudoku| sudoku.before_noise),
+            (Mask::Sudoku, Mask::Header) => sudoku.map(|sudoku| sudoku.before_header_custom),
+            _ => None,
+        };
+        before(first, second)
+            .or_else(|| before(second, first).map(|after| !after))
+            .unwrap_or(false)
     }
 
     /// The first remote address: with `remote` or `remote_once`, a random
@@ -320,11 +471,67 @@ pub(crate) fn wrap(
     config: &HysteriaCarrierConfig,
     session: &CarrierSession,
 ) -> io::Result<Arc<dyn AsyncUdpSocket>> {
-    // Socket protection has already happened, before connect or any send.
-    #[cfg(target_os = "macos")]
-    let mut socket = crate::connected_quic::wrap(socket, wire_peer)?;
-    #[cfg(not(target_os = "macos"))]
-    let mut socket = quinn::TokioRuntime.wrap_udp_socket(socket)?;
+    if let Some(tunnel) = tunnel(config, session, wire_peer)? {
+        drop(socket);
+        return wrap_masks(tunnel, logical_peer, wire_peer, config, session);
+    }
+    // Quinn sets the don't-fragment bit as it wraps the socket; sudoku's
+    // datagrams need it clear again, through a clone of the socket.
+    let fragmenting = config
+        .sudoku
+        .as_ref()
+        .map(|_| socket.try_clone())
+        .transpose()?;
+    // A realm socket is unconnected and may be dual-stack, its peer of
+    // another family than the server's address.
+    let socket = if config.realm.is_some() {
+        use quinn::Runtime as _;
+        crate::realm::quic::wrap(quinn::TokioRuntime.wrap_udp_socket(socket)?, logical_peer)?
+    } else {
+        // Socket protection has already happened, before connect or any send.
+        #[cfg(target_os = "macos")]
+        let socket = crate::connected_quic::wrap(socket, wire_peer)?;
+        #[cfg(not(target_os = "macos"))]
+        let socket = quinn::TokioRuntime.wrap_udp_socket(socket)?;
+        socket
+    };
+    if let Some(clone) = fragmenting {
+        crate::sudoku::quic::allow_fragmentation(&clone)?;
+    }
+    wrap_masks(socket, logical_peer, wire_peer, config, session)
+}
+
+/// The client that carries every datagram when the masks name xicmp or
+/// xdns. The UDP socket then goes unused: Xray-core dials none under
+/// xicmp, and the one it dials under xdns stays idle.
+pub(crate) fn tunnel(
+    config: &HysteriaCarrierConfig,
+    session: &CarrierSession,
+    wire_peer: SocketAddr,
+) -> io::Result<Option<Arc<dyn AsyncUdpSocket>>> {
+    if config.xicmp.is_some() {
+        let client = session.xicmp.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "the xicmp client is not open")
+        })?;
+        return Ok(Some(crate::xicmp::quic::socket(client, wire_peer)));
+    }
+    if config.xdns.is_some() {
+        let client = session.xdns.clone().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotConnected, "the xdns client is not open")
+        })?;
+        return Ok(Some(crate::xdns::quic::socket(client, wire_peer)));
+    }
+    Ok(None)
+}
+
+/// The masks over the carrier's socket, built from the wire inwards.
+pub(crate) fn wrap_masks(
+    mut socket: Arc<dyn AsyncUdpSocket>,
+    logical_peer: SocketAddr,
+    wire_peer: SocketAddr,
+    config: &HysteriaCarrierConfig,
+    session: &CarrierSession,
+) -> io::Result<Arc<dyn AsyncUdpSocket>> {
     // Built from the wire inwards. Masks outside the carrier socket see the
     // wire peer and those inside it the logical one; it sits at Salamander's
     // place, or innermost without Salamander.
@@ -335,6 +542,10 @@ pub(crate) fn wrap(
             (Mask::Noise, Some(noise), _) => {
                 crate::udp_noise::wrap(socket, peer, noise.clone(), session.noise.clone())?
             }
+            (Mask::Sudoku, ..) => match &config.sudoku {
+                Some(sudoku) => crate::sudoku::quic::wrap(socket, &sudoku.config)?,
+                None => socket,
+            },
             (Mask::Header, _, Some(header)) => {
                 let state = match &session.header {
                     Some(state) => state.clone(),
@@ -481,7 +692,7 @@ impl fmt::Debug for CarrierSocket {
     }
 }
 
-fn key(password: &str, salt: &[u8]) -> [u8; 32] {
+pub(crate) fn key(password: &str, salt: &[u8]) -> [u8; 32] {
     let mut hasher = Blake2b::<U32>::new();
     hasher.update(password.as_bytes());
     hasher.update(salt);
@@ -695,6 +906,7 @@ mod tests {
                         random_length: zero(),
                         random_bytes: zero(),
                         delay_ms: zero(),
+                        segments: Vec::new(),
                     }],
                     reset_secs: zero(),
                     before_salamander: before,
@@ -1015,6 +1227,315 @@ mod tests {
         config.udp_hop.ports = vec![443, 8443];
         config.udp_hop.local = true;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn xdns_runs_without_udphop_and_sudoku_and_needs_its_client() {
+        let xdns = Arc::new(crate::xdns::XdnsConfig {
+            domains: vec![crate::xdns::XdnsDomain {
+                name: "t.example.com".into(),
+                len_limit: 255,
+                label_limit: 63,
+                types: vec![],
+                edns0: 0,
+            }],
+            resolvers: vec![crate::xdns::XdnsResolver::Udp(vec!["127.0.0.1:53"
+                .parse()
+                .unwrap()])],
+            extra_poll: 0,
+        });
+        let mut config = HysteriaCarrierConfig {
+            xdns: Some(xdns.clone()),
+            ..Default::default()
+        };
+        assert!(config.enabled());
+        config.validate().unwrap();
+        config.udp_hop.ports = vec![443, 8443];
+        config.udp_hop.local = true;
+        assert!(config.validate().is_err(), "udphop");
+        config.udp_hop = Default::default();
+        config.sudoku = Some(SudokuCarrier {
+            config: Arc::new(crate::sudoku::SudokuConfig {
+                password: "synthetic".into(),
+                ..Default::default()
+            }),
+            before_salamander: false,
+            before_noise: false,
+            before_header_custom: false,
+        });
+        assert!(config.validate().is_err(), "sudoku");
+        config.sudoku = None;
+        config.xdns = Some(Arc::new(crate::xdns::XdnsConfig {
+            resolvers: vec![],
+            ..(*xdns).clone()
+        }));
+        assert!(config.validate().is_err(), "no resolver");
+        // The session opens the client; without it the socket is refused.
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        config.xdns = Some(xdns);
+        let session = CarrierSession::new(&config).unwrap();
+        assert!(wrap(socket, peer, peer, &config, &session).is_err());
+    }
+
+    #[test]
+    fn xicmp_runs_without_udphop_xdns_realm_header_custom_and_sudoku() {
+        let xicmp = Arc::new(crate::xicmp::XicmpConfig {
+            dgram: true,
+            ips: vec![],
+        });
+        let mut config = HysteriaCarrierConfig {
+            xicmp: Some(xicmp),
+            ..Default::default()
+        };
+        assert!(config.enabled());
+        config.validate().unwrap();
+        config.udp_hop.ports = vec![443, 8443];
+        config.udp_hop.local = true;
+        assert!(config.validate().is_err(), "udphop");
+        config.udp_hop = Default::default();
+        config.xdns = Some(Arc::new(crate::xdns::XdnsConfig::default()));
+        assert!(config.validate().is_err(), "xdns");
+        config.xdns = None;
+        config.realm = Some(Arc::new(crate::realm::RealmConfig {
+            scheme: crate::realm::RealmScheme::Http,
+            host: "127.0.0.1".into(),
+            port_text: "80".into(),
+            port: 80,
+            token: Arc::new(Zeroizing::new("t".into())),
+            id: "x".into(),
+            stun_servers: vec![crate::realm::RealmStunServer {
+                host: "127.0.0.1".into(),
+                port_text: "3478".into(),
+                port: 3478,
+            }],
+            tls: None,
+            family: crate::realm::RealmFamily::Dual,
+        }));
+        assert!(config.validate().is_err(), "realm");
+        config.realm = None;
+        config.header_custom = Some(HeaderCustomCarrier {
+            config: Arc::new(HeaderCustomUdpConfig::default()),
+            before_salamander: false,
+            before_noise: false,
+        });
+        assert!(config.validate().is_err(), "header-custom");
+        config.header_custom = None;
+        config.sudoku = Some(SudokuCarrier {
+            config: Arc::new(crate::sudoku::SudokuConfig {
+                password: "synthetic".into(),
+                ..Default::default()
+            }),
+            before_salamander: false,
+            before_noise: false,
+            before_header_custom: false,
+        });
+        assert!(config.validate().is_err(), "sudoku");
+        config.sudoku = None;
+        config.salamander_password = Some(Arc::new(Zeroizing::new("synthetic".into())));
+        config.validate().unwrap();
+        // The session opens the client; without it the socket is refused.
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let session = CarrierSession::new(&config).unwrap();
+        assert!(wrap(socket, peer, peer, &config, &session).is_err());
+    }
+
+    #[test]
+    fn realm_runs_without_udphop_xdns_and_header_custom() {
+        let realm = Arc::new(crate::realm::RealmConfig {
+            scheme: crate::realm::RealmScheme::Http,
+            host: "127.0.0.1".into(),
+            port_text: "80".into(),
+            port: 80,
+            token: Arc::new(Zeroizing::new("t".into())),
+            id: "x".into(),
+            stun_servers: vec![crate::realm::RealmStunServer {
+                host: "127.0.0.1".into(),
+                port_text: "3478".into(),
+                port: 3478,
+            }],
+            tls: None,
+            family: crate::realm::RealmFamily::Dual,
+        });
+        let mut config = HysteriaCarrierConfig {
+            realm: Some(realm.clone()),
+            ..Default::default()
+        };
+        assert!(config.enabled());
+        config.validate().unwrap();
+        config.udp_hop.ports = vec![443, 8443];
+        config.udp_hop.local = true;
+        assert!(config.validate().is_err(), "udphop");
+        config.udp_hop = Default::default();
+        config.header_custom = Some(HeaderCustomCarrier {
+            config: Arc::new(HeaderCustomUdpConfig::default()),
+            before_salamander: false,
+            before_noise: false,
+        });
+        assert!(config.validate().is_err(), "header-custom");
+        config.header_custom = None;
+        config.xdns = Some(Arc::new(crate::xdns::XdnsConfig::default()));
+        assert!(config.validate().is_err(), "xdns");
+        config.xdns = None;
+        // HTTPS needs its TLS settings.
+        config.realm = Some(Arc::new(crate::realm::RealmConfig {
+            scheme: crate::realm::RealmScheme::Https,
+            ..(*realm).clone()
+        }));
+        assert!(config.validate().is_err(), "HTTPS without TLS");
+        config.salamander_password = Some(Arc::new(Zeroizing::new("synthetic".into())));
+        config.realm = Some(realm);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn sudoku_ranks_against_every_other_mask() {
+        use crate::header_custom::HeaderCustomUdpConfig;
+        use crate::udp_noise::{NoiseRange, UdpNoiseConfig};
+        use Mask::{Header as H, Noise as N, Salamander as S, Sudoku as K};
+        // Each position of a list as Xray-core reads it, from the innermost.
+        let lists: [&[Mask]; 6] = [
+            &[K, S],
+            &[S, K],
+            &[K, N, H, S],
+            &[N, S, K, H],
+            &[H, K, S, N],
+            &[S, H, N, K],
+        ];
+        for list in lists {
+            let at = |mask| list.iter().position(|&m| m == mask);
+            let before = |first, second| at(first).zip(at(second)).is_some_and(|(a, b)| a < b);
+            let config = HysteriaCarrierConfig {
+                salamander_password: at(S).map(|_| Arc::new(Zeroizing::new("synthetic".into()))),
+                noise: at(N).map(|_| UdpNoiseConfig {
+                    items: vec![],
+                    reset_secs: NoiseRange { from: 0, to: 0 },
+                    before_salamander: before(N, S),
+                }),
+                header_custom: at(H).map(|_| HeaderCustomCarrier {
+                    config: Arc::new(HeaderCustomUdpConfig::default()),
+                    before_salamander: before(H, S),
+                    before_noise: before(H, N),
+                }),
+                sudoku: at(K).map(|_| SudokuCarrier {
+                    config: Arc::new(crate::sudoku::SudokuConfig::default()),
+                    before_salamander: before(K, S),
+                    before_noise: before(K, N),
+                    before_header_custom: before(K, H),
+                }),
+                ..Default::default()
+            };
+            assert_eq!(config.mask_order(), list, "{list:?}");
+        }
+        // An unbuildable table is refused.
+        let config = HysteriaCarrierConfig {
+            sudoku: Some(SudokuCarrier {
+                config: Arc::new(crate::sudoku::SudokuConfig {
+                    ascii: "text".into(),
+                    ..Default::default()
+                }),
+                before_salamander: false,
+                before_noise: false,
+                before_header_custom: false,
+            }),
+            ..Default::default()
+        };
+        assert!(config.enabled());
+        assert!(config.validate().is_err());
+    }
+
+    /// Sudoku outside Salamander: the wire carries sudoku, Salamander
+    /// inside it, and the reply comes back through both.
+    #[tokio::test]
+    async fn the_carrier_puts_sudoku_at_its_place_and_lets_it_fragment() {
+        use crate::sudoku::{datagram::DatagramMask, SudokuConfig};
+        use std::future::poll_fn;
+        const PASSWORD: &str = "synthetic-password";
+        let sudoku = SudokuConfig {
+            password: "synthetic-sudoku".into(),
+            ..Default::default()
+        };
+        let mask = DatagramMask::new(&sudoku).unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let wire_peer = peer.local_addr().unwrap();
+        let local = UdpSocket::bind("127.0.0.1:0").unwrap();
+        local.set_nonblocking(true).unwrap();
+        // A clone shows the socket's options after the carrier took it.
+        let probe = local.try_clone().unwrap();
+        let config = HysteriaCarrierConfig {
+            salamander_password: Some(Arc::new(Zeroizing::new(PASSWORD.into()))),
+            sudoku: Some(SudokuCarrier {
+                config: Arc::new(sudoku),
+                before_salamander: false,
+                before_noise: false,
+                before_header_custom: false,
+            }),
+            ..Default::default()
+        };
+        config.validate().unwrap();
+        let client = wrap(
+            local,
+            wire_peer,
+            wire_peer,
+            &config,
+            &CarrierSession::default(),
+        )
+        .unwrap();
+        assert!(client.may_fragment());
+        assert_eq!(client.max_transmit_segments(), 1);
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "ios"
+        ))]
+        {
+            use std::os::fd::AsFd;
+            let [(level, name, allowed), _] = crate::sudoku::quic::FRAGMENTATION;
+            let value = crate::sockopt_sys::get_int(probe.as_fd(), level, name);
+            assert_eq!(value.unwrap(), allowed, "the system may fragment");
+        }
+        drop(probe);
+        let packet = vec![0x5a; 1200];
+        let transmit = udp::Transmit {
+            destination: wire_peer,
+            ecn: None,
+            contents: &packet,
+            segment_size: None,
+            src_ip: None,
+        };
+        let mut poller = client.clone().create_io_poller();
+        loop {
+            match client.try_send(&transmit) {
+                Ok(()) => break,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    poll_fn(|cx| poller.as_mut().poll_writable(cx))
+                        .await
+                        .unwrap()
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let mut wire = vec![0; 65_536];
+        let (n, from) = peer.recv_from(&mut wire).await.unwrap();
+        assert!(n >= (packet.len() + SALT_LEN) * 4, "{n}");
+        let inner = mask.decode(&mut wire, 0..n).unwrap();
+        assert_eq!(salamander_plaintext(PASSWORD, &wire[inner]), packet);
+
+        let reply = mask.encode(&salamander_datagram(PASSWORD, b"reply"));
+        peer.send_to(&reply, from).await.unwrap();
+        let mut output = vec![0; 1472];
+        let mut bufs = [IoSliceMut::new(&mut output)];
+        let mut meta = [udp::RecvMeta::default()];
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            poll_fn(|cx| client.poll_recv(cx, &mut bufs, &mut meta)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&output[..meta[0].len], b"reply");
     }
 
     #[test]

@@ -78,6 +78,8 @@ mod tun_admission;
 mod blackhole;
 #[path = "runtime_data_path_tests/dns_use_system.rs"]
 mod dns_use_system;
+#[path = "runtime_data_path_tests/finalmask_filter.rs"]
+mod finalmask_filter;
 #[path = "runtime_data_path_tests/freedom_domain_strategy.rs"]
 mod freedom_domain_strategy;
 #[path = "runtime_data_path_tests/freedom_noises.rs"]
@@ -88,6 +90,8 @@ mod freedom_settings;
 mod http_inbound;
 #[path = "runtime_data_path_tests/loopback_outbound.rs"]
 mod loopback_outbound;
+#[path = "runtime_data_path_tests/masque_tun.rs"]
+mod masque_tun;
 #[path = "runtime_data_path_tests/routing_attributes.rs"]
 mod routing_attributes;
 #[path = "runtime_data_path_tests/routing_origin.rs"]
@@ -138,6 +142,7 @@ fn compile_vless_tcp_outbound_one_shot(config: &CoreConfig) -> Result<VlessTcpOu
         | TcpOutbound::Shadowsocks2022(_)
         | TcpOutbound::Hysteria(_)
         | TcpOutbound::Wireguard(_)
+        | TcpOutbound::Masque(_)
         | TcpOutbound::Chained { .. } => Err(CoreError::NoSupportedOutbound),
     }
 }
@@ -156,6 +161,11 @@ fn vless_outbound(security: StreamSecurity, server: TargetAddr, port: u16) -> Ou
             tcp_header_custom: None,
             udp_header_custom: None,
             tcp_sudoku: None,
+            tcp_xmc: None,
+            udp_xdns: None,
+            udp_realm: None,
+            udp_xicmp: None,
+            udp_salamander: None,
             udp_sudoku: None,
             udp_noise: None,
             socket_options: None,
@@ -171,6 +181,7 @@ fn vless_outbound(security: StreamSecurity, server: TargetAddr, port: u16) -> Ou
                 vision_seed: xray_proxy::vless::DEFAULT_VISION_SEED,
                 pre_connections: 0,
             }],
+            reverse: None,
         }),
     }
 }
@@ -189,6 +200,11 @@ fn freedom_outbound() -> OutboundConfig {
             tcp_header_custom: None,
             udp_header_custom: None,
             tcp_sudoku: None,
+            tcp_xmc: None,
+            udp_xdns: None,
+            udp_realm: None,
+            udp_xicmp: None,
+            udp_salamander: None,
             udp_sudoku: None,
             udp_noise: None,
             socket_options: None,
@@ -211,6 +227,11 @@ fn dns_outbound(settings: DnsOutboundSettings) -> OutboundConfig {
             tcp_header_custom: None,
             udp_header_custom: None,
             tcp_sudoku: None,
+            tcp_xmc: None,
+            udp_xdns: None,
+            udp_realm: None,
+            udp_xicmp: None,
+            udp_salamander: None,
             udp_sudoku: None,
             udp_noise: None,
             socket_options: None,
@@ -2750,6 +2771,194 @@ async fn tun_udp_client_reaches_echo_target_through_freedom_outbound() {
     timeout(Duration::from_secs(2), run_tun_udp_freedom_echo_scenario())
         .await
         .unwrap();
+}
+
+/// A TUN UDP flow through freedom goes under `finalmask.udp`, as Xray-core's
+/// freedom dials it: the noise inside a header-custom prefix, which the
+/// server checks and answers with its own. The reply reaches the client
+/// with the prefix taken off.
+#[tokio::test]
+async fn tun_udp_freedom_flow_runs_under_masks() {
+    timeout(Duration::from_secs(5), async {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let SocketAddr::V4(server_addr) = server.local_addr().unwrap() else {
+            unreachable!("bound to IPv4");
+        };
+        let mut config = runtime_tun_config_with_freedom_outbound();
+        let raw = serde_json::json!({"outbounds": [{"protocol": "freedom", "tag": "direct",
+            "streamSettings": {"finalmask": {"udp": [
+                {"type": "noise", "settings": {"noise": [{"type": "str", "packet": "noise"}]}},
+                {"type": "header-custom", "settings": {"mode": "prefix",
+                    "client": [{"type": "str", "packet": "hello"}],
+                    "server": [{"type": "str", "packet": "world"}]}}]}}}]});
+        config.outbounds = xray_config::parse_xray_json(&raw.to_string())
+            .unwrap()
+            .config
+            .outbounds;
+        let mut core = Core::new(config).unwrap();
+        core.start().await.unwrap();
+
+        let client_addr = Ipv4Addr::new(10, 10, 0, 2);
+        let request = ipv4_udp_packet(
+            client_addr,
+            49154,
+            *server_addr.ip(),
+            server_addr.port(),
+            b"masked tun udp",
+        );
+        core.tun().push_inbound(Bytes::from(request)).await.unwrap();
+        let mut seen = Vec::new();
+        let mut buffer = [0; 256];
+        while seen.len() < 2 {
+            let (n, peer) = server.recv_from(&mut buffer).await.unwrap();
+            let datagram = &buffer[..n];
+            assert!(datagram.starts_with(b"hello"), "{datagram:?}");
+            seen.push(datagram[5..].to_vec());
+            let mut reply = b"world".to_vec();
+            reply.extend_from_slice(&datagram[5..]);
+            server.send_to(&reply, peer).await.unwrap();
+        }
+        assert_eq!(seen, [b"noise".to_vec(), b"masked tun udp".to_vec()]);
+        let reply = poll_tun_outbound_until(core.tun(), |packet| {
+            ipv4_udp_payload(packet).is_some_and(|payload| payload == b"masked tun udp")
+        })
+        .await;
+        assert_ipv4_udp_packet(
+            &reply,
+            *server_addr.ip(),
+            server_addr.port(),
+            client_addr,
+            49154,
+            b"masked tun udp",
+        );
+        core.stop().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// A standalone header-custom mask holds a freedom flow's first datagram
+/// until the server answers its request, as Xray-core's write blocks; the
+/// flow must read that answer while the datagram waits.
+#[tokio::test]
+async fn tun_udp_freedom_flow_waits_out_a_standalone_header() {
+    timeout(Duration::from_secs(5), async {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let SocketAddr::V4(server_addr) = server.local_addr().unwrap() else {
+            unreachable!("bound to IPv4");
+        };
+        let mut config = runtime_tun_config_with_freedom_outbound();
+        let raw = serde_json::json!({"outbounds": [{"protocol": "freedom", "tag": "direct",
+            "streamSettings": {"finalmask": {"udp": [
+                {"type": "header-custom", "settings": {"mode": "standalone",
+                    "client": [{"type": "str", "packet": "hello"}],
+                    "server": [{"type": "str", "packet": "world"}]}}]}}}]});
+        config.outbounds = xray_config::parse_xray_json(&raw.to_string())
+            .unwrap()
+            .config
+            .outbounds;
+        let mut core = Core::new(config).unwrap();
+        core.start().await.unwrap();
+
+        let client_addr = Ipv4Addr::new(10, 10, 0, 2);
+        let request = ipv4_udp_packet(
+            client_addr,
+            49155,
+            *server_addr.ip(),
+            server_addr.port(),
+            b"standalone tun udp",
+        );
+        core.tun().push_inbound(Bytes::from(request)).await.unwrap();
+        let mut buffer = [0; 256];
+        let mut requests = 0;
+        loop {
+            let (n, peer) = server.recv_from(&mut buffer).await.unwrap();
+            if &buffer[..n] == b"hello" {
+                requests += 1;
+                server.send_to(b"world", peer).await.unwrap();
+                continue;
+            }
+            assert_eq!(
+                &buffer[..n],
+                b"standalone tun udp",
+                "after {requests} requests"
+            );
+            server.send_to(&buffer[..n], peer).await.unwrap();
+            break;
+        }
+        let reply = poll_tun_outbound_until(core.tun(), |packet| {
+            ipv4_udp_payload(packet).is_some_and(|payload| payload == b"standalone tun udp")
+        })
+        .await;
+        assert_ipv4_udp_packet(
+            &reply,
+            *server_addr.ip(),
+            server_addr.port(),
+            client_addr,
+            49155,
+            b"standalone tun udp",
+        );
+        core.stop().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+/// A query the TUN DNS proxy sends through freedom goes under its
+/// `finalmask.udp`, as every UDP flow through freedom does: a standalone
+/// header's request first, then the query once the upstream answered it,
+/// and the upstream's response back to the client.
+#[tokio::test]
+async fn tun_dns_proxy_query_through_freedom_runs_under_masks() {
+    timeout(Duration::from_secs(5), async {
+        let upstream = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let mut config = runtime_tun_config_with_freedom_outbound();
+        let raw = serde_json::json!({"outbounds": [{"protocol": "freedom", "tag": "direct",
+            "streamSettings": {"finalmask": {"udp": [
+                {"type": "header-custom", "settings": {"mode": "standalone",
+                    "client": [{"type": "str", "packet": "hello"}],
+                    "server": [{"type": "str", "packet": "world"}]}}]}}}]});
+        config.outbounds = xray_config::parse_xray_json(&raw.to_string())
+            .unwrap()
+            .config
+            .outbounds;
+        config.dns.servers = vec![DnsServerConfig::Ip(upstream.local_addr().unwrap())];
+        let mut core = Core::new(config).unwrap();
+        core.start().await.unwrap();
+
+        // An HTTPS query is proxied, where an A query is resolved.
+        let query = build_dns_query(0x2212, "masked-proxy.example", 65, 1);
+        let client_addr = Ipv4Addr::new(10, 10, 0, 2);
+        let anchor = Ipv4Addr::new(198, 18, 0, 1);
+        core.tun()
+            .push_inbound(Bytes::from(ipv4_udp_packet(
+                client_addr,
+                53_021,
+                anchor,
+                53,
+                &query,
+            )))
+            .await
+            .unwrap();
+        let mut buffer = [0; 512];
+        let (n, peer) = upstream.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..n], b"hello", "the query went out unmasked");
+        upstream.send_to(b"world", peer).await.unwrap();
+        let (n, _) = upstream.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..n], query.as_slice());
+        let mut response = query.clone();
+        response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+        upstream.send_to(&response, peer).await.unwrap();
+
+        let reply = poll_tun_outbound_until(core.tun(), |packet| {
+            ipv4_udp_payload(packet) == Some(response.as_slice())
+        })
+        .await;
+        assert_ipv4_udp_packet(&reply, anchor, 53, client_addr, 53_021, &response);
+        core.stop().await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -13287,4 +13496,54 @@ async fn socks_freedom_fragment_flushes_first_record_and_leaves_later_writes_unc
         assert_eq!(later, record);
         drop(client);core.stop().await.unwrap();echo_task.await.unwrap();
     }).await.unwrap();
+}
+
+/// Freedom cuts the writes `packets` selects into raw pieces, each its own
+/// write spaced by the delay, and sends the others whole.
+#[tokio::test]
+async fn socks_freedom_fragment_cuts_selected_writes_into_raw_pieces() {
+    timeout(Duration::from_secs(5), async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let reads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&reads);
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 64];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                recorded.lock().unwrap().push(buffer[..read].to_vec());
+                stream.write_all(&buffer[..read]).await.unwrap();
+            }
+        });
+        let mut config = runtime_config_with_freedom_outbound();
+        let parsed = xray_config::parse_xray_json(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"fragment":{"packets":"1-2","length":3,"interval":5}}}]}"#,
+        )
+        .unwrap();
+        config.outbounds[0].stream.tcp_fragment =
+            parsed.config.outbounds[0].stream.tcp_fragment.clone();
+        let mut core = Core::new(config).unwrap();
+        core.start().await.unwrap();
+        let mut client = TcpStream::connect(core.inbound_addr(Some("socks-in")).unwrap())
+            .await
+            .unwrap();
+        socks5_connect(&mut client, target).await;
+        for write in [&b"abcdefgh"[..], b"ijkl", b"mnopqrst"] {
+            client.write_all(write).await.unwrap();
+            let mut echoed = vec![0; write.len()];
+            client.read_exact(&mut echoed).await.unwrap();
+            assert_eq!(echoed, write);
+        }
+        let expected = [&b"abc"[..], b"def", b"gh", b"ijk", b"l", b"mnopqrst"];
+        assert_eq!(*reads.lock().unwrap(), expected.map(<[u8]>::to_vec));
+        drop(client);
+        core.stop().await.unwrap();
+        server.await.unwrap();
+    })
+    .await
+    .unwrap();
 }

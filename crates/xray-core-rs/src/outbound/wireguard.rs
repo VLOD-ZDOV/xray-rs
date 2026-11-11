@@ -1,5 +1,5 @@
 //! Lazy shared WireGuard device with separate bootstrap and destination DNS.
-mod dns;
+pub(super) mod dns;
 use super::*;
 use xray_config::{AddressFamilies, WireguardOutboundSettings};
 use xray_wireguard::{Client, Config, Error, PeerConfig};
@@ -11,6 +11,8 @@ struct Owner {
     settings: WireguardOutboundSettings,
     /// `sockopt`, for the UDP socket.
     socket_options: Option<Arc<xray_transport::SocketOptions>>,
+    /// `finalmask.udp`, over the UDP socket.
+    masks: Option<Arc<xray_transport::hysteria::HysteriaCarrierConfig>>,
     /// `sockopt.domainStrategy`, which picks a domain endpoint's address.
     endpoint_strategy: DomainStrategy,
     /// The dialer given and the one made from it with `socket_options`,
@@ -61,9 +63,16 @@ impl WireguardOutbound {
         engine_config(settings)
             .validate()
             .map_err(|_| CoreError::UnsupportedOutboundNetwork)?;
+        // Xray-core dials its masked socket to the first peer's endpoint, so
+        // masks take one peer.
+        let masks = super::direct_udp_masks(&outbound.stream)?;
+        if masks.is_some() && settings.peers.len() != 1 {
+            return Err(CoreError::UnsupportedOutboundNetwork);
+        }
         Ok(Self(Arc::new(Owner {
             settings: settings.clone(),
             socket_options: socket_options::compile(&outbound.stream),
+            masks,
             endpoint_strategy: outbound
                 .stream
                 .socket_options
@@ -170,7 +179,8 @@ impl WireguardOutbound {
             .ok_or(Error::NoRoute)?;
         }
         let generation = self.0.network_generation.load(Ordering::Acquire);
-        let client = Client::start(config, protector.clone()).await?;
+        let client =
+            Client::start_with_masks(config, self.0.masks.clone(), protector.clone()).await?;
         let mut slot = self.0.session.lock().unwrap_or_else(|e| e.into_inner());
         if *self.0.shutdown.borrow() {
             client.close();
@@ -181,7 +191,10 @@ impl WireguardOutbound {
         if self.0.network_generation.load(Ordering::Acquire) != generation {
             client.rebind();
         }
-        let dns = dns::resolver(client.clone(), &self.0.settings.remote_dns);
+        let dns = dns::resolver(
+            dns::TunnelFlows::Wireguard(client.clone()),
+            &self.0.settings.remote_dns,
+        );
         *slot = Some(Cached {
             client: client.clone(),
             dns: dns.clone(),
@@ -327,7 +340,10 @@ fn engine_config(settings: &WireguardOutboundSettings) -> Config {
 /// The address a domain endpoint dials, as Xray-core's `MakeResolveLocal`
 /// picks it: one of the families `strategy` prefers, else of its fallback
 /// family. Xray-core picks one of them at random; the first is taken here.
-fn endpoint_address(candidates: &[SocketAddr], strategy: DomainStrategy) -> Option<SocketAddr> {
+pub(super) fn endpoint_address(
+    candidates: &[SocketAddr],
+    strategy: DomainStrategy,
+) -> Option<SocketAddr> {
     let of = |families: AddressFamilies| {
         candidates.iter().copied().find(|candidate| match families {
             AddressFamilies::Both => true,

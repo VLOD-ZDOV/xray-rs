@@ -12,15 +12,39 @@ impl Parser<'_> {
         let parsed = (|| {
             let settings = outbound.get("settings").filter(|v| v.is_object())?;
             self.reject_unknown_fields(settings, &path, &surface::WIREGUARD);
-            // Xray-core reads only `sockopt` from a WireGuard outbound's
-            // streams; its UDP masks are not supported here. The stream
-            // parser refuses a stream that is not an object.
+            // Xray-core reads `sockopt` and the UDP masks from a WireGuard
+            // outbound's streams: it dials its socket through
+            // `FinalMask.DialUDP`. The stream parser refuses a stream that is
+            // not an object.
             if let Some(fields) = outbound.get("streamSettings").and_then(Value::as_object) {
-                for key in fields.keys().filter(|key| *key != "sockopt") {
+                for key in fields
+                    .keys()
+                    .filter(|key| !matches!(key.as_str(), "sockopt" | "finalmask"))
+                {
                     self.error(
                         format!("$.outbounds[{index}].streamSettings.{key}"),
-                        "WireGuard takes only streamSettings.sockopt",
+                        "WireGuard takes only streamSettings.sockopt and finalmask.udp",
                     );
+                }
+                // It dials no TCP and no QUIC, where Xray-core leaves those
+                // masks unused. Filters wrap nothing on any client, so they
+                // go unused here as everywhere.
+                if let Some(finalmask) = fields.get("finalmask").and_then(Value::as_object) {
+                    for key in ["tcp", "quicParams"] {
+                        let unused = finalmask.get(key).is_some_and(|value| match value {
+                            Value::Null => false,
+                            Value::Array(masks) => masks
+                                .iter()
+                                .any(|mask| key == "quicParams" || !super::filter::is_filter(mask)),
+                            _ => true,
+                        });
+                        if unused {
+                            self.error(
+                                format!("$.outbounds[{index}].streamSettings.finalmask.{key}"),
+                                "WireGuard takes only streamSettings.sockopt and finalmask.udp",
+                            );
+                        }
+                    }
                 }
             }
             let dialer_proxy = outbound

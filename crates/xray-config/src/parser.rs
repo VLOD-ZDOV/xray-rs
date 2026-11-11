@@ -1,14 +1,18 @@
 mod blackhole;
 mod dns;
+mod filter;
 mod fragment;
 mod freedom;
+use xray_proxy::go_url;
 mod header_custom;
 mod http_inbound;
 mod http_outbound;
 mod hysteria;
 mod kcp;
 mod loopback;
+mod masque;
 mod noise;
+mod realm;
 mod routing;
 mod shadowsocks;
 mod socks;
@@ -20,7 +24,11 @@ mod trojan;
 mod vless;
 mod vmess;
 mod wireguard;
+mod xdns;
+mod xdrive;
 mod xhttp;
+mod xicmp;
+mod xmc;
 mod xray_lists;
 use xray_lists::PlainDomain;
 
@@ -83,6 +91,8 @@ enum StreamNetwork {
     Grpc,
     Xhttp,
     Kcp,
+    Masque,
+    Xdrive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,6 +412,18 @@ impl Parser<'_> {
             .is_some_and(|meta| !meta.is_object() && !meta.is_null())
         {
             self.error("$.meta", "field `meta` must be an object or null");
+        }
+        // Xray-core v26.10.31 refuses any legacy reverse proxy, bridges and
+        // portals alike, before reading it.
+        if self
+            .root
+            .get("reverse")
+            .is_some_and(|reverse| !reverse.is_null())
+        {
+            self.error(
+                "$.reverse",
+                "The feature \"legacy reverse\" has been removed and migrated to \"VLESS Reverse Proxy\". Please update your config(s) according to release note and documentation.",
+            );
         }
     }
 
@@ -1070,6 +1092,7 @@ impl Parser<'_> {
             Some("loopback") => OutboundProtocol::Loopback,
             Some("socks") => OutboundProtocol::Socks,
             Some("http") => OutboundProtocol::Http,
+            Some("masque") => OutboundProtocol::Masque,
             Some(protocol) => {
                 self.error(
                     protocol_path,
@@ -1121,6 +1144,9 @@ impl Parser<'_> {
             OutboundProtocol::Http => {
                 OutboundSettings::Http(self.parse_http_outbound_settings(outbound, index)?)
             }
+            OutboundProtocol::Masque => {
+                OutboundSettings::Masque(self.parse_masque_settings(outbound, index)?)
+            }
         };
         let target_strategy = self.domain_strategy_at(
             outbound,
@@ -1148,16 +1174,18 @@ impl Parser<'_> {
                     "targetStrategy is supported only on freedom outbounds",
                 );
             }
-            // WireGuard reads it for its peer endpoints.
-            if protocol != OutboundProtocol::Wireguard
-                && stream
-                    .socket_options
-                    .as_ref()
-                    .is_some_and(|options| options.domain_strategy.has_strategy())
+            // WireGuard reads it for its peer endpoints, MASQUE for its server.
+            if !matches!(
+                protocol,
+                OutboundProtocol::Wireguard | OutboundProtocol::Masque
+            ) && stream
+                .socket_options
+                .as_ref()
+                .is_some_and(|options| options.domain_strategy.has_strategy())
             {
                 self.error(
                     format!("$.outbounds[{index}].streamSettings.sockopt.domainStrategy"),
-                    "sockopt.domainStrategy is supported only on freedom and WireGuard outbounds",
+                    "sockopt.domainStrategy is supported only on freedom, WireGuard and MASQUE outbounds",
                 );
             }
         }
@@ -1198,6 +1226,7 @@ impl Parser<'_> {
             }
         }
         self.validate_hysteria_pair(&settings, &stream, proxy_settings.is_some(), index);
+        self.validate_masque_pair(&settings, &stream, proxy_settings.is_some(), index);
         self.validate_trojan_stream(&settings, &stream, index);
 
         // Xray v26.7.28 applies this policy only to its simplified top-level
@@ -1227,7 +1256,9 @@ impl Parser<'_> {
             // Basic credentials then travel in cleartext, which is
             // documented, not rejected.
             | OutboundSettings::Socks(_)
-            | OutboundSettings::Http(_) => false,
+            | OutboundSettings::Http(_)
+            // MASQUE requires TLS.
+            | OutboundSettings::Masque(_) => false,
         };
         if rejects_plaintext_server {
             self.error(
@@ -1257,6 +1288,7 @@ impl Parser<'_> {
         }
 
         let mux = self.parse_mux(outbound, index, &settings);
+        self.validate_xdrive_pair(&settings, &stream, mux.as_ref(), index);
         // Xray's XHTTP inbound and its VLESS inbound for a Vision account both
         // restrict a Mux.Cool connection to UDP children and break the whole
         // connection on the first TCP child. Refuse the TCP pool up front.
@@ -1316,12 +1348,13 @@ impl Parser<'_> {
         let mut numbers = [0i16; 2];
         for (slot, key) in numbers.iter_mut().zip(["concurrency", "xudpConcurrency"]) {
             if let Some(value) = mux.get(key) {
-                if let Some(n) = value.as_i64().filter(|n| (-32768..=64).contains(n)) {
-                    *slot = n as i16;
+                // Xray-core decodes both into an int16.
+                if let Some(n) = value.as_i64().and_then(|n| i16::try_from(n).ok()) {
+                    *slot = n;
                 } else {
                     self.error(
                         format!("{mux_path}.{key}"),
-                        "Mux concurrency must be an integer between -32768 and 64",
+                        "Mux concurrency must be an integer between -32768 and 32767",
                     );
                 }
             }
@@ -1361,7 +1394,7 @@ impl Parser<'_> {
             );
         }
         Some(crate::MuxSettings {
-            concurrency: if numbers[0] == 0 { 8 } else { numbers[0] },
+            concurrency: crate::mux_tcp_concurrency(numbers[0]),
             xudp_concurrency: numbers[1],
             udp443,
         })
@@ -2559,7 +2592,7 @@ fn dns_ip_rule_uses_geodata(value: &str) -> bool {
 }
 
 /// Go's `net.SplitHostPort`, with its error texts.
-fn go_split_host_port(hostport: &str) -> Result<(&str, &str), &'static str> {
+pub(super) fn go_split_host_port(hostport: &str) -> Result<(&str, &str), &'static str> {
     const MISSING_PORT: &str = "missing port in address";
     const TOO_MANY_COLONS: &str = "too many colons in address";
     // The port starts after the last colon.
