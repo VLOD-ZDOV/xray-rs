@@ -428,10 +428,53 @@ const SECTIONS: [&str; 17] = [
     "env",
 ];
 
+/// Gives nested keys Xray's spelling when they match one of its field names
+/// without case, as Go's JSON decoding does. Maps whose keys are data, not
+/// field names, are left alone.
+fn normalize_keys(value: &mut Value) {
+    const DATA_MAPS: [&str; 6] = [
+        "headers",
+        "responseHeaders",
+        "hosts",
+        "attrs",
+        "levels",
+        "env",
+    ];
+    match value {
+        Value::Object(map) => {
+            let keys: Vec<String> = map.keys().cloned().collect();
+            for key in keys {
+                let canonical = crate::xray_keys::XRAY_JSON_KEYS
+                    .iter()
+                    .find(|k| k.eq_ignore_ascii_case(&key) && **k != key);
+                if let Some(canonical) = canonical {
+                    if !map.contains_key(*canonical) {
+                        if let Some(child) = map.remove(&key) {
+                            map.insert((*canonical).to_owned(), child);
+                        }
+                    }
+                }
+            }
+            for (key, child) in map.iter_mut() {
+                if !DATA_MAPS.contains(&key.as_str()) {
+                    normalize_keys(child);
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(normalize_keys),
+        _ => {}
+    }
+}
+
 fn normalize_sections(root: &mut Value) {
     let Some(map) = root.as_object_mut() else {
         return;
     };
+    for (key, section) in map.iter_mut() {
+        if !key.eq_ignore_ascii_case("env") {
+            normalize_keys(section);
+        }
+    }
     let keys: Vec<String> = map.keys().cloned().collect();
     for key in keys {
         if let Some(canonical) = SECTIONS
@@ -2720,6 +2763,22 @@ pub(crate) fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn keys_take_xray_spelling_without_case() {
+        let mut root = serde_json::json!({"inbounds": [{
+            "PORT": 1, "Protocol": "vless",
+            "streamSettings": {"xhttpSettings": {"headers": {"Host": "a"}}}
+        }]});
+        normalize_sections(&mut root);
+        assert_eq!(
+            root,
+            serde_json::json!({"inbounds": [{
+                "port": 1, "protocol": "vless",
+                "streamSettings": {"xhttpSettings": {"headers": {"Host": "a"}}}
+            }]})
+        );
+    }
+
     #[test]
     fn dns_section_is_read_as_xray_reads_it() {
         let dns = xray_dns_section(&serde_json::json!({

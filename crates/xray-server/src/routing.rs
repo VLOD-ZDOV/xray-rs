@@ -1883,7 +1883,7 @@ impl Router {
                     return Decision {
                         open_private: self.inbound_opens_private(query.inbound),
                         ..decision
-                    }
+                    };
                 }
             }
         }
