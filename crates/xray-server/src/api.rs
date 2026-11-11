@@ -1395,12 +1395,12 @@ async fn handle_handler(
                 "hysteria",
                 "vless",
             ];
-            if !known.iter().any(|k| proxy_type.contains(k)) {
+            let Some(proxy_name) = known.iter().find(|k| proxy_type.contains(*k)) else {
                 return status(
                     UNKNOWN,
                     &format!("AddInbound does not support proxy type {proxy_type:?} yet"),
                 );
-            }
+            };
             let (port, listen, sniffing, transport) =
                 if let Some(rec) = inbound_cfg.receiver_settings {
                     let rec = ReceiverConfig::decode(rec.value).unwrap_or(ReceiverConfig {
@@ -1658,6 +1658,9 @@ async fn handle_handler(
             };
             match crate::start_inbound(&inbound, None, inbound_manager.router().clone()).await {
                 Ok((ctx, tcp_abort, udp_abort)) => {
+                    inbound_manager
+                        .router()
+                        .set_inbound_protocol(&tag, Some(proxy_name));
                     if let Err(e) =
                         inbound_manager.add_entry(tag, ctx, tcp_abort.clone(), udp_abort.clone())
                     {
@@ -1678,6 +1681,7 @@ async fn handle_handler(
             if !inbound_manager.remove(&r.tag) {
                 return missing_handler(&r.tag);
             }
+            inbound_manager.router().set_inbound_protocol(&r.tag, None);
             reply(&RemoveInboundResponse {})
         }
         "AddOutbound" => {

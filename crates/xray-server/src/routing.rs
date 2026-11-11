@@ -1081,6 +1081,9 @@ impl Action {
 pub struct Decision {
     pub tag: String,
     pub action: Action,
+    /// Freedom may dial private addresses with no matching `finalRules`
+    /// entry: Xray blocks them only for public proxy inbounds.
+    pub open_private: bool,
 }
 
 pub struct Query<'a> {
@@ -1283,6 +1286,7 @@ pub struct Router {
     pub observatory: Arc<std::sync::RwLock<Option<Arc<crate::observatory::Observatory>>>>,
     pub dialer_proxies: Vec<(String, String)>,
     pub reverse_portals: std::sync::RwLock<HashMap<String, Arc<crate::mux::ReversePortal>>>,
+    pub inbound_protocols: std::sync::RwLock<HashMap<String, String>>,
 }
 
 pub struct Rule {
@@ -1629,6 +1633,16 @@ impl Router {
             observatory: Arc::new(std::sync::RwLock::new(None)),
             dialer_proxies,
             reverse_portals,
+            inbound_protocols: std::sync::RwLock::new(
+                array(root, "inbounds")
+                    .iter()
+                    .filter_map(|inbound| {
+                        let tag = str_field(inbound, "tag");
+                        (!tag.is_empty())
+                            .then(|| (tag.to_owned(), str_field(inbound, "protocol").to_owned()))
+                    })
+                    .collect(),
+            ),
         })
     }
 
@@ -1757,10 +1771,49 @@ impl Router {
         outbounds.remove(tag).is_some()
     }
 
+    pub fn set_inbound_protocol(&self, tag: &str, protocol: Option<&str>) {
+        let mut protocols = self
+            .inbound_protocols
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match protocol {
+            Some(protocol) if !tag.is_empty() => {
+                protocols.insert(tag.to_owned(), protocol.to_owned());
+            }
+            _ => {
+                protocols.remove(tag);
+            }
+        }
+    }
+
+    /// Xray's freedom `getDefaultFinalRule`: public proxy inbounds may not
+    /// reach private addresses by default, local ones (socks, http, tunnel)
+    /// may. An untagged inbound cannot be told apart, so it stays blocked.
+    fn inbound_opens_private(&self, tag: &str) -> bool {
+        let protocols = self
+            .inbound_protocols
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(protocol) = protocols.get(tag) else {
+            return false;
+        };
+        let protocol = protocol.to_ascii_lowercase();
+        !(matches!(
+            protocol.as_str(),
+            "vless" | "vmess" | "trojan" | "hysteria" | "hysteria2" | "wireguard"
+        ) || protocol.starts_with("shadowsocks"))
+    }
+
     /// Freedom's last check on the resolved address: the first matching
-    /// `finalRules` entry wins, otherwise private addresses are blocked, as
-    /// Xray does for VLESS inbounds.
-    pub fn final_action(&self, outbound: &str, network: Network, addr: SocketAddr) -> Action {
+    /// `finalRules` entry wins, otherwise private addresses are blocked
+    /// unless the inbound may reach them.
+    pub fn final_action(
+        &self,
+        outbound: &str,
+        network: Network,
+        addr: SocketAddr,
+        open_private: bool,
+    ) -> Action {
         let ip = addr.ip();
         let final_rules = self
             .final_rules
@@ -1780,7 +1833,7 @@ impl Router {
                     && rule.matches_ip(Some(&ip))
             })
             .map_or(
-                if is_private(ip) {
+                if !open_private && is_private(ip) {
                     Action::Block(BlockAction::Drop)
                 } else {
                     outbounds
@@ -1826,11 +1879,17 @@ impl Router {
                 Action::Loopback(inbound_tag) => {
                     current_inbound = inbound_tag;
                 }
-                _ => return decision,
+                _ => {
+                    return Decision {
+                        open_private: self.inbound_opens_private(&current_inbound),
+                        ..decision
+                    }
+                }
             }
         }
 
         Decision {
+            open_private: false,
             tag: "loopback".into(),
             action: Action::Block(BlockAction::Drop),
         }
@@ -1921,12 +1980,14 @@ impl Router {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     if let Some((tag, action)) = balancer.select(&outbounds, obs.as_deref()) {
                         return Decision {
+                            open_private: false,
                             tag: tag.to_owned(),
                             action: action.clone(),
                         };
                     }
                 }
                 Decision {
+                    open_private: false,
                     tag: format!("balancer:{balancer_tag}"),
                     action: Action::Block(BlockAction::Drop),
                 }
@@ -1944,6 +2005,7 @@ impl Router {
                 .unwrap_or(Action::Block(BlockAction::Drop))
         };
         Decision {
+            open_private: false,
             tag: tag.to_owned(),
             action,
         }
@@ -2494,6 +2556,7 @@ mod tests {
         assert_eq!(
             r.route(&query(Some("example.com"), None, 443)).await,
             Decision {
+                open_private: false,
                 tag: "direct".into(),
                 action: Action::Direct(FreedomStrategy::AsIs.into())
             }
@@ -2517,6 +2580,7 @@ mod tests {
         assert_eq!(
             blocked,
             Decision {
+                open_private: false,
                 tag: "warp".into(),
                 action: Action::Block(BlockAction::Drop)
             }
@@ -2536,6 +2600,37 @@ mod tests {
     }
 
     #[test]
+    fn private_addresses_open_only_to_local_inbounds() {
+        let r = router(json!({
+            "inbounds": [
+                {"tag": "s", "protocol": "socks"},
+                {"tag": "d", "protocol": "dokodemo-door"},
+                {"tag": "v", "protocol": "vless"},
+                {"tag": "ss", "protocol": "shadowsocks"}
+            ],
+            "outbounds": [{"tag": "plain", "protocol": "freedom"}]
+        }));
+        assert!(r.inbound_opens_private("s"));
+        assert!(r.inbound_opens_private("d"));
+        assert!(!r.inbound_opens_private("v"));
+        assert!(!r.inbound_opens_private("ss"));
+        assert!(!r.inbound_opens_private(""));
+        r.set_inbound_protocol("api-added", Some("http"));
+        assert!(r.inbound_opens_private("api-added"));
+        r.set_inbound_protocol("api-added", None);
+        assert!(!r.inbound_opens_private("api-added"));
+        let at = "192.168.1.1:80".parse::<SocketAddr>().unwrap();
+        assert!(matches!(
+            r.final_action("plain", Network::Tcp, at, false),
+            Action::Block(_)
+        ));
+        assert!(matches!(
+            r.final_action("plain", Network::Tcp, at, true),
+            Action::Direct(_)
+        ));
+    }
+
+    #[test]
     fn freedom_final_rules() {
         let r = router(json!({
             "outbounds": [{"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [
@@ -2545,23 +2640,23 @@ mod tests {
         }));
         let at = |s: &str| s.parse::<SocketAddr>().unwrap();
         assert_eq!(
-            r.final_action("direct", Network::Tcp, at("127.0.0.1:8080")),
+            r.final_action("direct", Network::Tcp, at("127.0.0.1:8080"), false),
             Action::Direct(FreedomStrategy::AsIs.into())
         );
         assert_eq!(
-            r.final_action("direct", Network::Tcp, at("127.0.0.1:22")),
+            r.final_action("direct", Network::Tcp, at("127.0.0.1:22"), false),
             Action::Block(BlockAction::Drop)
         );
         assert_eq!(
-            r.final_action("direct", Network::Udp, at("1.1.1.1:53")),
+            r.final_action("direct", Network::Udp, at("1.1.1.1:53"), false),
             Action::Block(BlockAction::Drop)
         );
         assert_eq!(
-            r.final_action("plain", Network::Tcp, at("1.1.1.1:53")),
+            r.final_action("plain", Network::Tcp, at("1.1.1.1:53"), false),
             Action::Direct(FreedomStrategy::AsIs.into())
         );
         assert_eq!(
-            r.final_action("plain", Network::Tcp, at("192.168.1.1:80")),
+            r.final_action("plain", Network::Tcp, at("192.168.1.1:80"), false),
             Action::Block(BlockAction::Drop)
         );
     }
@@ -2585,6 +2680,7 @@ mod tests {
         assert_eq!(
             r.route(&q).await,
             Decision {
+                open_private: false,
                 tag: "forbidden".into(),
                 action: Action::Block(BlockAction::Http403)
             }
@@ -2594,6 +2690,7 @@ mod tests {
         assert_eq!(
             r.route(&q).await,
             Decision {
+                open_private: false,
                 tag: "forbidden".into(),
                 action: Action::Block(BlockAction::Http403)
             }
@@ -2603,6 +2700,7 @@ mod tests {
         assert_eq!(
             r.route(&q).await,
             Decision {
+                open_private: false,
                 tag: "blocked".into(),
                 action: Action::Block(BlockAction::Drop)
             }
@@ -2612,6 +2710,7 @@ mod tests {
         assert_eq!(
             r.route(&q).await,
             Decision {
+                open_private: false,
                 tag: "direct".into(),
                 action: Action::Direct(FreedomStrategy::AsIs.into())
             }
@@ -2630,6 +2729,7 @@ mod tests {
         assert_eq!(
             r.route(&query(Some("example.com"), None, 80)).await,
             Decision {
+                open_private: false,
                 tag: "v4only".into(),
                 action: Action::Direct(FreedomStrategy::UseIPv4.into())
             }

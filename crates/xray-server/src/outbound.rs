@@ -47,7 +47,15 @@ pub async fn connect(
                 Some(r) => r.apply(host, port),
                 None => (host.clone(), port),
             };
-            connect_direct(router, &decision.tag, settings, &target_host, target_port).await
+            connect_direct(
+                router,
+                &decision.tag,
+                settings,
+                &target_host,
+                target_port,
+                decision.open_private,
+            )
+            .await
         }
         Action::Wireguard(wg) => Ok(Box::new(wg.connect(host, port).await?)),
         Action::Masque(masque) => Ok(Box::new(masque.connect(host, port).await?)),
@@ -99,8 +107,9 @@ pub fn check_final(
     outbound: &str,
     network: Network,
     addr: SocketAddr,
+    open_private: bool,
 ) -> io::Result<()> {
-    match router.final_action(outbound, network, addr) {
+    match router.final_action(outbound, network, addr, open_private) {
         Action::Block(_) => Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("{addr} blocked by finalRules of {outbound:?}"),
@@ -373,9 +382,13 @@ async fn connect_direct(
     settings: &FreedomSettings,
     host: &Host,
     port: u16,
+    open_private: bool,
 ) -> io::Result<Box<dyn Stream>> {
     if let Some(ref proxy_tag) = settings.dialer_proxy {
-        let decision = router.decision_for_tag(proxy_tag);
+        let decision = Decision {
+            open_private,
+            ..router.decision_for_tag(proxy_tag)
+        };
         let stream = Box::pin(connect(router, &decision, host, port)).await?;
         if let Some(ref fragment) = settings.fragment {
             return Ok(Box::new(FragmentWriterStream::new(
@@ -404,7 +417,9 @@ async fn connect_direct(
                 // Filter candidate addresses through final rules if needed
                 let valid_addrs: Vec<SocketAddr> = addrs
                     .into_iter()
-                    .filter(|&a| check_final(router, outbound, Network::Tcp, a).is_ok())
+                    .filter(|&a| {
+                        check_final(router, outbound, Network::Tcp, a, open_private).is_ok()
+                    })
                     .collect();
                 if valid_addrs.is_empty() {
                     return Err(io::Error::new(
@@ -430,7 +445,7 @@ async fn connect_direct(
         }
     }
     for addr in addrs {
-        if let Err(e) = check_final(router, outbound, Network::Tcp, addr) {
+        if let Err(e) = check_final(router, outbound, Network::Tcp, addr, open_private) {
             last_error = Some(e);
             continue;
         }
@@ -493,7 +508,13 @@ impl UdpLink {
                 let mut addrs = resolve_all(&target_host, target_port).await?;
                 apply_strategy(&target_host, &mut addrs, settings.strategy)?;
                 let target = addrs[0];
-                check_final(router, &decision.tag, Network::Udp, target)?;
+                check_final(
+                    router,
+                    &decision.tag,
+                    Network::Udp,
+                    target,
+                    decision.open_private,
+                )?;
                 let bind_ip = settings
                     .send_through
                     .as_ref()
@@ -610,6 +631,7 @@ pub enum ConeUdp {
         outbound: String,
         settings: FreedomSettings,
         noised_targets: Arc<Mutex<HashSet<SocketAddr>>>,
+        open_private: bool,
     },
     Wireguard {
         wg: Arc<WgOutbound>,
@@ -653,6 +675,7 @@ impl ConeUdp {
                     outbound: decision.tag.clone(),
                     settings: settings.clone(),
                     noised_targets: Arc::new(Mutex::new(HashSet::new())),
+                    open_private: decision.open_private,
                 })
             }
             Action::Wireguard(wg) => {
@@ -709,6 +732,7 @@ impl ConeUdp {
                 router,
                 outbound,
                 settings,
+                open_private,
                 ..
             } => {
                 let (target_host, target_port) = match &settings.redirect {
@@ -718,7 +742,7 @@ impl ConeUdp {
                 let mut addrs = resolve_all(&target_host, target_port).await?;
                 apply_strategy(&target_host, &mut addrs, settings.strategy)?;
                 let addr = addrs[0];
-                check_final(router, outbound, Network::Udp, addr)?;
+                check_final(router, outbound, Network::Udp, addr, *open_private)?;
                 Ok(addr)
             }
             Self::Wireguard { wg, .. } => wg.udp_target(host, port).await,
