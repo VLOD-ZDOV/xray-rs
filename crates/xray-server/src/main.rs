@@ -1201,6 +1201,72 @@ async fn dispatch(
     f.await;
 }
 
+const XHTTP_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
+
+/// Go's ReadHeaderTimeout runs from accept; hyper's starts at the first byte,
+/// so a client that sends nothing is cut off here instead.
+struct FirstByteDeadline<I> {
+    io: I,
+    deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl<I: AsyncRead + Unpin> AsyncRead for FirstByteDeadline<I> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.io).poll_read(cx, buf);
+        if let Some(deadline) = self.deadline.as_mut() {
+            if matches!(polled, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+                self.deadline = None;
+            } else if polled.is_pending()
+                && std::future::Future::poll(deadline.as_mut(), cx).is_ready()
+            {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+            }
+        }
+        polled
+    }
+}
+
+impl<I: AsyncWrite + Unpin> AsyncWrite for FirstByteDeadline<I> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.io).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        Pin::new(&mut self.io).poll_shutdown(cx)
+    }
+}
+
 async fn serve_http<I>(io: I, peer: SocketAddr, handler: Arc<xhttp::Handler>)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1222,7 +1288,11 @@ where
     builder
         .http1()
         .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(std::time::Duration::from_secs(4));
+        .header_read_timeout(XHTTP_HEADER_TIMEOUT);
+    let io = FirstByteDeadline {
+        io,
+        deadline: Some(Box::pin(tokio::time::sleep(XHTTP_HEADER_TIMEOUT))),
+    };
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
         log::debug(format!(
             "http connection from {} ended: {e}",
