@@ -2033,6 +2033,29 @@ pub fn parse_single_rule(raw: &Value, asset_dirs: &[PathBuf]) -> Result<Rule, St
         RuleTarget::Outbound(t) => t.clone(),
         RuleTarget::Balancer(t) => format!("balancer:{t}"),
     };
+    // Xray's conditions; a rule left only with fields it ignores fails there.
+    const CONDITIONS: [&str; 17] = [
+        "domain",
+        "domains",
+        "ip",
+        "port",
+        "network",
+        "sourceIP",
+        "source",
+        "sourcePort",
+        "user",
+        "vlessRoute",
+        "inboundTag",
+        "protocol",
+        "attrs",
+        "localIP",
+        "localPort",
+        "process",
+        "localOS",
+    ];
+    if !rule.keys().any(|k| CONDITIONS.contains(&k.as_str())) {
+        return Err("this rule has no effective fields".into());
+    }
     let users = take_strings(&mut rule, "user")
         .into_iter()
         .map(|u| match u.strip_prefix("regexp:") {
@@ -2109,11 +2132,15 @@ pub fn parse_single_rule(raw: &Value, asset_dirs: &[PathBuf]) -> Result<Rule, St
         "ip",
         "localOS",
     ];
-    if let Some(unknown) = rule
+    // Go's JSON decoding drops fields Xray does not know, so they are ignored.
+    let unknown: Vec<String> = rule
         .keys()
-        .find(|k| !known.contains(&k.as_str()) && !SERVER_FIELDS.contains(&k.as_str()))
-    {
-        return Err(format!("field {unknown:?} is not supported yet"));
+        .filter(|k| !known.contains(&k.as_str()) && !SERVER_FIELDS.contains(&k.as_str()))
+        .cloned()
+        .collect();
+    for key in unknown {
+        log::warn(format!("routing rule field {key:?} is unknown, ignored"));
+        rule.remove(&key);
     }
     // The parser rejects a rule without conditions; this one matches everything.
     if !rule.keys().any(|k| k != "type") {
