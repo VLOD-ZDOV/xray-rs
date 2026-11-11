@@ -607,10 +607,17 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         }
     }
     check_version(&root)?;
+    if root
+        .get("api")
+        .is_some_and(|api| str_field(api, "tag").is_empty())
+    {
+        return Err("API tag can't be empty.".into());
+    }
     let api_tag = root
         .get("api")
         .map(|api| str_field(api, "tag"))
         .filter(|t| !t.is_empty());
+    let mut seen_tags = std::collections::HashSet::new();
     let mut api = match root.get("api").map(|a| str_field(a, "listen")) {
         Some(listen) if !listen.is_empty() => Some(
             listen
@@ -622,6 +629,9 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     let mut inbounds = Vec::new();
     for (index, item) in array(&root, "inbounds").iter().enumerate() {
         let tag = str_field(item, "tag").to_owned();
+        if !tag.is_empty() && !seen_tags.insert(tag.clone()) {
+            return Err(format!("existing tag found: {tag}"));
+        }
         if api.is_none() && api_tag == Some(tag.as_str()) {
             let port = parse_port(item.get("port")).ok_or("api inbound: invalid port")?;
             let listen = match str_field(item, "listen") {
@@ -1024,6 +1034,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                     r#"VLESS users: "flow" doesn't support "{other}" in this version"#
                 ))
             }
+            (InboundProtocol::Trojan, flow) if !flow.is_empty() => {
+                return Err("The feature Flow for Trojan has been removed. Please update your config(s) according to release note and documentation.".into());
+            }
             _ => "",
         };
         let reverse = if protocol == InboundProtocol::Vless {
@@ -1103,15 +1116,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
 
         if is_ss2022 {
             if clients.is_empty() {
-                let m = match xray_proxy::shadowsocks2022::Method::new(top_method, top_password) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        log::warn(format!(
-                            "skipping inbound {tag:?}: shadowsocks 2022 {top_method:?}: {e}"
-                        ));
-                        return Ok(None);
-                    }
-                };
+                let m = ss2022_method(top_method, top_password)?;
                 let level = settings.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
                 shadowsocks_users.push(ShadowsocksUser {
                     method: ShadowsocksMethod::Ss2022(Arc::new(m)),
@@ -1130,15 +1135,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                     } else {
                         format!("{top_password}:{password}")
                     };
-                    let m = match xray_proxy::shadowsocks2022::Method::new(method, &full_password) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            log::warn(format!(
-                                "skipping inbound {tag:?}: shadowsocks 2022 {method:?}: {e}"
-                            ));
-                            return Ok(None);
-                        }
-                    };
+                    let m = ss2022_method(method, &full_password)?;
                     let level = entry.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
                     shadowsocks_users.push(ShadowsocksUser {
                         method: ShadowsocksMethod::Ss2022(Arc::new(m)),
@@ -2043,6 +2040,30 @@ fn xray_dns_section(section: &Value) -> Value {
         }
     }
     dns
+}
+
+/// Xray's shadowsocks_2022 server takes only keys of the cipher's exact
+/// length and fails to start otherwise; the upstream client hashes longer ones.
+fn ss2022_method(
+    method: &str,
+    password: &str,
+) -> Result<xray_proxy::shadowsocks2022::Method, String> {
+    use base64::Engine;
+    let key_len = if method == "2022-blake3-aes-128-gcm" {
+        16
+    } else {
+        32
+    };
+    for part in password.split(':') {
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(part)
+            .map_err(|_| "proxy/shadowsocks_2022: bad key".to_owned())?;
+        if key.len() != key_len {
+            return Err("proxy/shadowsocks_2022: bad key".into());
+        }
+    }
+    xray_proxy::shadowsocks2022::Method::new(method, password)
+        .map_err(|e| format!("shadowsocks 2022 {method:?}: {e}"))
 }
 
 fn parse_fakedns(

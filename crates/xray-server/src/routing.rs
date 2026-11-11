@@ -1501,6 +1501,14 @@ impl Router {
                 }
                 "vmess" => Action::Vmess(Arc::new(VmessOutbound::parse(&tag, outbound)?)),
                 "trojan" => {
+                    let settings = outbound.get("settings").unwrap_or(&Value::Null);
+                    if array(settings, "servers")
+                        .iter()
+                        .chain([settings])
+                        .any(|server| !str_field(server, "flow").is_empty())
+                    {
+                        return Err("The feature Flow for Trojan has been removed. Please update your config(s) according to release note and documentation.".into());
+                    }
                     require_transport_security(outbound, false)?;
                     Action::Trojan(Arc::new(TrojanOutbound::parse(&tag, outbound)?))
                 }
@@ -1541,6 +1549,9 @@ impl Router {
             if let Some(proxy_tag) = parse_dialer_proxy(outbound, &tag)? {
                 dialer_proxies.push((tag.clone(), proxy_tag));
             }
+            if !tag.is_empty() && outbounds.contains_key(&tag) {
+                return Err(format!("existing tag found: {tag}"));
+            }
             outbounds.insert(tag, action);
         }
         if let Some(metrics) = crate::metrics::parse(root)? {
@@ -1551,6 +1562,9 @@ impl Router {
         let mut balancers = HashMap::new();
         for (index, raw) in array(&routing, "balancers").iter().enumerate() {
             let balancer = Balancer::parse(index, raw)?;
+            if balancers.contains_key(&balancer.tag) {
+                return Err("duplicate balancer tag".into());
+            }
             balancers.insert(balancer.tag.clone(), Arc::new(balancer));
         }
 
@@ -2723,7 +2737,8 @@ mod tests {
         ] {
             assert_eq!(is_private_server_address(address), private, "{address}");
         }
-        let plain = json!({"protocol": "trojan", "settings": {"servers": [{"address": "203.0.113.42"}]}});
+        let plain =
+            json!({"protocol": "trojan", "settings": {"servers": [{"address": "203.0.113.42"}]}});
         assert!(require_transport_security(&plain, false).is_err());
         let tls = json!({"settings": {"servers": [{"address": "203.0.113.42"}]},
                          "streamSettings": {"security": "tls"}});
