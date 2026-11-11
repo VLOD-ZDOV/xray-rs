@@ -124,8 +124,24 @@ where
         parse_socks5_request_message(&mut stream),
     )
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks request timeout"))?
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("socks request: {e}")))?;
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks request timeout"))?;
+    let req = match req {
+        Ok(req) => req,
+        // Xray answers BIND and unknown commands with "command not supported".
+        Err(e @ xray_proxy::inbound::SocksParseError::UnsupportedCommand(_)) => {
+            let _ = write_socks5_command_not_supported(&mut stream).await;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("socks request: {e}"),
+            ));
+        }
+        Err(e) => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("socks request: {e}"),
+            ))
+        }
+    };
 
     match req.command {
         SocksCommand::Connect => {
