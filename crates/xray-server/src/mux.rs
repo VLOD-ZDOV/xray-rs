@@ -345,6 +345,13 @@ where
                                 )
                                 .await;
                             }
+                            // A re-sent NEW replaces this connection's own session for
+                            // the flow; its drop must not detach the new owner.
+                            if let Some(mut old) = sessions.remove(&frame.id) {
+                                if old.xudp.as_ref().is_some_and(|(g, ..)| *g == gid) {
+                                    old.xudp = None;
+                                }
+                            }
                             sessions.insert(frame.id, session);
                             continue;
                         }
@@ -541,6 +548,10 @@ async fn xudp_worker(
         let up = async {
             while let Some(packet) = input.recv().await {
                 last_active.store(unix_secs(), std::sync::atomic::Ordering::Relaxed);
+                // Keep frames carry an empty payload; Xray sends nothing for them.
+                if packet.data.is_empty() {
+                    continue;
+                }
                 let (host, port) = packet
                     .dest
                     .as_ref()
@@ -643,6 +654,9 @@ async fn udp_session(
         let mut resolved: HashMap<(String, u16), SocketAddr> = HashMap::new();
         let up = async {
             while let Some(packet) = input.recv().await {
+                if packet.data.is_empty() {
+                    continue;
+                }
                 let (host, port) = packet
                     .dest
                     .as_ref()
