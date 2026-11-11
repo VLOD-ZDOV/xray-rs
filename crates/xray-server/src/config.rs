@@ -1178,10 +1178,17 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         }
     }
 
+    let tls_section = stream.get("tlsSettings").unwrap_or(&Value::Null);
+    if security == "tls" && array(tls_section, "certificates").is_empty() {
+        // Xray starts such an inbound and fails every handshake; the others
+        // keep running there too, so only this one is left out.
+        log::warn(format!(
+            "skipping inbound {tag:?}: tlsSettings.certificates is empty"
+        ));
+        return Ok(None);
+    }
     let tls = if security == "tls" {
-        Some(parse_tls(
-            stream.get("tlsSettings").unwrap_or(&Value::Null),
-        )?)
+        Some(parse_tls(tls_section)?)
     } else {
         None
     };
