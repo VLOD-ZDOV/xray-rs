@@ -960,6 +960,12 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         None
     };
 
+    if is_port_list(item.get("port")) {
+        log::warn(format!(
+            "skipping inbound {tag:?}: port lists and ranges are not supported yet"
+        ));
+        return Ok(None);
+    }
     let port = if is_xdrive {
         parse_port(item.get("port")).unwrap_or(0)
     } else {
@@ -2737,9 +2743,23 @@ fn parse_range(value: Option<&Value>) -> Option<(usize, usize)> {
 fn parse_port(value: Option<&Value>) -> Option<u16> {
     match value? {
         Value::Number(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
-        Value::String(s) => s.trim().parse().ok(),
+        Value::String(s) => match s.trim().strip_prefix("env:") {
+            // Xray's EnvFlag: the name as given, then upper case with dots as underscores.
+            Some(name) => std::env::var(name)
+                .or_else(|_| std::env::var(name.to_uppercase().replace('.', "_")))
+                .ok()?
+                .trim()
+                .parse()
+                .ok(),
+            None => s.trim().parse().ok(),
+        },
         _ => None,
     }
+}
+
+/// Xray's inbound port is a list of ranges; only a single port is served here.
+fn is_port_list(value: Option<&Value>) -> bool {
+    matches!(value, Some(Value::String(s)) if s.contains(',') || s.trim().trim_start_matches("env:").contains('-'))
 }
 
 /// Where geoip.dat/geosite.dat live; the parser also adds the binary's directory.
