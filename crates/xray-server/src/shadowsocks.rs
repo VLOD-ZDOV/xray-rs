@@ -120,9 +120,7 @@ where
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());
     };
-    if let Action::Block(_) = decision.action {
-        return Ok(());
-    }
+    // Only blackhole's http response gets here; connect plays it back.
     ctx.sniffing.override_host(&early, &mut host);
 
     let mut outbound_stream = outbound::connect(&ctx.router, &decision, &host, port).await?;

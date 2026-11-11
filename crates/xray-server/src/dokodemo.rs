@@ -64,9 +64,7 @@ where
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());
     };
-    if let Action::Block(_) = decision.action {
-        return Ok(());
-    }
+    // Only blackhole's http response gets here; connect plays it back.
 
     let mut route_host = host.clone();
     ctx.sniffing.override_host(&early, &mut route_host);
