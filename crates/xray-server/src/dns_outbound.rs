@@ -151,9 +151,9 @@ impl DnsOutbound {
             crate::dns::resolve_dns_query(&qname, 0),
         )
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DNS lookup timed out"))?;
+        .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
         // NotFound means the name has no address at all; Xray answers that as an
-        // empty NOERROR, while other failures get no reply so the client retries.
+        // empty NOERROR and a failed lookup as SERVFAIL.
         let ips: Vec<IpAddr> = match lookup {
             Ok(addrs) => addrs
                 .into_iter()
@@ -165,7 +165,15 @@ impl DnsOutbound {
                 })
                 .collect(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e),
+            Err(e) => {
+                crate::log::debug(format!("dns outbound lookup of {qname}: {e}"));
+                let mut resp = Vec::with_capacity(qend);
+                resp.extend_from_slice(&id);
+                resp.extend_from_slice(&0x8182u16.to_be_bytes()); // SERVFAIL
+                resp.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]); // QDCOUNT = 1
+                resp.extend_from_slice(&query[12..qend]);
+                return Ok(resp);
+            }
         };
 
         let mut resp = Vec::with_capacity(qend + ips.len() * 16);
