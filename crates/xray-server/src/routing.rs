@@ -1495,9 +1495,15 @@ impl Router {
                     Action::Wireguard(wg)
                 }
                 "socks" => Action::Socks(Arc::new(SocksOutbound::parse(&tag, outbound)?)),
-                "vless" => Action::Vless(Arc::new(VlessOutbound::parse(&tag, outbound)?)),
+                "vless" => {
+                    require_transport_security(outbound, true)?;
+                    Action::Vless(Arc::new(VlessOutbound::parse(&tag, outbound)?))
+                }
                 "vmess" => Action::Vmess(Arc::new(VmessOutbound::parse(&tag, outbound)?)),
-                "trojan" => Action::Trojan(Arc::new(TrojanOutbound::parse(&tag, outbound)?)),
+                "trojan" => {
+                    require_transport_security(outbound, false)?;
+                    Action::Trojan(Arc::new(TrojanOutbound::parse(&tag, outbound)?))
+                }
                 "shadowsocks" => {
                     Action::Shadowsocks(Arc::new(ShadowsocksOutbound::parse(&tag, outbound)?))
                 }
@@ -2010,6 +2016,83 @@ impl Router {
             action,
         }
     }
+}
+
+/// Xray's validateOutboundTransportSecurity: VLESS without encryption and
+/// Trojan need TLS or REALITY unless the server is a private address.
+fn require_transport_security(outbound: &Value, vless: bool) -> Result<(), String> {
+    let security = outbound
+        .get("streamSettings")
+        .map(|s| str_field(s, "security"))
+        .unwrap_or_default();
+    if !matches!(security, "" | "none") {
+        return Ok(());
+    }
+    let settings = outbound.get("settings").unwrap_or(&Value::Null);
+    let server = array(settings, if vless { "vnext" } else { "servers" })
+        .first()
+        .unwrap_or(settings);
+    if vless {
+        let encryption = array(server, "users")
+            .first()
+            .map(|u| str_field(u, "encryption"))
+            .unwrap_or_else(|| str_field(settings, "encryption"));
+        if !matches!(encryption, "" | "none") {
+            return Ok(());
+        }
+    }
+    if is_private_server_address(str_field(server, "address")) {
+        return Ok(());
+    }
+    Err(if vless {
+        "vless without TLS or other encryption is prohibited unless the server address is a private IP or domain"
+    } else {
+        "trojan without TLS is prohibited unless the server address is a private IP or domain"
+    }
+    .into())
+}
+
+/// Xray's requiresTransportSecurity, negated: Go's IsPrivate, IsLoopback and
+/// IsLinkLocalUnicast for IPs, its private domain list for names.
+fn is_private_server_address(address: &str) -> bool {
+    if address.is_empty() {
+        return false;
+    }
+    if let Ok(ip) = address.trim_matches(['[', ']']).parse::<IpAddr>() {
+        return match ip {
+            IpAddr::V4(v4) => v4.is_private() || v4.is_loopback() || v4.is_link_local(),
+            IpAddr::V6(v6) => {
+                let first = v6.segments()[0];
+                v6.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    let domain = address.trim_end_matches('.').to_ascii_lowercase();
+    const PRIVATE: [&str; 9] = [
+        "lan",
+        "localdomain",
+        "example",
+        "invalid",
+        "localhost",
+        "test",
+        "local",
+        "home.arpa",
+        "internal",
+    ];
+    let dotless = !domain.contains('.')
+        && (1..=63).contains(&domain.len())
+        && domain.starts_with(|c: char| c.is_ascii_lowercase())
+        && !domain.ends_with('-')
+        && domain
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+    dotless
+        || PRIVATE.iter().any(|p| {
+            domain == *p
+                || domain
+                    .strip_suffix(p)
+                    .is_some_and(|rest| rest.ends_with('.'))
+        })
 }
 
 pub fn parse_single_rule(raw: &Value, asset_dirs: &[PathBuf]) -> Result<Rule, String> {
@@ -2624,6 +2707,27 @@ mod tests {
         assert_eq!(r.route(&src).await.tag, "warp");
         src.source = "198.51.100.7:5000".parse().unwrap();
         assert_eq!(r.route(&src).await.tag, "direct");
+    }
+
+    #[test]
+    fn plaintext_outbounds_need_a_private_server() {
+        for (address, private) in [
+            ("10.0.0.1", true),
+            ("127.0.0.1", true),
+            ("fe80::1", true),
+            ("203.0.113.42", false),
+            ("example.com", false),
+            ("router.lan", true),
+            ("nas", true),
+            ("", false),
+        ] {
+            assert_eq!(is_private_server_address(address), private, "{address}");
+        }
+        let plain = json!({"protocol": "trojan", "settings": {"servers": [{"address": "203.0.113.42"}]}});
+        assert!(require_transport_security(&plain, false).is_err());
+        let tls = json!({"settings": {"servers": [{"address": "203.0.113.42"}]},
+                         "streamSettings": {"security": "tls"}});
+        assert!(require_transport_security(&tls, false).is_ok());
     }
 
     #[test]
