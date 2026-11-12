@@ -73,11 +73,17 @@ cargo build --release -p xray-server
 The binary is `target/release/xray-server`. It runs on glibc 2.34 or newer
 (Ubuntu 22.04, Debian 12 and later).
 
+Releases carry a binary per CPU, named as 3x-ui names its core:
+`xray-linux-amd64`, `xray-linux-arm64`, `xray-linux-arm32` (ARMv7),
+`xray-linux-arm32-v6`, `xray-linux-arm32-v5`, `xray-linux-386` and
+`xray-linux-s390x`. 3x-ui runs every 32-bit ARM core as `xray-linux-arm32`.
+The amd64 and arm64 builds need glibc 2.34; the others need glibc 2.31.
+
 ## Install into 3x-ui
 
-`scripts/install-3x-ui.sh` tests the current panel config with the new core,
-keeps the original core as `xray-linux-amd64.orig` and rolls back if the core
-does not come up. Install or update from the latest release:
+`scripts/install-3x-ui.sh` picks the build for the CPU, tests the current
+panel config with the new core, keeps the original core as
+`xray-linux-<arch>.orig` and rolls back if the core does not come up. Install or update from the latest release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/VLOD-ZDOV/xray-rs/main/scripts/install-3x-ui.sh | sudo bash
@@ -98,7 +104,7 @@ sudo ./scripts/install-3x-ui.sh path/to/xray-server  # a binary you have
 sudo ./scripts/install-3x-ui.sh --rollback           # back to the original core
 ```
 
-Manual steps:
+Manual steps (amd64 shown; use your CPU's core name):
 
 ```bash
 systemctl stop x-ui

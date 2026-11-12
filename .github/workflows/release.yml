@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v*'
+  # Builds every target without publishing, to check a change to this workflow.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,30 +14,73 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    runs-on: ubuntu-24.04
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # File names follow 3x-ui: armv5/v6/v7 hosts all run bin/xray-linux-arm32.
+          - { name: xray-linux-amd64, target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
+          - { name: xray-linux-arm64, target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { name: xray-linux-arm32, target: armv7-unknown-linux-gnueabihf, os: ubuntu-24.04, cross: true }
+          - { name: xray-linux-arm32-v6, target: arm-unknown-linux-gnueabihf, os: ubuntu-24.04, cross: true }
+          - { name: xray-linux-arm32-v5, target: armv5te-unknown-linux-gnueabi, os: ubuntu-24.04, cross: true }
+          - { name: xray-linux-386, target: i686-unknown-linux-gnu, os: ubuntu-24.04, cross: true }
+          # The only big-endian target, so its unit tests run under qemu.
+          - { name: xray-linux-s390x, target: s390x-unknown-linux-gnu, os: ubuntu-24.04, cross: true, test: true }
+    runs-on: ${{ matrix.os }}
+    env:
+      # Keep the runner's home and checkout paths out of the binary.
+      RUSTFLAGS: --remap-path-prefix=/home/runner=~ --remap-path-prefix=${{ github.workspace }}=.
     steps:
       - uses: actions/checkout@v4
       # rustup installs the toolchain pinned in rust-toolchain.toml.
       - run: rustup show active-toolchain
-      - run: cargo test -p xray-server
+      - name: Test
+        if: ${{ !matrix.cross }}
+        run: cargo test -p xray-server
       - name: Build
-        # Keep the runner's home and checkout paths out of the binary.
-        run: >-
-          RUSTFLAGS="--remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=."
-          cargo build --release -p xray-server
-      - name: Check glibc requirement
-        # README promises glibc 2.34; src/compat.c covers newer C23 symbols.
+        if: ${{ !matrix.cross }}
+        run: cargo build --release -p xray-server --target ${{ matrix.target }}
+      - name: Install cross
+        if: ${{ matrix.cross }}
         run: |
-          need=$(objdump -T target/release/xray-server | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
-          echo "requires $need"
-          [ "$(printf '%s\nGLIBC_2.34\n' "$need" | sort -V | tail -1)" = GLIBC_2.34 ]
+          rustup target add ${{ matrix.target }}
+          cargo install cross --locked --version 0.2.5
+      - name: Cross test
+        if: ${{ matrix.cross && matrix.test }}
+        run: cross test -p xray-server --target ${{ matrix.target }}
+      - name: Cross build
+        if: ${{ matrix.cross }}
+        # cross mounts the checkout at the same path, so RUSTFLAGS still applies.
+        run: cross build --release -p xray-server --target ${{ matrix.target }}
+      - name: Check glibc requirement
+        # README promises glibc 2.34 (2.31 for cross builds); src/compat.c covers
+        # newer C23 symbols.
+        run: |
+          max=${{ matrix.cross && 'GLIBC_2.31' || 'GLIBC_2.34' }}
+          need=$(readelf --dyn-syms -W target/${{ matrix.target }}/release/xray-server | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
+          echo "requires $need, allowed $max"
+          [ "$(printf '%s\n%s\n' "$need" "$max" | sort -V | tail -1)" = "$max" ]
       - name: Package
         run: |
-          cp target/release/xray-server xray-linux-amd64
-          sha256sum xray-linux-amd64 > xray-linux-amd64.sha256
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/xray-server dist/${{ matrix.name }}
+          cd dist && sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: |
-            xray-linux-amd64
-            xray-linux-amd64.sha256
+          files: dist/*

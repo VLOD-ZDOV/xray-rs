@@ -7,10 +7,23 @@ set -euo pipefail
 GITHUB_REPO="${GITHUB_REPO:-VLOD-ZDOV/xray-rs}"
 XUI_DIR="/usr/local/x-ui"
 XUI_BIN_DIR="${XUI_DIR}/bin"
-TARGET_BIN="${XUI_BIN_DIR}/xray-linux-amd64"
 CONFIG_FILE="${XUI_BIN_DIR}/config.json"
-ORIG_BIN="${XUI_BIN_DIR}/xray-linux-amd64.orig"
-BAK_BIN="${XUI_BIN_DIR}/xray-linux-amd64.bak"
+
+# The panel's core name and the release file for this CPU. 3x-ui runs every
+# 32-bit ARM host as xray-linux-arm32.
+case "$(uname -m)" in
+    x86_64 | x64 | amd64) CORE_NAME="xray-linux-amd64"; ASSET="xray-linux-amd64" ;;
+    i*86 | x86) CORE_NAME="xray-linux-386"; ASSET="xray-linux-386" ;;
+    aarch64 | arm64 | armv8*) CORE_NAME="xray-linux-arm64"; ASSET="xray-linux-arm64" ;;
+    armv7* | arm) CORE_NAME="xray-linux-arm32"; ASSET="xray-linux-arm32" ;;
+    armv6*) CORE_NAME="xray-linux-arm32"; ASSET="xray-linux-arm32-v6" ;;
+    armv5*) CORE_NAME="xray-linux-arm32"; ASSET="xray-linux-arm32-v5" ;;
+    s390x) CORE_NAME="xray-linux-s390x"; ASSET="xray-linux-s390x" ;;
+    *) CORE_NAME=""; ASSET="" ;;
+esac
+TARGET_BIN="${XUI_BIN_DIR}/${CORE_NAME}"
+ORIG_BIN="${TARGET_BIN}.orig"
+BAK_BIN="${TARGET_BIN}.bak"
 
 TMP_DIR=""
 cleanup() {
@@ -71,10 +84,9 @@ check_environment() {
         exit 1
     fi
 
-    local arch
-    arch="$(uname -m)"
-    if [ "$arch" != "x86_64" ] && [ "$arch" != "amd64" ]; then
-        log_warn "Current architecture is $arch, but target binary is expected to be x86_64 / amd64."
+    if [ -z "$CORE_NAME" ]; then
+        log_error "Unsupported CPU architecture: $(uname -m)."
+        exit 1
     fi
 
     if [ ! -d "$XUI_BIN_DIR" ]; then
@@ -91,7 +103,7 @@ check_environment() {
 # x-ui stays active even when the core it runs keeps failing, so check the core too.
 core_running() {
     sleep 5
-    systemctl is-active --quiet x-ui && pidof xray-linux-amd64 >/dev/null
+    systemctl is-active --quiet x-ui && pidof "$CORE_NAME" >/dev/null
 }
 
 do_rollback() {
@@ -128,17 +140,17 @@ download_latest_release() {
     TMP_DIR="$(mktemp -d -t xray-rs-XXXXXX)"
     local base="https://github.com/${GITHUB_REPO}/releases/latest/download"
     log_info "Downloading the latest release from ${base} ..."
-    if ! curl -fL --progress-bar -o "${TMP_DIR}/xray-linux-amd64" "${base}/xray-linux-amd64" ||
-        ! curl -fsSL -o "${TMP_DIR}/xray-linux-amd64.sha256" "${base}/xray-linux-amd64.sha256"; then
+    if ! curl -fL --progress-bar -o "${TMP_DIR}/${ASSET}" "${base}/${ASSET}" ||
+        ! curl -fsSL -o "${TMP_DIR}/${ASSET}.sha256" "${base}/${ASSET}.sha256"; then
         log_error "No release found in https://github.com/${GITHUB_REPO}/releases."
         log_error "Pass a binary path or use --build."
         exit 1
     fi
-    if ! (cd "$TMP_DIR" && sha256sum --check --quiet xray-linux-amd64.sha256); then
+    if ! (cd "$TMP_DIR" && sha256sum --check --quiet "${ASSET}.sha256"); then
         log_error "Checksum mismatch, the download is corrupted."
         exit 1
     fi
-    SOURCE_BIN="${TMP_DIR}/xray-linux-amd64"
+    SOURCE_BIN="${TMP_DIR}/${ASSET}"
 }
 
 BUILD_FLAG=0
@@ -182,6 +194,7 @@ if [ "$BUILD_FLAG" -eq 1 ]; then
 fi
 
 if [ -z "$SOURCE_BIN" ]; then
+    check_environment
     download_latest_release
 fi
 
