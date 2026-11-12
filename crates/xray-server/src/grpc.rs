@@ -243,8 +243,9 @@ where
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
         .http2()
-        .initial_stream_window_size(4 * 1024 * 1024)
-        .initial_connection_window_size(16 * 1024 * 1024)
+        // Go's http2 server: windows start at 64 KiB and grow with the measured BDP,
+        // so a client that has not authenticated cannot make the server buffer much.
+        .adaptive_window(true)
         .max_concurrent_streams(1024);
     builder
         .http1()
