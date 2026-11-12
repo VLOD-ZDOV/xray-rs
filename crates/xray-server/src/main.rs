@@ -1820,14 +1820,14 @@ fn tls_acceptor(
         .filter(|p| *p != "h3")
         .map(|p| p.as_bytes().to_vec())
         .collect();
+    // Xray's GetTLSConfig: grpc-go asks for h2, everything else gets h2 and http/1.1,
+    // which the fallbacks' "alpn" match against.
     let alpn = if !alpn.is_empty() {
         alpn
     } else if is_grpc {
         vec![b"h2".to_vec()]
-    } else if is_xhttp {
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     } else {
-        Vec::new()
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     };
     let config = build_rustls_server_config(settings, alpn, false)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
