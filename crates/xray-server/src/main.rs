@@ -1157,7 +1157,9 @@ async fn dispatch(
             match ws::accept(stream, &ws_settings, &trusted_xff, peer).await {
                 Ok((ws_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(ws_stream);
-                    if let Err(e) = Box::pin(vmess::serve(uplink, downlink, &ctx, peer, false)).await {
+                    if let Err(e) =
+                        Box::pin(vmess::serve(uplink, downlink, &ctx, peer, false)).await
+                    {
                         log::info(format!("vmess-ws from {} rejected: {e}", log::mask(peer)));
                     }
                 }
@@ -1170,7 +1172,9 @@ async fn dispatch(
             match httpupgrade::accept(stream, &hu_settings, &trusted_xff, peer).await {
                 Ok((prefixed_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
-                    if let Err(e) = Box::pin(vmess::serve(uplink, downlink, &ctx, peer, false)).await {
+                    if let Err(e) =
+                        Box::pin(vmess::serve(uplink, downlink, &ctx, peer, false)).await
+                    {
                         log::info(format!(
                             "vmess-httpupgrade from {} rejected: {e}",
                             log::mask(peer)

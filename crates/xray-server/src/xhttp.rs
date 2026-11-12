@@ -833,13 +833,14 @@ impl Drop for CloseOnDrop {
 }
 
 fn reader_body(reader: DuplexStream, on_drop: Option<CloseOnDrop>) -> Body {
-    let stream = futures_util::stream::unfold((reader, on_drop), |(mut reader, on_drop)| async move {
-        let mut buf = BytesMut::with_capacity(32 * 1024);
-        match reader.read_buf(&mut buf).await {
-            Ok(n) if n > 0 => Some((Ok(Frame::data(buf.freeze())), (reader, on_drop))),
-            _ => None,
-        }
-    });
+    let stream =
+        futures_util::stream::unfold((reader, on_drop), |(mut reader, on_drop)| async move {
+            let mut buf = BytesMut::with_capacity(32 * 1024);
+            match reader.read_buf(&mut buf).await {
+                Ok(n) if n > 0 => Some((Ok(Frame::data(buf.freeze())), (reader, on_drop))),
+                _ => None,
+            }
+        });
     BodyExt::boxed(StreamBody::new(stream))
 }
 
