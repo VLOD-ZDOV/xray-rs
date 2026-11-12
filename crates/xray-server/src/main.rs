@@ -996,6 +996,18 @@ async fn accept_loop(
             } else {
                 match (tls, http_obfs) {
                     (Some(acceptor), _) => {
+                        match tokio::time::timeout(handshake_timeout, looks_like_tls(&mut stream))
+                            .await
+                        {
+                            Ok(Ok(true)) => {}
+                            _ => {
+                                log::debug(format!(
+                                    "tls from {}: first record does not look like a TLS handshake",
+                                    log::mask(peer)
+                                ));
+                                return;
+                            }
+                        }
                         let captured = penetrating_tls::CapturedStream::new(stream);
                         match tokio::time::timeout(handshake_timeout, acceptor.accept(captured))
                             .await
@@ -1055,6 +1067,25 @@ async fn accept_loop(
             }
         });
     }
+}
+
+/// Go's TLS server reads the first record header (and whatever else has arrived)
+/// and closes without an alert when it is neither a handshake nor an alert, or
+/// its version is 16.0 or later. rustls would answer with a decode_error alert.
+async fn looks_like_tls(
+    stream: &mut httpupgrade::PrefixedStream<InboundIo>,
+) -> std::io::Result<bool> {
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::with_capacity(4096);
+    while head.len() < 5 {
+        if stream.read_buf(&mut head).await? == 0 {
+            return Ok(false);
+        }
+    }
+    let vers = u16::from_be_bytes([head[1], head[2]]);
+    let ok = matches!(head[0], 0x15 | 0x16) && vers < 0x1000;
+    stream.unread(head);
+    Ok(ok)
 }
 
 async fn dispatch(

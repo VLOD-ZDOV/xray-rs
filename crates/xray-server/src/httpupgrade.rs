@@ -34,6 +34,13 @@ impl<S> PrefixedStream<S> {
         }
     }
 
+    /// Puts bytes back in front of what is still to be read.
+    pub fn unread(&mut self, mut bytes: Vec<u8>) {
+        bytes.extend_from_slice(&self.prefix[self.consumed..]);
+        self.prefix = bytes;
+        self.consumed = 0;
+    }
+
     fn drain_prefix(&mut self, output: &mut ReadBuf<'_>) -> bool {
         if self.consumed >= self.prefix.len() {
             return false;
