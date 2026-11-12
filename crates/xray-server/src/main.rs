@@ -996,10 +996,15 @@ async fn accept_loop(
             } else {
                 match (tls, http_obfs) {
                     (Some(acceptor), _) => {
-                        match tokio::time::timeout(handshake_timeout, looks_like_tls(&mut stream))
+                        match tokio::time::timeout(handshake_timeout, first_record(&mut stream))
                             .await
                         {
-                            Ok(Ok(true)) => {}
+                            Ok(Ok(FirstRecord::Tls)) => {}
+                            Ok(Ok(FirstRecord::OldTls)) => {
+                                use tokio::io::AsyncWriteExt;
+                                let _ = stream.write_all(&TLS_PROTOCOL_VERSION_ALERT).await;
+                                return;
+                            }
                             _ => {
                                 log::debug(format!(
                                     "tls from {}: first record does not look like a TLS handshake",
@@ -1069,24 +1074,78 @@ async fn accept_loop(
     }
 }
 
+enum FirstRecord {
+    Tls,
+    NotTls,
+    /// A ClientHello offering nothing newer than TLS 1.1.
+    OldTls,
+}
+
 /// Go's TLS server reads the first record header (and whatever else has arrived)
 /// and closes without an alert when it is neither a handshake nor an alert, or
 /// its version is 16.0 or later. rustls would answer with a decode_error alert.
-async fn looks_like_tls(
+async fn first_record(
     stream: &mut httpupgrade::PrefixedStream<InboundIo>,
-) -> std::io::Result<bool> {
+) -> std::io::Result<FirstRecord> {
     use tokio::io::AsyncReadExt;
     let mut head = Vec::with_capacity(4096);
     while head.len() < 5 {
         if stream.read_buf(&mut head).await? == 0 {
-            return Ok(false);
+            return Ok(FirstRecord::NotTls);
         }
     }
     let vers = u16::from_be_bytes([head[1], head[2]]);
-    let ok = matches!(head[0], 0x15 | 0x16) && vers < 0x1000;
+    let kind = if !matches!(head[0], 0x15 | 0x16) || vers >= 0x1000 {
+        FirstRecord::NotTls
+    } else if client_hello_max_version(&head).is_some_and(|v| v < 0x0303) {
+        FirstRecord::OldTls
+    } else {
+        FirstRecord::Tls
+    };
     stream.unread(head);
-    Ok(ok)
+    Ok(kind)
 }
+
+/// The newest version a ClientHello offers, when the whole hello is in `record`.
+fn client_hello_max_version(record: &[u8]) -> Option<u16> {
+    let u16_at = |b: &[u8], i: usize| Some(u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?]));
+    if *record.first()? != 0x16 {
+        return None;
+    }
+    let body = record.get(5..5 + usize::from(u16_at(record, 3)?))?;
+    if *body.first()? != 1 {
+        return None;
+    }
+    let len = usize::from(*body.get(1)?) << 16 | usize::from(u16_at(body, 2)?);
+    let hello = body.get(4..4 + len)?;
+    let legacy = u16_at(hello, 0)?;
+    let mut i = 34;
+    i += 1 + usize::from(*hello.get(i)?);
+    i += 2 + usize::from(u16_at(hello, i)?);
+    i += 1 + usize::from(*hello.get(i)?);
+    let Some(ext_len) = u16_at(hello, i) else {
+        return Some(legacy);
+    };
+    let exts = hello.get(i + 2..i + 2 + usize::from(ext_len))?;
+    let mut j = 0;
+    while j + 4 <= exts.len() {
+        let (kind, size) = (u16_at(exts, j)?, usize::from(u16_at(exts, j + 2)?));
+        let data = exts.get(j + 4..j + 4 + size)?;
+        if kind == 43 {
+            let list = data.get(1..1 + usize::from(*data.first()?))?;
+            return list
+                .chunks_exact(2)
+                .map(|v| u16::from_be_bytes([v[0], v[1]]))
+                .filter(|v| v & 0x0f0f != 0x0a0a)
+                .max();
+        }
+        j += 4 + size;
+    }
+    Some(legacy)
+}
+
+/// Go's answer to a hello without TLS 1.2: protocol_version in a TLS 1.0 record.
+const TLS_PROTOCOL_VERSION_ALERT: [u8; 7] = [0x15, 0x03, 0x01, 0x00, 0x02, 0x02, 0x46];
 
 async fn dispatch(
     stream: InboundStream,
@@ -1935,6 +1994,43 @@ fn tls_acceptor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hello(legacy: u16, versions: Option<&[u16]>) -> Vec<u8> {
+        let mut h = legacy.to_be_bytes().to_vec();
+        h.extend([0u8; 32]); // random
+        h.push(0); // session id
+        h.extend([0, 2, 0x13, 0x01, 1, 0]); // one suite, null compression
+        if let Some(vs) = versions {
+            let list: Vec<u8> = vs.iter().flat_map(|v| v.to_be_bytes()).collect();
+            let mut ext = vec![0, 43];
+            ext.extend(((list.len() + 1) as u16).to_be_bytes());
+            ext.push(list.len() as u8);
+            ext.extend(list);
+            h.extend((ext.len() as u16).to_be_bytes());
+            h.extend(ext);
+        }
+        let mut body = vec![1, 0];
+        body.extend((h.len() as u16).to_be_bytes());
+        body.extend(h);
+        let mut rec = vec![0x16, 3, 1];
+        rec.extend((body.len() as u16).to_be_bytes());
+        rec.extend(body);
+        rec
+    }
+
+    #[test]
+    fn reads_the_newest_offered_tls_version() {
+        assert_eq!(client_hello_max_version(&hello(0x0301, None)), Some(0x0301));
+        assert_eq!(client_hello_max_version(&hello(0x0303, None)), Some(0x0303));
+        let tls13 = hello(0x0303, Some(&[0x0a0a, 0x0304, 0x0303]));
+        assert_eq!(client_hello_max_version(&tls13), Some(0x0304));
+        assert_eq!(
+            client_hello_max_version(&hello(0x0303, Some(&[0x0302]))),
+            Some(0x0302)
+        );
+        let cut = hello(0x0301, None);
+        assert_eq!(client_hello_max_version(&cut[..cut.len() - 1]), None);
+    }
 
     #[test]
     fn test_match_sni() {
