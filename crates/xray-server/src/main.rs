@@ -1221,14 +1221,15 @@ async fn dispatch(
 
 const XHTTP_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
-/// Go's ReadHeaderTimeout runs from accept; hyper's starts at the first byte,
-/// so a client that sends nothing is cut off here instead.
-struct FirstByteDeadline<I> {
+/// Go's ReadHeaderTimeout for the first request: from accept until the end of its
+/// headers. An h2c preface ends the same way.
+struct HeaderDeadline<I> {
     io: I,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    tail: [u8; 3],
 }
 
-impl<I: AsyncRead + Unpin> AsyncRead for FirstByteDeadline<I> {
+impl<I: AsyncRead + Unpin> AsyncRead for HeaderDeadline<I> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1238,7 +1239,13 @@ impl<I: AsyncRead + Unpin> AsyncRead for FirstByteDeadline<I> {
         let polled = Pin::new(&mut self.io).poll_read(cx, buf);
         if let Some(deadline) = self.deadline.as_mut() {
             if matches!(polled, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
-                self.deadline = None;
+                let mut seen = self.tail.to_vec();
+                seen.extend_from_slice(&buf.filled()[before..]);
+                if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+                    self.deadline = None;
+                } else {
+                    self.tail.copy_from_slice(&seen[seen.len() - 3..]);
+                }
             } else if polled.is_pending()
                 && std::future::Future::poll(deadline.as_mut(), cx).is_ready()
             {
@@ -1249,7 +1256,7 @@ impl<I: AsyncRead + Unpin> AsyncRead for FirstByteDeadline<I> {
     }
 }
 
-impl<I: AsyncWrite + Unpin> AsyncWrite for FirstByteDeadline<I> {
+impl<I: AsyncWrite + Unpin> AsyncWrite for HeaderDeadline<I> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1301,15 +1308,14 @@ where
         .max_concurrent_streams(1024);
     // XHTTP header uplink splits data over many headers; Go limits only their total size.
     builder.http1().max_headers(MAX_HEADERS);
-    // Go's http.Server in Xray's XHTTP hub: ReadHeaderTimeout 4 s. Without a timer hyper
-    // never times a request's headers out.
-    builder
-        .http1()
-        .timer(hyper_util::rt::TokioTimer::new())
-        .header_read_timeout(XHTTP_HEADER_TIMEOUT);
-    let io = FirstByteDeadline {
+    // Go's http.Server in Xray's XHTTP hub: ReadHeaderTimeout 4 s from accept. Not hyper's
+    // header_read_timeout: it also runs while a keep-alive connection waits for its next
+    // request, and Go keeps those open, so a reverse proxy's pooled connection would close
+    // under it.
+    let io = HeaderDeadline {
         io,
         deadline: Some(Box::pin(tokio::time::sleep(XHTTP_HEADER_TIMEOUT))),
+        tail: [0; 3],
     };
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
         log::debug(format!(
