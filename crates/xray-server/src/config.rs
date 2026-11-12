@@ -1039,6 +1039,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             }
             _ => "",
         };
+        if protocol == InboundProtocol::Vless && !str_field(client, "encryption").is_empty() {
+            return Err(r#"VLESS users: "encryption" should not be in inbound settings"#.into());
+        }
         let reverse = if protocol == InboundProtocol::Vless {
             if let Some(rev) = client.get("reverse") {
                 if !rev.is_null() {
@@ -1234,11 +1237,19 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let sniffing = parse_sniffing(item.get("sniffing").unwrap_or(&Value::Null), &tag);
 
     let mut fallbacks = Vec::new();
+    let fallback_owner = if protocol == InboundProtocol::Trojan {
+        "Trojan"
+    } else {
+        "VLESS"
+    };
     for (i, fb) in array(settings, "fallbacks").iter().enumerate() {
-        match parse_fallback(fb) {
-            Ok(f) => fallbacks.push(f),
-            Err(e) => log::warn(format!("inbound {tag:?}: fallback {i} skipped: {e}")),
+        if str_field(fb, "dest") == "serve-ws-none" {
+            log::warn(format!(
+                "inbound {tag:?}: fallback {i} skipped: serve-ws-none is not supported"
+            ));
+            continue;
         }
+        fallbacks.push(parse_fallback(fb).map_err(|e| format!("{fallback_owner} fallbacks: {e}"))?);
     }
 
     let dokodemo = if protocol == InboundProtocol::Dokodemo {
@@ -2180,10 +2191,11 @@ fn parse_fallback(item: &Value) -> Result<Fallback, String> {
     if !path.is_empty() && !path.starts_with('/') {
         return Err(r#""path" must be empty or start with "/""#.into());
     }
-    let dest = parse_dest(item.get("dest"))?;
+    let dest = parse_dest(item.get("dest"))
+        .map_err(|_| r#"please fill in a valid value for every "dest""#.to_string())?;
     let xver = match item.get("xver").and_then(Value::as_u64).unwrap_or(0) {
         x @ 0..=2 => x as u8,
-        x => return Err(format!("xver {x} is not 0, 1 or 2")),
+        _ => return Err(r#"invalid PROXY protocol version, "xver" only accepts 0, 1, 2"#.into()),
     };
     Ok(Fallback {
         name: str_field(item, "name").to_owned(),
@@ -2963,6 +2975,37 @@ mod tests {
         assert!(err.contains(
             "VLESS settings: \"fallbacks\" can not be used together with \"decryption\""
         ));
+    }
+
+    #[test]
+    fn rejects_inbound_settings_xray_refuses() {
+        let cases = [
+            (
+                r#"{"protocol": "vless", "settings": {"decryption": "none",
+                    "clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "encryption": "none"}]}}"#,
+                r#"VLESS users: "encryption" should not be in inbound settings"#,
+            ),
+            (
+                r#"{"protocol": "trojan", "settings": {"clients": [{"password": "p"}],
+                    "fallbacks": [{"xver": 1}]}}"#,
+                r#"Trojan fallbacks: please fill in a valid value for every "dest""#,
+            ),
+            (
+                r#"{"protocol": "vless", "settings": {"decryption": "none",
+                    "clients": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811"}],
+                    "fallbacks": [{"dest": 80, "xver": 3}]}}"#,
+                r#"VLESS fallbacks: invalid PROXY protocol version, "xver" only accepts 0, 1, 2"#,
+            ),
+        ];
+        for (inbound, want) in cases {
+            let mut inbound: Value = serde_json::from_str(inbound).unwrap();
+            inbound["port"] = 443.into();
+            let raw = serde_json::json!({ "inbounds": [inbound] }).to_string();
+            match parse(&raw) {
+                Err(e) => assert!(e.contains(want), "{e}"),
+                Ok(_) => panic!("expected {want}"),
+            }
+        }
     }
 
     #[test]
