@@ -337,8 +337,20 @@ where
             read_http_request_head(&mut (&mut stream).take(MAX_HTTP_HEAD)),
         )
         .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http request timeout"))?
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("http request: {e}")))?;
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "http request timeout"))?;
+        let head = match head {
+            Ok(head) => head,
+            Err(e) => {
+                // Go's bufio has already read what the client sent, so closing sends
+                // a FIN; bytes left unread here would turn it into a reset.
+                let mut rest = [0u8; 4096];
+                let _ = timeout(std::time::Duration::ZERO, stream.read(&mut rest)).await;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("http request: {e}"),
+                ));
+            }
+        };
         let proxy_authorization = head.proxy_authorization.as_deref().map(|v| v.as_slice());
         let Some(user) = accounts.basic_user(proxy_authorization) else {
             stream.write_all(HTTP_PROXY_AUTH_REQUIRED).await?;
