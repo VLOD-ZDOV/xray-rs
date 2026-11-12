@@ -262,6 +262,9 @@ impl Handler {
 
         let (downlink, reader) = tokio::io::duplex(PIPE_SIZE);
         let this = self.clone();
+        // Xray closes the session's upload queue once the GET is gone, so the proxied
+        // connection ends even while its target is silent.
+        let on_drop = session.clone().map(CloseOnDrop);
         tokio::spawn(async move {
             if let Err(e) = vless::serve(uplink, downlink, &this.vless, peer).await {
                 log::info(format!("from {} rejected: {e}", log::mask(peer)));
@@ -277,7 +280,7 @@ impl Handler {
         if !s.no_sse_header {
             response = response.header(CONTENT_TYPE, "text/event-stream");
         }
-        finish(response, StatusCode::OK, reader_body(reader))
+        finish(response, StatusCode::OK, reader_body(reader, on_drop))
     }
 
     pub async fn handle_h3(
@@ -821,11 +824,19 @@ fn channel_body(rx: mpsc::Receiver<Result<Frame<Bytes>, io::Error>>) -> Body {
     BodyExt::boxed(StreamBody::new(stream))
 }
 
-fn reader_body(reader: DuplexStream) -> Body {
-    let stream = futures_util::stream::unfold(reader, |mut reader| async move {
+struct CloseOnDrop(Arc<Session>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
+fn reader_body(reader: DuplexStream, on_drop: Option<CloseOnDrop>) -> Body {
+    let stream = futures_util::stream::unfold((reader, on_drop), |(mut reader, on_drop)| async move {
         let mut buf = BytesMut::with_capacity(32 * 1024);
         match reader.read_buf(&mut buf).await {
-            Ok(n) if n > 0 => Some((Ok(Frame::data(buf.freeze())), reader)),
+            Ok(n) if n > 0 => Some((Ok(Frame::data(buf.freeze())), (reader, on_drop))),
             _ => None,
         }
     });
