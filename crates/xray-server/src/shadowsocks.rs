@@ -7,10 +7,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::timeout;
 use xray_config::Network;
 use xray_proxy::shadowsocks::aead2017::UdpSession;
 use xray_proxy::shadowsocks2022::ServerUdpSession;
@@ -23,7 +22,12 @@ use crate::routing::{Action, Query};
 use crate::stats;
 use crate::vless::{read_first, Activity, Context, Host, RouteRequest};
 
-pub async fn serve_tcp<S>(stream: S, ctx: &Context, peer: SocketAddr) -> io::Result<()>
+pub async fn serve_tcp<S>(
+    stream: S,
+    ctx: &Context,
+    peer: SocketAddr,
+    raw: Option<socket2::Socket>,
+) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -40,8 +44,9 @@ where
     }
     // The handshake index counts only users of the inbound's kind.
     let users = same_kind_users(users);
+    let deadline = tokio::time::Instant::now() + crate::policy::get().handshake;
     let (mut client_r, mut client_w, user_idx, target, mut early) = match &users[0].method {
-        ShadowsocksMethod::Ss2022(_) => {
+        ShadowsocksMethod::Ss2022(first) => {
             let methods: Vec<Arc<xray_proxy::shadowsocks2022::Method>> = users
                 .iter()
                 .filter_map(|u| match &u.method {
@@ -49,8 +54,29 @@ where
                     _ => None,
                 })
                 .collect();
-            let (server_stream, idx, target, early) = timeout(
-                crate::policy::get().handshake,
+            // Xray takes the salt and fixed header chunk in one read and resets the
+            // connection (SO_LINGER 0) when that read is short or the header is bad.
+            let identity = if first.is_multi_user() { 16 } else { 0 };
+            let header_len = first.cipher().key_len() + identity + 11 + 16;
+            let reset = |e: String| {
+                if let Some(raw) = &raw {
+                    let _ = raw.set_linger(Some(Duration::ZERO));
+                }
+                io::Error::new(io::ErrorKind::InvalidData, e)
+            };
+            let mut stream = stream;
+            let mut head = vec![0u8; header_len];
+            let n = match tokio::time::timeout_at(deadline, stream.read(&mut head)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(reset(format!("shadowsocks 2022: {e}"))),
+                Err(_) => return Err(reset("shadowsocks handshake timeout".into())),
+            };
+            if n < header_len {
+                return Err(reset("shadowsocks 2022: short handshake header".into()));
+            }
+            let stream = crate::httpupgrade::PrefixedStream::new(stream, head);
+            let (server_stream, idx, target, early) = match tokio::time::timeout_at(
+                deadline,
                 xray_proxy::shadowsocks2022::ServerStream::handshake_methods_with_pool(
                     stream,
                     &methods,
@@ -58,13 +84,11 @@ where
                 ),
             )
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "shadowsocks handshake timeout"))?
-            .map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("shadowsocks 2022 auth: {e}"),
-                )
-            })?;
+            {
+                Ok(Ok(hs)) => hs,
+                Ok(Err(e)) => return Err(reset(format!("shadowsocks 2022 auth: {e}"))),
+                Err(_) => return Err(reset("shadowsocks handshake timeout".into())),
+            };
             let (r, w) = tokio::io::split(server_stream);
             let r: Box<dyn AsyncRead + Unpin + Send> = Box::new(r);
             let w: Box<dyn AsyncWrite + Unpin + Send> = Box::new(w);
@@ -78,17 +102,45 @@ where
                     _ => None,
                 })
                 .collect();
-            let (server_stream, idx, target, early) = timeout(
-                crate::policy::get().handshake,
-                xray_proxy::shadowsocks::aead2017::ServerStream::handshake_methods(
-                    stream, &methods,
-                ),
-            )
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "shadowsocks handshake timeout"))?
-            .map_err(|e| {
-                io::Error::new(io::ErrorKind::InvalidData, format!("shadowsocks auth: {e}"))
-            })?;
+            // Xray matches a user on the first 50 bytes and drains a failed client.
+            let mut stream = stream;
+            let mut counted = crate::drain::Counted::new(&mut stream);
+            let header = tokio::time::timeout_at(deadline, async {
+                let mut first = [0u8; 50];
+                counted.read_exact(&mut first).await?;
+                let mut chained = (&first[..]).chain(&mut counted);
+                let header =
+                    xray_proxy::shadowsocks::aead2017::read_server_header(&mut chained, &methods)
+                        .await?;
+                if !chained.get_ref().0.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "short shadowsocks header",
+                    ));
+                }
+                Ok(header)
+            })
+            .await;
+            let read = counted.read;
+            let header = match header {
+                Ok(Ok(header)) => header,
+                Ok(Err(e)) => {
+                    let total = crate::drain::size(crate::drain::process_seed());
+                    crate::drain::discard(&mut stream, total, read, deadline).await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("shadowsocks auth: {e}"),
+                    ));
+                }
+                Err(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "shadowsocks handshake timeout",
+                    ))
+                }
+            };
+            let (server_stream, idx, target, early) =
+                xray_proxy::shadowsocks::aead2017::ServerStream::from_header(stream, header);
             let (r, w) = tokio::io::split(server_stream);
             let r: Box<dyn AsyncRead + Unpin + Send> = Box::new(r);
             let w: Box<dyn AsyncWrite + Unpin + Send> = Box::new(w);

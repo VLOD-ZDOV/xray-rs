@@ -6,6 +6,7 @@ mod config;
 mod dns;
 mod dns_outbound;
 mod dokodemo;
+mod drain;
 mod fakedns;
 mod fallback;
 mod finalmask;
@@ -746,6 +747,23 @@ impl InboundStream {
         matches!(self, Self::Plain(s) if matches!(s.get_ref(), InboundIo::Tcp(_)))
     }
 
+    /// A second handle on a bare TCP connection's socket, for socket options set
+    /// after the stream has been handed on.
+    fn raw_tcp_socket(&self) -> Option<socket2::Socket> {
+        use std::os::fd::AsFd;
+        match self {
+            Self::Plain(s) => match s.get_ref() {
+                InboundIo::Tcp(tcp) => tcp
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .ok()
+                    .map(socket2::Socket::from),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn handshake_info(&self) -> fallback::TlsInfo {
         match self {
             Self::Tls(stream) => stream.handshake_info(),
@@ -1201,7 +1219,8 @@ async fn dispatch(
             }
         }),
         InboundHandler::Shadowsocks(ctx) => Box::pin(async move {
-            if let Err(e) = shadowsocks::serve_tcp(stream, &ctx, peer).await {
+            let raw = stream.raw_tcp_socket();
+            if let Err(e) = shadowsocks::serve_tcp(stream, &ctx, peer, raw).await {
                 log::info(format!(
                     "shadowsocks from {} rejected: {e}",
                     log::mask(peer)

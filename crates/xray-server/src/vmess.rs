@@ -4,13 +4,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::PoisonError;
 
-use std::pin::Pin;
-use std::task::Poll;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use rand::Rng;
 use sha2::{Digest, Sha256};
-use tokio::io::ReadBuf;
 use tokio::time::{timeout_at, Instant};
 use xray_config::Network;
 use xray_proxy::vmess::server::{self, ServerHandshake, ServerStream, ServerUser};
@@ -45,10 +41,7 @@ where
     };
 
     let deadline = Instant::now() + crate::policy::get().handshake;
-    let mut counted = Counted {
-        inner: &mut uplink,
-        read: 0,
-    };
+    let mut counted = crate::drain::Counted::new(&mut uplink);
     let hs_res = timeout_at(
         deadline,
         server::handshake_with_filter(&mut counted, &server_users, Some(&ctx.vmess_filter)),
@@ -59,9 +52,8 @@ where
         Ok(Ok(hs)) => hs,
         Ok(Err(e)) => {
             if drain {
-                let left = drain_size(&seed.finalize()).saturating_sub(read);
-                let (mut rest, mut sink) = ((&mut uplink).take(left), tokio::io::sink());
-                let _ = timeout_at(deadline, tokio::io::copy(&mut rest, &mut sink)).await;
+                let total = crate::drain::size(&seed.finalize());
+                crate::drain::discard(&mut uplink, total, read, deadline).await;
             }
             return Err(e);
         }
@@ -203,33 +195,6 @@ where
     }
 }
 
-// Xray reads a server-constant amount plus a little noise from a raw TCP
-// client that fails the handshake, so a probe cannot time the close against
-// the bytes it sent (proxy/vmess/encoding/server.go, common/drain).
-fn drain_size(seed: &[u8]) -> u64 {
-    let base = u64::from_be_bytes(seed[..8].try_into().unwrap_or_default()) % 3266;
-    let rand_max = u64::from_be_bytes(seed[8..16].try_into().unwrap_or_default()) % 64 + 1;
-    16 + 38 + base + rand::thread_rng().gen_range(0..rand_max)
-}
-
-struct Counted<'a, R> {
-    inner: &'a mut R,
-    read: u64,
-}
-
-impl<R: AsyncRead + Unpin> AsyncRead for Counted<'_, R> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        let before = buf.filled().len();
-        let res = Pin::new(&mut *self.inner).poll_read(cx, buf);
-        self.read += (buf.filled().len() - before) as u64;
-        res
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,17 +202,6 @@ mod tests {
     use xray_proxy::vmess::server::{AuthIdFilter, ServerUser};
     use xray_proxy::vmess::{Account, Cipher, ClientStream, Options};
     use xray_routing::{Network, Target, TargetAddr};
-
-    #[test]
-    fn drain_size_is_server_constant_plus_noise() {
-        let seed = Sha256::digest([0x42u8; 16]);
-        let base = u64::from_be_bytes(seed[..8].try_into().unwrap()) % 3266;
-        let noise = u64::from_be_bytes(seed[8..16].try_into().unwrap()) % 64 + 1;
-        for _ in 0..200 {
-            let n = drain_size(&seed);
-            assert!((54 + base..54 + base + noise).contains(&n));
-        }
-    }
 
     #[tokio::test]
     async fn test_vmess_replayed_first_packet_rejected() {

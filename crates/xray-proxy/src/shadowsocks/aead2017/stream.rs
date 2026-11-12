@@ -294,43 +294,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerStream<S> {
         mut inner: S,
         methods: &[Arc<Method>],
     ) -> io::Result<(Self, usize, Target, Vec<u8>)> {
-        if methods.is_empty() {
-            return Err(invalid("no Shadowsocks methods provided"));
-        }
-        let key_len = methods[0].cipher.key_len();
-        let mut salt = vec![0u8; key_len];
-        inner.read_exact(&mut salt).await?;
+        let header = read_server_header(&mut inner, methods).await?;
+        Ok(Self::from_header(inner, header))
+    }
 
-        let mut len_record = [0u8; 2 + TAG_LENGTH];
-        inner.read_exact(&mut len_record).await?;
-
-        let mut matched = None;
-        for (i, m) in methods.iter().enumerate() {
-            if m.cipher.key_len() != key_len {
-                continue;
-            }
-            let mut test_buf = len_record;
-            let mut reader = Records::new(m, &salt);
-            if reader.open(&mut test_buf).is_ok() {
-                let length = u16::from_be_bytes(test_buf[..2].try_into().unwrap()) as usize;
-                if length > 0 && length <= MAX_PAYLOAD_LENGTH {
-                    matched = Some((i, m.clone(), reader, length));
-                    break;
-                }
-            }
-        }
-
-        let (user_idx, method, mut reader, addr_len) =
-            matched.ok_or_else(|| invalid("Shadowsocks AEAD authentication failed"))?;
-
-        let mut addr_buf = Zeroizing::new(vec![0u8; addr_len + TAG_LENGTH]);
-        inner.read_exact(&mut addr_buf).await?;
-        let plain_len = reader.open(&mut addr_buf)?;
-
-        let (mut target, used) = address::decode(&addr_buf[..plain_len])?;
-        target.network = Network::Tcp;
-        let early = addr_buf[used..plain_len].to_vec();
-
+    /// Wraps a stream whose request header was read by `read_server_header`.
+    pub fn from_header(inner: S, header: ServerHeader) -> (Self, usize, Target, Vec<u8>) {
+        let ServerHeader {
+            user_idx,
+            method,
+            reader,
+            target,
+            early,
+        } = header;
         let stream = Self {
             inner,
             method,
@@ -346,8 +322,68 @@ impl<S: AsyncRead + AsyncWrite + Unpin> ServerStream<S> {
             eof: false,
             write_closed: false,
         };
-        Ok((stream, user_idx, target, early))
+        (stream, user_idx, target, early)
     }
+}
+
+/// A server request header read off the stream, which the caller keeps.
+pub struct ServerHeader {
+    user_idx: usize,
+    method: Arc<Method>,
+    reader: Records,
+    target: Target,
+    early: Vec<u8>,
+}
+
+/// Reads a server request header, matching it against `methods`.
+pub async fn read_server_header<S: AsyncRead + Unpin>(
+    inner: &mut S,
+    methods: &[Arc<Method>],
+) -> io::Result<ServerHeader> {
+    if methods.is_empty() {
+        return Err(invalid("no Shadowsocks methods provided"));
+    }
+    let key_len = methods[0].cipher.key_len();
+    let mut salt = vec![0u8; key_len];
+    inner.read_exact(&mut salt).await?;
+
+    let mut len_record = [0u8; 2 + TAG_LENGTH];
+    inner.read_exact(&mut len_record).await?;
+
+    let mut matched = None;
+    for (i, m) in methods.iter().enumerate() {
+        if m.cipher.key_len() != key_len {
+            continue;
+        }
+        let mut test_buf = len_record;
+        let mut reader = Records::new(m, &salt);
+        if reader.open(&mut test_buf).is_ok() {
+            let length = u16::from_be_bytes(test_buf[..2].try_into().unwrap()) as usize;
+            if length > 0 && length <= MAX_PAYLOAD_LENGTH {
+                matched = Some((i, m.clone(), reader, length));
+                break;
+            }
+        }
+    }
+
+    let (user_idx, method, mut reader, addr_len) =
+        matched.ok_or_else(|| invalid("Shadowsocks AEAD authentication failed"))?;
+
+    let mut addr_buf = Zeroizing::new(vec![0u8; addr_len + TAG_LENGTH]);
+    inner.read_exact(&mut addr_buf).await?;
+    let plain_len = reader.open(&mut addr_buf)?;
+
+    let (mut target, used) = address::decode(&addr_buf[..plain_len])?;
+    target.network = Network::Tcp;
+    let early = addr_buf[used..plain_len].to_vec();
+
+    Ok(ServerHeader {
+        user_idx,
+        method,
+        reader,
+        target,
+        early,
+    })
 }
 
 impl<S> ServerStream<S> {
