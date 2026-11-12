@@ -1285,6 +1285,8 @@ struct ConnRequests {
 /// Go's ReadHeaderTimeout: from accept, and on a keep-alive HTTP/1.1 connection from the
 /// first byte of the next request, until hyper hands the request to the service. An idle
 /// connection has no deadline, as in Go. h2 frames are not request headers.
+/// Over the same span it counts the header bytes against Go's read limit,
+/// MaxHeaderBytes plus 4096, and answers 431 past it.
 struct HeaderDeadline<I> {
     io: I,
     requests: Arc<ConnRequests>,
@@ -1292,9 +1294,15 @@ struct HeaderDeadline<I> {
     armed_at: u64,
     prefix: Vec<u8>,
     h2: bool,
+    limit: usize,
+    head_len: usize,
+    head_done: bool,
+    tail: [u8; 3],
 }
 
-impl<I: AsyncRead + Unpin> AsyncRead for HeaderDeadline<I> {
+const HEADERS_TOO_LARGE: &[u8] = b"HTTP/1.1 431 Request Header Fields Too Large\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n431 Request Header Fields Too Large";
+
+impl<I: AsyncRead + AsyncWrite + Unpin> AsyncRead for HeaderDeadline<I> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1319,6 +1327,36 @@ impl<I: AsyncRead + Unpin> AsyncRead for HeaderDeadline<I> {
             } else if !self.h2 && self.deadline.is_none() && self.requests.open.load(Relaxed) == 0 {
                 self.deadline = Some(Box::pin(tokio::time::sleep(XHTTP_HEADER_TIMEOUT)));
                 self.armed_at = started;
+                self.head_len = 0;
+                self.head_done = false;
+                self.tail = [0; 3];
+            }
+            if self.deadline.is_some() && !self.h2 && !self.head_done {
+                // Only the head counts: hyper reads the body along with it.
+                let mut seen = self.tail.to_vec();
+                seen.extend_from_slice(&buf.filled()[before..]);
+                let head = match seen.windows(4).position(|w| w == b"\r\n\r\n") {
+                    Some(end) => {
+                        self.head_done = true;
+                        (end + 4).saturating_sub(3)
+                    }
+                    None => {
+                        self.tail.copy_from_slice(&seen[seen.len() - 3..]);
+                        seen.len() - 3
+                    }
+                };
+                self.head_len += head;
+                if self.head_len > self.limit + 4096 {
+                    let _ = Pin::new(&mut self.io).poll_write(cx, HEADERS_TOO_LARGE);
+                    log::debug(format!(
+                        "xhttp: request headers over {} bytes",
+                        self.head_len
+                    ));
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "request headers too large",
+                    )));
+                }
             }
         }
         if polled.is_pending() {
@@ -1406,6 +1444,7 @@ async fn serve_http<I>(io: I, peer: SocketAddr, handler: Arc<xhttp::Handler>)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let limit = handler.max_header_bytes();
     let requests = Arc::new(ConnRequests::default());
     let tracked = requests.clone();
     let service = service_fn(move |req| {
@@ -1426,6 +1465,11 @@ where
         .max_concurrent_streams(1024);
     // XHTTP header uplink splits data over many headers; Go limits only their total size.
     builder.http1().max_headers(MAX_HEADERS);
+    // hyper's own head limit is its read buffer (about 408 KiB by default); a larger
+    // serverMaxHeaderBytes must not be cut short by it. Smaller buffers cost CPU.
+    if limit + 4096 > HYPER_DEFAULT_MAX_BUF {
+        builder.http1().max_buf_size(limit + 4096 + 8192);
+    }
     // Go's http.Server in Xray's XHTTP hub: ReadHeaderTimeout 4 s from accept. Not hyper's
     // header_read_timeout: it also runs while a keep-alive connection waits for its next
     // request, and Go keeps those open, so a reverse proxy's pooled connection would close
@@ -1437,6 +1481,10 @@ where
         armed_at: 0,
         prefix: Vec::new(),
         h2: false,
+        limit,
+        head_len: 0,
+        head_done: false,
+        tail: [0; 3],
     };
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
         log::debug(format!(
@@ -1447,6 +1495,7 @@ where
 }
 
 const MAX_HEADERS: usize = 1024;
+const HYPER_DEFAULT_MAX_BUF: usize = 8192 + 4096 * 100;
 
 fn extract_cert_names(cert_der: &[u8]) -> Vec<String> {
     use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};

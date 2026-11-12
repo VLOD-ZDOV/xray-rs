@@ -373,6 +373,8 @@ pub struct XhttpSettings {
     pub max_each_post: usize,
     pub max_buffered_posts: usize,
     pub response_headers: Vec<(HeaderName, HeaderValue)>,
+    /// `serverMaxHeaderBytes`, Go's http.Server MaxHeaderBytes.
+    pub max_header_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2677,6 +2679,11 @@ fn parse_xhttp(x: &Value) -> Result<XhttpSettings, String> {
         max_each_post,
         max_buffered_posts,
         response_headers,
+        max_header_bytes: x
+            .get("serverMaxHeaderBytes")
+            .and_then(Value::as_i64)
+            .filter(|n| *n > 0)
+            .unwrap_or(8192) as usize,
     })
 }
 

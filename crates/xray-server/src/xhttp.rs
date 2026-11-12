@@ -72,6 +72,10 @@ enum Upload {
 }
 
 impl Handler {
+    pub fn max_header_bytes(&self) -> usize {
+        self.settings.max_header_bytes
+    }
+
     pub fn new(settings: XhttpSettings, vless: Arc<vless::Context>) -> Arc<Self> {
         Arc::new(Self {
             settings,
