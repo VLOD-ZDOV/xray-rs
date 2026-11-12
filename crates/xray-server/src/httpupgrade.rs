@@ -22,6 +22,10 @@ pub struct PrefixedStream<S> {
 }
 
 impl<S> PrefixedStream<S> {
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
     pub fn new(inner: S, prefix: Vec<u8>) -> Self {
         Self {
             inner,

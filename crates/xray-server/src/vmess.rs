@@ -5,7 +5,13 @@ use std::net::SocketAddr;
 use std::sync::PoisonError;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::time::timeout;
+use std::pin::Pin;
+use std::task::Poll;
+
+use rand::Rng;
+use sha2::{Digest, Sha256};
+use tokio::io::ReadBuf;
+use tokio::time::{timeout_at, Instant};
 use xray_config::Network;
 use xray_proxy::vmess::server::{self, ServerHandshake, ServerStream, ServerUser};
 use xray_routing::TargetAddr;
@@ -20,27 +26,45 @@ pub async fn serve<R, W>(
     downlink: W,
     ctx: &Context,
     peer: SocketAddr,
+    drain: bool,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    let mut seed = Sha256::new();
     let (server_users, levels): (Vec<ServerUser>, Vec<u32>) = {
         let users = ctx.users.read().unwrap_or_else(PoisonError::into_inner);
         users
             .iter()
-            .map(|u| (ServerUser::new(&u.id, u.email.clone()), u.level))
+            .map(|u| {
+                seed.update(u.id);
+                (ServerUser::new(&u.id, u.email.clone()), u.level)
+            })
             .unzip()
     };
 
-    let hs_res = timeout(
-        crate::policy::get().handshake,
-        server::handshake_with_filter(&mut uplink, &server_users, Some(&ctx.vmess_filter)),
+    let deadline = Instant::now() + crate::policy::get().handshake;
+    let mut counted = Counted {
+        inner: &mut uplink,
+        read: 0,
+    };
+    let hs_res = timeout_at(
+        deadline,
+        server::handshake_with_filter(&mut counted, &server_users, Some(&ctx.vmess_filter)),
     )
     .await;
+    let read = counted.read;
     let hs: ServerHandshake = match hs_res {
         Ok(Ok(hs)) => hs,
-        Ok(Err(e)) => return Err(e),
+        Ok(Err(e)) => {
+            if drain {
+                let left = drain_size(&seed.finalize()).saturating_sub(read);
+                let (mut rest, mut sink) = ((&mut uplink).take(left), tokio::io::sink());
+                let _ = timeout_at(deadline, tokio::io::copy(&mut rest, &mut sink)).await;
+            }
+            return Err(e);
+        }
         Err(_) => {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -87,7 +111,9 @@ where
         sniffing: &ctx.sniffing,
     };
 
+    // Xray writes the response header even when the request goes nowhere.
     let Some(decision) = route.allow(&ctx.router, &early).await else {
+        let _ = server_w.flush().await;
         return Ok(());
     };
 
@@ -104,6 +130,7 @@ where
         return Ok(());
     }
     if let Action::Block(_) = decision.action {
+        let _ = server_w.flush().await;
         return Ok(());
     }
 
@@ -176,6 +203,33 @@ where
     }
 }
 
+// Xray reads a server-constant amount plus a little noise from a raw TCP
+// client that fails the handshake, so a probe cannot time the close against
+// the bytes it sent (proxy/vmess/encoding/server.go, common/drain).
+fn drain_size(seed: &[u8]) -> u64 {
+    let base = u64::from_be_bytes(seed[..8].try_into().unwrap_or_default()) % 3266;
+    let rand_max = u64::from_be_bytes(seed[8..16].try_into().unwrap_or_default()) % 64 + 1;
+    16 + 38 + base + rand::thread_rng().gen_range(0..rand_max)
+}
+
+struct Counted<'a, R> {
+    inner: &'a mut R,
+    read: u64,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for Counted<'_, R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let res = Pin::new(&mut *self.inner).poll_read(cx, buf);
+        self.read += (buf.filled().len() - before) as u64;
+        res
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +237,17 @@ mod tests {
     use xray_proxy::vmess::server::{AuthIdFilter, ServerUser};
     use xray_proxy::vmess::{Account, Cipher, ClientStream, Options};
     use xray_routing::{Network, Target, TargetAddr};
+
+    #[test]
+    fn drain_size_is_server_constant_plus_noise() {
+        let seed = Sha256::digest([0x42u8; 16]);
+        let base = u64::from_be_bytes(seed[..8].try_into().unwrap()) % 3266;
+        let noise = u64::from_be_bytes(seed[8..16].try_into().unwrap()) % 64 + 1;
+        for _ in 0..200 {
+            let n = drain_size(&seed);
+            assert!((54 + base..54 + base + noise).contains(&n));
+        }
+    }
 
     #[tokio::test]
     async fn test_vmess_replayed_first_packet_rejected() {

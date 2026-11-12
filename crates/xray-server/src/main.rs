@@ -741,6 +741,11 @@ pub enum InboundStream {
 }
 
 impl InboundStream {
+    /// Xray drains failed VMess handshakes only on a bare TCP connection.
+    fn is_raw_tcp(&self) -> bool {
+        matches!(self, Self::Plain(s) if matches!(s.get_ref(), InboundIo::Tcp(_)))
+    }
+
     fn handshake_info(&self) -> fallback::TlsInfo {
         match self {
             Self::Tls(stream) => stream.handshake_info(),
@@ -1142,8 +1147,9 @@ async fn dispatch(
             }
         }),
         InboundHandler::VmessTcp(ctx) => Box::pin(async move {
+            let drain = stream.is_raw_tcp();
             let (r, w) = tokio::io::split(stream);
-            if let Err(e) = Box::pin(vmess::serve(r, w, &ctx, peer)).await {
+            if let Err(e) = Box::pin(vmess::serve(r, w, &ctx, peer, drain)).await {
                 log::info(format!("vmess from {} rejected: {e}", log::mask(peer)));
             }
         }),
@@ -1151,7 +1157,7 @@ async fn dispatch(
             match ws::accept(stream, &ws_settings, &trusted_xff, peer).await {
                 Ok((ws_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(ws_stream);
-                    if let Err(e) = Box::pin(vmess::serve(uplink, downlink, &ctx, peer)).await {
+                    if let Err(e) = Box::pin(vmess::serve(uplink, downlink, &ctx, peer, false)).await {
                         log::info(format!("vmess-ws from {} rejected: {e}", log::mask(peer)));
                     }
                 }
@@ -1164,7 +1170,7 @@ async fn dispatch(
             match httpupgrade::accept(stream, &hu_settings, &trusted_xff, peer).await {
                 Ok((prefixed_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
-                    if let Err(e) = Box::pin(vmess::serve(uplink, downlink, &ctx, peer)).await {
+                    if let Err(e) = Box::pin(vmess::serve(uplink, downlink, &ctx, peer, false)).await {
                         log::info(format!(
                             "vmess-httpupgrade from {} rejected: {e}",
                             log::mask(peer)
