@@ -1221,12 +1221,23 @@ async fn dispatch(
 
 const XHTTP_HEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(4);
 
-/// Go's ReadHeaderTimeout for the first request: from accept until the end of its
-/// headers. An h2c preface ends the same way.
+/// Requests on one XHTTP connection, as seen by its service.
+#[derive(Default)]
+struct ConnRequests {
+    started: std::sync::atomic::AtomicU64,
+    open: std::sync::atomic::AtomicUsize,
+}
+
+/// Go's ReadHeaderTimeout: from accept, and on a keep-alive HTTP/1.1 connection from the
+/// first byte of the next request, until hyper hands the request to the service. An idle
+/// connection has no deadline, as in Go. h2 frames are not request headers.
 struct HeaderDeadline<I> {
     io: I,
+    requests: Arc<ConnRequests>,
     deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-    tail: [u8; 3],
+    armed_at: u64,
+    prefix: Vec<u8>,
+    h2: bool,
 }
 
 impl<I: AsyncRead + Unpin> AsyncRead for HeaderDeadline<I> {
@@ -1235,24 +1246,69 @@ impl<I: AsyncRead + Unpin> AsyncRead for HeaderDeadline<I> {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        use std::sync::atomic::Ordering::Relaxed;
         let before = buf.filled().len();
         let polled = Pin::new(&mut self.io).poll_read(cx, buf);
-        if let Some(deadline) = self.deadline.as_mut() {
-            if matches!(polled, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
-                let mut seen = self.tail.to_vec();
-                seen.extend_from_slice(&buf.filled()[before..]);
-                if seen.windows(4).any(|w| w == b"\r\n\r\n") {
+        let started = self.requests.started.load(Relaxed);
+        if self.deadline.is_some() && started != self.armed_at {
+            self.deadline = None;
+        }
+        if matches!(polled, std::task::Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            if self.prefix.len() < 4 {
+                let take = (4 - self.prefix.len()).min(buf.filled().len() - before);
+                let head = buf.filled()[before..before + take].to_vec();
+                self.prefix.extend_from_slice(&head);
+                if self.prefix == b"PRI " {
+                    self.h2 = true;
                     self.deadline = None;
-                } else {
-                    self.tail.copy_from_slice(&seen[seen.len() - 3..]);
                 }
-            } else if polled.is_pending()
-                && std::future::Future::poll(deadline.as_mut(), cx).is_ready()
-            {
-                return std::task::Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+            } else if !self.h2 && self.deadline.is_none() && self.requests.open.load(Relaxed) == 0 {
+                self.deadline = Some(Box::pin(tokio::time::sleep(XHTTP_HEADER_TIMEOUT)));
+                self.armed_at = started;
+            }
+        }
+        if polled.is_pending() {
+            if let Some(deadline) = self.deadline.as_mut() {
+                if std::future::Future::poll(deadline.as_mut(), cx).is_ready() {
+                    return std::task::Poll::Ready(Err(std::io::ErrorKind::TimedOut.into()));
+                }
             }
         }
         polled
+    }
+}
+
+/// A response body that marks its request finished when hyper drops it.
+struct TrackedBody {
+    inner: xhttp::Body,
+    requests: Arc<ConnRequests>,
+}
+
+impl Drop for TrackedBody {
+    fn drop(&mut self) {
+        self.requests
+            .open
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl hyper::body::Body for TrackedBody {
+    type Data = hyper::body::Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -1296,9 +1352,17 @@ async fn serve_http<I>(io: I, peer: SocketAddr, handler: Arc<xhttp::Handler>)
 where
     I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let requests = Arc::new(ConnRequests::default());
+    let tracked = requests.clone();
     let service = service_fn(move |req| {
-        let handler = handler.clone();
-        async move { Ok::<_, Infallible>(handler.handle(req, peer).await) }
+        use std::sync::atomic::Ordering::Relaxed;
+        let (handler, requests) = (handler.clone(), tracked.clone());
+        requests.open.fetch_add(1, Relaxed);
+        requests.started.fetch_add(1, Relaxed);
+        async move {
+            let response = handler.handle(req, peer).await;
+            Ok::<_, Infallible>(response.map(|inner| TrackedBody { inner, requests }))
+        }
     });
     let mut builder = auto::Builder::new(TokioExecutor::new());
     builder
@@ -1314,8 +1378,11 @@ where
     // under it.
     let io = HeaderDeadline {
         io,
+        requests,
         deadline: Some(Box::pin(tokio::time::sleep(XHTTP_HEADER_TIMEOUT))),
-        tail: [0; 3],
+        armed_at: 0,
+        prefix: Vec::new(),
+        h2: false,
     };
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
         log::debug(format!(
