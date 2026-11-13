@@ -86,7 +86,8 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/xray-server${{ matrix.ext }} dist/${{ matrix.name }}${{ matrix.ext }}
-          cd dist && shasum -a 256 ${{ matrix.name }}${{ matrix.ext }} > ${{ matrix.name }}${{ matrix.ext }}.sha256
+          sum="shasum -a 256"; command -v sha256sum >/dev/null && sum=sha256sum
+          cd dist && $sum ${{ matrix.name }}${{ matrix.ext }} > ${{ matrix.name }}${{ matrix.ext }}.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
