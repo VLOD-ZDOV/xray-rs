@@ -17,7 +17,6 @@ case "$(uname -m)" in
     aarch64 | arm64 | armv8*) CORE_NAME="xray-linux-arm64"; ASSET="xray-linux-arm64" ;;
     armv7* | arm) CORE_NAME="xray-linux-arm32"; ASSET="xray-linux-arm32" ;;
     armv6*) CORE_NAME="xray-linux-arm32"; ASSET="xray-linux-arm32-v6" ;;
-    armv5*) CORE_NAME="xray-linux-arm32"; ASSET="xray-linux-arm32-v5" ;;
     s390x) CORE_NAME="xray-linux-s390x"; ASSET="xray-linux-s390x" ;;
     *) CORE_NAME=""; ASSET="" ;;
 esac

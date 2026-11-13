@@ -14,39 +14,52 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # The arm64 binary is built by cross for an older glibc; its tests run here natively.
+  test-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - run: cargo test -p xray-server
+
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          # File names follow 3x-ui: armv5/v6/v7 hosts all run bin/xray-linux-arm32.
-          - { name: xray-linux-amd64, target: x86_64-unknown-linux-gnu, os: ubuntu-24.04 }
-          - { name: xray-linux-arm64, target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
-          - { name: xray-linux-arm32, target: armv7-unknown-linux-gnueabihf, os: ubuntu-24.04, cross: true }
-          - { name: xray-linux-arm32-v6, target: arm-unknown-linux-gnueabihf, os: ubuntu-24.04, cross: true }
-          - { name: xray-linux-arm32-v5, target: armv5te-unknown-linux-gnueabi, os: ubuntu-24.04, cross: true }
-          - { name: xray-linux-386, target: i686-unknown-linux-gnu, os: ubuntu-24.04, cross: true }
+          # Server builds, named as 3x-ui names its core: armv6/v7 hosts run bin/xray-linux-arm32.
+          # ARMv5 has no 64-bit atomics, which the WireGuard stack needs.
+          - { name: xray-linux-amd64, target: x86_64-unknown-linux-gnu, os: ubuntu-24.04, glibc: '2.34', test: true }
+          - { name: xray-linux-arm64, target: aarch64-unknown-linux-gnu, os: ubuntu-24.04, cross: true, glibc: '2.31' }
+          - { name: xray-linux-arm32, target: armv7-unknown-linux-gnueabihf, os: ubuntu-24.04, cross: true, glibc: '2.31' }
+          - { name: xray-linux-arm32-v6, target: arm-unknown-linux-gnueabihf, os: ubuntu-24.04, cross: true, glibc: '2.31' }
+          - { name: xray-linux-386, target: i686-unknown-linux-gnu, os: ubuntu-24.04, cross: true, glibc: '2.31' }
           # The only big-endian target, so its unit tests run under qemu.
-          - { name: xray-linux-s390x, target: s390x-unknown-linux-gnu, os: ubuntu-24.04, cross: true, test: true }
+          - { name: xray-linux-s390x, target: s390x-unknown-linux-gnu, os: ubuntu-24.04, cross: true, glibc: '2.31', test: true }
+          # Static builds for routers (OpenWrt) and other systems without glibc.
+          - { name: xray-linux-musl-amd64, target: x86_64-unknown-linux-musl, os: ubuntu-24.04, cross: true }
+          - { name: xray-linux-musl-arm64, target: aarch64-unknown-linux-musl, os: ubuntu-24.04, cross: true }
+          - { name: xray-linux-musl-arm32, target: armv7-unknown-linux-musleabihf, os: ubuntu-24.04, cross: true }
+          - { name: xray-macos-arm64, target: aarch64-apple-darwin, os: macos-14 }
+          - { name: xray-macos-amd64, target: x86_64-apple-darwin, os: macos-14 }
     runs-on: ${{ matrix.os }}
     env:
       # Keep the runner's home and checkout paths out of the binary.
-      RUSTFLAGS: --remap-path-prefix=/home/runner=~ --remap-path-prefix=${{ github.workspace }}=.
+      RUSTFLAGS: --remap-path-prefix=/home/runner=~ --remap-path-prefix=/Users/runner=~ --remap-path-prefix=${{ github.workspace }}=.
     steps:
       - uses: actions/checkout@v4
       # rustup installs the toolchain pinned in rust-toolchain.toml.
       - run: rustup show active-toolchain
+      - run: rustup target add ${{ matrix.target }}
       - name: Test
-        if: ${{ !matrix.cross }}
+        if: ${{ !matrix.cross && matrix.test }}
         run: cargo test -p xray-server
       - name: Build
         if: ${{ !matrix.cross }}
         run: cargo build --release -p xray-server --target ${{ matrix.target }}
       - name: Install cross
         if: ${{ matrix.cross }}
-        run: |
-          rustup target add ${{ matrix.target }}
-          cargo install cross --locked --version 0.2.5
+        run: cargo install cross --locked --version 0.2.5
       - name: Cross test
         if: ${{ matrix.cross && matrix.test }}
         run: cross test -p xray-server --target ${{ matrix.target }}
@@ -55,18 +68,22 @@ jobs:
         # cross mounts the checkout at the same path, so RUSTFLAGS still applies.
         run: cross build --release -p xray-server --target ${{ matrix.target }}
       - name: Check glibc requirement
-        # README promises glibc 2.34 (2.31 for cross builds); src/compat.c covers
-        # newer C23 symbols.
+        if: ${{ matrix.glibc }}
+        # README promises these; src/compat.c covers newer C23 symbols.
         run: |
-          max=${{ matrix.cross && 'GLIBC_2.31' || 'GLIBC_2.34' }}
+          max=GLIBC_${{ matrix.glibc }}
           need=$(readelf --dyn-syms -W target/${{ matrix.target }}/release/xray-server | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)
           echo "requires $need, allowed $max"
           [ "$(printf '%s\n%s\n' "$need" "$max" | sort -V | tail -1)" = "$max" ]
+      - name: Check static linking
+        if: ${{ contains(matrix.target, 'musl') }}
+        run: |
+          ! readelf -d target/${{ matrix.target }}/release/xray-server | grep -q NEEDED
       - name: Package
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/xray-server dist/${{ matrix.name }}
-          cd dist && sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          cd dist && shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
@@ -74,7 +91,7 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: build
+    needs: [build, test-arm64]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4

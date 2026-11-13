@@ -75,9 +75,13 @@ The binary is `target/release/xray-server`. It runs on glibc 2.34 or newer
 
 Releases carry a binary per CPU, named as 3x-ui names its core:
 `xray-linux-amd64`, `xray-linux-arm64`, `xray-linux-arm32` (ARMv7),
-`xray-linux-arm32-v6`, `xray-linux-arm32-v5`, `xray-linux-386` and
-`xray-linux-s390x`. 3x-ui runs every 32-bit ARM core as `xray-linux-arm32`.
-The amd64 and arm64 builds need glibc 2.34; the others need glibc 2.31.
+`xray-linux-arm32-v6`, `xray-linux-386` and `xray-linux-s390x`. 3x-ui runs
+every 32-bit ARM core as `xray-linux-arm32`. The amd64 build needs glibc 2.34,
+the others glibc 2.31. ARMv5 is not built: it has no 64-bit atomics.
+
+Static builds without glibc, for routers such as OpenWrt:
+`xray-linux-musl-amd64`, `xray-linux-musl-arm64`, `xray-linux-musl-arm32`.
+macOS builds: `xray-macos-arm64`, `xray-macos-amd64`.
 
 ## Install into 3x-ui
 
