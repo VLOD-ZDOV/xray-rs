@@ -16,14 +16,14 @@ use crate::log;
 
 /// Binds a listener with Xray's inbound options.
 pub fn bind_tcp(addr: SocketAddr, sockopt: &SockoptSettings) -> io::Result<TcpListener> {
-    let protocol = sockopt.mptcp.then_some(Protocol::MPTCP);
+    let protocol = if sockopt.mptcp { os::mptcp() } else { None };
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, protocol)?;
     socket.set_reuse_address(true)?;
     if addr.is_ipv6() {
         socket.set_only_v6(sockopt.v6only)?;
     }
     if sockopt.mark != 0 {
-        warn("mark", socket.set_mark(sockopt.mark));
+        warn("mark", os::set_mark(&socket, sockopt.mark));
     }
     apply_tcp(&socket, sockopt);
     if let Some(clamp) = sockopt.tcp_window_clamp {
@@ -35,11 +35,7 @@ pub fn bind_tcp(addr: SocketAddr, sockopt: &SockoptSettings) -> io::Result<TcpLi
     let net = if addr.is_ipv6() { "tcp6" } else { "tcp4" };
     apply_custom_sockopts(&socket, sockopt, net);
     if sockopt.tproxy != TproxyMode::Off {
-        let transparent = if addr.is_ipv4() {
-            socket.set_ip_transparent_v4(true)
-        } else {
-            socket.set_ip_transparent_v6(true)
-        };
+        let transparent = os::set_transparent(&socket, addr.is_ipv4());
         warn("tproxy", transparent);
     }
     socket.set_nonblocking(true)?;
@@ -63,21 +59,17 @@ pub fn set_nodelay(stream: &impl AsFd) {
 
 /// Where a redirected connection was going (`tproxy: "redirect"`).
 pub fn original_destination(stream: &impl AsFd) -> Option<SocketAddr> {
-    let sock = SockRef::from(stream);
-    sock.original_dst_v4()
-        .or_else(|_| sock.original_dst_v6())
-        .ok()
-        .and_then(|addr| addr.as_socket())
+    os::original_dst(&SockRef::from(stream))
 }
 
 /// Xray's outbound options, set before connecting.
 pub fn apply_dial(socket: &TcpSocket, sockopt: &SockoptSettings) {
     let sock = SockRef::from(socket);
     if sockopt.mark != 0 {
-        warn("mark", sock.set_mark(sockopt.mark));
+        warn("mark", os::set_mark(&sock, sockopt.mark));
     }
     if let Some(iface) = &sockopt.interface {
-        warn("interface", sock.bind_device(Some(iface.as_bytes())));
+        warn("interface", os::bind_device(&sock, iface));
     }
     apply_tcp(&sock, sockopt);
     if let Some(clamp) = sockopt.tcp_window_clamp {
@@ -88,9 +80,8 @@ pub fn apply_dial(socket: &TcpSocket, sockopt: &SockoptSettings) {
     }
     apply_custom_sockopts(socket, sockopt, "tcp");
     if sockopt.tproxy != TproxyMode::Off {
-        let transparent = sock
-            .set_ip_transparent_v4(true)
-            .or_else(|_| sock.set_ip_transparent_v6(true));
+        let transparent =
+            os::set_transparent(&sock, true).or_else(|_| os::set_transparent(&sock, false));
         warn("tproxy", transparent);
     }
 }
@@ -98,16 +89,15 @@ pub fn apply_dial(socket: &TcpSocket, sockopt: &SockoptSettings) {
 pub fn apply_dial_udp(socket: &impl AsFd, sockopt: &SockoptSettings) {
     let sock = SockRef::from(socket);
     if sockopt.mark != 0 {
-        warn("mark", sock.set_mark(sockopt.mark));
+        warn("mark", os::set_mark(&sock, sockopt.mark));
     }
     if let Some(iface) = &sockopt.interface {
-        warn("interface", sock.bind_device(Some(iface.as_bytes())));
+        warn("interface", os::bind_device(&sock, iface));
     }
     apply_custom_sockopts(socket, sockopt, "udp");
     if sockopt.tproxy != TproxyMode::Off {
-        let transparent = sock
-            .set_ip_transparent_v4(true)
-            .or_else(|_| sock.set_ip_transparent_v6(true));
+        let transparent =
+            os::set_transparent(&sock, true).or_else(|_| os::set_transparent(&sock, false));
         warn("tproxy", transparent);
     }
 }
@@ -149,14 +139,80 @@ fn apply_tcp(sock: &Socket, sockopt: &SockoptSettings) {
         warn("keepalive", sock.set_keepalive(false));
     }
     if let Some(name) = &sockopt.tcp_congestion {
-        warn("tcpCongestion", sock.set_tcp_congestion(name.as_bytes()));
+        warn("tcpCongestion", os::set_tcp_congestion(sock, name));
     }
     if let Some(ms) = sockopt.tcp_user_timeout_ms {
         let timeout = Duration::from_millis(u64::from(ms));
-        warn("tcpUserTimeout", sock.set_tcp_user_timeout(Some(timeout)));
+        warn("tcpUserTimeout", os::set_tcp_user_timeout(sock, timeout));
     }
     if let Some(mss) = sockopt.tcp_max_seg {
         warn("tcpMaxSeg", sock.set_tcp_mss(mss));
+    }
+}
+
+/// Options only Linux has. Elsewhere a configured one is skipped with a warning.
+#[cfg(target_os = "linux")]
+mod os {
+    use super::*;
+
+    pub fn mptcp() -> Option<Protocol> {
+        Some(Protocol::MPTCP)
+    }
+    pub fn set_mark(sock: &Socket, mark: u32) -> io::Result<()> {
+        sock.set_mark(mark)
+    }
+    pub fn bind_device(sock: &Socket, iface: &str) -> io::Result<()> {
+        sock.bind_device(Some(iface.as_bytes()))
+    }
+    pub fn set_transparent(sock: &Socket, v4: bool) -> io::Result<()> {
+        if v4 {
+            sock.set_ip_transparent_v4(true)
+        } else {
+            sock.set_ip_transparent_v6(true)
+        }
+    }
+    pub fn original_dst(sock: &Socket) -> Option<SocketAddr> {
+        sock.original_dst_v4()
+            .or_else(|_| sock.original_dst_v6())
+            .ok()
+            .and_then(|addr| addr.as_socket())
+    }
+    pub fn set_tcp_congestion(sock: &Socket, name: &str) -> io::Result<()> {
+        sock.set_tcp_congestion(name.as_bytes())
+    }
+    pub fn set_tcp_user_timeout(sock: &Socket, timeout: Duration) -> io::Result<()> {
+        sock.set_tcp_user_timeout(Some(timeout))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+mod os {
+    use super::*;
+
+    fn unsupported() -> io::Error {
+        io::Error::new(io::ErrorKind::Unsupported, "not supported on this platform")
+    }
+    pub fn mptcp() -> Option<Protocol> {
+        log::warn("sockopt mptcp: not supported on this platform");
+        None
+    }
+    pub fn set_mark(_: &Socket, _: u32) -> io::Result<()> {
+        Err(unsupported())
+    }
+    pub fn bind_device(_: &Socket, _: &str) -> io::Result<()> {
+        Err(unsupported())
+    }
+    pub fn set_transparent(_: &Socket, _: bool) -> io::Result<()> {
+        Err(unsupported())
+    }
+    pub fn original_dst(_: &Socket) -> Option<SocketAddr> {
+        None
+    }
+    pub fn set_tcp_congestion(_: &Socket, _: &str) -> io::Result<()> {
+        Err(unsupported())
+    }
+    pub fn set_tcp_user_timeout(_: &Socket, _: Duration) -> io::Result<()> {
+        Err(unsupported())
     }
 }
 
@@ -206,19 +262,15 @@ pub fn bind_udp(addr: SocketAddr, sockopt: Option<&SockoptSettings>) -> io::Resu
         socket.set_only_v6(false)?;
     }
     if sockopt.mark != 0 {
-        warn("mark", socket.set_mark(sockopt.mark));
+        warn("mark", os::set_mark(&socket, sockopt.mark));
     }
     if let Some(iface) = &sockopt.interface {
-        warn("interface", socket.bind_device(Some(iface.as_bytes())));
+        warn("interface", os::bind_device(&socket, iface));
     }
     let net = if addr.is_ipv6() { "udp6" } else { "udp4" };
     apply_custom_sockopts(&socket, sockopt, net);
     if sockopt.tproxy != TproxyMode::Off {
-        let transparent = if addr.is_ipv4() {
-            socket.set_ip_transparent_v4(true)
-        } else {
-            socket.set_ip_transparent_v6(true)
-        };
+        let transparent = os::set_transparent(&socket, addr.is_ipv4());
         warn("tproxy", transparent);
     }
     socket.set_nonblocking(true)?;
