@@ -22,15 +22,6 @@ jobs:
       - run: rustup show active-toolchain
       - run: cargo test -p xray-server
 
-  # Not ported yet: shows what still fails on Windows, without holding a release.
-  check-windows:
-    runs-on: windows-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show active-toolchain
-      - run: cargo check -p xray-server --message-format short
-
   build:
     strategy:
       fail-fast: false
@@ -51,10 +42,12 @@ jobs:
           - { name: xray-linux-musl-arm32, target: armv7-unknown-linux-musleabihf, os: ubuntu-24.04, cross: true }
           - { name: xray-macos-arm64, target: aarch64-apple-darwin, os: macos-latest }
           - { name: xray-macos-amd64, target: x86_64-apple-darwin, os: macos-latest }
+          - { name: xray-windows-amd64, target: x86_64-pc-windows-msvc, os: windows-latest, ext: .exe }
+          - { name: xray-windows-arm64, target: aarch64-pc-windows-msvc, os: windows-latest, ext: .exe }
     runs-on: ${{ matrix.os }}
     env:
       # Keep the runner's home and checkout paths out of the binary.
-      RUSTFLAGS: --remap-path-prefix=/home/runner=~ --remap-path-prefix=/Users/runner=~ --remap-path-prefix=${{ github.workspace }}=.
+      RUSTFLAGS: --remap-path-prefix=/home/runner=~ --remap-path-prefix=/Users/runner=~ --remap-path-prefix=C:\Users\runneradmin=~ --remap-path-prefix=${{ github.workspace }}=.
     steps:
       - uses: actions/checkout@v4
       # rustup installs the toolchain pinned in rust-toolchain.toml.
@@ -89,10 +82,11 @@ jobs:
         run: |
           ! readelf -d target/${{ matrix.target }}/release/xray-server | grep -q NEEDED
       - name: Package
+        shell: bash
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/xray-server dist/${{ matrix.name }}
-          cd dist && shasum -a 256 ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          cp target/${{ matrix.target }}/release/xray-server${{ matrix.ext }} dist/${{ matrix.name }}${{ matrix.ext }}
+          cd dist && shasum -a 256 ${{ matrix.name }}${{ matrix.ext }} > ${{ matrix.name }}${{ matrix.ext }}.sha256
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
