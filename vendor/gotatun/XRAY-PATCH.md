@@ -42,3 +42,7 @@ archive for offline provenance checks.
 MPL-2.0 and upstream BSD notices are retained in LICENSE and LICENSE-CLOUDFLARE.
 Production selects only `ring,device`; no kernel TUN, UAPI, PCAP or DAITA feature
 is enabled. The runtime accepts one peer with optional PSK and rejects nonzero reserved bytes.
+
+Fork change: `src/tun/buffer.rs` reads `wintun_bindings::Error` only with the
+`tun` feature, which brings that crate in, so a Windows build without `tun`
+compiles. No behavior changes where it compiled before.
