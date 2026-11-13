@@ -2079,8 +2079,50 @@ fn xray_dns_section(section: &Value) -> Value {
         for server in servers.iter_mut() {
             *server = keep(server, DNS_SERVER_FIELDS, "dns.servers[]");
         }
+        drop_trailing_localhost(servers);
     }
     dns
+}
+
+/// Xray's `localhost` server is the system resolver. Without domains or IP
+/// filters and with no plain server after it, it only answers what the others
+/// do not, which the system fallback here already does, so it is dropped.
+/// Any other `localhost` entry is left for the parser to reject.
+fn drop_trailing_localhost(servers: &mut Vec<Value>) {
+    let address = |server: &Value| match server {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(o) => o.get("address").and_then(Value::as_str).map(str::to_owned),
+        _ => None,
+    };
+    let filtered = |server: &Value| {
+        ["domains", "expectIPs", "expectedIPs", "unexpectedIPs"]
+            .iter()
+            .any(|key| {
+                server
+                    .get(key)
+                    .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+            })
+    };
+    let is_plain_localhost = |server: &Value| {
+        address(server).is_some_and(|a| a.eq_ignore_ascii_case("localhost")) && !filtered(server)
+    };
+    let mut keep = vec![true; servers.len()];
+    let mut later_plain = false;
+    for (i, server) in servers.iter().enumerate().rev() {
+        if is_plain_localhost(server) {
+            if !later_plain {
+                keep[i] = false;
+                log::warn(
+                    "dns.servers[]: localhost is answered by the system resolver fallback"
+                        .to_owned(),
+                );
+            }
+        } else if !filtered(server) {
+            later_plain = true;
+        }
+    }
+    let mut keep = keep.into_iter();
+    servers.retain(|_| keep.next().unwrap_or(true));
 }
 
 /// Xray's shadowsocks_2022 server takes only keys of the cipher's exact
@@ -3768,6 +3810,29 @@ mod tests {
         assert_eq!(he.try_delay_ms, 300);
         assert_eq!(he.max_concurrent_try, 6);
         assert!(parse(serde_json::json!({"addressPortStrategy": "invalid"})).is_err());
+    }
+
+    #[test]
+    fn trailing_localhost_dns_uses_the_system_resolver() {
+        let mut servers = vec![serde_json::json!({"tag": "local", "address": "localhost"})];
+        drop_trailing_localhost(&mut servers);
+        assert!(servers.is_empty());
+
+        let mut servers = vec![
+            serde_json::json!("192.0.2.1"),
+            serde_json::json!({"address": "localhost", "domains": ["example.com"]}),
+            serde_json::json!("localhost"),
+        ];
+        drop_trailing_localhost(&mut servers);
+        assert_eq!(servers.len(), 2);
+
+        // A localhost before a plain server answers first in Xray; keep it to be refused.
+        let mut servers = vec![
+            serde_json::json!("localhost"),
+            serde_json::json!("192.0.2.1"),
+        ];
+        drop_trailing_localhost(&mut servers);
+        assert_eq!(servers.len(), 2);
     }
 
     #[test]
