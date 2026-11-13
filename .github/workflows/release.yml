@@ -22,6 +22,15 @@ jobs:
       - run: rustup show active-toolchain
       - run: cargo test -p xray-server
 
+  # Not ported yet: shows what still fails on Windows, without holding a release.
+  check-windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - run: cargo check -p xray-server --message-format short
+
   build:
     strategy:
       fail-fast: false
@@ -40,8 +49,8 @@ jobs:
           - { name: xray-linux-musl-amd64, target: x86_64-unknown-linux-musl, os: ubuntu-24.04, cross: true }
           - { name: xray-linux-musl-arm64, target: aarch64-unknown-linux-musl, os: ubuntu-24.04, cross: true }
           - { name: xray-linux-musl-arm32, target: armv7-unknown-linux-musleabihf, os: ubuntu-24.04, cross: true }
-          - { name: xray-macos-arm64, target: aarch64-apple-darwin, os: macos-14 }
-          - { name: xray-macos-amd64, target: x86_64-apple-darwin, os: macos-14 }
+          - { name: xray-macos-arm64, target: aarch64-apple-darwin, os: macos-latest }
+          - { name: xray-macos-amd64, target: x86_64-apple-darwin, os: macos-latest }
     runs-on: ${{ matrix.os }}
     env:
       # Keep the runner's home and checkout paths out of the binary.
