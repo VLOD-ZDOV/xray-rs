@@ -393,6 +393,10 @@ impl LocalStorage {
         options.read(true);
         #[cfg(unix)]
         options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        // FILE_FLAG_OPEN_REPARSE_POINT: a link is opened itself, not followed, and
+        // then fails the is_file check below, as O_NOFOLLOW makes it fail on Unix.
+        #[cfg(windows)]
+        options.custom_flags(0x0020_0000);
         let file = match options.open(&full).await {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
