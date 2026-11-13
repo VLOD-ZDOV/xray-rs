@@ -4288,28 +4288,23 @@ fn accepts_eight_dns_servers() {
 }
 
 #[test]
-fn rejects_more_than_eight_dns_servers() {
-    let raw = raw_with_dns_servers(
-        r#"
-          "192.0.2.1",
-          "192.0.2.2",
-          "192.0.2.3",
-          "192.0.2.4",
-          "192.0.2.5",
-          "192.0.2.6",
-          "192.0.2.7",
-          "192.0.2.8",
-          "192.0.2.9"
-        "#,
-    );
+fn accepts_nine_dns_servers_and_rejects_absurd_counts() {
+    let nine = (1..=9)
+        .map(|i| format!("\"192.0.2.{i}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    let config = parse_xray_json(&raw_with_dns_servers(&nine)).unwrap();
+    assert_eq!(config.config.dns.servers.len(), 9);
 
-    let error = parse_xray_json(&raw).unwrap_err();
-
+    let many = (0..257)
+        .map(|i| format!("\"192.0.{}.{}\"", i / 250, i % 250 + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let error = parse_xray_json(&raw_with_dns_servers(&many)).unwrap_err();
     assert_eq!(error.diagnostics[0].path.as_deref(), Some("$.dns.servers"));
-    assert!(error.diagnostics[0].message.contains("9 servers"));
     assert!(error.diagnostics[0]
         .message
-        .contains("maximum supported per configuration is 8"));
+        .contains("maximum supported per configuration is 256"));
 }
 
 #[test]
