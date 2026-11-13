@@ -1593,6 +1593,44 @@ where
 const MAX_HEADERS: usize = 1024;
 const HYPER_DEFAULT_MAX_BUF: usize = 8192 + 4096 * 100;
 
+/// Like Go's tls.X509KeyPair: the PEM label only has to end in "PRIVATE KEY",
+/// and the DER is tried as PKCS #1, PKCS #8 and SEC 1 (`xray tls cert` labels
+/// a PKCS #8 EC key "RSA PRIVATE KEY").
+fn load_signing_key(
+    provider: &rustls::crypto::CryptoProvider,
+    pem: &[u8],
+) -> Result<Arc<dyn rustls::sign::SigningKey>, String> {
+    use rustls::pki_types::pem::SectionKind;
+    use rustls::pki_types::{PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer};
+    let mut first_error = None;
+    if let Ok(key) = PrivateKeyDer::from_pem_slice(pem) {
+        match provider.key_provider.load_private_key(key) {
+            Ok(k) => return Ok(k),
+            Err(e) => first_error = Some(e.to_string()),
+        }
+    }
+    let mut reader = pem;
+    while let Ok(Some((kind, der))) = rustls::pki_types::pem::from_buf(&mut reader) {
+        if !matches!(
+            kind,
+            SectionKind::RsaPrivateKey | SectionKind::PrivateKey | SectionKind::EcPrivateKey
+        ) {
+            continue;
+        }
+        for key in [
+            PrivateKeyDer::from(PrivatePkcs1KeyDer::from(der.clone())),
+            PrivateKeyDer::from(PrivatePkcs8KeyDer::from(der.clone())),
+            PrivateKeyDer::from(PrivateSec1KeyDer::from(der.clone())),
+        ] {
+            if let Ok(k) = provider.key_provider.load_private_key(key) {
+                return Ok(k);
+            }
+        }
+        break;
+    }
+    Err(first_error.unwrap_or_else(|| "no usable private key found".to_owned()))
+}
+
 fn extract_cert_names(cert_der: &[u8]) -> Vec<String> {
     use x509_parser::prelude::{FromDer, GeneralName, ParsedExtension, X509Certificate};
     let mut names = Vec::new();
@@ -1683,11 +1721,7 @@ impl ManagedCert {
             Ok(c) if !c.is_empty() => c,
             _ => return,
         };
-        let key = match PrivateKeyDer::from_pem_slice(&key_pem) {
-            Ok(k) => k,
-            Err(_) => return,
-        };
-        let signing_key = match provider.key_provider.load_private_key(key) {
+        let signing_key = match load_signing_key(provider, &key_pem) {
             Ok(k) => k,
             Err(_) => return,
         };
@@ -1906,11 +1940,7 @@ pub(crate) fn build_rustls_server_config(
                 if certs.is_empty() {
                     return Err("certificate file has no certificates".into());
                 }
-                let key = PrivateKeyDer::from_pem_slice(&cert_cfg.key_pem)
-                    .map_err(|e| format!("invalid private key: {e}"))?;
-                let signing_key = provider
-                    .key_provider
-                    .load_private_key(key)
+                let signing_key = load_signing_key(&provider, &cert_cfg.key_pem)
                     .map_err(|e| format!("invalid private key: {e}"))?;
                 let mut cert_names = extract_cert_names(certs[0].as_ref());
                 if idx == 0 {
@@ -2053,6 +2083,15 @@ mod tests {
         rec.extend((body.len() as u16).to_be_bytes());
         rec.extend(body);
         rec
+    }
+
+    #[test]
+    fn loads_a_pkcs8_key_labeled_rsa_like_go() {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let pem = rcgen::KeyPair::generate().unwrap().serialize_pem();
+        let mislabeled = pem.replace("PRIVATE KEY", "RSA PRIVATE KEY");
+        assert!(load_signing_key(&provider, mislabeled.as_bytes()).is_ok());
+        assert!(load_signing_key(&provider, b"not a key").is_err());
     }
 
     #[test]
