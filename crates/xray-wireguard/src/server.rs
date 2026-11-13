@@ -548,7 +548,7 @@ impl ServerStack {
                                 if !self.flows.values().any(|f| f.src == src && f.dst == dst) {
                                     let (bridge_app, bridge_stack) =
                                         tokio::io::duplex(STREAM_BUFFER);
-                                    let mut socket = tcp_socket();
+                                    let mut socket = tcp_socket(None);
                                     let _ = socket.set_receive_window_limit(1024 * 1024);
                                     if socket
                                         .listen(IpEndpoint::new(dst.ip().into(), dst.port()))
