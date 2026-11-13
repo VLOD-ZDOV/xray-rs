@@ -146,7 +146,13 @@ fn apply_tcp(sock: &Socket, sockopt: &SockoptSettings) {
         warn("tcpUserTimeout", os::set_tcp_user_timeout(sock, timeout));
     }
     if let Some(mss) = sockopt.tcp_max_seg {
+        #[cfg(unix)]
         warn("tcpMaxSeg", sock.set_tcp_mss(mss));
+        #[cfg(not(unix))]
+        {
+            let _ = mss;
+            log::warn("sockopt tcpMaxSeg: not supported on this platform");
+        }
     }
 }
 
