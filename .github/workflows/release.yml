@@ -40,8 +40,8 @@ jobs:
           - { name: xray-linux-musl-amd64, target: x86_64-unknown-linux-musl, os: ubuntu-24.04, cross: true }
           - { name: xray-linux-musl-arm64, target: aarch64-unknown-linux-musl, os: ubuntu-24.04, cross: true }
           - { name: xray-linux-musl-arm32, target: armv7-unknown-linux-musleabihf, os: ubuntu-24.04, cross: true }
-          - { name: xray-macos-arm64, target: aarch64-apple-darwin, os: macos-15 }
-          - { name: xray-macos-amd64, target: x86_64-apple-darwin, os: macos-latest }
+          - { name: xray-macos-arm64, target: aarch64-apple-darwin, os: macos-15-intel }
+          - { name: xray-macos-amd64, target: x86_64-apple-darwin, os: macos-15-intel }
           - { name: xray-windows-amd64, target: x86_64-pc-windows-msvc, os: windows-latest, ext: .exe }
           - { name: xray-windows-arm64, target: aarch64-pc-windows-msvc, os: windows-latest, ext: .exe }
     runs-on: ${{ matrix.os }}
