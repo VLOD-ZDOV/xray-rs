@@ -149,8 +149,34 @@ impl Default for HappyEyeballsSettings {
 pub struct DokodemoSettings {
     pub address: Option<crate::vless::Host>,
     pub port: Option<u16>,
-    #[allow(dead_code)]
     pub follow_redirect: bool,
+    /// Whether "tcp" is among the networks; Xray opens no TCP listener otherwise.
+    pub tcp: bool,
+}
+
+/// Xray's NetworkList: a comma-separated string or an array, "tcp" when absent.
+/// Dokodemo also takes `allowedNetwork`, which `network` overrides.
+fn network_list(settings: &Value, allowed_network: bool) -> Vec<String> {
+    let value = settings
+        .get("network")
+        .filter(|v| !v.is_null())
+        .or_else(|| {
+            allowed_network
+                .then(|| settings.get("allowedNetwork"))
+                .flatten()
+        })
+        .filter(|v| !v.is_null());
+    let names: Vec<&str> = match value {
+        None => vec!["tcp"],
+        Some(Value::String(s)) => s.split(',').collect(),
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+        Some(_) => Vec::new(),
+    };
+    names
+        .into_iter()
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1105,12 +1131,12 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     } else {
         xray_proxy::inbound::SocksInboundAuth::NoAuth
     };
-    let net_str = str_field(settings, "network");
+    let networks = network_list(settings, protocol == InboundProtocol::Dokodemo);
     let udp = settings
         .get("udp")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        || net_str.contains("udp");
+        || networks.iter().any(|n| n == "udp");
 
     let mut shadowsocks_users = Vec::new();
     if protocol == InboundProtocol::Shadowsocks {
@@ -1273,6 +1299,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             address,
             port,
             follow_redirect,
+            tcp: networks.iter().any(|n| n == "tcp"),
         })
     } else {
         None
@@ -3741,6 +3768,26 @@ mod tests {
         assert_eq!(he.try_delay_ms, 300);
         assert_eq!(he.max_concurrent_try, 6);
         assert!(parse(serde_json::json!({"addressPortStrategy": "invalid"})).is_err());
+    }
+
+    #[test]
+    fn dokodemo_networks_like_xray() {
+        let inbound = |settings: &str| {
+            let raw = format!(
+                r#"{{"inbounds": [{{"port": 2001, "protocol": "tunnel", "settings": {settings}}}]}}"#
+            );
+            let config = parse(&raw).unwrap();
+            let inbound = &config.inbounds[0];
+            (inbound.dokodemo.as_ref().unwrap().tcp, inbound.udp)
+        };
+        assert_eq!(inbound(r#"{"followRedirect": true}"#), (true, false));
+        assert_eq!(inbound(r#"{"allowedNetwork": "udp"}"#), (false, true));
+        assert_eq!(inbound(r#"{"allowedNetwork": "tcp"}"#), (true, false));
+        assert_eq!(inbound(r#"{"network": ["tcp", "udp"]}"#), (true, true));
+        assert_eq!(
+            inbound(r#"{"network": "tcp", "allowedNetwork": "udp"}"#),
+            (true, false)
+        );
     }
 
     #[test]

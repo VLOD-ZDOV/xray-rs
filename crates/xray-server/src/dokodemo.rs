@@ -16,6 +16,7 @@ use crate::log;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::Action;
 use crate::stats;
+use crate::tproxy_udp;
 use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest};
 
 impl DokodemoSettings {
@@ -90,7 +91,7 @@ where
 
 const MAX_UDP_SESSIONS: usize = 4096;
 
-type SessionsMap = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>;
+type SessionsMap = Arc<Mutex<HashMap<(SocketAddr, Option<SocketAddr>), mpsc::Sender<Vec<u8>>>>>;
 
 #[derive(Clone)]
 pub struct DokodemoUdpHandler {
@@ -98,24 +99,38 @@ pub struct DokodemoUdpHandler {
     settings: Arc<DokodemoSettings>,
     ctx: Arc<Context>,
     sessions: SessionsMap,
+    /// The socket mark when the socket is a TPROXY one.
+    tproxy: Option<u32>,
 }
 
 impl DokodemoUdpHandler {
-    pub fn new(socket: Arc<UdpSocket>, settings: Arc<DokodemoSettings>, ctx: Arc<Context>) -> Self {
+    pub fn new(
+        socket: Arc<UdpSocket>,
+        settings: Arc<DokodemoSettings>,
+        ctx: Arc<Context>,
+        tproxy: Option<u32>,
+    ) -> Self {
         Self {
             socket,
             settings,
             ctx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            tproxy,
         }
     }
 
     pub async fn run(self) {
-        let (host, port) = self.settings.fallback_target(self.ctx.port);
-
         let mut buf = vec![0u8; 65535];
         loop {
-            let (n, peer) = match self.socket.recv_from(&mut buf).await {
+            let received = match self.tproxy {
+                Some(_) => tproxy_udp::recv(&self.socket, &mut buf).await,
+                None => self
+                    .socket
+                    .recv_from(&mut buf)
+                    .await
+                    .map(|(n, peer)| (n, peer, None)),
+            };
+            let (n, peer, original) = match received {
                 Ok(res) => res,
                 Err(e) => {
                     log::warn(format!("dokodemo udp recv error: {e}"));
@@ -123,13 +138,15 @@ impl DokodemoUdpHandler {
                     continue;
                 }
             };
+            let original = original.filter(|_| self.settings.follow_redirect);
+            let key = (peer, original);
             let mut sessions = self.sessions.lock().await;
             let packet = buf[..n].to_vec();
-            let packet = if let Some(tx) = sessions.get(&peer) {
+            let packet = if let Some(tx) = sessions.get(&key) {
                 match tx.try_send(packet) {
                     Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
                     Err(mpsc::error::TrySendError::Closed(packet)) => {
-                        sessions.remove(&peer);
+                        sessions.remove(&key);
                         packet
                     }
                 }
@@ -141,34 +158,99 @@ impl DokodemoUdpHandler {
                 continue;
             }
             let (tx, rx) = mpsc::channel(128);
-            sessions.insert(peer, tx.clone());
+            sessions.insert(key, tx.clone());
             drop(sessions);
 
-            // Sessions hold the socket weakly so that removing the inbound frees the port.
-            let socket = Arc::downgrade(&self.socket);
+            let (host, port) = match original {
+                Some(addr) => (Host::Ip(addr.ip()), addr.port()),
+                None => self.settings.fallback_target(self.ctx.port),
+            };
+            let reply = match (self.tproxy, original) {
+                (Some(mark), Some(original)) => Reply::Forged {
+                    original,
+                    mark,
+                    sockets: HashMap::new(),
+                },
+                _ => Reply::Inbound(Arc::downgrade(&self.socket)),
+            };
             let ctx = self.ctx.clone();
             let map = self.sessions.clone();
-            let target_host = host.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    serve_udp_session(socket, ctx, peer, target_host, port, packet, rx).await
-                {
+                if let Err(e) = serve_udp_session(reply, ctx, peer, host, port, packet, rx).await {
                     log::debug(format!(
                         "dokodemo udp session {} ended: {e}",
                         log::mask(peer)
                     ));
                 }
                 let mut map = map.lock().await;
-                if map.get(&peer).is_some_and(|cur| cur.same_channel(&tx)) {
-                    map.remove(&peer);
+                if map.get(&key).is_some_and(|cur| cur.same_channel(&tx)) {
+                    map.remove(&key);
                 }
             });
         }
     }
 }
 
+/// Where replies go out from.
+enum Reply {
+    /// The inbound socket, held weakly so that removing the inbound frees the port.
+    Inbound(Weak<UdpSocket>),
+    /// TPROXY: sockets bound to each answering address, as Xray's FakeUDP.
+    Forged {
+        original: SocketAddr,
+        mark: u32,
+        sockets: HashMap<SocketAddr, Arc<UdpSocket>>,
+    },
+}
+
+// A session normally hears from one address; cap the forged sockets per session.
+const MAX_REPLY_SOCKETS: usize = 64;
+
+impl Reply {
+    async fn send(&mut self, data: &[u8], from: SocketAddr, peer: SocketAddr) -> io::Result<()> {
+        match self {
+            Self::Inbound(socket) => {
+                let Some(socket) = socket.upgrade() else {
+                    return Err(io::Error::new(io::ErrorKind::BrokenPipe, "inbound removed"));
+                };
+                let _ = socket.send_to(data, peer).await;
+            }
+            Self::Forged {
+                original,
+                mark,
+                sockets,
+            } => {
+                let from = tproxy_udp::canonical(from);
+                let from = if from.ip().is_unspecified() || from.is_ipv4() != peer.is_ipv4() {
+                    *original
+                } else {
+                    from
+                };
+                if !sockets.contains_key(original) {
+                    let socket = Arc::new(tproxy_udp::reply_socket(*original, *mark)?);
+                    sockets.insert(*original, socket);
+                }
+                if !sockets.contains_key(&from) && sockets.len() < MAX_REPLY_SOCKETS {
+                    // An address that cannot be bound (a local one in use) answers as the original.
+                    let socket = match tproxy_udp::reply_socket(from, *mark) {
+                        Ok(socket) => Arc::new(socket),
+                        Err(e) => {
+                            log::debug(format!("tproxy udp reply from {from}: {e}"));
+                            sockets[original].clone()
+                        }
+                    };
+                    sockets.insert(from, socket);
+                }
+                let socket = sockets.get(&from).unwrap_or(&sockets[original]);
+                let _ = socket.send_to(data, peer).await;
+            }
+        }
+        Ok(())
+    }
+}
+
 async fn serve_udp_session(
-    socket: Weak<UdpSocket>,
+    mut reply: Reply,
     ctx: Arc<Context>,
     peer: SocketAddr,
     host: Host,
@@ -218,12 +300,9 @@ async fn serve_udp_session(
     let down = Box::pin(async {
         let mut buf = vec![0u8; 65535];
         loop {
-            let (n, _from) = cone.recv_from(&mut buf).await?;
+            let (n, from) = cone.recv_from(&mut buf).await?;
             activity.touch();
-            let Some(socket) = socket.upgrade() else {
-                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "inbound removed"));
-            };
-            let _ = socket.send_to(&buf[..n], peer).await;
+            reply.send(&buf[..n], from, peer).await?;
             traffic.down(n);
         }
     });

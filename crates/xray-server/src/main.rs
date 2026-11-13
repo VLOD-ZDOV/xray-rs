@@ -42,6 +42,7 @@ mod sockopt;
 mod socks;
 mod stats;
 mod tcp_mask;
+mod tproxy_udp;
 mod trojan;
 mod trojan_outbound;
 mod vless;
@@ -343,6 +344,7 @@ pub(crate) fn select_inbound_handler(
                     address: None,
                     port: None,
                     follow_redirect: false,
+                    tcp: true,
                 });
             Ok(InboundHandler::Dokodemo(ctx, Arc::new(settings)))
         }
@@ -463,6 +465,16 @@ pub(crate) async fn start_inbound(
         return Ok((ctx, Some(abort), None));
     }
 
+    // Xray opens a TCP listener only when "tcp" is among dokodemo's networks.
+    if let Some(settings) = inbound.dokodemo.as_ref().filter(|d| !d.tcp) {
+        let udp_abort = if inbound.udp {
+            Some(start_dokodemo_udp(inbound, settings.clone(), &ctx).await?)
+        } else {
+            None
+        };
+        return Ok((ctx, None, udp_abort));
+    }
+
     let listener = bind(inbound).await?;
     log::info(format!(
         "listening {} on {}",
@@ -530,28 +542,49 @@ pub(crate) async fn start_inbound(
     }
     if is_dokodemo_udp {
         if let Some(settings) = dokodemo_settings {
-            let udp_socket = match bind_udp_addr(&inbound.listen, inbound.port).await {
-                Ok(s) => s,
+            match start_dokodemo_udp(inbound, settings, &ctx).await {
+                Ok(abort) => udp_abort = Some(abort),
                 Err(e) => {
                     tcp_task.abort();
                     return Err(e);
                 }
-            };
-            log::info(format!(
-                "listening udp {} on {}",
-                inbound.tag,
-                udp_socket.local_addr().map_err(|e| e.to_string())?
-            ));
-            let udp_handler = dokodemo::DokodemoUdpHandler::new(
-                Arc::new(udp_socket),
-                Arc::new(settings),
-                ctx.clone(),
-            );
-            let udp_task = tokio::spawn(udp_handler.run());
-            udp_abort = Some(udp_task.abort_handle());
+            }
         }
     }
     Ok((ctx, Some(tcp_task.abort_handle()), udp_abort))
+}
+
+async fn start_dokodemo_udp(
+    inbound: &Inbound,
+    settings: config::DokodemoSettings,
+    ctx: &Arc<vless::Context>,
+) -> Result<tokio::task::AbortHandle, String> {
+    let tproxy = inbound
+        .sockopt
+        .as_ref()
+        .filter(|s| s.tproxy == config::TproxyMode::Tproxy)
+        .map(|s| s.mark);
+    let udp_socket = match tproxy {
+        Some(mark) => tproxy_udp::bind(&inbound.listen, inbound.port, mark).map_err(|e| {
+            format!(
+                "failed to listen tproxy udp on {}:{}: {e}",
+                inbound.listen, inbound.port
+            )
+        })?,
+        None => bind_udp_addr(&inbound.listen, inbound.port).await?,
+    };
+    log::info(format!(
+        "listening udp {} on {}",
+        inbound.tag,
+        udp_socket.local_addr().map_err(|e| e.to_string())?
+    ));
+    let udp_handler = dokodemo::DokodemoUdpHandler::new(
+        Arc::new(udp_socket),
+        Arc::new(settings),
+        ctx.clone(),
+        tproxy,
+    );
+    Ok(tokio::spawn(udp_handler.run()).abort_handle())
 }
 
 async fn bind(inbound: &Inbound) -> Result<TcpListener, String> {

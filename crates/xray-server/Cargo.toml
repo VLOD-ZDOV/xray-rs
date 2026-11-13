@@ -57,5 +57,8 @@ xray-transport = { path = "../xray-transport" }
 xray-vless-encryption = { path = "../xray-vless-encryption" }
 xray-wireguard = { path = "../xray-wireguard" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { workspace = true, features = ["socket", "net", "uio"] }
+
 [build-dependencies]
 cc = "1.2"
