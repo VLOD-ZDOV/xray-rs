@@ -125,6 +125,7 @@ impl xray_transport::SocketProtector for OutboundProtector {
         Ok(())
     }
 
+    #[cfg(unix)]
     fn protect_fd(&self, socket: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
         if let Some(inner) = &self.inner {
             inner.protect_fd(socket)?;

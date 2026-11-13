@@ -1322,12 +1322,23 @@ async fn post_webhook(
         req.push_str("\r\n");
 
         if let Some(sock) = socket_path {
-            let mut stream = tokio::net::UnixStream::connect(sock).await?;
-            stream.write_all(req.as_bytes()).await?;
-            stream.write_all(body).await?;
-            stream.flush().await?;
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf).await;
+            #[cfg(not(unix))]
+            {
+                let _ = sock;
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "unix sockets are not supported on this platform",
+                ));
+            }
+            #[cfg(unix)]
+            {
+                let mut stream = tokio::net::UnixStream::connect(sock).await?;
+                stream.write_all(req.as_bytes()).await?;
+                stream.write_all(body).await?;
+                stream.flush().await?;
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf).await;
+            }
         } else {
             let mut stream = tokio::net::TcpStream::connect((host, port)).await?;
             stream.write_all(req.as_bytes()).await?;

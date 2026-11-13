@@ -6,7 +6,9 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpStream, UnixStream};
+use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 
 use crate::config::{Fallback, FallbackDest};
 use crate::vless::{copy, relay, Activity, Host};
@@ -198,6 +200,14 @@ pub(crate) async fn connect_unix(path: &str) -> io::Result<UnixStream> {
 #[cfg(all(unix, not(target_os = "linux")))]
 pub(crate) async fn connect_unix(path: &str) -> io::Result<UnixStream> {
     UnixStream::connect(path).await
+}
+
+#[cfg(not(unix))]
+pub(crate) async fn connect_unix(_: &str) -> io::Result<TcpStream> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "unix sockets are not supported on this platform",
+    ))
 }
 
 pub(crate) async fn write_proxy_header<W: AsyncWrite + Unpin>(

@@ -389,12 +389,11 @@ impl LocalStorage {
         // The folder is shared with the peer: O_NOFOLLOW keeps a planted link
         // from opening a device, O_NONBLOCK keeps a FIFO from blocking the
         // open, and the type is checked on the opened file itself.
-        let file = match tokio::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-            .open(&full)
-            .await
-        {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        let file = match options.open(&full).await {
             Ok(f) => f,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),

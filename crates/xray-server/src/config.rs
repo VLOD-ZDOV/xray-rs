@@ -1619,7 +1619,8 @@ pub fn parse_sockopt(sockopt: &Value, _owner: &str) -> Result<Option<SockoptSett
                     .get("network")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                let level = parse_i32_val(obj.get("level")).unwrap_or(libc::IPPROTO_TCP);
+                // IPPROTO_TCP, which Windows' libc does not export.
+                let level = parse_i32_val(obj.get("level")).unwrap_or(6);
                 // Xray fails the socket setup for entries that apply to this system.
                 let applies = system
                     .as_deref()

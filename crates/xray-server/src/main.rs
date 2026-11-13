@@ -750,11 +750,15 @@ impl InboundStream {
     /// A second handle on a bare TCP connection's socket, for socket options set
     /// after the stream has been handed on.
     fn raw_tcp_socket(&self) -> Option<socket2::Socket> {
-        use std::os::fd::AsFd;
         match self {
             Self::Plain(s) => match s.get_ref() {
-                InboundIo::Tcp(tcp) => tcp
-                    .as_fd()
+                #[cfg(unix)]
+                InboundIo::Tcp(tcp) => std::os::fd::AsFd::as_fd(tcp)
+                    .try_clone_to_owned()
+                    .ok()
+                    .map(socket2::Socket::from),
+                #[cfg(windows)]
+                InboundIo::Tcp(tcp) => std::os::windows::io::AsSocket::as_socket(tcp)
                     .try_clone_to_owned()
                     .ok()
                     .map(socket2::Socket::from),

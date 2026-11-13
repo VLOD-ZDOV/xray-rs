@@ -4,7 +4,6 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::AsFd;
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
@@ -13,6 +12,7 @@ use tokio_tfo::{TfoListener, TfoStream};
 
 use crate::config::{SockoptSettings, TproxyMode};
 use crate::log;
+use crate::raw_sockopt::AsSock;
 
 /// Binds a listener with Xray's inbound options.
 pub fn bind_tcp(addr: SocketAddr, sockopt: &SockoptSettings) -> io::Result<TcpListener> {
@@ -53,12 +53,12 @@ pub fn bind_tcp(addr: SocketAddr, sockopt: &SockoptSettings) -> io::Result<TcpLi
     TcpListener::from_std(listener)
 }
 
-pub fn set_nodelay(stream: &impl AsFd) {
+pub fn set_nodelay(stream: &impl AsSock) {
     let _ = SockRef::from(stream).set_tcp_nodelay(true);
 }
 
 /// Where a redirected connection was going (`tproxy: "redirect"`).
-pub fn original_destination(stream: &impl AsFd) -> Option<SocketAddr> {
+pub fn original_destination(stream: &impl AsSock) -> Option<SocketAddr> {
     os::original_dst(&SockRef::from(stream))
 }
 
@@ -86,7 +86,7 @@ pub fn apply_dial(socket: &TcpSocket, sockopt: &SockoptSettings) {
     }
 }
 
-pub fn apply_dial_udp(socket: &impl AsFd, sockopt: &SockoptSettings) {
+pub fn apply_dial_udp(socket: &impl AsSock, sockopt: &SockoptSettings) {
     let sock = SockRef::from(socket);
     if sockopt.mark != 0 {
         warn("mark", os::set_mark(&sock, sockopt.mark));
@@ -222,7 +222,7 @@ fn warn(option: &str, result: io::Result<()>) {
     }
 }
 
-fn apply_custom_sockopts(fd: &impl AsFd, sockopt: &SockoptSettings, network: &str) {
+fn apply_custom_sockopts(fd: &impl AsSock, sockopt: &SockoptSettings, network: &str) {
     let os = std::env::consts::OS;
     for custom in &sockopt.custom_sockopt {
         if let Some(sys) = &custom.system {
