@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 #![warn(clippy::large_futures)]
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod api;
 mod config;
 mod dns;
@@ -39,6 +42,7 @@ mod routing;
 mod shadowsocks;
 mod shadowsocks_outbound;
 mod sockopt;
+mod splice;
 mod socks;
 mod stats;
 mod tcp_mask;

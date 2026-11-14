@@ -87,9 +87,10 @@ zeroize = "1"
 zstd = { version = "0.14.3", default-features = false }
 
 [profile.release]
+opt-level = 3
 codegen-units = 1
-lto = "thin"
-panic = "unwind"
+lto = true
+panic = "abort"
 strip = "symbols"
 
 [profile.dev]

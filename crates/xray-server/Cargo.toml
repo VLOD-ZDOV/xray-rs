@@ -41,6 +41,7 @@ h3.workspace = true
 h3-quinn.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
+mimalloc = { version = "0.1", default-features = false }
 quinn.workspace = true
 quinn-proto.workspace = true
 x25519-dalek.workspace = true
@@ -58,7 +59,7 @@ xray-vless-encryption = { path = "../xray-vless-encryption" }
 xray-wireguard = { path = "../xray-wireguard" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { workspace = true, features = ["socket", "net", "uio"] }
+nix = { workspace = true, features = ["socket", "net", "uio", "fs", "zerocopy"] }
 
 [build-dependencies]
 cc = "1.2"
