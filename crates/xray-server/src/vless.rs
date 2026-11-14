@@ -25,6 +25,8 @@ use crate::config::VISION_FLOW;
 pub struct Addons {
     #[prost(string, tag = "1")]
     pub flow: String,
+    #[prost(bytes = "vec", tag = "2")]
+    pub seed: Vec<u8>,
 }
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1407,8 +1409,14 @@ async fn write_vision_response<S: AsyncWrite + Unpin>(
     stream: &mut S,
     version: u8,
 ) -> io::Result<()> {
+    use rand::Rng;
+    let pad_len = rand::thread_rng().gen_range(64..=128);
+    let mut seed = vec![0u8; pad_len];
+    rand::thread_rng().fill(&mut seed[..]);
+
     let addons = prost::Message::encode_to_vec(&Addons {
         flow: VISION_FLOW.to_owned(),
+        seed,
     });
     let mut header = vec![version, addons.len() as u8];
     header.extend_from_slice(&addons);

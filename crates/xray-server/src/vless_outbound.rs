@@ -1183,8 +1183,9 @@ impl VlessConeUdp {
                 );
                 let (reader, tx) = (new_link.clone(), self.tx.clone());
                 let task = tokio::spawn(async move {
-                    let mut buf = vec![0u8; 65535];
-                    while let Ok(n) = reader.recv(&mut buf).await {
+                    let mut pooled = crate::vless::PooledBuffer::acquire(65535);
+                    let buf = &mut pooled.buf;
+                    while let Ok(n) = reader.recv(buf).await {
                         if n == 0 {
                             break;
                         }
