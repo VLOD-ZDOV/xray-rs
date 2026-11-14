@@ -13,16 +13,16 @@ use xray_routing::IpMatcherSetBuilder;
 
 use crate::{ConfigModelError, DomainMatcher, IpCidr, RegexMatcher};
 
-const MAX_GEODATA_FILE_SIZE: u64 = 128 * 1024 * 1024;
-const MAX_GEODATA_ENTRY_SIZE: usize = 32 * 1024 * 1024;
+const MAX_GEODATA_FILE_SIZE: u64 = 512 * 1024 * 1024;
+const MAX_GEODATA_ENTRY_SIZE: usize = 128 * 1024 * 1024;
 const MAX_GEODATA_INDEX_ENTRIES: usize = 65_536;
-const MAX_GEODATA_INDEX_CODE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GEODATA_INDEX_CODE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GEODATA_CODE_SIZE: usize = 256;
-const MAX_GEODATA_DOMAINS: usize = 200_000;
-const MAX_GEODATA_DOMAIN_ATTRIBUTES: usize = 400_000;
+const MAX_GEODATA_DOMAINS: usize = 1_000_000;
+const MAX_GEODATA_DOMAIN_ATTRIBUTES: usize = 2_000_000;
 const MAX_GEODATA_DOMAIN_VALUE_SIZE: usize = 4 * 1024;
 const MAX_GEODATA_ATTRIBUTE_SIZE: usize = 1024;
-const MAX_GEODATA_CIDRS: usize = 500_000;
+const MAX_GEODATA_CIDRS: usize = 1_000_000;
 const MAX_GEODATA_CIDR_SIZE: usize = 128;
 
 #[derive(Debug)]

@@ -14,6 +14,18 @@ use crate::config::{SockoptSettings, TproxyMode};
 use crate::log;
 use crate::raw_sockopt::AsSock;
 
+fn max_backlog() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(s) = std::fs::read_to_string("/proc/sys/net/core/somaxconn") {
+            if let Ok(val) = s.trim().parse::<i32>() {
+                return val.clamp(128, 65535);
+            }
+        }
+    }
+    4096
+}
+
 /// Binds a listener with Xray's inbound options.
 pub fn bind_tcp(addr: SocketAddr, sockopt: &SockoptSettings) -> io::Result<TcpListener> {
     let protocol = if sockopt.mptcp { os::mptcp() } else { None };
@@ -42,7 +54,7 @@ pub fn bind_tcp(addr: SocketAddr, sockopt: &SockoptSettings) -> io::Result<TcpLi
     }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;
-    socket.listen(1024)?;
+    socket.listen(max_backlog())?;
     let listener = std::net::TcpListener::from(socket);
     // tokio-tfo sets TCP_FASTOPEN (queue 1024) on the socket; the duplicate
     // descriptor it owns shares the socket, so the option stays.
@@ -267,26 +279,28 @@ fn apply_custom_sockopts(fd: &impl AsSock, sockopt: &SockoptSettings, network: &
 
 /// A freedom UDP socket with Xray's outbound mark and interface.
 pub fn bind_udp(addr: SocketAddr, sockopt: Option<&SockoptSettings>) -> io::Result<UdpSocket> {
-    let Some(sockopt) = sockopt else {
-        let socket = std::net::UdpSocket::bind(addr)?;
-        socket.set_nonblocking(true)?;
-        return UdpSocket::from_std(socket);
-    };
     let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, None)?;
+    socket.set_reuse_address(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    if addr.port() != 0 {
+        let _ = socket.set_reuse_port(true);
+    }
     if addr.is_ipv6() && addr.ip().is_unspecified() {
         socket.set_only_v6(false)?;
     }
-    if sockopt.mark != 0 {
-        warn("mark", os::set_mark(&socket, sockopt.mark));
-    }
-    if let Some(iface) = &sockopt.interface {
-        warn("interface", os::bind_device(&socket, iface));
-    }
-    let net = if addr.is_ipv6() { "udp6" } else { "udp4" };
-    apply_custom_sockopts(&socket, sockopt, net);
-    if sockopt.tproxy != TproxyMode::Off {
-        let transparent = os::set_transparent(&socket, addr.is_ipv4());
-        warn("tproxy", transparent);
+    if let Some(sockopt) = sockopt {
+        if sockopt.mark != 0 {
+            warn("mark", os::set_mark(&socket, sockopt.mark));
+        }
+        if let Some(iface) = &sockopt.interface {
+            warn("interface", os::bind_device(&socket, iface));
+        }
+        let net = if addr.is_ipv6() { "udp6" } else { "udp4" };
+        apply_custom_sockopts(&socket, sockopt, net);
+        if sockopt.tproxy != TproxyMode::Off {
+            let transparent = os::set_transparent(&socket, addr.is_ipv4());
+            warn("tproxy", transparent);
+        }
     }
     socket.set_nonblocking(true)?;
     socket.bind(&addr.into())?;

@@ -47,7 +47,14 @@ where
                     "received PROXY protocol v2 but only v1 is accepted",
                 ));
             }
-            let total_len = 16 + (u16::from_be_bytes([buf[14], buf[15]]) as usize);
+            let v2_len = u16::from_be_bytes([buf[14], buf[15]]) as usize;
+            if v2_len > 4096 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "PROXY protocol v2 header exceeds 4096 bytes",
+                ));
+            }
+            let total_len = 16 + v2_len;
             if buf.len() >= total_len {
                 let peer = parse_v2_header(&buf[..total_len], original_peer)?;
                 let leftover = buf[total_len..].to_vec();

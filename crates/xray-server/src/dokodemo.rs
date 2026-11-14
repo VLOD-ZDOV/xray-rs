@@ -48,6 +48,17 @@ where
         None => settings.fallback_target(ctx.port),
     };
 
+    if port == ctx.port && matches!(&host, Host::Ip(ip) if ip.is_loopback()) {
+        log::info(format!(
+            "loopback connection detected from {}",
+            log::mask(peer)
+        ));
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "loopback connection detected",
+        ));
+    }
+
     let mut early = Vec::new();
     if ctx.router.needs_sniff() || ctx.sniffing.enabled() {
         read_first(&mut stream, &mut early).await;

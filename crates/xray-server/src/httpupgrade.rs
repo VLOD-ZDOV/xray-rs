@@ -117,8 +117,8 @@ where
 {
     let mut header_buf = Vec::with_capacity(2048);
     let mut temp = [0u8; 1024];
-    // One deadline for the whole header, like Xray's absolute read deadline.
-    let deadline = tokio::time::Instant::now() + crate::policy::get().handshake;
+    // One deadline for the whole header, matching Go Xray's 4-second ReadHeaderTimeout.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
 
     let header_end = loop {
         if let Some(pos) = header_buf.windows(4).position(|w| w == b"\r\n\r\n") {

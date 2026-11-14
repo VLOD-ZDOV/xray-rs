@@ -692,15 +692,16 @@ async fn bind(inbound: &Inbound) -> Result<TcpListener, String> {
 
 async fn bind_udp_addr(listen: &str, port: u16) -> Result<UdpSocket, String> {
     if !listen.is_empty() {
-        let addr = format!("{}:{port}", bracket(listen));
-        return UdpSocket::bind(&addr)
-            .await
-            .map_err(|e| format!("failed to bind udp on {addr}: {e}"));
+        let addr_str = format!("{}:{port}", bracket(listen));
+        let addr = addr_str
+            .parse::<SocketAddr>()
+            .map_err(|e| format!("invalid udp listen addr {addr_str}: {e}"))?;
+        return crate::sockopt::bind_udp(addr, None)
+            .map_err(|e| format!("failed to bind udp on {addr_str}: {e}"));
     }
-    match UdpSocket::bind(("::", port)).await {
+    match crate::sockopt::bind_udp(([0u16; 8], port).into(), None) {
         Ok(socket) => Ok(socket),
-        Err(_) => UdpSocket::bind(("0.0.0.0", port))
-            .await
+        Err(_) => crate::sockopt::bind_udp(([0, 0, 0, 0], port).into(), None)
             .map_err(|e| format!("failed to bind udp on port {port}: {e}")),
     }
 }
@@ -1001,8 +1002,9 @@ async fn accept_loop(
         tokio::spawn(async move {
             let handshake_timeout = policy::get().handshake;
             let leftover = if accept_proxy_protocol.is_enabled() {
+                let proxy_timeout = handshake_timeout.min(std::time::Duration::from_secs(10));
                 match tokio::time::timeout(
-                    handshake_timeout,
+                    proxy_timeout,
                     proxy_proto::read_proxy_header(&mut stream, accept_proxy_protocol, peer),
                 )
                 .await

@@ -1087,7 +1087,7 @@ impl VlessConeUdp {
             .vless
             .open_raw_stream(
                 &Host::Domain("v1.mux.cool".into()),
-                0,
+                666,
                 VlessCommand::Mux,
                 false,
             )
@@ -1124,7 +1124,13 @@ impl VlessConeUdp {
                 }
             }
         });
-        let global_id: [u8; 8] = rand::random();
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"xray-xudp-global-id");
+        hasher.update(&self.vless.user_id);
+        let hash = hasher.finalize();
+        let mut global_id = [0u8; 8];
+        global_id.copy_from_slice(&hash[..8]);
         Ok(Arc::new(XudpConn {
             writer: Mutex::new(writer),
             sessions,

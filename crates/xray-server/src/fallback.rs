@@ -121,12 +121,37 @@ fn request_path(first: &[u8]) -> Option<&str> {
 }
 
 pub async fn serve<R, W>(
+    client_r: R,
+    client_w: W,
+    fallback: &Fallback,
+    early: Vec<u8>,
+    peer: SocketAddr,
+    inbound_port: u16,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    serve_with_local(
+        client_r,
+        client_w,
+        fallback,
+        early,
+        peer,
+        inbound_port,
+        None,
+    )
+    .await
+}
+
+pub async fn serve_with_local<R, W>(
     mut client_r: R,
     mut client_w: W,
     fallback: &Fallback,
     early: Vec<u8>,
     peer: SocketAddr,
     inbound_port: u16,
+    local_addr: Option<SocketAddr>,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -157,7 +182,7 @@ where
         }
         FallbackDest::Unix(path) => Box::new(connect_unix(path).await?),
     };
-    write_proxy_header(&mut dest, fallback.xver, peer, inbound_port).await?;
+    write_proxy_header_with_local(&mut dest, fallback.xver, peer, inbound_port, local_addr).await?;
     dest.write_all(&early).await?;
     let (mut dest_r, mut dest_w) = tokio::io::split(dest);
     let activity = Activity::new();
@@ -216,15 +241,31 @@ pub(crate) async fn write_proxy_header<W: AsyncWrite + Unpin>(
     peer: SocketAddr,
     inbound_port: u16,
 ) -> io::Result<()> {
+    write_proxy_header_with_local(writer, xver, peer, inbound_port, None).await
+}
+
+pub(crate) async fn write_proxy_header_with_local<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    xver: u8,
+    peer: SocketAddr,
+    inbound_port: u16,
+    local_addr: Option<SocketAddr>,
+) -> io::Result<()> {
+    let local_ip = local_addr.map(|a| a.ip()).unwrap_or_else(|| {
+        if peer.is_ipv4() {
+            Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        }
+    });
+    let local_port = local_addr.map(|a| a.port()).unwrap_or(inbound_port);
     match xver {
         1 => {
             let proto = if peer.is_ipv4() { "TCP4" } else { "TCP6" };
-            let local_ip = if peer.is_ipv4() { "127.0.0.1" } else { "::1" };
             let line = format!(
-                "PROXY {proto} {} {local_ip} {} {}\r\n",
+                "PROXY {proto} {} {local_ip} {} {local_port}\r\n",
                 peer.ip(),
                 peer.port(),
-                inbound_port
             );
             writer.write_all(line.as_bytes()).await?;
         }
@@ -238,9 +279,13 @@ pub(crate) async fn write_proxy_header<W: AsyncWrite + Unpin>(
                     hdr[1] = 0x11;
                     hdr[2..4].copy_from_slice(&12u16.to_be_bytes());
                     hdr[4..8].copy_from_slice(&v4.ip().octets());
-                    hdr[8..12].copy_from_slice(&Ipv4Addr::LOCALHOST.octets());
+                    let local_v4 = match local_ip {
+                        std::net::IpAddr::V4(ip) => ip,
+                        std::net::IpAddr::V6(_) => Ipv4Addr::LOCALHOST,
+                    };
+                    hdr[8..12].copy_from_slice(&local_v4.octets());
                     hdr[12..14].copy_from_slice(&v4.port().to_be_bytes());
-                    hdr[14..16].copy_from_slice(&inbound_port.to_be_bytes());
+                    hdr[14..16].copy_from_slice(&local_port.to_be_bytes());
                     writer.write_all(&hdr).await?;
                 }
                 SocketAddr::V6(v6) => {
@@ -249,9 +294,13 @@ pub(crate) async fn write_proxy_header<W: AsyncWrite + Unpin>(
                     hdr[1] = 0x21;
                     hdr[2..4].copy_from_slice(&36u16.to_be_bytes());
                     hdr[4..20].copy_from_slice(&v6.ip().octets());
-                    hdr[20..36].copy_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+                    let local_v6 = match local_ip {
+                        std::net::IpAddr::V6(ip) => ip,
+                        std::net::IpAddr::V4(_) => std::net::Ipv6Addr::LOCALHOST,
+                    };
+                    hdr[20..36].copy_from_slice(&local_v6.octets());
                     hdr[36..38].copy_from_slice(&v6.port().to_be_bytes());
-                    hdr[38..40].copy_from_slice(&inbound_port.to_be_bytes());
+                    hdr[38..40].copy_from_slice(&local_port.to_be_bytes());
                     writer.write_all(&hdr).await?;
                 }
             }

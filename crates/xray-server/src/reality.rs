@@ -1060,11 +1060,13 @@ impl RealityServer {
         let mut server_hs_iv = [0u8; 12];
         server_hs_iv.copy_from_slice(&hkdf_expand_label(cipher, &server_hs_secret, "iv", &[], 12));
 
-        // 4. Construct EncryptedExtensions
+        // 4. Construct EncryptedExtensions (server preference order matches Go REALITY)
         let negotiated_alpn = if dest_hs.handshake_lens[2] >= 37 {
-            find_client_alpn(client_hello_payload)
-                .into_iter()
-                .find(|p| self.alpn_protocols.iter().any(|s| s == p))
+            let client_alpn = find_client_alpn(client_hello_payload);
+            self.alpn_protocols
+                .iter()
+                .find(|s| client_alpn.iter().any(|c| c == *s))
+                .cloned()
         } else {
             None
         };
