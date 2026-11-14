@@ -1388,6 +1388,25 @@ pub enum RuleTarget {
     Balancer(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RouteCacheKey {
+    pub inbound: String,
+    pub inbound_port: u16,
+    pub user: String,
+    pub source_ip: Option<IpAddr>,
+    pub source_port: u16,
+    pub network: Network,
+    pub domain: Option<String>,
+    pub ip: Option<IpAddr>,
+    pub port: u16,
+    pub protocol: Option<String>,
+    pub local_ip: Option<IpAddr>,
+    pub vless_route: Option<u32>,
+}
+
+pub type MatchedRule = (RuleTarget, Option<Arc<WebhookNotifier>>, usize, String);
+pub type RouteCache = HashMap<RouteCacheKey, Option<MatchedRule>>;
+
 pub struct Router {
     pub rules: std::sync::RwLock<Vec<Rule>>,
     pub strategy: RoutingDomainStrategy,
@@ -1401,6 +1420,7 @@ pub struct Router {
     pub dialer_proxies: Vec<(String, String)>,
     pub reverse_portals: std::sync::RwLock<HashMap<String, Arc<crate::mux::ReversePortal>>>,
     pub inbound_protocols: std::sync::RwLock<HashMap<String, String>>,
+    pub route_cache: std::sync::RwLock<RouteCache>,
 }
 
 pub struct Rule {
@@ -1788,6 +1808,7 @@ impl Router {
                     })
                     .collect(),
             ),
+            route_cache: std::sync::RwLock::new(HashMap::new()),
         })
     }
 
@@ -1896,6 +1917,10 @@ impl Router {
             .rules
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.route_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         if should_append {
             rules.push(rule);
         } else {
@@ -1911,6 +1936,10 @@ impl Router {
         if rule_tag.is_empty() {
             return 0;
         }
+        self.route_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         let before = rules.len();
         rules.retain(|r| r.rule_tag != rule_tag);
         before - rules.len()
@@ -1951,6 +1980,10 @@ impl Router {
         if outbounds.contains_key(&tag) {
             return false;
         }
+        self.route_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         crate::stats::get().register("outbound", &tag);
         outbounds.insert(tag, action);
         true
@@ -1961,6 +1994,10 @@ impl Router {
             .outbounds
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.route_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         outbounds.remove(tag).is_some()
     }
 
@@ -2167,8 +2204,46 @@ impl Router {
         rules: &'a [Rule],
         query: &Query<'_>,
         ip: Option<IpAddr>,
-    ) -> Option<(RuleTarget, Option<Arc<WebhookNotifier>>, usize, String)> {
-        rules
+    ) -> Option<MatchedRule> {
+        let is_cacheable = query.attributes.is_none() && query.process_info.is_none();
+
+        let key = if is_cacheable {
+            let has_source_port = rules
+                .iter()
+                .any(|r| r.source.as_ref().is_some_and(|s| s.port_ranges.is_some()));
+            Some(RouteCacheKey {
+                inbound: query.inbound.to_string(),
+                inbound_port: query.inbound_port,
+                user: query.user.to_string(),
+                source_ip: Some(query.source.ip()),
+                source_port: if has_source_port {
+                    query.source.port()
+                } else {
+                    0
+                },
+                network: query.network,
+                domain: query.domain.map(str::to_string),
+                ip,
+                port: query.port,
+                protocol: query.protocol.map(str::to_string),
+                local_ip: query.local_ip,
+                vless_route: query.vless_route,
+            })
+        } else {
+            None
+        };
+
+        if let Some(ref k) = key {
+            let cache = self
+                .route_cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(res) = cache.get(k) {
+                return res.clone();
+            }
+        }
+
+        let res = rules
             .iter()
             .enumerate()
             .find(|(_, rule)| rule.matches(query, ip))
@@ -2179,7 +2254,20 @@ impl Router {
                     idx,
                     rule.tag.clone(),
                 )
-            })
+            });
+
+        if let Some(k) = key {
+            let mut cache = self
+                .route_cache
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cache.len() >= 2048 {
+                cache.clear();
+            }
+            cache.insert(k, res.clone());
+        }
+
+        res
     }
 
     async fn resolve_target(&self, target: &RuleTarget, source: Option<IpAddr>) -> Decision {
