@@ -22,7 +22,7 @@ const MAX_GEODATA_DOMAINS: usize = 1_000_000;
 const MAX_GEODATA_DOMAIN_ATTRIBUTES: usize = 2_000_000;
 const MAX_GEODATA_DOMAIN_VALUE_SIZE: usize = 4 * 1024;
 const MAX_GEODATA_ATTRIBUTE_SIZE: usize = 1024;
-const MAX_GEODATA_CIDRS: usize = 1_000_000;
+const MAX_GEODATA_CIDRS: usize = 500_000;
 const MAX_GEODATA_CIDR_SIZE: usize = 128;
 
 #[derive(Debug)]
@@ -210,7 +210,7 @@ impl GeodataLoader {
         }
         let inverse = inverse ^ (apply_asset_reverse && geoip.reverse_match);
         for cidr in &geoip.cidr {
-            matchers.insert_cidr(cidr_to_ip_cidr(cidr, file_name, &code)?.cidr(), inverse);
+            matchers.insert_geoip_cidr(cidr_to_ip_cidr(cidr, file_name, &code)?.cidr(), inverse);
             #[cfg(test)]
             {
                 self.ip_matcher_builds += 1;
