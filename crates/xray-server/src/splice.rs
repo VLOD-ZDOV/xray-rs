@@ -34,7 +34,10 @@ impl Pipe {
         let (read_fd, write_fd) = nix::unistd::pipe2(OFlag::O_NONBLOCK | OFlag::O_CLOEXEC)
             .map_err(|e| io::Error::from_raw_os_error(e as i32))?;
         // Set pipe buffer capacity to 1 MB for high throughput
-        let _ = nix::fcntl::fcntl(&write_fd, nix::fcntl::FcntlArg::F_SETPIPE_SZ(PIPE_CAPACITY as i32));
+        let _ = nix::fcntl::fcntl(
+            &write_fd,
+            nix::fcntl::FcntlArg::F_SETPIPE_SZ(PIPE_CAPACITY as i32),
+        );
         Ok(Self { read_fd, write_fd })
     }
 }
