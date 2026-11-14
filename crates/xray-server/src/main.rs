@@ -978,6 +978,7 @@ async fn accept_loop(
             }
         };
         let _ = stream.set_nodelay(true);
+        sockopt::set_nodelay(&stream);
         let local = stream.local_addr().ok();
         // Where a transparently proxied connection was going, as Xray's TCP hub
         // records it for dokodemo-door followRedirect.

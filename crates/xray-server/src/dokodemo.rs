@@ -300,9 +300,10 @@ async fn serve_udp_session(
         Ok(())
     });
     let down = Box::pin(async {
-        let mut buf = vec![0u8; 65535];
+        let mut pooled = crate::vless::PooledBuffer::acquire(65535);
+        let buf = &mut pooled.buf;
         loop {
-            let (n, from) = cone.recv_from(&mut buf).await?;
+            let (n, from) = cone.recv_from(buf).await?;
             activity.touch();
             reply.send(&buf[..n], from, peer).await?;
             traffic.down(n);

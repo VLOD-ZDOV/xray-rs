@@ -55,6 +55,7 @@ pub fn bind_tcp(addr: SocketAddr, sockopt: &SockoptSettings) -> io::Result<TcpLi
 
 pub fn set_nodelay(stream: &impl AsSock) {
     let _ = SockRef::from(stream).set_tcp_nodelay(true);
+    let _ = crate::raw_sockopt::set_tcp_quickack(stream);
 }
 
 /// Where a redirected connection was going (`tproxy: "redirect"`).
@@ -117,7 +118,7 @@ pub async fn connect(
         }
     }
     let stream = socket.connect(addr).await?;
-    stream.set_nodelay(true)?;
+    set_nodelay(&stream);
     Ok(Box::new(stream))
 }
 

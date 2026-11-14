@@ -52,3 +52,15 @@ pub fn set_tcp_window_clamp(fd: &impl AsSock, clamp: u32) -> io::Result<()> {
         Ok(())
     }
 }
+
+pub fn set_tcp_quickack(fd: &impl AsSock) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_QUICKACK, 1)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        Ok(())
+    }
+}

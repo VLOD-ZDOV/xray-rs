@@ -994,6 +994,45 @@ where
     .await
 }
 
+/// A pool of reusable memory buffers for stream copying to avoid heap churn.
+static BUFFER_POOL: std::sync::Mutex<Vec<Vec<u8>>> = std::sync::Mutex::new(Vec::new());
+const MAX_POOLED_BUFFERS: usize = 128;
+
+pub(crate) struct PooledBuffer {
+    pub(crate) buf: Vec<u8>,
+}
+
+impl PooledBuffer {
+    pub(crate) fn acquire(capacity: usize) -> Self {
+        let target_cap = capacity.max(512);
+        if let Ok(mut pool) = BUFFER_POOL.lock() {
+            if let Some(mut buf) = pool.pop() {
+                if buf.capacity() >= target_cap {
+                    buf.resize(target_cap, 0);
+                    return Self { buf };
+                }
+            }
+        }
+        Self {
+            buf: vec![0u8; target_cap],
+        }
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        if self.buf.capacity() <= 256 * 1024 {
+            if let Ok(mut pool) = BUFFER_POOL.lock() {
+                if pool.len() < MAX_POOLED_BUFFERS {
+                    let mut b = std::mem::take(&mut self.buf);
+                    b.clear();
+                    pool.push(b);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn copy_buf<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -1005,9 +1044,10 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; buf_size.max(512)];
+    let mut pooled = PooledBuffer::acquire(buf_size);
+    let buf = &mut pooled.buf;
     loop {
-        let n = reader.read(&mut buf).await?;
+        let n = reader.read(buf).await?;
         if n == 0 {
             let _ = writer.shutdown().await;
             return Ok(());
@@ -1327,7 +1367,8 @@ async fn udp_up<R: AsyncRead + Unpin>(
     activity: &Activity,
     traffic: &Traffic,
 ) -> io::Result<()> {
-    let mut packet = vec![0u8; 65535];
+    let mut pooled = PooledBuffer::acquire(65535);
+    let packet = &mut pooled.buf;
     loop {
         let mut len = [0u8; 2];
         match reader.read_exact(&mut len).await {
@@ -1350,7 +1391,8 @@ async fn udp_down<W: AsyncWrite + Unpin>(
     activity: &Activity,
     traffic: &Traffic,
 ) -> io::Result<()> {
-    let mut packet = vec![0u8; 2 + 65535];
+    let mut pooled = PooledBuffer::acquire(2 + 65535);
+    let packet = &mut pooled.buf;
     loop {
         let n = link.recv(&mut packet[2..]).await?;
         traffic.down(n);
