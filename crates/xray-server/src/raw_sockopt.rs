@@ -64,3 +64,27 @@ pub fn set_tcp_quickack(fd: &impl AsSock) -> io::Result<()> {
         Ok(())
     }
 }
+
+pub fn set_tcp_fastopen_connect(fd: &impl AsSock) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_FASTOPEN_CONNECT, 1)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = fd;
+        Ok(())
+    }
+}
+
+pub fn set_tcp_notsent_lowat(fd: &impl AsSock, bytes: u32) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        setsockopt_int(fd, libc::IPPROTO_TCP, libc::TCP_NOTSENT_LOWAT, bytes as i32)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, bytes);
+        Ok(())
+    }
+}

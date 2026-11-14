@@ -19,6 +19,8 @@ pub fn bind_tcp(addr: SocketAddr, sockopt: &SockoptSettings) -> io::Result<TcpLi
     let protocol = if sockopt.mptcp { os::mptcp() } else { None };
     let socket = Socket::new(Domain::for_address(addr), Type::STREAM, protocol)?;
     socket.set_reuse_address(true)?;
+    #[cfg(all(unix, not(target_os = "solaris"), not(target_os = "illumos")))]
+    let _ = socket.set_reuse_port(true);
     if addr.is_ipv6() {
         socket.set_only_v6(sockopt.v6only)?;
     }
@@ -56,6 +58,7 @@ pub fn bind_tcp(addr: SocketAddr, sockopt: &SockoptSettings) -> io::Result<TcpLi
 pub fn set_nodelay(stream: &impl AsSock) {
     let _ = SockRef::from(stream).set_tcp_nodelay(true);
     let _ = crate::raw_sockopt::set_tcp_quickack(stream);
+    let _ = crate::raw_sockopt::set_tcp_notsent_lowat(stream, 131072);
 }
 
 /// Where a redirected connection was going (`tproxy: "redirect"`).
@@ -78,6 +81,9 @@ pub fn apply_dial(socket: &TcpSocket, sockopt: &SockoptSettings) {
             "tcpWindowClamp",
             crate::raw_sockopt::set_tcp_window_clamp(socket, clamp),
         );
+    }
+    if sockopt.tcp_fast_open.is_none_or(|tfo| tfo > 0) {
+        let _ = crate::raw_sockopt::set_tcp_fastopen_connect(socket);
     }
     apply_custom_sockopts(socket, sockopt, "tcp");
     if sockopt.tproxy != TproxyMode::Off {
@@ -116,6 +122,8 @@ pub async fn connect(
             set_nodelay(&stream);
             return Ok(Box::new(stream));
         }
+    } else {
+        let _ = crate::raw_sockopt::set_tcp_fastopen_connect(&socket);
     }
     let stream = socket.connect(addr).await?;
     set_nodelay(&stream);
