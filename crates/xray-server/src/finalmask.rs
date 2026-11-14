@@ -336,7 +336,12 @@ pub fn warn_inbound_finalmask(stream: &Value, protocol: &str, tag: &str) {
     let Some(finalmask) = stream.get("finalmask").and_then(Value::as_object) else {
         return;
     };
-    let network = stream.get("network").and_then(Value::as_str).unwrap_or("");
+    let network = stream
+        .get("network")
+        .or_else(|| stream.get("method"))
+        .or_else(|| stream.get("transport"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     for (layer, masks) in [("tcp", finalmask.get("tcp")), ("udp", finalmask.get("udp"))] {
         for mask in masks.and_then(Value::as_array).into_iter().flatten() {
             let kind = mask.get("type").and_then(Value::as_str).unwrap_or("");

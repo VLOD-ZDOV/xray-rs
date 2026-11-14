@@ -70,7 +70,12 @@ impl MasqueOutbound {
         }
 
         let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
-        let network = stream.get("network").and_then(Value::as_str).unwrap_or("");
+        let network = stream
+            .get("network")
+            .or_else(|| stream.get("method"))
+            .or_else(|| stream.get("transport"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if network != "masque" {
             return Err("the masque transport can only be used by the masque outbound".into());
         }

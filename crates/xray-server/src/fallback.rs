@@ -335,4 +335,66 @@ mod tests {
         };
         assert_eq!(pick("b.example"), "");
     }
+
+    #[test]
+    fn empty_path_matches_http_root() {
+        let f = [fallback("", 7)];
+        assert!(find_fallback(&f, &TlsInfo::default(), b"GET / HTTP/1.1\r\n\r\n").is_some());
+    }
+    #[test]
+    fn exact_path_is_selected() {
+        let f = [fallback("/ws", 7)];
+        assert_eq!(
+            find_fallback(&f, &TlsInfo::default(), b"GET /ws HTTP/1.1\r\n\r\n")
+                .unwrap()
+                .path,
+            "/ws"
+        );
+    }
+    #[test]
+    fn path_query_does_not_change_match() {
+        let f = [fallback("/api", 7)];
+        assert_eq!(
+            find_fallback(&f, &TlsInfo::default(), b"GET /api?q=1 HTTP/1.1\r\n\r\n")
+                .unwrap()
+                .path,
+            "/api"
+        );
+    }
+    #[test]
+    fn path_prefix_requires_boundary() {
+        let f = [fallback("/ws", 7)];
+        assert!(find_fallback(&f, &TlsInfo::default(), b"GET /wsx HTTP/1.1\r\n\r\n").is_none());
+    }
+    #[test]
+    fn unmatched_path_returns_none_without_default() {
+        let f = [fallback("/ws", 7)];
+        assert!(find_fallback(&f, &TlsInfo::default(), b"GET /other HTTP/1.1\r\n\r\n").is_none());
+    }
+    #[test]
+    fn binary_tls_prefix_can_select_empty_path() {
+        let f = [fallback("", 7)];
+        assert!(find_fallback(&f, &TlsInfo::default(), b"\x16\x03\x01").is_some());
+    }
+    #[test]
+    fn http2_preface_can_select_empty_path() {
+        let f = [fallback("", 7)];
+        assert!(
+            find_fallback(&f, &TlsInfo::default(), b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").is_some()
+        );
+    }
+    #[test]
+    fn post_request_path_matches() {
+        let f = [fallback("/upload", 7)];
+        assert!(find_fallback(&f, &TlsInfo::default(), b"POST /upload HTTP/1.1\r\n\r\n").is_some());
+    }
+    #[test]
+    fn lowercase_method_request_matches() {
+        let f = [fallback("/", 7)];
+        assert!(find_fallback(&f, &TlsInfo::default(), b"get / HTTP/1.1\r\n\r\n").is_some());
+    }
+    #[test]
+    fn empty_fallback_list_never_matches() {
+        assert!(find_fallback(&[], &TlsInfo::default(), b"GET / HTTP/1.1\r\n\r\n").is_none());
+    }
 }

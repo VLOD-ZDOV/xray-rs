@@ -92,6 +92,65 @@ mod tests {
     }
 
     #[test]
+    fn non_tokenish_generation_uses_fixed_x_padding() {
+        assert_eq!(generate(false, 0), "");
+        assert_eq!(generate(false, 1), "X");
+        assert_eq!(generate(false, 17), "X".repeat(17));
+    }
+
+    #[test]
+    fn tokenish_zero_length_is_empty() {
+        assert_eq!(generate(true, 0), "");
+    }
+
+    #[test]
+    fn non_tokenish_range_includes_both_endpoints() {
+        assert!(is_valid("abc", (3, 5), false));
+        assert!(is_valid("abcde", (3, 5), false));
+        assert!(!is_valid("ab", (3, 5), false));
+        assert!(!is_valid("abcdef", (3, 5), false));
+    }
+
+    #[test]
+    fn tokenish_range_uses_huffman_length_tolerance() {
+        assert!(is_valid("a", (2, 2), true));
+        assert!(!is_valid("a", (4, 4), true));
+    }
+
+    #[test]
+    fn tokenish_lower_bound_saturates_at_zero() {
+        assert!(is_valid("a", (0, 0), true));
+    }
+
+    #[test]
+    fn reversed_draw_range_is_normalized() {
+        assert_eq!(draw((4, 3)), 3);
+    }
+
+    #[test]
+    fn adjacent_draw_range_returns_its_lower_endpoint() {
+        assert_eq!(draw((9, 10)), 9);
+    }
+
+    #[test]
+    fn generated_tokenish_string_uses_only_base62() {
+        let value = generate(true, 128);
+        assert!(value.bytes().all(|b| BASE62.contains(&b)));
+    }
+
+    #[test]
+    fn generated_tokenish_padding_matches_target_with_tolerance() {
+        let value = generate(true, 256);
+        assert!(is_valid(&value, (256, 256), true));
+    }
+
+    #[test]
+    fn empty_padding_is_never_accepted() {
+        assert!(!is_valid("", (0, usize::MAX), false));
+        assert!(!is_valid("", (0, usize::MAX), true));
+    }
+
+    #[test]
     fn tokenish_targets_huffman_length() {
         for length in [1, 100, 500, 1000] {
             let value = generate(true, length);

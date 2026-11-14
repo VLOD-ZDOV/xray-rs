@@ -308,7 +308,7 @@ impl GeodataLoader {
             path: path.clone(),
             source,
         })?;
-        if decoded_code(&decoded) != code {
+        if !decoded_code(&decoded).eq_ignore_ascii_case(code) {
             return Err(GeodataError::InvalidFile {
                 path,
                 message: "decoded geodata code does not match its index entry".to_owned(),
@@ -669,6 +669,7 @@ fn index_geodata_file(
                 message: "geodata entry extends beyond the end of the file".to_owned(),
             })?;
         if let Some(code) = scan_entry_code(&mut reader, body_len, path)? {
+            let code = normalize_code(&code);
             if let std::collections::hash_map::Entry::Vacant(entry) = entries.entry(code) {
                 indexed_code_bytes = indexed_code_bytes
                     .checked_add(entry.key().len())
@@ -1601,6 +1602,38 @@ mod tests {
         assert_eq!(loader.index_builds, 1);
         assert_eq!(loader.ip_matcher_builds, 0);
         assert!(loader.ips.is_empty(), "no entry was decoded");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn load_ip_matchers_is_case_insensitive() {
+        let root = unique_temp_dir("case-insensitive");
+        let body = GeoIp {
+            code: "refilter".to_owned(),
+            cidr: vec![GeoCidr {
+                ip: vec![162, 159, 135, 0],
+                prefix: 24,
+            }],
+            reverse_match: false,
+        }
+        .encode_to_vec();
+        let mut bytes = vec![0x0a];
+        encode_varint(body.len() as u64, &mut bytes);
+        bytes.extend_from_slice(&body);
+        fs::write(root.join("geoip.dat"), bytes).unwrap();
+
+        let mut loader = GeodataLoader::from_dirs(vec![root.clone()]);
+        let mut matchers = crate::model::IpMatcherSet::builder();
+        let count_lower = loader
+            .load_ip_matchers("geoip.dat", "refilter", false, 10, &mut matchers)
+            .unwrap();
+        assert_eq!(count_lower, 1);
+
+        let count_upper = loader
+            .load_ip_matchers("geoip.dat", "REFILTER", false, 10, &mut matchers)
+            .unwrap();
+        assert_eq!(count_upper, 1);
 
         fs::remove_dir_all(root).unwrap();
     }

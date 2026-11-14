@@ -195,4 +195,113 @@ mod tests {
             d.buffer_size
         );
     }
+
+    #[test]
+    fn empty_policy_object_uses_defaults() {
+        assert_eq!(
+            PolicyManager::from_config(&serde_json::json!({"policy":{}})).for_level(0),
+            PolicySettings::default()
+        );
+    }
+    #[test]
+    fn missing_policy_uses_defaults() {
+        assert_eq!(
+            PolicyManager::from_config(&serde_json::json!({})).for_level(4),
+            PolicySettings::default()
+        );
+    }
+    #[test]
+    fn non_object_levels_are_ignored() {
+        assert_eq!(
+            PolicyManager::from_config(&serde_json::json!({"policy":{"levels":[]}})).for_level(0),
+            PolicySettings::default()
+        );
+    }
+    #[test]
+    fn non_numeric_level_names_are_ignored() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"bad":{"handshake":1}}}}),
+        );
+        assert_eq!(m.for_level(0).handshake, Duration::from_secs(60));
+    }
+    #[test]
+    fn leading_zero_level_key_maps_to_integer_level() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"01":{"handshake":12}}}}),
+        );
+        assert_eq!(m.for_level(1).handshake, Duration::from_secs(12));
+    }
+    #[test]
+    fn negative_timeout_is_ignored() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"0":{"handshake":-1}}}}),
+        );
+        assert_eq!(m.for_level(0).handshake, Duration::from_secs(60));
+    }
+    #[test]
+    fn string_timeout_is_ignored() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"0":{"connIdle":"9"}}}}),
+        );
+        assert_eq!(m.for_level(0).conn_idle, Duration::from_secs(300));
+    }
+    #[test]
+    fn each_timeout_can_be_overridden_independently() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"0":{"uplinkOnly":9}}}}),
+        );
+        let p = m.for_level(0);
+        assert_eq!(p.uplink_only, Duration::from_secs(9));
+        assert_eq!(p.downlink_only, Duration::from_secs(1));
+    }
+    #[test]
+    fn zero_timeout_is_a_valid_override() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"0":{"handshake":0}}}}),
+        );
+        assert_eq!(m.for_level(0).handshake, Duration::ZERO);
+    }
+    #[test]
+    fn zero_buffer_size_does_not_replace_default() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"0":{"bufferSize":0}}}}),
+        );
+        assert_eq!(m.for_level(0).buffer_size, 32 * 1024);
+    }
+    #[test]
+    fn buffer_size_is_converted_from_kibibytes() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"0":{"bufferSize":2}}}}),
+        );
+        assert_eq!(m.for_level(0).buffer_size, 2048);
+    }
+    #[test]
+    fn buffer_size_is_capped_at_sixteen_mibibytes() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"0":{"bufferSize":20000}}}}),
+        );
+        assert_eq!(m.for_level(0).buffer_size, MAX_BUFFER_SIZE);
+    }
+    #[test]
+    fn stats_flags_require_boolean_values() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"0":{"statsUserUplink":1}}}}),
+        );
+        assert!(!m.for_level(0).stats_user_uplink);
+    }
+    #[test]
+    fn stats_flags_accept_false_override() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"0":{"statsUserOnline":true}}}}),
+        );
+        assert!(m.for_level(0).stats_user_online);
+    }
+    #[test]
+    fn multiple_levels_do_not_leak_settings() {
+        let m = PolicyManager::from_config(
+            &serde_json::json!({"policy":{"levels":{"2":{"bufferSize":8},"3":{"handshake":4}}}}),
+        );
+        assert_eq!(m.for_level(2).handshake, Duration::from_secs(60));
+        assert_eq!(m.for_level(3).buffer_size, 32 * 1024);
+    }
 }

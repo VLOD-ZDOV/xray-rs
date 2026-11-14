@@ -216,4 +216,188 @@ mod tests {
         assert_eq!(settings.listen.unwrap().port(), 11111);
         assert!(parse(&json!({"metrics": {"listen": "no port"}})).is_err());
     }
+
+    #[test]
+    fn absent_metrics_section_disables_metrics() {
+        assert_eq!(parse(&json!({})).unwrap(), None);
+    }
+    #[test]
+    fn null_metrics_section_disables_metrics() {
+        assert_eq!(parse(&json!({"metrics": null})).unwrap(), None);
+    }
+    #[test]
+    fn empty_metrics_section_requires_a_destination() {
+        assert!(parse(&json!({"metrics": {}})).is_err());
+    }
+    #[test]
+    fn tag_alone_is_valid() {
+        assert_eq!(
+            parse(&json!({"metrics": {"tag": "stats"}}))
+                .unwrap()
+                .unwrap()
+                .tag,
+            "stats"
+        );
+    }
+    #[test]
+    fn listen_only_uses_xray_default_tag() {
+        assert_eq!(
+            parse(&json!({"metrics": {"listen": "127.0.0.1:1234"}}))
+                .unwrap()
+                .unwrap()
+                .tag,
+            "Metrics"
+        );
+    }
+    #[test]
+    fn explicit_tag_is_preserved_with_listener() {
+        assert_eq!(
+            parse(&json!({"metrics": {"tag": "custom", "listen": "127.0.0.1:80"}}))
+                .unwrap()
+                .unwrap()
+                .tag,
+            "custom"
+        );
+    }
+    #[test]
+    fn metrics_tag_must_be_a_string() {
+        assert!(parse(&json!({"metrics": {"tag": 7}}))
+            .unwrap_err()
+            .contains("tag must be a string"));
+    }
+    #[test]
+    fn metrics_listen_must_be_a_string() {
+        assert!(parse(&json!({"metrics": {"tag": "x", "listen": false}}))
+            .unwrap_err()
+            .contains("listen must be a string"));
+    }
+    #[test]
+    fn empty_tag_is_treated_as_missing() {
+        assert!(parse(&json!({"metrics": {"tag": ""}})).is_err());
+    }
+    #[test]
+    fn empty_listener_with_tag_is_allowed() {
+        assert_eq!(
+            parse(&json!({"metrics": {"tag": "x", "listen": ""}}))
+                .unwrap()
+                .unwrap()
+                .listen,
+            None
+        );
+    }
+    #[test]
+    fn ipv4_listener_address_is_parsed() {
+        assert_eq!(
+            parse(&json!({"metrics": {"listen": "192.0.2.1:3000"}}))
+                .unwrap()
+                .unwrap()
+                .listen
+                .unwrap()
+                .port(),
+            3000
+        );
+    }
+    #[test]
+    fn ipv6_listener_address_is_parsed() {
+        assert_eq!(
+            parse(&json!({"metrics": {"listen": "[::1]:3001"}}))
+                .unwrap()
+                .unwrap()
+                .listen
+                .unwrap()
+                .port(),
+            3001
+        );
+    }
+    #[test]
+    fn unsupported_listener_scheme_is_rejected() {
+        assert!(parse(&json!({"metrics": {"listen": "http://localhost"}})).is_err());
+    }
+    #[test]
+    fn debug_vars_route_is_json() {
+        assert_eq!(
+            respond("/debug/vars").headers()[hyper::header::CONTENT_TYPE],
+            "application/json; charset=utf-8"
+        );
+    }
+    #[test]
+    fn unknown_metrics_route_is_not_found() {
+        assert_eq!(
+            respond("/debug/pprof").status(),
+            hyper::StatusCode::NOT_FOUND
+        );
+    }
+    #[test]
+    fn unknown_route_has_xray_plain_text_body() {
+        let r = respond("/");
+        assert_eq!(
+            r.headers()[hyper::header::CONTENT_TYPE],
+            "text/plain; charset=utf-8"
+        );
+    }
+    #[test]
+    fn empty_outbound_status_omits_zero_values() {
+        let status = crate::observatory::OutboundStatus {
+            alive: false,
+            delay: 0,
+            last_error_reason: String::new(),
+            outbound_tag: String::new(),
+            last_seen_time: 0,
+            last_try_time: 0,
+            health_ping: None,
+        };
+        assert!(outbound_status(&status).as_object().unwrap().is_empty());
+    }
+    #[test]
+    fn outbound_status_keeps_nonzero_delay() {
+        let status = crate::observatory::OutboundStatus {
+            alive: false,
+            delay: 23,
+            last_error_reason: String::new(),
+            outbound_tag: String::new(),
+            last_seen_time: 0,
+            last_try_time: 0,
+            health_ping: None,
+        };
+        assert_eq!(outbound_status(&status)["delay"], 23);
+    }
+    #[test]
+    fn outbound_status_keeps_nonempty_error() {
+        let status = crate::observatory::OutboundStatus {
+            alive: false,
+            delay: 0,
+            last_error_reason: "offline".into(),
+            outbound_tag: String::new(),
+            last_seen_time: 0,
+            last_try_time: 0,
+            health_ping: None,
+        };
+        assert_eq!(outbound_status(&status)["last_error_reason"], "offline");
+    }
+    #[test]
+    fn outbound_status_keeps_health_ping_even_when_all_zero() {
+        let status = crate::observatory::OutboundStatus {
+            alive: false,
+            delay: 0,
+            last_error_reason: String::new(),
+            outbound_tag: String::new(),
+            last_seen_time: 0,
+            last_try_time: 0,
+            health_ping: Some(crate::observatory::HealthPingStats::default()),
+        };
+        assert!(outbound_status(&status).get("health_ping").is_some());
+    }
+    #[test]
+    fn outbound_status_keeps_alive_true() {
+        let status = crate::observatory::OutboundStatus {
+            alive: true,
+            delay: 0,
+            last_error_reason: String::new(),
+            outbound_tag: String::new(),
+            last_seen_time: 0,
+            last_try_time: 0,
+            health_ping: None,
+        };
+        assert_eq!(outbound_status(&status)["alive"], true);
+    }
 }

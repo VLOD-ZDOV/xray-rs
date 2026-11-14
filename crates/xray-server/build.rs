@@ -5,5 +5,7 @@ fn main() {
             .file("src/compat.c")
             .flag("-fno-stack-protector")
             .compile("xray_compat");
+        println!("cargo:rustc-link-arg=-Wl,--undefined=__isoc23_sscanf");
+        println!("cargo:rustc-link-arg=-Wl,--undefined=__isoc23_strtol");
     }
 }

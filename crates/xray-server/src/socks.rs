@@ -398,4 +398,108 @@ mod tests {
         packet[2] = 1;
         assert!(parse_udp_header(&packet).is_none());
     }
+
+    #[test]
+    fn address_encoder_writes_ipv4_type_and_port() {
+        let mut b = vec![];
+        put_address(&mut b, &Host::Ip("192.0.2.7".parse().unwrap()), 8080).unwrap();
+        assert_eq!(b, [1, 192, 0, 2, 7, 0x1f, 0x90]);
+    }
+    #[test]
+    fn address_encoder_writes_ipv6_type_and_port() {
+        let mut b = vec![];
+        put_address(&mut b, &Host::Ip("::1".parse().unwrap()), 53).unwrap();
+        assert_eq!(b[0], 4);
+        assert_eq!(&b[17..], &[0, 53]);
+    }
+    #[test]
+    fn address_encoder_writes_domain_length() {
+        let mut b = vec![];
+        put_address(&mut b, &Host::Domain("proxy.test".into()), 443).unwrap();
+        assert_eq!(
+            &b[..12],
+            &[3, 10, b'p', b'r', b'o', b'x', b'y', b'.', b't', b'e', b's', b't']
+        );
+        assert_eq!(&b[12..], &[1, 0xbb]);
+    }
+    #[test]
+    fn address_encoder_rejects_domains_longer_than_rfc_limit() {
+        assert_eq!(
+            put_address(&mut vec![], &Host::Domain("a".repeat(256)), 80)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    #[test]
+    fn udp_header_rejects_too_short_packet() {
+        assert!(parse_udp_header(&[0, 0, 0]).is_none());
+    }
+    #[test]
+    fn udp_header_rejects_unknown_address_type() {
+        assert!(parse_udp_header(&[0, 0, 0, 3, 1, b'a', 0, 1]).is_none());
+    }
+    #[test]
+    fn udp_header_rejects_truncated_ipv4_address() {
+        assert!(parse_udp_header(&[0, 0, 0, 1, 127, 0, 0]).is_none());
+    }
+    #[test]
+    fn udp_header_rejects_missing_port() {
+        assert!(parse_udp_header(&[0, 0, 0, 1, 127, 0, 0, 1, 0]).is_none());
+    }
+    #[test]
+    fn udp_header_reads_ipv4_and_payload_offset() {
+        let p = [0, 0, 0, 1, 198, 51, 100, 2, 0x12, 0x34, 9];
+        let (a, o) = parse_udp_header(&p).unwrap();
+        assert_eq!(a, "198.51.100.2:4660".parse::<SocketAddr>().unwrap());
+        assert_eq!(&p[o..], &[9]);
+    }
+    #[test]
+    fn udp_header_reads_ipv6_address() {
+        let mut p = vec![0, 0, 0, 4];
+        p.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        p.extend_from_slice(&[0, 53]);
+        let (a, _) = parse_udp_header(&p).unwrap();
+        assert_eq!(a, "[::1]:53".parse::<SocketAddr>().unwrap());
+    }
+    #[test]
+    fn udp_header_rejects_fragmented_datagrams() {
+        assert!(parse_udp_header(&[0, 0, 1, 1, 127, 0, 0, 1, 0, 53]).is_none());
+    }
+    #[test]
+    fn reply_code_one_has_standard_text() {
+        assert_eq!(reply_text(1), "general failure");
+    }
+    #[test]
+    fn reply_code_two_has_standard_text() {
+        assert_eq!(reply_text(2), "connection not allowed by ruleset");
+    }
+    #[test]
+    fn reply_code_three_has_standard_text() {
+        assert_eq!(reply_text(3), "network unreachable");
+    }
+    #[test]
+    fn reply_code_four_has_standard_text() {
+        assert_eq!(reply_text(4), "host unreachable");
+    }
+    #[test]
+    fn reply_code_five_has_standard_text() {
+        assert_eq!(reply_text(5), "connection refused");
+    }
+    #[test]
+    fn reply_code_six_has_standard_text() {
+        assert_eq!(reply_text(6), "TTL expired");
+    }
+    #[test]
+    fn reply_code_seven_has_standard_text() {
+        assert_eq!(reply_text(7), "command not supported");
+    }
+    #[test]
+    fn reply_code_eight_has_standard_text() {
+        assert_eq!(reply_text(8), "address type not supported");
+    }
+    #[test]
+    fn unknown_reply_code_is_preserved() {
+        assert_eq!(reply_text(42), "error 42");
+    }
 }

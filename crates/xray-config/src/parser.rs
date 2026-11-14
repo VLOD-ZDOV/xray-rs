@@ -1834,7 +1834,7 @@ impl Parser<'_> {
         matchers: &mut IpMatcherSetBuilder,
     ) -> Option<usize> {
         let max_matchers = self.matcher_budget.remaining_ip_matchers();
-        let inserted = match mode {
+        let mut inserted = match mode {
             IpMatcherParseMode::Routing => self.geodata_loader.load_ip_matchers(
                 file_name,
                 code,
@@ -1850,6 +1850,38 @@ impl Parser<'_> {
                 matchers,
             ),
         };
+        if matches!(
+            inserted,
+            Err(crate::geodata::GeodataError::CodeNotFound { .. })
+        ) && file_name == "geoip.dat"
+        {
+            let alt_files = [
+                format!("{}.dat", code.to_ascii_lowercase()),
+                format!("geoip-{}.dat", code.to_ascii_lowercase()),
+            ];
+            for alt_file in alt_files {
+                let alt_inserted = match mode {
+                    IpMatcherParseMode::Routing => self.geodata_loader.load_ip_matchers(
+                        &alt_file,
+                        code,
+                        inverse,
+                        max_matchers,
+                        matchers,
+                    ),
+                    IpMatcherParseMode::XrayDns => self.geodata_loader.load_dns_ip_matchers(
+                        &alt_file,
+                        code,
+                        inverse,
+                        max_matchers,
+                        matchers,
+                    ),
+                };
+                if alt_inserted.is_ok() {
+                    inserted = alt_inserted;
+                    break;
+                }
+            }
+        }
         match inserted {
             Ok(0) => {
                 self.error(

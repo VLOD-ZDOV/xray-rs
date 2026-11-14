@@ -253,6 +253,8 @@ impl ServerConnector {
         let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
         let network = stream
             .get("network")
+            .or_else(|| stream.get("method"))
+            .or_else(|| stream.get("transport"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         let security = stream
@@ -668,11 +670,28 @@ pub(crate) fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, Str
         })
         .unwrap_or_default();
 
+    let verify_peer_cert_by_name = match tls.get("verifyPeerCertByName") {
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    };
+
     Ok(ConnectorConfig::Tls(TlsClientConfig {
         server_name,
         allow_insecure,
         pinned_peer_cert_sha256,
-        verify_peer_cert_by_name: Vec::new(),
+        verify_peer_cert_by_name,
         custom_roots,
         alpn,
         fingerprint,

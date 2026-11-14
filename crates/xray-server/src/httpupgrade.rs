@@ -213,8 +213,13 @@ where
         ));
     }
 
-    let is_upgrade = connection.is_some_and(|c| c.eq_ignore_ascii_case("upgrade"))
-        && upgrade_hdr.is_some_and(|u| u.eq_ignore_ascii_case("websocket"));
+    let is_upgrade = connection.is_some_and(|c| {
+        c.split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
+    }) && upgrade_hdr.is_some_and(|u| {
+        u.split(',')
+            .any(|t| t.trim().eq_ignore_ascii_case("websocket"))
+    });
     if !is_upgrade {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -275,5 +280,67 @@ mod tests {
         assert!(!is_valid_http_host("::1", "::1"));
         assert!(!is_valid_http_host("other.com", "example.com"));
         assert!(!is_valid_http_host("", "example.com"));
+    }
+
+    #[test]
+    fn host_validation_accepts_case_insensitive_names() {
+        assert!(is_valid_http_host("EXAMPLE.COM", "example.com"));
+    }
+    #[test]
+    fn host_validation_ignores_numeric_port() {
+        assert!(is_valid_http_host("example.com:8443", "example.com"));
+    }
+    #[test]
+    fn host_validation_rejects_different_name_with_same_port() {
+        assert!(!is_valid_http_host("other.example:443", "example"));
+    }
+    #[test]
+    fn host_validation_rejects_empty_configured_host() {
+        assert!(!is_valid_http_host("example.com", ""));
+    }
+    #[test]
+    fn host_validation_rejects_trailing_dot_difference() {
+        assert!(!is_valid_http_host("example.com.", "example.com"));
+    }
+    #[test]
+    fn host_validation_accepts_bracketed_ipv6_with_port() {
+        assert!(is_valid_http_host("[2001:db8::1]:443", "2001:db8::1"));
+    }
+    #[test]
+    fn host_validation_rejects_unbracketed_ipv6() {
+        assert!(!is_valid_http_host("2001:db8::1", "2001:db8::1"));
+    }
+    #[test]
+    fn host_validation_rejects_bracketed_ipv6_without_port() {
+        assert!(!is_valid_http_host("[::1]", "::1"));
+    }
+    #[test]
+    fn host_validation_rejects_bracketed_ipv6_with_extra_port_separator() {
+        assert!(!is_valid_http_host("[::1]:80:90", "::1"));
+    }
+    #[test]
+    fn host_validation_accepts_hostname_case_and_port_combined() {
+        assert!(is_valid_http_host("MiXeD.Example:80", "mixed.example"));
+    }
+
+    #[tokio::test]
+    async fn upgrade_request_accepts_comma_separated_connection_header() {
+        let (mut client, server) = tokio::io::duplex(1024);
+        let client_task = tokio::spawn(async move {
+            let req = b"GET /hu HTTP/1.1\r\nHost: example.com\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+            client.write_all(req).await.unwrap();
+            let mut resp = vec![0u8; 256];
+            let n = client.read(&mut resp).await.unwrap();
+            let resp_str = String::from_utf8_lossy(&resp[..n]);
+            assert!(resp_str.starts_with("HTTP/1.1 101 Switching Protocols"));
+        });
+        let settings = HttpUpgradeSettings {
+            host: Some("example.com".into()),
+            path: "/hu".into(),
+        };
+        let peer = "127.0.0.1:12345".parse().unwrap();
+        let res = accept(server, &settings, &[], peer).await;
+        assert!(res.is_ok());
+        client_task.await.unwrap();
     }
 }

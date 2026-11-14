@@ -85,6 +85,9 @@ pub(crate) const COMPAT_VERSION: &str = "26.11.9";
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("test-route") {
+        return run_test_route(&args[1..]);
+    }
     let mut config_path = None;
     let mut test_only = false;
     let mut iter = args.iter().map(String::as_str);
@@ -280,8 +283,33 @@ async fn run(
         )
         .await?;
     }
-    let _ = tokio::signal::ctrl_c().await;
+    shutdown_signal().await;
     Ok(())
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+
+    let (mut interrupt, mut terminate) = match (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::terminate()),
+    ) {
+        (Ok(interrupt), Ok(terminate)) => (interrupt, terminate),
+        (Err(error), _) | (_, Err(error)) => {
+            log::warn(format!("failed to wait for shutdown signal: {error}"));
+            return;
+        }
+    };
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 pub(crate) fn select_inbound_handler(
@@ -562,7 +590,11 @@ async fn start_dokodemo_udp(
     let tproxy = inbound
         .sockopt
         .as_ref()
-        .filter(|s| s.tproxy == config::TproxyMode::Tproxy)
+        .filter(|s| {
+            s.tproxy == config::TproxyMode::Tproxy
+                || s.tproxy == config::TproxyMode::Redirect
+                || settings.follow_redirect
+        })
         .map(|s| s.mark);
     let udp_socket = match tproxy {
         Some(mark) => tproxy_udp::bind(&inbound.listen, inbound.port, mark).map_err(|e| {
@@ -1356,7 +1388,7 @@ async fn dispatch(
         }),
         InboundHandler::Dokodemo(ctx, settings) => Box::pin(async move {
             if let Err(e) = dokodemo::serve_tcp(stream, &settings, &ctx, peer, original).await {
-                log::info(format!("dokodemo from {} rejected: {e}", log::mask(peer)));
+                log::warn(format!("dokodemo from {} rejected: {e}", log::mask(peer)));
             }
         }),
         InboundHandler::VlessGrpc(h) | InboundHandler::TrojanGrpc(h) => Box::pin(async move {
@@ -2056,6 +2088,129 @@ fn tls_acceptor(
     };
     let config = build_rustls_server_config(settings, alpn, false)?;
     Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+fn run_test_route(args: &[String]) -> ExitCode {
+    let mut config_path = "config.json".to_string();
+    let mut ip_str = None;
+    let mut domain = None;
+    let mut port = 443u16;
+    let mut source_str = "127.0.0.1:0".to_string();
+    let mut is_udp = false;
+    let mut inbound = "in".to_string();
+    let mut sniffed_proto_str: Option<String> = None;
+
+    let mut iter = args.iter().map(String::as_str);
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-c" | "--config" => {
+                if let Some(c) = iter.next() {
+                    config_path = c.to_string();
+                }
+            }
+            "--ip" => {
+                if let Some(i) = iter.next() {
+                    ip_str = Some(i.to_string());
+                }
+            }
+            "--domain" => {
+                if let Some(d) = iter.next() {
+                    domain = Some(d.to_string());
+                }
+            }
+            "--port" => {
+                if let Some(p) = iter.next().and_then(|p| p.parse().ok()) {
+                    port = p;
+                }
+            }
+            "--source" => {
+                if let Some(s) = iter.next() {
+                    source_str = s.to_string();
+                }
+            }
+            "--protocol" | "--network" => {
+                if let Some(proto) = iter.next() {
+                    is_udp = proto.eq_ignore_ascii_case("udp");
+                }
+            }
+            "--sniff" | "--sniffed" | "--protocol-l7" => {
+                if let Some(proto) = iter.next() {
+                    sniffed_proto_str = Some(proto.to_string());
+                }
+            }
+            "--inbound" => {
+                if let Some(inb) = iter.next() {
+                    inbound = inb.to_string();
+                }
+            }
+            "--help" | "-h" => {
+                println!("Usage: xray-server test-route -c <config.json> [OPTIONS]");
+                println!();
+                println!("Options:");
+                println!("  -c, --config <FILE>     Configuration file (default: config.json)");
+                println!("  --ip <IP>               Destination IP address");
+                println!("  --domain <DOMAIN>       Destination domain name");
+                println!("  --port <PORT>           Destination port (default: 443)");
+                println!("  --source <IP:PORT>      Source socket address (default: 127.0.0.1:0)");
+                println!("  --protocol <tcp|udp>    L4 protocol / network (default: tcp)");
+                println!("  --sniff <tls|http|quic> Sniffed L7 application protocol");
+                println!("  --inbound <TAG>         Inbound tag (default: first inbound or 'in')");
+                return ExitCode::SUCCESS;
+            }
+            _ => {}
+        }
+    }
+
+    let config = match config::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to load config: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let router = config.router;
+
+    let ip = ip_str
+        .as_deref()
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+    let source: std::net::SocketAddr = source_str
+        .parse()
+        .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
+    let network = if is_udp {
+        xray_config::Network::Udp
+    } else {
+        xray_config::Network::Tcp
+    };
+
+    let sniffed_proto: Option<&'static str> =
+        sniffed_proto_str.map(|s| match s.to_ascii_lowercase().as_str() {
+            "tls" => "tls",
+            "http" => "http",
+            "quic" => "quic",
+            "bittorrent" => "bittorrent",
+            other => Box::leak(other.to_string().into_boxed_str()) as &'static str,
+        });
+
+    let query = crate::routing::Query {
+        inbound: &inbound,
+        inbound_port: 0,
+        user: "",
+        source,
+        network,
+        domain: domain.as_deref(),
+        ip,
+        port,
+        protocol: sniffed_proto,
+        attributes: None,
+        local_ip: None,
+        vless_route: None,
+        process_info: None,
+    };
+
+    let explanation = router.explain(&query);
+    println!("{explanation}");
+    ExitCode::SUCCESS
 }
 
 #[cfg(test)]

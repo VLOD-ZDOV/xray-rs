@@ -191,11 +191,42 @@ pub async fn resolve_dns_query(domain: &str, port: u16) -> io::Result<Vec<Socket
     resolve_via_resolver(domain, port).await
 }
 
+pub(crate) fn is_local_or_dotless_domain(d: &str) -> bool {
+    let d = d.trim_end_matches('.');
+    if !d.contains('.') {
+        return true;
+    }
+    const LOCAL_TLDS: &[&str] = &[
+        ".local",
+        ".lan",
+        ".localdomain",
+        ".home.arpa",
+        ".localhost",
+        ".example",
+        ".invalid",
+        ".test",
+    ];
+    LOCAL_TLDS.iter().any(|tld| d.ends_with(tld))
+}
+
 pub async fn resolve_all(domain: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
     resolve_via_resolver(domain, port).await
 }
 
 async fn resolve_via_resolver(domain: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    let normalized = domain.trim_end_matches('.').to_ascii_lowercase();
+    // Prioritize local resolver for dotless domains and local TLDs, matching Xray-core
+    // (app/dns/config.go: localTLDsAndDotlessDomainsRules)
+    if is_local_or_dotless_domain(&normalized) {
+        if let Ok(lookup) = SystemDnsResolver.resolve_all(domain, port).await {
+            let mut addrs: Vec<SocketAddr> = lookup.socket_addrs().to_vec();
+            if !addrs.is_empty() {
+                addrs.sort_by_key(SocketAddr::is_ipv6);
+                return Ok(addrs);
+            }
+        }
+    }
+
     let r = resolver();
     match r.resolve_all(domain, port).await {
         Ok(lookup) => {
@@ -209,7 +240,16 @@ async fn resolve_via_resolver(domain: &str, port: u16) -> io::Result<Vec<SocketA
             addrs.sort_by_key(SocketAddr::is_ipv6);
             Ok(addrs)
         }
-        Err(e) => Err(io::Error::other(e.to_string())),
+        Err(e) => {
+            if let Ok(lookup) = SystemDnsResolver.resolve_all(domain, port).await {
+                let mut addrs: Vec<SocketAddr> = lookup.socket_addrs().to_vec();
+                if !addrs.is_empty() {
+                    addrs.sort_by_key(SocketAddr::is_ipv6);
+                    return Ok(addrs);
+                }
+            }
+            Err(io::Error::other(e.to_string()))
+        }
     }
 }
 
@@ -241,5 +281,20 @@ mod tests {
             lookup.socket_addrs(),
             &[SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)), 80)]
         );
+    }
+
+    #[test]
+    fn identifies_local_and_dotless_domains() {
+        assert!(is_local_or_dotless_domain("openwrt"));
+        assert!(is_local_or_dotless_domain("router"));
+        assert!(is_local_or_dotless_domain("nas.lan"));
+        assert!(is_local_or_dotless_domain("device.local"));
+        assert!(is_local_or_dotless_domain("server.localdomain"));
+        assert!(is_local_or_dotless_domain("my.home.arpa"));
+        assert!(is_local_or_dotless_domain("localhost"));
+
+        assert!(!is_local_or_dotless_domain("google.com"));
+        assert!(!is_local_or_dotless_domain("youtube.com"));
+        assert!(!is_local_or_dotless_domain("ya.ru"));
     }
 }

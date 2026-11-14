@@ -70,14 +70,15 @@ pub enum InboundProtocol {
     Masque,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum TproxyMode {
+    #[default]
     Off,
     Tproxy,
     Redirect,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SockoptSettings {
     pub mark: u32,
     /// As Xray builds it: 256 for `true`, -1 for `false`, else the number.
@@ -812,7 +813,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 addr => addr.to_owned(),
             };
             let stream = item.get("streamSettings").unwrap_or(&Value::Null);
-            let network = str_field(stream, "network");
+            let network = stream_network(stream);
             if network != "masque" {
                 return Err("the masque transport can only be used by the masque inbound".into());
             }
@@ -871,7 +872,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         }
     };
     let stream = item.get("streamSettings").unwrap_or(&Value::Null);
-    let network = str_field(stream, "network");
+    let network = stream_network(stream);
     let security = str_field(stream, "security");
 
     if network == "masque" {
@@ -1311,7 +1312,24 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         .unwrap_or(&Value::Null);
     let accept_proxy_protocol = parse_accept_proxy_protocol(sockopt.get("acceptProxyProtocol"));
     let tcp_masks = crate::tcp_mask::parse(stream).map_err(|e| format!("inbound {tag:?}: {e}"))?;
-    let sockopt_settings = parse_sockopt(sockopt, &format!("inbound {tag:?}"))?;
+    let mut sockopt_settings = parse_sockopt(sockopt, &format!("inbound {tag:?}"))?;
+
+    // As in Go Xray-core (always.go:102-110), dokodemo followRedirect automatically
+    // enables receiving original destination and defaults tproxy to Redirect if Off.
+    if let Some(ref doko) = dokodemo {
+        if doko.follow_redirect {
+            if let Some(ref mut s) = sockopt_settings {
+                if s.tproxy == TproxyMode::Off {
+                    s.tproxy = TproxyMode::Redirect;
+                }
+            } else {
+                sockopt_settings = Some(SockoptSettings {
+                    tproxy: TproxyMode::Redirect,
+                    ..Default::default()
+                });
+            }
+        }
+    }
 
     let (shadowsocks_top_method, shadowsocks_top_password) =
         if protocol == InboundProtocol::Shadowsocks {
@@ -2080,6 +2098,7 @@ fn xray_dns_section(section: &Value) -> Value {
             *server = keep(server, DNS_SERVER_FIELDS, "dns.servers[]");
         }
         drop_trailing_localhost(servers);
+        map_remaining_localhost(servers);
     }
     dns
 }
@@ -2087,7 +2106,7 @@ fn xray_dns_section(section: &Value) -> Value {
 /// Xray's `localhost` server is the system resolver. Without domains or IP
 /// filters and with no plain server after it, it only answers what the others
 /// do not, which the system fallback here already does, so it is dropped.
-/// Any other `localhost` entry is left for the parser to reject.
+/// Any other `localhost` entry is mapped to 127.0.0.1 for local resolution.
 fn drop_trailing_localhost(servers: &mut Vec<Value>) {
     let address = |server: &Value| match server {
         Value::String(s) => Some(s.clone()),
@@ -2123,6 +2142,38 @@ fn drop_trailing_localhost(servers: &mut Vec<Value>) {
     }
     let mut keep = keep.into_iter();
     servers.retain(|_| keep.next().unwrap_or(true));
+}
+
+/// Maps any remaining `localhost` server address to `127.0.0.1`.
+/// In Xray-core, `localhost` queries the system/local resolver.
+/// On platforms where a local resolver (such as dnsmasq or unbound) runs
+/// at 127.0.0.1:53, mapping to 127.0.0.1 allows xray-config to parse
+/// it with its domain/IP filters rather than rejecting it as unsupported.
+fn map_remaining_localhost(servers: &mut [Value]) {
+    for server in servers {
+        match server {
+            Value::String(s) if s.eq_ignore_ascii_case("localhost") => {
+                *s = "127.0.0.1".to_owned();
+            }
+            Value::Object(map) => {
+                if let Some(Value::String(addr)) = map.get_mut("address") {
+                    if addr.eq_ignore_ascii_case("localhost") {
+                        *addr = "127.0.0.1".to_owned();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn stream_network(stream: &Value) -> &str {
+    stream
+        .get("network")
+        .or_else(|| stream.get("method"))
+        .or_else(|| stream.get("transport"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 /// Xray's shadowsocks_2022 server takes only keys of the cipher's exact
@@ -3816,6 +3867,7 @@ mod tests {
     fn trailing_localhost_dns_uses_the_system_resolver() {
         let mut servers = vec![serde_json::json!({"tag": "local", "address": "localhost"})];
         drop_trailing_localhost(&mut servers);
+        map_remaining_localhost(&mut servers);
         assert!(servers.is_empty());
 
         let mut servers = vec![
@@ -3824,15 +3876,39 @@ mod tests {
             serde_json::json!("localhost"),
         ];
         drop_trailing_localhost(&mut servers);
+        map_remaining_localhost(&mut servers);
         assert_eq!(servers.len(), 2);
+        assert_eq!(servers[1]["address"], "127.0.0.1");
 
-        // A localhost before a plain server answers first in Xray; keep it to be refused.
+        // A localhost before a plain server is mapped to 127.0.0.1 for local resolution.
         let mut servers = vec![
             serde_json::json!("localhost"),
             serde_json::json!("192.0.2.1"),
         ];
         drop_trailing_localhost(&mut servers);
+        map_remaining_localhost(&mut servers);
         assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0], "127.0.0.1");
+    }
+
+    #[test]
+    fn parses_dns_with_filtered_localhost_server() {
+        let raw = r#"{
+          "dns": {
+            "servers": [
+              "1.1.1.1",
+              "8.8.8.8",
+              {
+                "tag": "dns-local",
+                "address": "localhost",
+                "domains": ["vps.example.com"]
+              }
+            ]
+          }
+        }"#;
+        let config = parse(raw).unwrap();
+        let dns = config.dns.expect("dns must parse");
+        assert_eq!(dns.servers.len(), 3);
     }
 
     #[test]

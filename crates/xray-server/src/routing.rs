@@ -591,6 +591,7 @@ pub enum BalancerStrategy {
     RoundRobin,
     LeastPing,
     LeastLoad(LeastLoadConfig),
+    ConsistentHash,
 }
 
 pub struct Balancer {
@@ -780,6 +781,7 @@ impl Balancer {
                 "random" | "" => BalancerStrategy::Random,
                 "roundrobin" => BalancerStrategy::RoundRobin,
                 "leastping" => BalancerStrategy::LeastPing,
+                "consistenthash" | "sourcehash" | "sticky" => BalancerStrategy::ConsistentHash,
                 "leastload" => {
                     let settings_val = strat.get("settings").unwrap_or(&Value::Null);
                     let mut costs = Vec::new();
@@ -867,6 +869,7 @@ impl Balancer {
         &self,
         outbounds: &'a HashMap<String, Action>,
         observatory: Option<&crate::observatory::Observatory>,
+        source: Option<IpAddr>,
     ) -> Option<(&'a str, &'a Action)> {
         if let Some(target) = self.override_target.read().unwrap().as_ref() {
             if let Some((tag, action)) = outbounds.get_key_value(target) {
@@ -966,6 +969,30 @@ impl Balancer {
                 }
                 None
             }
+            BalancerStrategy::ConsistentHash => {
+                let mut valid = candidates;
+                if let Some(obs) = observatory {
+                    valid.retain(|(t, _)| obs.get_status_for(t).is_none_or(|s| s.alive));
+                }
+                if valid.is_empty() {
+                    if let Some(fallback) = &self.fallback_tag {
+                        if let Some((tag, action)) = outbounds.get_key_value(fallback) {
+                            return Some((tag.as_str(), action));
+                        }
+                    }
+                    return None;
+                }
+                let hash = match source {
+                    Some(IpAddr::V4(v4)) => u32::from_be_bytes(v4.octets()) as usize,
+                    Some(IpAddr::V6(v6)) => {
+                        let s = v6.segments();
+                        (s[0] as usize) ^ (s[1] as usize) ^ (s[2] as usize) ^ (s[3] as usize)
+                    }
+                    None => 0,
+                };
+                let index = hash % valid.len();
+                Some(valid[index])
+            }
         }
     }
 
@@ -982,7 +1009,9 @@ impl Balancer {
         candidates.sort();
 
         match &self.strategy {
-            BalancerStrategy::Random | BalancerStrategy::RoundRobin => {
+            BalancerStrategy::Random
+            | BalancerStrategy::RoundRobin
+            | BalancerStrategy::ConsistentHash => {
                 candidates.into_iter().map(str::to_owned).collect()
             }
             BalancerStrategy::LeastPing => {
@@ -1423,7 +1452,12 @@ impl Router {
             let tag = str_field(outbound, "tag").to_owned();
             let protocol = str_field(outbound, "protocol");
             let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
-            let network = str_field(stream, "network");
+            let network = stream
+                .get("network")
+                .or_else(|| stream.get("method"))
+                .or_else(|| stream.get("transport"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
 
             if network == "masque" && protocol != "masque" {
                 return Err("the masque transport can only be used by the masque outbound".into());
@@ -1809,6 +1843,54 @@ impl Router {
         self.decision(&outbounds, tag)
     }
 
+    pub fn explain(&self, query: &Query<'_>) -> String {
+        let mut out = String::new();
+        out.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
+        out.push_str(&format!(
+            "Query: destination={:?}:{}, ip={:?}, network={:?}, source={}, inbound={}\n",
+            query.domain, query.port, query.ip, query.network, query.source, query.inbound
+        ));
+        out.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
+        let rules = self
+            .rules
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut matched_idx = None;
+        for (idx, rule) in rules.iter().enumerate() {
+            let is_match = rule.matches(query, query.ip);
+            let status = if is_match { "MATCH" } else { "NO MATCH" };
+            out.push_str(&format!(
+                "Rule #{idx:02} [{:>8}] -> tag: {:<20} | ruleTag: {:<15}\n",
+                status, rule.tag, rule.rule_tag
+            ));
+            if is_match && matched_idx.is_none() {
+                matched_idx = Some((idx, rule.tag.clone()));
+            }
+        }
+        out.push_str(
+            "--------------------------------------------------------------------------------\n",
+        );
+        if let Some((idx, tag)) = matched_idx {
+            out.push_str(&format!(
+                "=> DECISION: Matched rule #{idx} -> OUTBOUND: [{tag}]\n"
+            ));
+        } else {
+            let default_tag = self
+                .default_tag
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            out.push_str(&format!(
+                "=> DECISION: No rules matched -> DEFAULT OUTBOUND: [{default_tag}]\n"
+            ));
+        }
+        out
+    }
+
     pub fn add_rule(&self, rule: Rule, should_append: bool) {
         let mut rules = self
             .rules
@@ -2016,6 +2098,11 @@ impl Router {
     }
 
     async fn route_once(&self, query: &Query<'_>, resolved: Option<IpAddr>) -> Decision {
+        let dest = match (query.domain, query.ip) {
+            (Some(d), _) => format!("{d}:{}", query.port),
+            (None, Some(ip)) => format!("{ip}:{}", query.port),
+            _ => format!(":{}", query.port),
+        };
         let matched = {
             let rules = self
                 .rules
@@ -2023,8 +2110,12 @@ impl Router {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.first_match(&rules, query, query.ip.or(resolved))
         };
-        if let Some((target, webhook)) = matched {
-            let decision = self.resolve_target(&target).await;
+        if let Some((target, webhook, idx, rule_tag)) = matched {
+            let decision = self.resolve_target(&target, Some(query.source.ip())).await;
+            crate::log::info(format!(
+                "routing: {dest} matched rule #{idx} [{rule_tag}] -> outbound [{}]",
+                decision.tag
+            ));
             if let Some(wh) = webhook {
                 wh.fire(query, &decision.tag);
             }
@@ -2043,8 +2134,12 @@ impl Router {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     self.first_match(&rules, query, Some(ip))
                 };
-                if let Some((target, webhook)) = matched {
-                    let decision = self.resolve_target(&target).await;
+                if let Some((target, webhook, idx, rule_tag)) = matched {
+                    let decision = self.resolve_target(&target, Some(query.source.ip())).await;
+                    crate::log::info(format!(
+                        "routing: {dest} (resolved {ip}) matched rule #{idx} [{rule_tag}] -> outbound [{}]",
+                        decision.tag
+                    ));
                     if let Some(wh) = webhook {
                         wh.fire(query, &decision.tag);
                     }
@@ -2061,6 +2156,9 @@ impl Router {
             .outbounds
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::log::info(format!(
+            "routing: {dest} did not match any rule, fallback to default outbound [{default_tag}]"
+        ));
         self.decision(&outbounds, &default_tag)
     }
 
@@ -2069,14 +2167,22 @@ impl Router {
         rules: &'a [Rule],
         query: &Query<'_>,
         ip: Option<IpAddr>,
-    ) -> Option<(RuleTarget, Option<Arc<WebhookNotifier>>)> {
+    ) -> Option<(RuleTarget, Option<Arc<WebhookNotifier>>, usize, String)> {
         rules
             .iter()
-            .find(|rule| rule.matches(query, ip))
-            .map(|rule| (rule.target.clone(), rule.webhook.clone()))
+            .enumerate()
+            .find(|(_, rule)| rule.matches(query, ip))
+            .map(|(idx, rule)| {
+                (
+                    rule.target.clone(),
+                    rule.webhook.clone(),
+                    idx,
+                    rule.tag.clone(),
+                )
+            })
     }
 
-    async fn resolve_target(&self, target: &RuleTarget) -> Decision {
+    async fn resolve_target(&self, target: &RuleTarget, source: Option<IpAddr>) -> Decision {
         let outbounds = self
             .outbounds
             .read()
@@ -2089,7 +2195,8 @@ impl Router {
                         .observatory
                         .read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Some((tag, action)) = balancer.select(&outbounds, obs.as_deref()) {
+                    if let Some((tag, action)) = balancer.select(&outbounds, obs.as_deref(), source)
+                    {
                         return Decision {
                             open_private: false,
                             tag: tag.to_owned(),
@@ -3146,6 +3253,44 @@ mod tests {
             }
             _ => panic!("expected LeastLoad"),
         }
+    }
+
+    #[test]
+    fn parses_and_evaluates_consistent_hash_balancer() {
+        let val = json!({
+            "tag": "b_hash",
+            "selector": ["node-"],
+            "strategy": "consistentHash"
+        });
+        let b = Balancer::parse(0, &val).expect("consistentHash must parse");
+        assert_eq!(b.strategy, BalancerStrategy::ConsistentHash);
+
+        let mut outbounds = HashMap::new();
+        outbounds.insert(
+            "node-1".into(),
+            Action::Direct(FreedomStrategy::AsIs.into()),
+        );
+        outbounds.insert(
+            "node-2".into(),
+            Action::Direct(FreedomStrategy::AsIs.into()),
+        );
+
+        let client1: IpAddr = "198.51.100.97".parse().unwrap();
+        let client2: IpAddr = "203.0.113.5".parse().unwrap();
+
+        let choice1_a = b.select(&outbounds, None, Some(client1)).unwrap().0;
+        let choice1_b = b.select(&outbounds, None, Some(client1)).unwrap().0;
+        assert_eq!(
+            choice1_a, choice1_b,
+            "same client IP must consistently map to the same node"
+        );
+
+        let choice2_a = b.select(&outbounds, None, Some(client2)).unwrap().0;
+        let choice2_b = b.select(&outbounds, None, Some(client2)).unwrap().0;
+        assert_eq!(
+            choice2_a, choice2_b,
+            "second client IP must also be consistent"
+        );
     }
 
     #[tokio::test]

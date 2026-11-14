@@ -18,7 +18,6 @@ const TLS_APPLICATION_DATA_START: [u8; 3] = [0x17, 0x03, 0x03];
 const TLS_13_SUPPORTED_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
 const TLS_HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 const TLS_HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
-const TLS_AES_128_CCM_8_SHA256: u16 = 0x1305;
 
 /// Whether the bytes a stream has yet to return are a TCP socket's, unchanged.
 ///
@@ -279,7 +278,7 @@ impl<S> VisionStream<S> {
                 .windows(TLS_13_SUPPORTED_VERSIONS.len())
                 .any(|window| window == TLS_13_SUPPORTED_VERSIONS)
             {
-                if self.cipher != 0 && self.cipher != TLS_AES_128_CCM_8_SHA256 {
+                if matches!(self.cipher, 0x1301..=0x1304) {
                     self.enable_xtls = true;
                 }
                 self.packets_to_filter = 0;

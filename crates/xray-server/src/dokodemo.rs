@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
@@ -77,6 +78,7 @@ where
 
     if !early.is_empty() {
         target_w.write_all(&early).await?;
+        target_w.flush().await?;
         traffic.up(early.len());
     }
 
@@ -91,7 +93,7 @@ where
 
 const MAX_UDP_SESSIONS: usize = 4096;
 
-type SessionsMap = Arc<Mutex<HashMap<(SocketAddr, Option<SocketAddr>), mpsc::Sender<Vec<u8>>>>>;
+type SessionsMap = Arc<Mutex<HashMap<(SocketAddr, Option<SocketAddr>), mpsc::Sender<Bytes>>>>;
 
 #[derive(Clone)]
 pub struct DokodemoUdpHandler {
@@ -141,7 +143,7 @@ impl DokodemoUdpHandler {
             let original = original.filter(|_| self.settings.follow_redirect);
             let key = (peer, original);
             let mut sessions = self.sessions.lock().await;
-            let packet = buf[..n].to_vec();
+            let packet = Bytes::copy_from_slice(&buf[..n]);
             let packet = if let Some(tx) = sessions.get(&key) {
                 match tx.try_send(packet) {
                     Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
@@ -255,8 +257,8 @@ async fn serve_udp_session(
     peer: SocketAddr,
     host: Host,
     port: u16,
-    initial_payload: Vec<u8>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    initial_payload: Bytes,
+    mut rx: mpsc::Receiver<Bytes>,
 ) -> io::Result<()> {
     let route = RouteRequest {
         ctx_tag: &ctx.tag,

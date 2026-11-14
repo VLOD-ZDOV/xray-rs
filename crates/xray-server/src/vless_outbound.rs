@@ -17,7 +17,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 use uuid::Uuid;
 use xray_proxy::vless::{
-    encode_request_header, encode_udp_packet, read_udp_packet, VisionStream, VisionStreamIo,
+    encode_request_header, encode_udp_packet, UdpResponseReader, VisionStream, VisionStreamIo,
     VlessCommand, VlessRequest, VlessResponseStream, DEFAULT_VISION_SEED,
 };
 use xray_routing::{Target, TargetAddr};
@@ -33,11 +33,55 @@ use crate::vless::{resolve, resolve_all, Host, CONNECT_TIMEOUT};
 
 pub struct VisionTransportStream {
     inner: BoxedTransportStream,
+    pending_header: Option<Vec<u8>>,
+    header_written: usize,
 }
 
 impl VisionTransportStream {
     pub fn new(inner: BoxedTransportStream) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            pending_header: None,
+            header_written: 0,
+        }
+    }
+
+    pub fn new_with_header(inner: BoxedTransportStream, header: Vec<u8>) -> Self {
+        Self {
+            inner,
+            pending_header: Some(header),
+            header_written: 0,
+        }
+    }
+
+    fn flush_pending_header(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        while let Some(ref hdr) = self.pending_header {
+            if self.header_written < hdr.len() {
+                match Pin::new(&mut *self.inner).poll_write(cx, &hdr[self.header_written..]) {
+                    Poll::Ready(Ok(0)) => {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write header",
+                        )));
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        self.header_written += n;
+                        if self.header_written >= hdr.len() {
+                            self.pending_header = None;
+                            self.header_written = 0;
+                            break;
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            } else {
+                self.pending_header = None;
+                self.header_written = 0;
+                break;
+            }
+        }
+        Poll::Ready(Ok(()))
     }
 }
 
@@ -47,7 +91,12 @@ impl AsyncRead for VisionTransportStream {
         cx: &mut Context<'_>,
         output: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.get_mut().inner).poll_read(cx, output)
+        let this = self.get_mut();
+        match this.flush_pending_header(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut *this.inner).poll_read(cx, output),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -57,15 +106,50 @@ impl AsyncWrite for VisionTransportStream {
         cx: &mut Context<'_>,
         input: &[u8],
     ) -> Poll<io::Result<usize>> {
-        Pin::new(&mut *self.get_mut().inner).poll_write(cx, input)
+        let this = self.get_mut();
+        if let Some(ref hdr) = this.pending_header {
+            if this.header_written < hdr.len() {
+                let remaining_hdr = &hdr[this.header_written..];
+                let mut combined = Vec::with_capacity(remaining_hdr.len() + input.len());
+                combined.extend_from_slice(remaining_hdr);
+                combined.extend_from_slice(input);
+                match Pin::new(&mut *this.inner).poll_write(cx, &combined) {
+                    Poll::Ready(Ok(n)) => {
+                        if n < remaining_hdr.len() {
+                            this.header_written += n;
+                            cx.waker().wake_by_ref();
+                            return Poll::Ready(Ok(0));
+                        } else {
+                            let written_input = n - remaining_hdr.len();
+                            this.pending_header = None;
+                            this.header_written = 0;
+                            return Poll::Ready(Ok(written_input));
+                        }
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+        Pin::new(&mut *this.inner).poll_write(cx, input)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.get_mut().inner).poll_flush(cx)
+        let this = self.get_mut();
+        match this.flush_pending_header(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut *this.inner).poll_flush(cx),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.get_mut().inner).poll_shutdown(cx)
+        let this = self.get_mut();
+        match this.flush_pending_header(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut *this.inner).poll_shutdown(cx),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -79,7 +163,20 @@ impl VisionStreamIo for VisionTransportStream {
         cx: &mut Context<'_>,
         output: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.get_mut().inner).poll_read_direct(cx, output)
+        let this = self.get_mut();
+        match this.flush_pending_header(cx) {
+            Poll::Ready(Ok(())) => Pin::new(&mut *this.inner).poll_read_direct(cx, output),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn raw_read_direct(&mut self) -> xray_proxy::vless::RawRead<'_> {
+        if self.pending_header.is_some() {
+            return xray_proxy::vless::RawRead::NotYet;
+        }
+        self.inner.raw_read_direct()
     }
 
     fn poll_write_direct(
@@ -239,6 +336,8 @@ impl VlessOutbound {
         let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
         let network = stream
             .get("network")
+            .or_else(|| stream.get("method"))
+            .or_else(|| stream.get("transport"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         let security = stream
@@ -595,13 +694,9 @@ impl VlessOutbound {
             let header = encode_request_header(&request)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-            let mut carrier = carrier;
-            carrier.write_all(&header).await?;
-            carrier.flush().await?;
-
-            return Ok(VlessResponseStream::new(VisionTransportStream::new(
-                carrier,
-            )));
+            return Ok(VlessResponseStream::new(
+                VisionTransportStream::new_with_header(carrier, header),
+            ));
         }
 
         let (server_host, server_port) = match &self.server.0 {
@@ -779,13 +874,9 @@ impl VlessOutbound {
         let header = encode_request_header(&request)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
 
-        let mut carrier = carrier;
-        carrier.write_all(&header).await?;
-        carrier.flush().await?;
-
-        Ok(VlessResponseStream::new(VisionTransportStream::new(
-            carrier,
-        )))
+        Ok(VlessResponseStream::new(
+            VisionTransportStream::new_with_header(carrier, header),
+        ))
     }
 
     pub async fn connect(
@@ -851,7 +942,10 @@ impl VlessOutbound {
 
 pub struct VlessUdpLink {
     writer: Mutex<tokio::io::WriteHalf<VlessResponseStream<VisionTransportStream>>>,
-    reader: Mutex<tokio::io::ReadHalf<VlessResponseStream<VisionTransportStream>>>,
+    reader: Mutex<(
+        tokio::io::ReadHalf<VlessResponseStream<VisionTransportStream>>,
+        UdpResponseReader,
+    )>,
 }
 
 impl VlessUdpLink {
@@ -859,7 +953,7 @@ impl VlessUdpLink {
         let (reader, writer) = tokio::io::split(stream);
         Self {
             writer: Mutex::new(writer),
-            reader: Mutex::new(reader),
+            reader: Mutex::new((reader, UdpResponseReader::default())),
         }
     }
 
@@ -873,8 +967,9 @@ impl VlessUdpLink {
     }
 
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut reader = self.reader.lock().await;
-        match read_udp_packet(&mut *reader).await {
+        let mut guard = self.reader.lock().await;
+        let (ref mut reader, ref mut response_reader) = *guard;
+        match response_reader.read_udp_packet(reader).await {
             Ok(packet) => {
                 let n = packet.len().min(buf.len());
                 buf[..n].copy_from_slice(&packet[..n]);
@@ -896,6 +991,7 @@ struct XudpConn {
     writer: Mutex<tokio::io::WriteHalf<VlessResponseStream<VisionTransportStream>>>,
     sessions: Arc<Mutex<XudpSessions>>,
     task: JoinHandle<()>,
+    global_id: [u8; 8],
 }
 
 impl XudpConn {
@@ -928,7 +1024,7 @@ impl XudpConn {
                 s.next_id = session_id.checked_add(1).unwrap_or(1);
                 s.by_addr.insert(addr, session_id);
                 s.by_id.insert(session_id, addr);
-                let global_id: [u8; 8] = rand::random();
+                let global_id = self.global_id;
                 let target = Target::new(
                     TargetAddr::Ip(addr.ip()),
                     addr.port(),
@@ -1028,10 +1124,12 @@ impl VlessConeUdp {
                 }
             }
         });
+        let global_id: [u8; 8] = rand::random();
         Ok(Arc::new(XudpConn {
             writer: Mutex::new(writer),
             sessions,
             task,
+            global_id,
         }))
     }
 
@@ -1220,11 +1318,28 @@ fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, String> {
         })
         .unwrap_or_default();
 
+    let verify_peer_cert_by_name = match tls.get("verifyPeerCertByName") {
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    };
+
     Ok(ConnectorConfig::Tls(TlsClientConfig {
         server_name,
         allow_insecure: false,
         pinned_peer_cert_sha256,
-        verify_peer_cert_by_name: Vec::new(),
+        verify_peer_cert_by_name,
         custom_roots,
         alpn,
         fingerprint,
@@ -1629,5 +1744,38 @@ mod tests {
         assert_eq!(from2, dest2);
 
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn parses_method_in_stream_settings() {
+        let config = json!({
+            "settings": {
+                "address": "1.2.3.4",
+                "port": 443,
+                "id": "5055b881-2090-410e-b762-fe36e4f16b25"
+            },
+            "streamSettings": {
+                "method": "ws",
+                "security": "tls",
+                "tlsSettings": {
+                    "serverName": "example.com",
+                    "verifyPeerCertByName": "cert1.example, cert2.example"
+                },
+                "wsSettings": {
+                    "path": "/vless-ws"
+                }
+            }
+        });
+        let out = VlessOutbound::parse("outbound-ws", &config).unwrap();
+        assert!(matches!(out.transport, TransportLayer::WebSocket(_)));
+        if let ConnectorConfig::Tls(tls) = &out.connector {
+            assert_eq!(tls.server_name, "example.com");
+            assert_eq!(
+                tls.verify_peer_cert_by_name,
+                vec!["cert1.example", "cert2.example"]
+            );
+        } else {
+            panic!("expected tls connector");
+        }
     }
 }

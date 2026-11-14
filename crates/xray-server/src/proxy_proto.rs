@@ -389,4 +389,115 @@ mod tests {
         let result = read_proxy_header(&mut cursor, ProxyProtocolAccept::V2, fallback).await;
         assert!(result.is_err());
     }
+
+    #[test]
+    fn v1_unknown_preserves_original_peer() {
+        let p = "[::1]:1234".parse().unwrap();
+        assert_eq!(parse_v1_header(b"PROXY UNKNOWN", p).unwrap(), p);
+    }
+    #[test]
+    fn v1_requires_proxy_prefix() {
+        assert_eq!(
+            parse_v1_header(b"OTHER UNKNOWN", "127.0.0.1:1".parse().unwrap())
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+    #[test]
+    fn v1_rejects_missing_fields() {
+        assert!(parse_v1_header(b"PROXY TCP4 192.0.2.1", "127.0.0.1:1".parse().unwrap()).is_err());
+    }
+    #[test]
+    fn v1_rejects_unknown_protocol_keyword() {
+        assert!(parse_v1_header(
+            b"PROXY UDP4 192.0.2.1 198.51.100.1 1 2",
+            "127.0.0.1:1".parse().unwrap()
+        )
+        .is_err());
+    }
+    #[test]
+    fn v1_rejects_source_address_family_mismatch() {
+        assert!(parse_v1_header(
+            b"PROXY TCP4 2001:db8::1 198.51.100.1 1 2",
+            "127.0.0.1:1".parse().unwrap()
+        )
+        .is_err());
+    }
+    #[test]
+    fn v1_rejects_invalid_source_address() {
+        assert!(parse_v1_header(
+            b"PROXY TCP4 nope 198.51.100.1 1 2",
+            "127.0.0.1:1".parse().unwrap()
+        )
+        .is_err());
+    }
+    #[test]
+    fn v1_uses_source_address_and_ignores_destination_fields() {
+        assert_eq!(
+            parse_v1_header(
+                b"PROXY TCP4 192.0.2.1 nope 1 2",
+                "127.0.0.1:1".parse().unwrap()
+            )
+            .unwrap(),
+            "192.0.2.1:1".parse().unwrap()
+        );
+    }
+    #[test]
+    fn v1_rejects_port_overflow() {
+        assert!(parse_v1_header(
+            b"PROXY TCP4 192.0.2.1 198.51.100.1 65536 2",
+            "127.0.0.1:1".parse().unwrap()
+        )
+        .is_err());
+    }
+    #[test]
+    fn v1_rejects_negative_port() {
+        assert!(parse_v1_header(
+            b"PROXY TCP4 192.0.2.1 198.51.100.1 -1 2",
+            "127.0.0.1:1".parse().unwrap()
+        )
+        .is_err());
+    }
+    #[test]
+    fn v1_rejects_non_ascii_header() {
+        assert!(parse_v1_header(b"PROXY UNKNOWN\xff", "127.0.0.1:1".parse().unwrap()).is_err());
+    }
+    #[test]
+    fn v2_signature_is_twelve_bytes() {
+        assert_eq!(PROXY_V2_SIGNATURE.len(), 12);
+    }
+    #[test]
+    fn v2_rejects_truncated_signature_and_header() {
+        let peer = "127.0.0.1:1".parse().unwrap();
+        assert!(parse_v2_header(&PROXY_V2_SIGNATURE[..8], peer).is_err());
+    }
+    #[test]
+    fn v2_rejects_bad_version_command_byte() {
+        let peer = "127.0.0.1:1".parse().unwrap();
+        let mut h = PROXY_V2_SIGNATURE.to_vec();
+        h.extend_from_slice(&[0x11, 0x11, 0, 12]);
+        h.extend_from_slice(&[0; 12]);
+        assert!(parse_v2_header(&h, peer).is_err());
+    }
+    #[test]
+    fn v2_rejects_bad_address_protocol() {
+        let peer = "127.0.0.1:1".parse().unwrap();
+        let mut h = PROXY_V2_SIGNATURE.to_vec();
+        h.extend_from_slice(&[0x21, 0x10, 0, 12]);
+        h.extend_from_slice(&[0; 12]);
+        assert!(parse_v2_header(&h, peer).is_err());
+    }
+    #[tokio::test]
+    async fn disabled_mode_returns_original_peer_without_consuming() {
+        let peer = "192.0.2.1:443".parse().unwrap();
+        let mut c = Cursor::new(b"unparsed".to_vec());
+        assert_eq!(
+            read_proxy_header(&mut c, ProxyProtocolAccept::None, peer)
+                .await
+                .unwrap(),
+            (peer, vec![])
+        );
+        assert_eq!(c.position(), 0);
+    }
 }
