@@ -448,6 +448,7 @@ pub(crate) async fn start_inbound(
             xray_proxy::shadowsocks2022::SaltPool::default_ss2022(),
         )),
         vless_encryption: inbound.vless_encryption.clone(),
+        vmess_keys: Default::default(),
     });
 
     if inbound.protocol != InboundProtocol::Hysteria

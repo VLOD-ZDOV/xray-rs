@@ -325,12 +325,22 @@ pub struct Context {
     pub vmess_filter: Arc<std::sync::Mutex<xray_proxy::vmess::server::AuthIdFilter>>,
     pub ss2022_salt_pool: Arc<std::sync::Mutex<xray_proxy::shadowsocks2022::SaltPool>>,
     pub vless_encryption: Option<Arc<xray_vless_encryption::Server>>,
+    /// VMess keys derived from `users`; rebuilt lazily after any change to them.
+    pub vmess_keys: std::sync::Mutex<Option<Arc<crate::vmess::Keys>>>,
 }
 
 impl Context {
+    /// Write access to `users`. Clears the VMess key cache under the write lock, so a
+    /// reader that builds the cache under the read lock never stores stale keys.
+    fn users_mut(&self) -> std::sync::RwLockWriteGuard<'_, Vec<User>> {
+        let users = self.users.write().unwrap_or_else(PoisonError::into_inner);
+        *self.vmess_keys.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        users
+    }
+
     /// HandlerService AddUser; errors use Xray's wording, which 3x-ui matches on.
     pub fn add_user(&self, user: User) -> Result<(), String> {
-        let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
+        let mut users = self.users_mut();
         if !user.email.is_empty()
             && users
                 .iter()
@@ -352,7 +362,7 @@ impl Context {
             return Err("Email must not be empty.".into());
         }
         // Lock order is users, then the protocol lists, as in remove_user.
-        let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
+        let mut users = self.users_mut();
         let mut ss_users = self
             .ss_users
             .write()
@@ -392,7 +402,7 @@ impl Context {
                 return Err(format!("User {} already exists.", user.email));
             }
         }
-        let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
+        let mut users = self.users_mut();
         let mut h_users = self
             .hysteria_users
             .write()
@@ -428,7 +438,7 @@ impl Context {
         if email.is_empty() {
             return Err("Email must not be empty.".into());
         }
-        let mut users = self.users.write().unwrap_or_else(PoisonError::into_inner);
+        let mut users = self.users_mut();
         let mut ss_users = self
             .ss_users
             .write()
@@ -1671,6 +1681,7 @@ mod tests {
                 xray_proxy::shadowsocks2022::SaltPool::new(60, 65536),
             )),
             vless_encryption: None,
+            vmess_keys: Default::default(),
         };
 
         let _lock = crate::policy::TEST_LOCK.lock().unwrap();

@@ -2052,6 +2052,7 @@ mod tests {
                 xray_proxy::shadowsocks2022::SaltPool::default_ss2022(),
             )),
             vless_encryption: None,
+            vmess_keys: Default::default(),
         };
 
         // Add VMess user
@@ -2068,7 +2069,10 @@ mod tests {
                 value: vmess_acc.encode_to_vec().into(),
             }),
         };
+        let vmess_count = || crate::vmess::Keys::get(&ctx).users.len();
+        let before = vmess_count();
         assert!(add_user_to_inbound(p_user.clone(), &ctx).is_ok());
+        assert_eq!(vmess_count(), before + 1, "VMess key cache must see new users");
         // Duplicate VMess user
         let err = add_user_to_inbound(p_user, &ctx).unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
@@ -2095,6 +2099,7 @@ mod tests {
         // Remove users
         assert!(ctx.remove_user("vmess_user@test").is_ok());
         assert!(ctx.remove_user("ss_user@test").is_ok());
+        assert_eq!(vmess_count(), before, "VMess key cache must drop removed users");
         // Remove non-existent user
         let err = ctx.remove_user("nonexistent").unwrap_err();
         assert!(err.contains("not found"), "got: {err}");

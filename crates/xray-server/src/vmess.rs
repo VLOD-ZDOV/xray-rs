@@ -2,7 +2,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::sync::PoisonError;
+use std::sync::{Arc, PoisonError};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -17,6 +17,41 @@ use crate::routing::{Action, BlockAction};
 use crate::stats;
 use crate::vless::{read_first, Activity, Context, Host, RouteRequest};
 
+/// Per-user VMess keys (MD5, KDF, AES schedule), built once per user list like
+/// Xray's AuthIDDecoderHolder instead of on every connection.
+pub struct Keys {
+    pub(crate) users: Vec<ServerUser>,
+    levels: Vec<u32>,
+    /// SHA-256 over all user IDs: seeds the drain length on auth failure.
+    seed: [u8; 32],
+}
+
+impl Keys {
+    pub(crate) fn get(ctx: &Context) -> Arc<Self> {
+        // Built under the users read lock; Context::users_mut clears it under the write lock.
+        let users = ctx.users.read().unwrap_or_else(PoisonError::into_inner);
+        let mut cache = ctx.vmess_keys.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(keys) = cache.as_ref() {
+            return keys.clone();
+        }
+        let mut seed = Sha256::new();
+        let (users, levels) = users
+            .iter()
+            .map(|u| {
+                seed.update(u.id);
+                (ServerUser::new(&u.id, u.email.clone()), u.level)
+            })
+            .unzip();
+        let keys = Arc::new(Self {
+            users,
+            levels,
+            seed: seed.finalize().into(),
+        });
+        *cache = Some(keys.clone());
+        keys
+    }
+}
+
 pub async fn serve<R, W>(
     mut uplink: R,
     downlink: W,
@@ -28,23 +63,14 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let mut seed = Sha256::new();
-    let (server_users, levels): (Vec<ServerUser>, Vec<u32>) = {
-        let users = ctx.users.read().unwrap_or_else(PoisonError::into_inner);
-        users
-            .iter()
-            .map(|u| {
-                seed.update(u.id);
-                (ServerUser::new(&u.id, u.email.clone()), u.level)
-            })
-            .unzip()
-    };
+    let keys = Keys::get(ctx);
+    let (server_users, levels) = (&keys.users, &keys.levels);
 
     let deadline = Instant::now() + crate::policy::get().handshake;
     let mut counted = crate::drain::Counted::new(&mut uplink);
     let hs_res = timeout_at(
         deadline,
-        server::handshake_with_filter(&mut counted, &server_users, Some(&ctx.vmess_filter)),
+        server::handshake_with_filter(&mut counted, server_users, Some(&ctx.vmess_filter)),
     )
     .await;
     let read = counted.read;
@@ -52,7 +78,7 @@ where
         Ok(Ok(hs)) => hs,
         Ok(Err(e)) => {
             if drain {
-                let total = crate::drain::size(&seed.finalize());
+                let total = crate::drain::size(&keys.seed);
                 crate::drain::discard(&mut uplink, total, read, deadline).await;
             }
             return Err(e);
