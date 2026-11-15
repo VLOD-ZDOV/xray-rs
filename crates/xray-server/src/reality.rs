@@ -740,10 +740,11 @@ impl RealityServer {
             return None;
         }
 
-        let key_share = client_hello.key_share?;
+        let (x25519, hybrid) = find_client_key_shares(payload);
+        let peer_pub = x25519.or_else(|| hybrid.map(|h| h.1))?;
         let decrypted = xray_transport::reality::decrypt_reality_session_id(
             &self.settings.private_key,
-            &key_share.public_key,
+            &peer_pub,
             &client_hello.random,
             payload,
             client_hello.session_id_offset,
@@ -1590,11 +1591,21 @@ fn find_client_key_shares(payload: &[u8]) -> ClientKeyShares {
                 if sp + klen > send {
                     break;
                 }
+                // XTLS/REALITY order: one X25519MLKEM768 share, then at most the first
+                // X25519 one. Anything else (X25519 first, a second hybrid share, no
+                // hybrid share) is an outdated or strange hello and goes to dest.
                 if grp == 0x001d && klen == 32 {
+                    if hybrid_pub.is_none() {
+                        return (None, None);
+                    }
                     let mut b = [0u8; 32];
                     b.copy_from_slice(&payload[sp..sp + 32]);
                     x25519_pub = Some(b);
+                    break;
                 } else if grp == 0x11ec && klen == 1216 {
+                    if hybrid_pub.is_some() {
+                        return (None, None);
+                    }
                     let mut mlkem = [0u8; 1184];
                     let mut x25519 = [0u8; 32];
                     mlkem.copy_from_slice(&payload[sp..sp + 1184]);
@@ -1607,6 +1618,9 @@ fn find_client_key_shares(payload: &[u8]) -> ClientKeyShares {
         pos += elen;
     }
 
+    if hybrid_pub.is_none() {
+        return (None, None);
+    }
     (x25519_pub, hybrid_pub)
 }
 
@@ -2205,6 +2219,41 @@ impl<S: AsyncRead + AsyncWrite + Unpin> VisionStreamIo for Tls13Stream<S> {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    fn hello_with_shares(shares: &[(u16, usize)]) -> Vec<u8> {
+        let mut list = Vec::new();
+        for (i, &(group, len)) in shares.iter().enumerate() {
+            list.extend_from_slice(&group.to_be_bytes());
+            list.extend_from_slice(&(len as u16).to_be_bytes());
+            list.extend(std::iter::repeat_n(i as u8 + 1, len));
+        }
+        let mut ext = (list.len() as u16).to_be_bytes().to_vec();
+        ext.extend_from_slice(&list);
+        let mut exts = 0x0033u16.to_be_bytes().to_vec();
+        exts.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&ext);
+        let mut p = vec![0x01, 0, 0, 0, 0x03, 0x03];
+        p.extend_from_slice(&[0; 32]);
+        p.push(0); // session id length
+        p.extend_from_slice(&[0, 2, 0x13, 0x01, 1, 0]);
+        p.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        p.extend_from_slice(&exts);
+        p
+    }
+
+    #[test]
+    fn key_shares_follow_xtls_order() {
+        let x = (0x001d, 32);
+        let h = (0x11ec, 1216);
+        let grease = (0x0a0a, 1);
+        let (x25519, hybrid) = find_client_key_shares(&hello_with_shares(&[grease, h, x]));
+        assert_eq!(x25519, Some([3; 32]));
+        assert_eq!(hybrid.map(|h| h.1), Some([2; 32]));
+        assert!(find_client_key_shares(&hello_with_shares(&[h])).1.is_some());
+        for bad in [&[x][..], &[x, h], &[h, h, x]] {
+            assert_eq!(find_client_key_shares(&hello_with_shares(bad)), (None, None));
+        }
+    }
 
     #[test]
     fn parse_server_hello_rejects_truncated() {
