@@ -281,6 +281,7 @@ async fn run(
     if let Some(addr) = config.api {
         api::serve(
             addr,
+            config.api_services,
             inbound_manager,
             router.clone(),
             config.observatory.clone(),

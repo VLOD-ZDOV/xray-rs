@@ -20,6 +20,8 @@ pub struct Config {
     pub log: log::Settings,
     /// gRPC API address from the inbound tagged like `api.tag` (or `api.listen`).
     pub api: Option<SocketAddr>,
+    /// `api.services`, lowercased; Xray serves only the listed ones.
+    pub api_services: Vec<String>,
     pub stats: stats::Policy,
     pub inbounds: Vec<Inbound>,
     pub router: Router,
@@ -731,6 +733,13 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         observatory,
         metrics_listen: crate::metrics::parse(&root)?.and_then(|m| m.listen),
         api_tag: api_tag.map(str::to_owned),
+        api_services: root
+            .get("api")
+            .map(|api| array(api, "services"))
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|s| s.as_str().map(str::to_ascii_lowercase))
+            .collect(),
         env: env_map,
     })
 }

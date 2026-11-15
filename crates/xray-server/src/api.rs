@@ -669,6 +669,19 @@ enum ServiceType<'a> {
     Observatory(&'a str),
 }
 
+impl ServiceType<'_> {
+    /// The lowercased `api.services` entry that enables this service.
+    fn config_name(&self) -> &'static str {
+        match self {
+            Self::Stats(_) => "statsservice",
+            Self::Handler(_) => "handlerservice",
+            Self::Logger(_) => "loggerservice",
+            Self::Router(_) => "routingservice",
+            Self::Observatory(_) => "observatoryservice",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Message)]
 pub struct Empty {}
 
@@ -778,6 +791,7 @@ impl InboundManager {
 
 pub async fn serve(
     addr: SocketAddr,
+    services: Vec<String>,
     inbound_manager: Arc<InboundManager>,
     router: Arc<Router>,
     observatory: Option<Arc<crate::observatory::Observatory>>,
@@ -786,6 +800,7 @@ pub async fn serve(
         .await
         .map_err(|e| format!("failed to listen on api {addr}: {e}"))?;
     log::info(format!("api listening on {addr}"));
+    let services: Arc<[String]> = services.into();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -795,14 +810,16 @@ pub async fn serve(
             let inbound_manager = inbound_manager.clone();
             let router = router.clone();
             let observatory = observatory.clone();
+            let services = services.clone();
             tokio::spawn(async move {
                 let service = service_fn(|req| {
                     let inbound_manager = inbound_manager.clone();
                     let router = router.clone();
                     let observatory = observatory.clone();
+                    let services = services.clone();
                     async move {
                         Ok::<_, Infallible>(
-                            handle(req, &inbound_manager, &router, &observatory).await,
+                            handle(req, &services, &inbound_manager, &router, &observatory).await,
                         )
                     }
                 });
@@ -817,6 +834,7 @@ pub async fn serve(
 
 async fn handle(
     req: Request<Incoming>,
+    services: &[String],
     inbound_manager: &Arc<InboundManager>,
     router: &Arc<Router>,
     observatory: &Option<Arc<crate::observatory::Observatory>>,
@@ -835,6 +853,9 @@ async fn handle(
     } else {
         return status(UNIMPLEMENTED, "unknown service");
     };
+    if !services.iter().any(|s| s == svc.config_name()) {
+        return status(UNIMPLEMENTED, "unknown service");
+    }
     let body = match http_body_util::Limited::new(req.into_body(), MAX_REQUEST)
         .collect()
         .await
