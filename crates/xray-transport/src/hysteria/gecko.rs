@@ -192,6 +192,11 @@ impl Reassembly {
         Some(message.chunks.into_iter().flatten().flatten().collect())
     }
 
+    /// Payload bytes held for incomplete messages.
+    pub fn buffered(&self) -> usize {
+        self.messages.iter().map(|m| m.len).sum()
+    }
+
     #[cfg(test)]
     fn incomplete(&self) -> usize {
         self.messages.len()
@@ -347,6 +352,7 @@ mod tests {
             reassembly.accept(now, parse_frame(&[0x80, 1, 0x13, 0, 0, b'b']).unwrap()),
             None
         );
+        assert_eq!(reassembly.buffered(), 1);
         assert_eq!(
             reassembly.accept(now, parse_frame(&[0x80, 1, 0x12, 0, 0, b'c']).unwrap()),
             Some(b"ac".to_vec())
@@ -367,6 +373,7 @@ mod tests {
         let later = now + REASSEMBLY_TTL + Duration::from_millis(1);
         assert_eq!(reassembly.accept(later, parse_frame(&ninth).unwrap()), None);
         assert_eq!(reassembly.incomplete(), 1);
+        assert_eq!(reassembly.buffered(), 1);
         assert_eq!(
             reassembly.accept(later, parse_frame(&[0x80, 8, 0x12, 0, 0, b'!']).unwrap()),
             Some(b"n!".to_vec())

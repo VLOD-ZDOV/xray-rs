@@ -35,6 +35,12 @@ use crate::{
 };
 use xray_config::Network;
 
+const GECKO_MAX_PEERS: usize = 4096;
+/// About 2000 messages mid-reassembly (8 chunks of up to 2 KiB each).
+const GECKO_MAX_BUFFERED: usize = 32 << 20;
+
+type GeckoPeers = HashMap<SocketAddr, (Reassembly, Instant)>;
+
 const SALT_LEN: usize = 8;
 
 const MAX_REASSEMBLERS: usize = 256;
@@ -86,7 +92,8 @@ pub(crate) struct ServerCarrierSocket {
     last_message: AtomicU32,
     scratch: Mutex<Box<[u8]>>,
     send_buffer: Mutex<Vec<u8>>,
-    reassemblies: Mutex<HashMap<SocketAddr, (Reassembly, Instant)>>,
+    /// Pre-auth Gecko reassembly per source address, plus the payload bytes it holds.
+    reassemblies: Mutex<(GeckoPeers, usize)>,
 }
 
 impl ServerCarrierSocket {
@@ -102,7 +109,7 @@ impl ServerCarrierSocket {
             last_message: AtomicU32::new(0),
             scratch: Mutex::new(vec![0u8; 65536].into_boxed_slice()),
             send_buffer: Mutex::new(Vec::with_capacity(2048)),
-            reassemblies: Mutex::new(HashMap::new()),
+            reassemblies: Mutex::new((HashMap::new(), 0)),
         }
     }
 
@@ -201,14 +208,24 @@ impl AsyncUdpSocket for ServerCarrierSocket {
                     if let Some(frame) = gecko::parse_frame(datagram) {
                         let now = Instant::now();
                         let completed = {
-                            let mut reassemblies =
+                            let mut guard =
                                 self.reassemblies.lock().unwrap_or_else(|e| e.into_inner());
-                            if reassemblies.len() >= 4096 {
-                                reassemblies.retain(|_, (_, last)| {
-                                    now.duration_since(*last) < Duration::from_secs(10)
+                            let (reassemblies, buffered) = &mut *guard;
+                            if reassemblies.len() >= GECKO_MAX_PEERS
+                                || *buffered >= GECKO_MAX_BUFFERED
+                            {
+                                reassemblies.retain(|_, (r, last)| {
+                                    let keep = now.duration_since(*last) < Duration::from_secs(10);
+                                    if !keep {
+                                        *buffered -= r.buffered();
+                                    }
+                                    keep
                                 });
-                                if reassemblies.len() >= 4096
-                                    && !reassemblies.contains_key(&meta[0].addr)
+                                // Source addresses are spoofable before auth, so the
+                                // byte budget, not the peer count, bounds memory.
+                                if *buffered >= GECKO_MAX_BUFFERED
+                                    || (reassemblies.len() >= GECKO_MAX_PEERS
+                                        && !reassemblies.contains_key(&meta[0].addr))
                                 {
                                     continue;
                                 }
@@ -217,7 +234,10 @@ impl AsyncUdpSocket for ServerCarrierSocket {
                                 .entry(meta[0].addr)
                                 .or_insert_with(|| (Reassembly::default(), now));
                             entry.1 = now;
-                            entry.0.accept(now, frame)
+                            let before = entry.0.buffered();
+                            let done = entry.0.accept(now, frame);
+                            *buffered = *buffered - before + entry.0.buffered();
+                            done
                         };
                         if let Some(msg) = completed {
                             meta[0].len = msg.len();
