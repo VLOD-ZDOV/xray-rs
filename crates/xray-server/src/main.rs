@@ -1941,7 +1941,12 @@ pub(crate) fn build_rustls_server_config(
     alpn: Vec<Vec<u8>>,
     only_tls13: bool,
 ) -> Result<rustls::ServerConfig, String> {
-    let mut provider_builder = rustls::crypto::ring::default_provider();
+    // aws-lc has VAES/AVX-512 AES-GCM (ring does not) and X25519MLKEM768. Go's server
+    // (Xray) prefers the hybrid group, so it goes first, as there.
+    let mut provider_builder = rustls::crypto::aws_lc_rs::default_provider();
+    provider_builder
+        .kx_groups
+        .sort_by_key(|g| g.name() != rustls::NamedGroup::X25519MLKEM768);
     if !settings.cipher_suites.is_empty() {
         provider_builder.cipher_suites.retain(|cs| {
             let name = format!("{:?}", cs.suite());
@@ -2068,6 +2073,9 @@ pub(crate) fn build_rustls_server_config(
         .with_no_client_auth()
         .with_cert_resolver(resolver);
     config.alpn_protocols = alpn;
+    // Go's crypto/tls (Xray) never compresses certificates. Matching it also avoids a
+    // memory spike: concurrent cache misses each run a brotli/zlib compressor.
+    config.cert_compressors = Vec::new();
     Ok(config)
 }
 
