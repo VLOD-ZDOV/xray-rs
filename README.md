@@ -45,6 +45,14 @@ min and max.
   <img alt="Server memory (RSS), lower is better. Idle: xray-rs 8.55 MiB, Xray-core 42.2 MiB. 100 open flows: 15.7 and 51.0. 1000 open flows: 60.2 and 125." src="assets/server-memory-light.svg">
 </picture>
 
+Many open connections, each its own TCP+TLS connection (VLESS over raw TCP).
+Median of 3 runs.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/server-flows-dark.svg">
+  <img alt="Server memory with many open flows in MiB, lower is better. 1000 flows: xray-rs 133, Xray-core 96.8. 5000 flows: 263 and 337. 10000 flows: 447 and 666." src="assets/server-flows-light.svg">
+</picture>
+
 Throughput over an emulated link (network namespace with netem: 50 ms RTT,
 MTU 1500, 0 and 5% packet loss). Without loss xray-rs is up to 20% faster.
 With loss the kernel's TCP recovery dominates and the cores land within run
