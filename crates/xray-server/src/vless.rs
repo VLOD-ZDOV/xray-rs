@@ -1020,6 +1020,7 @@ impl PooledBuffer {
         if let Ok(mut pool) = BUFFER_POOL.lock() {
             if let Some(mut buf) = pool.pop() {
                 if buf.capacity() >= target_cap {
+                    // Pooled buffers keep their length: only the grown tail is zeroed.
                     buf.resize(target_cap, 0);
                     return Self { buf };
                 }
@@ -1036,13 +1037,32 @@ impl Drop for PooledBuffer {
         if self.buf.capacity() <= 256 * 1024 {
             if let Ok(mut pool) = BUFFER_POOL.lock() {
                 if pool.len() < MAX_POOLED_BUFFERS {
-                    let mut b = std::mem::take(&mut self.buf);
-                    b.clear();
-                    pool.push(b);
+                    pool.push(std::mem::take(&mut self.buf));
                 }
             }
         }
     }
+}
+
+/// Reads into a pooled buffer that is held only while data is ready: an idle flow
+/// returns it on every Pending, so open but quiet flows cost no copy buffers.
+async fn read_pooled<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    buf_size: usize,
+) -> io::Result<(PooledBuffer, usize)> {
+    std::future::poll_fn(|cx| {
+        let mut pooled = PooledBuffer::acquire(buf_size);
+        let mut buf = ReadBuf::new(&mut pooled.buf);
+        match Pin::new(&mut *reader).poll_read(cx, &mut buf) {
+            Poll::Ready(Ok(())) => {
+                let n = buf.filled().len();
+                Poll::Ready(Ok((pooled, n)))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await
 }
 
 pub(crate) async fn copy_buf<R, W>(
@@ -1056,15 +1076,14 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut pooled = PooledBuffer::acquire(buf_size);
-    let buf = &mut pooled.buf;
     loop {
-        let n = reader.read(buf).await?;
+        let (pooled, n) = read_pooled(reader, buf_size).await?;
         if n == 0 {
             let _ = writer.shutdown().await;
             return Ok(());
         }
-        writer.write_all(&buf[..n]).await?;
+        writer.write_all(&pooled.buf[..n]).await?;
+        drop(pooled);
         writer.flush().await?;
         count(n);
         activity.touch();
