@@ -2,7 +2,7 @@
 //! StatsService API. Counter names follow Xray: `user>>>EMAIL>>>traffic>>>uplink`,
 //! `inbound>>>TAG>>>traffic>>>downlink`, `outbound>>>TAG>>>traffic>>>uplink`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -54,6 +54,7 @@ pub struct Stats {
     policy: Policy,
     counters: Mutex<HashMap<String, Arc<AtomicI64>>>,
     online: Mutex<HashMap<String, HashMap<IpAddr, Online>>>,
+    known_users: Mutex<BTreeSet<String>>,
     started: Instant,
 }
 
@@ -71,11 +72,12 @@ pub fn get() -> &'static Stats {
 }
 
 impl Stats {
-    fn new(policy: Policy) -> Self {
+    pub fn new(policy: Policy) -> Self {
         Self {
             policy,
             counters: Mutex::new(HashMap::new()),
             online: Mutex::new(HashMap::new()),
+            known_users: Mutex::new(BTreeSet::new()),
             started: Instant::now(),
         }
     }
@@ -86,6 +88,44 @@ impl Stats {
 
     fn counter(&self, name: String) -> Arc<AtomicI64> {
         lock(&self.counters).entry(name).or_default().clone()
+    }
+
+    /// Pre-registers user uplink and downlink traffic counters at zero.
+    pub fn register_user(&self, email: &str, level: u32) {
+        if email.is_empty() {
+            return;
+        }
+        lock(&self.known_users).insert(email.to_string());
+        if !self.policy.enabled {
+            return;
+        }
+        let user_policy = crate::policy::for_level(level);
+        if user_policy.stats_user_uplink || self.policy.user_uplink {
+            self.counter(format!("user>>>{email}>>>traffic>>>uplink"));
+        }
+        if user_policy.stats_user_downlink || self.policy.user_downlink {
+            self.counter(format!("user>>>{email}>>>traffic>>>downlink"));
+        }
+    }
+
+    /// Returns all known user emails (configured, online, or with counters).
+    pub fn all_users(&self) -> Vec<String> {
+        let mut set = lock(&self.known_users).clone();
+        for key in lock(&self.counters).keys() {
+            if let Some(rest) = key.strip_prefix("user>>>") {
+                if let Some(email) = rest.split(">>>").next() {
+                    if !email.is_empty() {
+                        set.insert(email.to_string());
+                    }
+                }
+            }
+        }
+        for email in lock(&self.online).keys() {
+            if !email.is_empty() {
+                set.insert(email.clone());
+            }
+        }
+        set.into_iter().collect()
     }
 
     /// Xray creates an inbound's or outbound's counters with its handler, so
@@ -112,6 +152,9 @@ impl Stats {
         if !self.policy.enabled {
             return Traffic::default();
         }
+        if !email.is_empty() {
+            lock(&self.known_users).insert(email.to_string());
+        }
         let p = self.policy;
         let user_policy = crate::policy::for_level(level);
         let mut traffic = Traffic::default();
@@ -127,12 +170,12 @@ impl Stats {
         };
         if !email.is_empty() {
             add(
-                user_policy.stats_user_uplink,
+                user_policy.stats_user_uplink || p.user_uplink,
                 format!("user>>>{email}>>>traffic>>>uplink"),
                 true,
             );
             add(
-                user_policy.stats_user_downlink,
+                user_policy.stats_user_downlink || p.user_downlink,
                 format!("user>>>{email}>>>traffic>>>downlink"),
                 false,
             );
@@ -200,8 +243,9 @@ impl Stats {
         if !self.policy.enabled || email.is_empty() {
             return None;
         }
+        lock(&self.known_users).insert(email.to_string());
         let user_policy = crate::policy::for_level(level);
-        if !user_policy.stats_user_online {
+        if !user_policy.stats_user_online && !self.policy.user_online {
             return None;
         }
         let ip = match ip {
@@ -363,5 +407,52 @@ mod tests {
         assert_eq!(stats.online_users().len(), 1);
         drop(b);
         assert!(stats.online_users().is_empty());
+    }
+
+    #[test]
+    fn registers_and_tracks_user_stats() {
+        let _lock = crate::policy::TEST_LOCK.lock().unwrap();
+        let panel = json!({
+            "stats": {},
+            "policy": {
+                "levels": {
+                    "0": {
+                        "statsUserUplink": true,
+                        "statsUserDownlink": true,
+                        "statsUserOnline": true
+                    }
+                }
+            }
+        });
+        crate::policy::init(crate::policy::PolicyManager::from_config(&panel));
+        let stats = leaked(Policy::from_config(&panel));
+
+        stats.register_user("charlie", 0);
+        assert_eq!(stats.all_users(), vec!["charlie".to_string()]);
+        assert_eq!(
+            stats.get_counter("user>>>charlie>>>traffic>>>uplink", false),
+            Some(0)
+        );
+        assert_eq!(
+            stats.get_counter("user>>>charlie>>>traffic>>>downlink", false),
+            Some(0)
+        );
+
+        let query = stats.query("user>>>charlie", false);
+        assert_eq!(
+            query,
+            vec![
+                ("user>>>charlie>>>traffic>>>downlink".into(), 0),
+                ("user>>>charlie>>>traffic>>>uplink".into(), 0),
+            ]
+        );
+
+        // Even with unconfigured level (e.g. 5), level 0 fallback in policy enables tracking
+        stats.register_user("david", 5);
+        assert!(stats.all_users().contains(&"david".to_string()));
+        assert_eq!(
+            stats.get_counter("user>>>david>>>traffic>>>uplink", false),
+            Some(0)
+        );
     }
 }

@@ -433,6 +433,15 @@ pub(crate) async fn start_inbound(
     String,
 > {
     stats::get().register("inbound", &inbound.tag);
+    for u in &inbound.users {
+        stats::get().register_user(&u.email, u.level);
+    }
+    for u in &inbound.shadowsocks_users {
+        stats::get().register_user(&u.email, u.level);
+    }
+    for u in &inbound.hysteria_users {
+        stats::get().register_user(&u.email, u.level);
+    }
     let ctx = Arc::new(vless::Context {
         tag: inbound.tag.clone(),
         port: inbound.port,

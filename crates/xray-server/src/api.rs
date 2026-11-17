@@ -1220,7 +1220,10 @@ async fn handle_observatory(
 }
 
 fn handle_stats(method: &str, message: Bytes) -> Response<Body> {
-    let stats = stats::get();
+    handle_stats_inner(stats::get(), method, message)
+}
+
+fn handle_stats_inner(stats: &crate::stats::Stats, method: &str, message: Bytes) -> Response<Body> {
     match method {
         "QueryStats" => {
             let Ok(r) = QueryStatsRequest::decode(message) else {
@@ -1264,10 +1267,19 @@ fn handle_stats(method: &str, message: Bytes) -> Response<Body> {
             let Ok(r) = GetUsersStatsRequest::decode(message) else {
                 return status(INVALID_ARGUMENT, "bad request");
             };
-            let users = stats
-                .online_users()
+            let online = stats.online_users();
+            let all_users = stats.all_users();
+            let users = all_users
                 .into_iter()
-                .map(|(email, ips)| {
+                .filter_map(|email| {
+                    let ips = online
+                        .iter()
+                        .find(|(e, _)| e == &email)
+                        .map(|(_, ips)| ips.clone())
+                        .unwrap_or_default();
+                    if !r.include_traffic && ips.is_empty() {
+                        return None;
+                    }
                     let traffic = r.include_traffic.then(|| TrafficUserStat {
                         uplink: stats
                             .get_counter(&format!("user>>>{email}>>>traffic>>>uplink"), r.reset)
@@ -1276,14 +1288,14 @@ fn handle_stats(method: &str, message: Bytes) -> Response<Body> {
                             .get_counter(&format!("user>>>{email}>>>traffic>>>downlink"), r.reset)
                             .unwrap_or(0),
                     });
-                    UserStat {
+                    Some(UserStat {
                         email,
                         ips: ips
                             .into_iter()
                             .map(|(ip, last_seen)| OnlineIpEntry { ip, last_seen })
                             .collect(),
                         traffic,
-                    }
+                    })
                 })
                 .collect();
             reply(&GetUsersStatsResponse { users })
@@ -1298,9 +1310,12 @@ fn handle_stats(method: &str, message: Bytes) -> Response<Body> {
                 .strip_prefix("user>>>")
                 .and_then(|n| n.strip_suffix(">>>online"))
                 .unwrap_or(&r.name);
-            let Some((_, ips)) = stats.online_users().into_iter().find(|(e, _)| e == email) else {
-                return status(NOT_FOUND, &format!("{} not found.", r.name));
-            };
+            let ips = stats
+                .online_users()
+                .into_iter()
+                .find(|(e, _)| e == email)
+                .map(|(_, ips)| ips)
+                .unwrap_or_default();
             if method == "GetStatsOnline" {
                 reply(&GetStatsResponse {
                     stat: Some(Stat {
@@ -1795,6 +1810,8 @@ fn missing_handler(tag: &str) -> Response<Body> {
 }
 
 fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> {
+    let email = user.email.clone();
+    let level = user.level;
     let account = user.account.unwrap_or_default();
     match account.r#type.as_str() {
         VLESS_ACCOUNT => {
@@ -1920,7 +1937,9 @@ fn add_user_to_inbound(user: ProtocolUser, ctx: &Context) -> Result<(), String> 
             })
         }
         other => Err(format!("account type {other:?} is not supported")),
-    }
+    }?;
+    crate::stats::get().register_user(&email, level);
+    Ok(())
 }
 
 fn protocol_user(user: InboundUser) -> ProtocolUser {
@@ -2325,5 +2344,105 @@ mod tests {
         )
         .await;
         assert_eq!(resp.headers().get("grpc-status").unwrap(), "2");
+    }
+
+    #[tokio::test]
+    async fn stats_service_reports_offline_and_online_clients() {
+        {
+            let _lock = crate::policy::TEST_LOCK.lock().unwrap();
+            let cfg = serde_json::json!({
+                "stats": {},
+                "policy": {
+                    "levels": {
+                        "0": {
+                            "statsUserUplink": true,
+                            "statsUserDownlink": true,
+                            "statsUserOnline": true
+                        }
+                    }
+                }
+            });
+            crate::policy::init(crate::policy::PolicyManager::from_config(&cfg));
+        }
+        let stats: &'static crate::stats::Stats = Box::leak(Box::new(crate::stats::Stats::new(crate::stats::Policy {
+            enabled: true,
+            user_uplink: true,
+            user_downlink: true,
+            user_online: true,
+            ..Default::default()
+        })));
+
+        // Register an offline user
+        stats.register_user("offline_user@test", 0);
+
+        // 1. GetStatsOnline for offline user returns 0, NOT an error
+        let req = GetStatsRequest {
+            name: "user>>>offline_user@test>>>online".into(),
+            reset: false,
+        };
+        let resp = handle_stats_inner(stats, "GetStatsOnline", req.encode_to_vec().into());
+        assert_eq!(resp.status(), 200);
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let stat_resp = GetStatsResponse::decode(unframe(collected).unwrap()).unwrap();
+        assert_eq!(stat_resp.stat.unwrap().value, 0);
+
+        // 2. GetStatsOnlineIpList for offline user returns empty map, NOT an error
+        let resp = handle_stats_inner(stats, "GetStatsOnlineIpList", req.encode_to_vec().into());
+        assert_eq!(resp.status(), 200);
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let iplist_resp = GetStatsOnlineIpListResponse::decode(unframe(collected).unwrap()).unwrap();
+        assert!(iplist_resp.ips.is_empty());
+
+        // 3. GetUsersStats with include_traffic: true reports offline users with their counters
+        let req = GetUsersStatsRequest {
+            reset: false,
+            include_traffic: true,
+        };
+        let resp = handle_stats_inner(stats, "GetUsersStats", req.encode_to_vec().into());
+        assert_eq!(resp.status(), 200);
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let users_resp = GetUsersStatsResponse::decode(unframe(collected).unwrap()).unwrap();
+        let found = users_resp
+            .users
+            .iter()
+            .find(|u| u.email == "offline_user@test")
+            .expect("offline user must be present in GetUsersStats when include_traffic is true");
+        assert!(found.ips.is_empty());
+        let traffic = found.traffic.as_ref().expect("traffic must be included");
+        assert_eq!(traffic.uplink, 0);
+        assert_eq!(traffic.downlink, 0);
+
+        // 4. GetUsersStats with include_traffic: false excludes offline users
+        let req = GetUsersStatsRequest {
+            reset: false,
+            include_traffic: false,
+        };
+        let resp = handle_stats_inner(stats, "GetUsersStats", req.encode_to_vec().into());
+        assert_eq!(resp.status(), 200);
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let users_resp = GetUsersStatsResponse::decode(unframe(collected).unwrap()).unwrap();
+        assert!(
+            users_resp
+                .users
+                .iter()
+                .all(|u| u.email != "offline_user@test"),
+            "offline users without active IPs must be excluded when include_traffic is false"
+        );
+
+        // 5. When a client connects, online stats and IPs are reported
+        stats.register_user("online_user@test", 0);
+        let guard = stats.connect("online_user@test", 0, "198.51.100.42".parse().unwrap());
+        assert!(guard.is_some());
+
+        let req = GetStatsRequest {
+            name: "user>>>online_user@test>>>online".into(),
+            reset: false,
+        };
+        let resp = handle_stats_inner(stats, "GetStatsOnline", req.encode_to_vec().into());
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let stat_resp = GetStatsResponse::decode(unframe(collected).unwrap()).unwrap();
+        assert_eq!(stat_resp.stat.unwrap().value, 1);
+
+        drop(guard);
     }
 }
