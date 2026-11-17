@@ -99,22 +99,100 @@ where
 }
 
 fn respond(path: &str) -> Response<Full<Bytes>> {
-    // pprof is the Go runtime's profiler; there is nothing like it to serve.
-    if path != "/debug/vars" {
-        let mut not_found = Response::new(Full::new(Bytes::from_static(b"404 page not found\n")));
-        *not_found.status_mut() = hyper::StatusCode::NOT_FOUND;
-        not_found.headers_mut().insert(
-            hyper::header::CONTENT_TYPE,
-            hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
-        );
-        return not_found;
+    match path {
+        "/debug/vars" => {
+            let mut response = Response::new(Full::new(Bytes::from(debug_vars().to_string())));
+            response.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("application/json; charset=utf-8"),
+            );
+            response
+        }
+        "/metrics" => {
+            let mut response = Response::new(Full::new(Bytes::from(prometheus_metrics())));
+            response.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static(
+                    "text/plain; version=0.0.4; charset=utf-8",
+                ),
+            );
+            response
+        }
+        _ => {
+            let mut not_found =
+                Response::new(Full::new(Bytes::from_static(b"404 page not found\n")));
+            *not_found.status_mut() = hyper::StatusCode::NOT_FOUND;
+            not_found.headers_mut().insert(
+                hyper::header::CONTENT_TYPE,
+                hyper::header::HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            not_found
+        }
     }
-    let mut response = Response::new(Full::new(Bytes::from(debug_vars().to_string())));
-    response.headers_mut().insert(
-        hyper::header::CONTENT_TYPE,
-        hyper::header::HeaderValue::from_static("application/json; charset=utf-8"),
-    );
-    response
+}
+
+/// Prometheus text exposition format (/metrics) for monitoring and Grafana scraping.
+fn prometheus_metrics() -> String {
+    let mut out = String::new();
+    out.push_str("# HELP xray_uptime_seconds Process uptime in seconds\n");
+    out.push_str("# TYPE xray_uptime_seconds gauge\n");
+    out.push_str(&format!("xray_uptime_seconds {}\n\n", stats::get().uptime_secs()));
+
+    out.push_str("# HELP xray_traffic_bytes_total Total bytes transferred\n");
+    out.push_str("# TYPE xray_traffic_bytes_total counter\n");
+    for (name, val) in stats::get().query("", false) {
+        let parts: Vec<&str> = name.split(">>>").collect();
+        if parts.len() >= 4 && parts[2] == "traffic" {
+            let kind = parts[0];
+            let tag = parts[1];
+            let direction = parts[3];
+            out.push_str(&format!(
+                "xray_traffic_bytes_total{{kind=\"{kind}\",tag=\"{tag}\",direction=\"{direction}\"}} {val}\n"
+            ));
+        }
+    }
+    out.push('\n');
+
+    let online = stats::get().online_users();
+    if !online.is_empty() {
+        out.push_str("# HELP xray_user_online_connections Active connection count per user\n");
+        out.push_str("# TYPE xray_user_online_connections gauge\n");
+        for (email, ips) in online {
+            out.push_str(&format!(
+                "xray_user_online_connections{{user=\"{email}\"}} {}\n",
+                ips.len()
+            ));
+        }
+        out.push('\n');
+    }
+
+    if let Some(Some(observatory)) = OBSERVATORY.get() {
+        let statuses = observatory.get_observation();
+        if !statuses.is_empty() {
+            out.push_str("# HELP xray_observatory_alive Whether outbound is reachable\n");
+            out.push_str("# TYPE xray_observatory_alive gauge\n");
+            for s in &statuses {
+                let alive = if s.alive { 1 } else { 0 };
+                out.push_str(&format!(
+                    "xray_observatory_alive{{outbound=\"{}\"}} {alive}\n",
+                    s.outbound_tag
+                ));
+            }
+            out.push_str(
+                "\n# HELP xray_observatory_delay_ms Outbound delay in milliseconds\n",
+            );
+            out.push_str("# TYPE xray_observatory_delay_ms gauge\n");
+            for s in &statuses {
+                out.push_str(&format!(
+                    "xray_observatory_delay_ms{{outbound=\"{}\"}} {}\n",
+                    s.outbound_tag, s.delay
+                ));
+            }
+            out.push('\n');
+        }
+    }
+
+    out
 }
 
 /// Xray's `/debug/vars`: Go's expvar `cmdline`, then `stats` split from the
@@ -318,6 +396,15 @@ mod tests {
         assert_eq!(
             respond("/debug/vars").headers()[hyper::header::CONTENT_TYPE],
             "application/json; charset=utf-8"
+        );
+    }
+    #[test]
+    fn metrics_route_is_prometheus_format() {
+        let resp = respond("/metrics");
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        assert_eq!(
+            resp.headers()[hyper::header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
         );
     }
     #[test]

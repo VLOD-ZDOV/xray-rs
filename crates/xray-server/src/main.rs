@@ -92,6 +92,9 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("test-route") {
         return run_test_route(&args[1..]);
     }
+    if args.first().map(|s| s.trim_start_matches('-')) == Some("x25519") {
+        return run_x25519(&args[1..]);
+    }
     let mut config_path = None;
     let mut test_only = false;
     let mut iter = args.iter().map(String::as_str);
@@ -2230,6 +2233,63 @@ fn run_test_route(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn run_x25519(args: &[String]) -> ExitCode {
+    match generate_or_derive_x25519(args) {
+        Ok((msg, pub_key)) => {
+            println!("{msg}");
+            println!("Public key: {pub_key}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn generate_or_derive_x25519(args: &[String]) -> Result<(String, String), String> {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+
+    let mut custom_i = None;
+    let mut iter = args.iter().map(String::as_str);
+    while let Some(arg) = iter.next() {
+        match arg.trim_start_matches('-') {
+            "i" => {
+                custom_i = iter.next().map(str::to_string);
+            }
+            other if other.starts_with("i=") => {
+                custom_i = other.split_once('=').map(|(_, v)| v.to_string());
+            }
+            _ => {
+                return Err(format!("unsupported argument for x25519: {arg}"));
+            }
+        }
+    }
+
+    if let Some(custom) = custom_i {
+        let priv_bytes = config::decode_base64_32(&custom)
+            .map_err(|e| format!("failed to parse private key: {e}"))?;
+        let secret = x25519_dalek::StaticSecret::from(priv_bytes);
+        let public = x25519_dalek::PublicKey::from(&secret);
+        let msg = format!(
+            "Custom private key: {}",
+            URL_SAFE_NO_PAD.encode(priv_bytes)
+        );
+        let pub_str = URL_SAFE_NO_PAD.encode(public.as_bytes());
+        Ok((msg, pub_str))
+    } else {
+        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+        let public = x25519_dalek::PublicKey::from(&secret);
+        let msg = format!(
+            "Private key: {}",
+            URL_SAFE_NO_PAD.encode(secret.to_bytes())
+        );
+        let pub_str = URL_SAFE_NO_PAD.encode(public.as_bytes());
+        Ok((msg, pub_str))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2372,5 +2432,22 @@ mod tests {
         let config = build_rustls_server_config(&settings, vec![b"h2".to_vec()], false).unwrap();
         assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_x25519_generation_and_derivation() {
+        let (msg1, pub1) = generate_or_derive_x25519(&[]).unwrap();
+        assert!(msg1.starts_with("Private key: "));
+        let priv1 = msg1.strip_prefix("Private key: ").unwrap();
+        assert_eq!(priv1.len(), 43);
+        assert_eq!(pub1.len(), 43);
+
+        let args = vec!["-i".to_string(), priv1.to_string()];
+        let (msg2, pub2) = generate_or_derive_x25519(&args).unwrap();
+        assert!(msg2.starts_with("Custom private key: "));
+        assert_eq!(pub2, pub1);
+
+        let bad_args = vec!["-i".to_string(), "not-a-valid-key".to_string()];
+        assert!(generate_or_derive_x25519(&bad_args).is_err());
     }
 }
