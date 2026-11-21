@@ -30,8 +30,12 @@ mod utls_tls_shaping_tests {
     const EXT_ENCRYPTED_CLIENT_HELLO: u16 = 0xfe0d;
     const GROUP_X25519: u16 = 0x001d;
     const GROUP_SECP256R1: u16 = 0x0017;
-    const CHROME_PROVIDER_SUPPORTED_CIPHERS: &[u16] = &[
-        0x0a0a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8,
+    /// Chrome's cipher suites as uTLS sends them, GREASE first: the nine
+    /// rustls implements, then the six CBC and RSA key exchange suites it only
+    /// advertises (`CHROME_LEGACY_TLS12_CIPHERS`).
+    const CHROME_CIPHERS: &[u16] = &[
+        0x0a0a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+        0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
     ];
     const CHROME_LEGACY_TLS12_CIPHERS: &[u16] = &[0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035];
 
@@ -294,20 +298,26 @@ mod utls_tls_shaping_tests {
         );
     }
 
+    /// Chrome's whole cipher list goes on the wire, in Chrome's order and
+    /// GREASE first, the six suites rustls does not implement included: a
+    /// list without them is a JA3/JA4 no Chrome sends.
     #[test]
-    fn legacy_cipher_advertisement_keeps_chrome_order_and_grease() {
+    fn chrome_advertises_its_whole_cipher_list_in_order() {
         let hello = plain_tls_client_hello_bytes(&config("chrome", &[]))
             .expect("chrome ClientHello must be produced");
 
         assert_eq!(
             canonical_cipher_suites(&hello),
-            CHROME_PROVIDER_SUPPORTED_CIPHERS,
-            "filtering must preserve the profile order and its leading GREASE slot"
+            CHROME_CIPHERS,
+            "the profile's suites, order and leading GREASE slot must all reach the wire"
         );
     }
 
+    /// Advertising suites rustls does not implement is safe only while each
+    /// hello still offers one it does: the server's choice among those is the
+    /// one that completes.
     #[test]
-    fn legacy_cipher_advertisement_is_supported_for_every_selectable_profile() {
+    fn every_selectable_profile_advertises_a_negotiable_suite() {
         for fingerprint in selectable_fingerprints() {
             let hello = plain_tls_client_hello_bytes(&config(fingerprint, &[]))
                 .unwrap_or_else(|error| panic!("{fingerprint}: ClientHello: {error}"));
@@ -323,11 +333,7 @@ mod utls_tls_shaping_tests {
                 .collect::<Vec<_>>();
 
             assert!(
-                !advertised.is_empty(),
-                "{fingerprint}: a selectable profile needs a negotiable suite"
-            );
-            assert!(
-                advertised.iter().all(|suite| supported.contains(suite)),
+                advertised.iter().any(|suite| supported.contains(suite)),
                 "{fingerprint}: advertised {advertised:04x?}, provider supports {supported:04x?}"
             );
         }
@@ -465,18 +471,29 @@ mod utls_tls_shaping_tests {
                 shape.encrypted_client_hello_length,
             );
 
-            // The hello is as long as uTLS's. Padding, where uTLS pads, makes
-            // up the suites the provider filtered and the `supported_versions`
-            // rustls adds to a TLS-1.2-era hello (below); an unpadded hello
-            // differs by exactly those.
+            // The hello offers uTLS's cipher suites, all of them, and is as
+            // long as uTLS's. Padding, where uTLS pads, takes off the
+            // `supported_versions` rustls adds to a TLS-1.2-era hello (below);
+            // an unpadded hello is longer by exactly that.
+            assert_eq!(
+                cipher_suites(&hello)
+                    .into_iter()
+                    .map(|suite| if is_grease(suite) {
+                        "GREASE".to_owned()
+                    } else {
+                        format!("0x{suite:04x}")
+                    })
+                    .collect::<Vec<_>>(),
+                shape.cipher_suites,
+                "{fingerprint}: the override must offer uTLS's cipher suites"
+            );
             let padding = client_hello_draws::extension_body(&hello[5..], EXT_PADDING);
             assert_eq!(
-                padding.is_some(),
-                shape.padding_length.is_some(),
-                "{fingerprint}: the override must pad where uTLS pads"
+                padding.map(<[u8]>::len),
+                shape.padding_length,
+                "{fingerprint}: the override must pad as uTLS pads"
             );
             let supported_versions = format!("0x{EXT_SUPPORTED_VERSIONS:04x}");
-            let filtered = 2 * (shape.cipher_suites.len() - cipher_suites(&hello).len());
             let added = if shape.extension_order.contains(&supported_versions) {
                 0
             } else {
@@ -486,13 +503,13 @@ mod utls_tls_shaping_tests {
             let expected_len = if shape.padding_length.is_some() {
                 shape.handshake_length
             } else {
-                shape.handshake_length - filtered + added
+                shape.handshake_length + added
             };
             assert_eq!(
                 hello.len() - 5,
                 expected_len,
                 "{fingerprint} (ECH {:?}): the override's hello must be as long as uTLS's, \
-                 less the filtered suites, plus what rustls adds",
+                 plus what rustls adds",
                 shape.encrypted_client_hello_length
             );
 
@@ -1036,9 +1053,9 @@ mod utls_tls_shaping_tests {
     /// other. uTLS's Chrome 120 hello is 494 bytes before padding with the
     /// shortest ECH GREASE length, so it is padded to 512, and 526, 558 and
     /// 590 with the other three, so it goes unpadded
-    /// (`clienthello_raw_hellochrome_120*.json`). Ours offers six suites
-    /// fewer, the CBC and RSA ones rustls lacks: the padding makes up their
-    /// twelve bytes, and an unpadded hello is twelve bytes shorter.
+    /// (`clienthello_raw_hellochrome_120*.json`). Ours offers the same
+    /// fifteen suites, the six CBC and RSA ones rustls lacks included, so it
+    /// is uTLS's length in every case.
     #[test]
     fn hellochrome_120_pads_only_the_hello_boringssl_pads() {
         let mut seen = BTreeMap::new();
@@ -1055,10 +1072,10 @@ mod utls_tls_shaping_tests {
         assert_eq!(
             seen,
             BTreeMap::from([
-                (186, (512, Some(26))),
-                (218, (514, None)),
-                (250, (546, None)),
-                (282, (578, None)),
+                (186, (512, Some(14))),
+                (218, (526, None)),
+                (250, (558, None)),
+                (282, (590, None)),
             ])
         );
     }
@@ -1565,9 +1582,8 @@ mod utls_tls_shaping_tests {
 
     /// Minimal TLS 1.2 legacy-only peer. It reads the real wire ClientHello,
     /// records its suites, then sends the handshake_failure a server with no
-    /// common cipher is required to produce. The suites are intentionally the
-    /// compatibility tail Chrome used to advertise despite being unusable by
-    /// our provider.
+    /// common cipher is required to produce: one that speaks only the
+    /// compatibility tail Chrome advertises and our provider cannot finish.
     async fn spawn_tls12_legacy_only_server() -> (
         SocketAddr,
         tokio::task::JoinHandle<Result<Vec<u16>, String>>,
@@ -1670,6 +1686,87 @@ mod utls_tls_shaping_tests {
 
     static ZSTD_CERTIFICATE_COMPRESSOR: ZstdCertificateCompressor = ZstdCertificateCompressor;
 
+    /// Writes the certificate as brotli "stored" data: one uncompressed
+    /// meta-block, then an empty last one (RFC 7932 sections 9.1 and 9.2).
+    /// `large_window` selects the stream header of brotli's nonstandard
+    /// large-window extension, which lets the peer pick a history window of
+    /// up to 1 GiB, instead of the standard header, with the same 16 MiB
+    /// window either way.
+    #[derive(Debug)]
+    struct StoredBrotliCertificateCompressor {
+        large_window: bool,
+    }
+
+    impl rustls::compress::CertCompressor for StoredBrotliCertificateCompressor {
+        fn compress(
+            &self,
+            input: Vec<u8>,
+            _level: rustls::compress::CompressionLevel,
+        ) -> Result<Vec<u8>, rustls::compress::CompressionFailed> {
+            const WINDOW_BITS: u64 = 24;
+            let length = u64::try_from(input.len())
+                .ok()
+                .filter(|length| (1..=1 << 16).contains(length))
+                .ok_or(rustls::compress::CompressionFailed)?;
+
+            let mut stream = BrotliBits::default();
+            if self.large_window {
+                // 0x11 is the large-window marker, followed by a reserved
+                // zero bit and six bits of window size.
+                stream.push(WINDOW_BITS << 8 | 0x11, 14);
+            } else {
+                stream.push((WINDOW_BITS - 17) << 1 | 1, 4);
+            }
+            // ISLAST = 0, MNIBBLES = 4, MLEN - 1, ISUNCOMPRESSED = 1.
+            stream.push(0, 1);
+            stream.push(0, 2);
+            stream.push(length - 1, 16);
+            stream.push(1, 1);
+            stream.extend_aligned(&input);
+            // ISLAST = 1, ISLASTEMPTY = 1.
+            stream.push(0b11, 2);
+            Ok(stream.bytes)
+        }
+
+        fn algorithm(&self) -> rustls::CertificateCompressionAlgorithm {
+            rustls::CertificateCompressionAlgorithm::Brotli
+        }
+    }
+
+    /// Bits in brotli's order, least significant first.
+    #[derive(Default)]
+    struct BrotliBits {
+        bytes: Vec<u8>,
+        /// The next bit in the last byte; zero starts a new byte
+        bit: u8,
+    }
+
+    impl BrotliBits {
+        fn push(&mut self, value: u64, bits: u32) {
+            for index in 0..bits {
+                if self.bit == 0 {
+                    self.bytes.push(0);
+                }
+                let last = self.bytes.len() - 1;
+                self.bytes[last] |= u8::from(value >> index & 1 == 1) << self.bit;
+                self.bit = (self.bit + 1) % 8;
+            }
+        }
+
+        /// Pads the last byte with zero bits, then appends `bytes`.
+        fn extend_aligned(&mut self, bytes: &[u8]) {
+            self.bit = 0;
+            self.bytes.extend_from_slice(bytes);
+        }
+    }
+
+    static STANDARD_WINDOW_BROTLI: StoredBrotliCertificateCompressor =
+        StoredBrotliCertificateCompressor {
+            large_window: false,
+        };
+    static LARGE_WINDOW_BROTLI: StoredBrotliCertificateCompressor =
+        StoredBrotliCertificateCompressor { large_window: true };
+
     /// Dials `addr` with one fingerprint through the shaping path.
     ///
     /// `system()` plus `allow_insecure: true` for the reason
@@ -1750,8 +1847,10 @@ mod utls_tls_shaping_tests {
         assert_eq!(negotiated, Ok(ProtocolVersion::TLSv1_3));
     }
 
+    /// The wire hello carries Chrome's legacy tail as Chrome sends it, and a
+    /// server that speaks nothing else ends the dial with an error.
     #[tokio::test]
-    async fn legacy_cipher_advertisement_has_no_chrome_tls12_legacy_server_overlap() {
+    async fn a_legacy_only_server_is_offered_chromes_legacy_suites() {
         let (addr, served) = spawn_tls12_legacy_only_server().await;
 
         dial_shaped("chrome", addr)
@@ -1761,16 +1860,113 @@ mod utls_tls_shaping_tests {
             .await
             .expect("the server task must finish")
             .expect("the server must read the ClientHello");
-        let overlap = offered
+        let legacy = offered
             .iter()
             .copied()
             .filter(|suite| CHROME_LEGACY_TLS12_CIPHERS.contains(suite))
             .collect::<Vec<_>>();
 
-        assert!(
-            overlap.is_empty(),
-            "Chrome advertised legacy-only suites the provider cannot finish: {overlap:04x?}"
+        assert_eq!(
+            legacy, CHROME_LEGACY_TLS12_CIPHERS,
+            "Chrome advertises its legacy suites, in its order"
         );
+    }
+
+    /// A TLS 1.2 peer that answers the wire ClientHello with a ServerHello
+    /// choosing the first suite it offered that our provider does not
+    /// implement, and reports that suite.
+    async fn spawn_advertised_only_suite_server(
+    ) -> (SocketAddr, tokio::task::JoinHandle<Result<u16, String>>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("loopback listener must bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener must report its address");
+
+        let served = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
+            let mut record = vec![0u8; 5];
+            stream
+                .read_exact(&mut record)
+                .await
+                .map_err(|e| e.to_string())?;
+            let payload_len = usize::from(u16::from_be_bytes([record[3], record[4]]));
+            record.resize(5 + payload_len, 0);
+            stream
+                .read_exact(&mut record[5..])
+                .await
+                .map_err(|e| e.to_string())?;
+            let implemented =
+                provider_cipher_suites(&[ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_2]);
+            let chosen = cipher_suites(&record)
+                .into_iter()
+                .find(|suite| !is_grease(*suite) && !implemented.contains(suite))
+                .ok_or_else(|| "the hello offers no advertise-only suite".to_owned())?;
+
+            // ServerHello: TLS 1.2, a random without the downgrade sentinel,
+            // an empty session id, `chosen`, no compression, no extensions.
+            let mut body = vec![0x03, 0x03];
+            body.extend_from_slice(&[0x5a; 32]);
+            body.push(0);
+            body.extend_from_slice(&chosen.to_be_bytes());
+            body.push(0);
+            let mut handshake = vec![0x02, 0, 0, body.len() as u8];
+            handshake.extend_from_slice(&body);
+            let mut server_hello = vec![0x16, 0x03, 0x03, 0, handshake.len() as u8];
+            server_hello.extend_from_slice(&handshake);
+            stream
+                .write_all(&server_hello)
+                .await
+                .map_err(|e| e.to_string())?;
+            // Whatever the client answers is its business; keep the socket
+            // open until it has had its say.
+            let mut rest = Vec::new();
+            let _ = stream.read_to_end(&mut rest).await;
+            Ok(chosen)
+        });
+
+        (addr, served)
+    }
+
+    /// A suite rustls only advertises cannot be negotiated: a server that
+    /// picks one gets a handshake failure from the client, which surfaces as
+    /// an ordinary dial error naming the reason, not a panic and not a
+    /// connection that carries on.
+    #[tokio::test]
+    async fn a_server_choosing_an_advertise_only_suite_fails_the_handshake_cleanly() {
+        for fingerprint in ["chrome", "firefox", "safari", "hellochrome_58"] {
+            let (addr, served) = spawn_advertised_only_suite_server().await;
+
+            let error = dial_shaped(fingerprint, addr)
+                .await
+                .expect_err("a suite the provider lacks must not be negotiated");
+            let chosen = served
+                .await
+                .expect("the server task must finish")
+                .unwrap_or_else(|error| panic!("{fingerprint}: server: {error}"));
+
+            assert!(
+                error.to_string().contains("SelectedUnofferedCipherSuite"),
+                "{fingerprint}: the server chose {chosen:#06x}; the error must say why, \
+                 got: {error}"
+            );
+        }
+    }
+
+    /// The other side of it: a real TLS-1.2-only server among the suites the
+    /// hello offers takes one rustls implements, and the dial completes.
+    #[tokio::test]
+    async fn chrome_completes_tls12_with_its_legacy_suites_advertised() {
+        let (addr, served) =
+            spawn_version_reporting_tls_server_with(&[&rustls::version::TLS12]).await;
+
+        dial_shaped("chrome", addr)
+            .await
+            .expect("chrome must complete a TLS 1.2 handshake");
+
+        let negotiated = served.await.expect("the server task must finish");
+        assert_eq!(negotiated, Ok(ProtocolVersion::TLSv1_2));
     }
 
     #[tokio::test]
@@ -1807,6 +2003,37 @@ mod utls_tls_shaping_tests {
             .unwrap_or_else(|error| panic!("server handshake: {error}"));
     }
 
+    /// RUSTSEC-2026-0348. Chrome's hello offers brotli, and the certificate
+    /// is decompressed before it is authenticated, so whoever answers the
+    /// hello picks the decoder's window. With brotli's large-window extension
+    /// a five-byte header made rustls allocate up to 1 GiB. The same stored
+    /// certificate decodes under a standard header and is refused under the
+    /// large-window one.
+    #[tokio::test]
+    async fn chrome_refuses_a_large_window_brotli_certificate() {
+        let (addr, served) = spawn_compressed_certificate_tls_server(&STANDARD_WINDOW_BROTLI).await;
+        dial_shaped("chrome", addr)
+            .await
+            .unwrap_or_else(|error| panic!("brotli-compressed handshake: {error}"));
+        served
+            .await
+            .expect("the server task must finish")
+            .unwrap_or_else(|error| panic!("server handshake: {error}"));
+
+        let (addr, served) = spawn_compressed_certificate_tls_server(&LARGE_WINDOW_BROTLI).await;
+        let error = dial_shaped("chrome", addr)
+            .await
+            .expect_err("a large-window brotli certificate must be refused");
+        assert!(
+            error.to_string().contains("InvalidCertCompression"),
+            "the refusal must name the certificate compression, got: {error}"
+        );
+        served
+            .await
+            .expect("the server task must finish")
+            .expect_err("the client must abort the server's handshake");
+    }
+
     /// uTLS puts 32 random bytes in the legacy session id of every ClientHello,
     /// TLS-1.2-era parrots included: `makeClientHello` fills it unconditionally
     /// for anything that is not QUIC
@@ -1837,10 +2064,12 @@ mod utls_tls_shaping_tests {
         usize::from(hello[5 + 4 + 2 + 32])
     }
 
-    /// Faking support would mean advertising suites we cannot use and losing
-    /// the connection at ServerHello with `SelectedUnofferedCipherSuite`, after
-    /// a socket, a round trip and an error naming neither the fingerprint nor
-    /// the reason. Refusing the config says the same thing for free.
+    /// Every profile advertises suites rustls does not implement, but each
+    /// other profile also offers one it does. These offer none, so every
+    /// server's choice would lose the connection at ServerHello with
+    /// `SelectedUnofferedCipherSuite`, after a socket, a round trip and an
+    /// error naming neither the fingerprint nor the reason. Refusing the config
+    /// says the same thing for free.
     #[test]
     fn a_fingerprint_with_no_implemented_cipher_suite_is_refused() {
         for fingerprint in UNNEGOTIABLE_FINGERPRINTS {

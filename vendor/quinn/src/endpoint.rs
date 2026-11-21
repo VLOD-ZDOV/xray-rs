@@ -8,14 +8,17 @@ use std::{
     net::{SocketAddr, SocketAddrV6},
     pin::Pin,
     str,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Waker},
 };
 
 #[cfg(all(not(wasm_browser), any(feature = "aws-lc-rs", feature = "ring")))]
 use crate::runtime::default_runtime;
 use crate::{
-    Instant,
+    Duration, Instant,
     runtime::{AsyncUdpSocket, Runtime},
     udp_transmit,
 };
@@ -251,6 +254,7 @@ impl Endpoint {
         let addr = socket.local_addr()?;
         let mut inner = self.inner.state.lock().unwrap();
         inner.prev_socket = Some(mem::replace(&mut inner.socket, socket));
+        inner.prev_socket_deadline = None;
         inner.ipv6 = addr.is_ipv6();
 
         // Update connection socket references
@@ -378,7 +382,9 @@ impl Future for EndpointDriver {
             self.0.shared.incoming.notify_waiters();
         }
 
-        if endpoint.ref_count == 0 && endpoint.recv_state.connections.is_empty() {
+        if self.0.shared.ref_count.load(Ordering::Relaxed) == 0
+            && endpoint.recv_state.connections.is_empty()
+        {
             Poll::Ready(Ok(()))
         } else {
             drop(endpoint);
@@ -464,19 +470,26 @@ impl EndpointInner {
     }
 }
 
+/// How long an abandoned socket still receives after the first packet on
+/// its successor. The peer's datagrams for the old path arrive for one
+/// old-path delay after the peer has moved over, and a peer that validates
+/// the new path first moves over a round trip later.
+const PREV_SOCKET_GRACE: Duration = Duration::from_secs(3);
+
 #[derive(Debug)]
 pub(crate) struct State {
     socket: Arc<dyn AsyncUdpSocket>,
     /// During an active migration, abandoned_socket receives traffic
-    /// until the first packet arrives on the new socket.
+    /// until [`PREV_SOCKET_GRACE`] after the first packet arrives on the new
+    /// socket.
     prev_socket: Option<Arc<dyn AsyncUdpSocket>>,
+    /// When `prev_socket` is let go; set by the first packet on the new socket.
+    prev_socket_deadline: Option<Instant>,
     inner: proto::Endpoint,
     recv_state: RecvState,
     driver: Option<Waker>,
     ipv6: bool,
     events: mpsc::UnboundedReceiver<(ConnectionHandle, EndpointEvent)>,
-    /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
-    ref_count: usize,
     driver_lost: bool,
     runtime: Arc<dyn Runtime>,
     stats: EndpointStats,
@@ -486,19 +499,35 @@ pub(crate) struct State {
 pub(crate) struct Shared {
     incoming: Notify,
     idle: Notify,
+    /// Number of live handles that can be used to initiate or handle I/O; excludes the driver
+    ref_count: AtomicUsize,
 }
 
 impl State {
     fn drive_recv(&mut self, cx: &mut Context, now: Instant) -> Result<bool, io::Error> {
         let get_time = || self.runtime.now();
         self.recv_state.recv_limiter.start_cycle(get_time);
+        if self
+            .prev_socket_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.prev_socket = None;
+            self.prev_socket_deadline = None;
+        }
+        let mut keep_going = false;
         if let Some(socket) = &self.prev_socket {
-            // We don't care about the `PollProgress` from old sockets.
-            let poll_res =
-                self.recv_state
-                    .poll_socket(cx, &mut self.inner, &**socket, &*self.runtime, now);
-            if poll_res.is_err() {
-                self.prev_socket = None;
+            match self
+                .recv_state
+                .poll_socket(cx, &mut self.inner, &**socket, &*self.runtime, now)
+            {
+                // The work limiter may end the poll with datagrams left in the
+                // old socket and no waker registered on it: come back for
+                // them, or they wait for an unrelated wake-up.
+                Ok(poll_res) => keep_going |= poll_res.keep_going,
+                Err(_) => {
+                    self.prev_socket = None;
+                    self.prev_socket_deadline = None;
+                }
             }
         };
         let poll_res =
@@ -506,12 +535,18 @@ impl State {
                 .poll_socket(cx, &mut self.inner, &*self.socket, &*self.runtime, now);
         self.recv_state.recv_limiter.finish_cycle(get_time);
         let poll_res = poll_res?;
-        if poll_res.received_connection_packet {
-            // Traffic has arrived on self.socket, therefore there is no need for the abandoned
-            // one anymore. TODO: Account for multiple outgoing connections.
-            self.prev_socket = None;
+        if poll_res.received_connection_packet
+            && self.prev_socket.is_some()
+            && self.prev_socket_deadline.is_none()
+        {
+            // Traffic has arrived on self.socket: the peer knows the new path.
+            // What it sent before that, and what it sends until it has moved
+            // over, is still on its way to the abandoned socket, so that one
+            // is kept for a while longer instead of being closed under those
+            // datagrams. TODO: Account for multiple outgoing connections.
+            self.prev_socket_deadline = Some(now + PREV_SOCKET_GRACE);
         }
-        Ok(poll_res.keep_going)
+        Ok(keep_going | poll_res.keep_going)
     }
 
     fn handle_events(&mut self, cx: &mut Context, shared: &Shared) -> bool {
@@ -690,15 +725,16 @@ impl EndpointRef {
             shared: Shared {
                 incoming: Notify::new(),
                 idle: Notify::new(),
+                ref_count: AtomicUsize::new(0),
             },
             state: Mutex::new(State {
                 socket,
                 prev_socket: None,
+                prev_socket_deadline: None,
                 inner,
                 ipv6,
                 events,
                 driver: None,
-                ref_count: 0,
                 driver_lost: false,
                 recv_state,
                 runtime,
@@ -710,23 +746,22 @@ impl EndpointRef {
 
 impl Clone for EndpointRef {
     fn clone(&self) -> Self {
-        self.0.state.lock().unwrap().ref_count += 1;
+        self.0.shared.ref_count.fetch_add(1, Ordering::Relaxed);
         Self(self.0.clone())
     }
 }
 
 impl Drop for EndpointRef {
     fn drop(&mut self) {
+        if self.shared.ref_count.fetch_sub(1, Ordering::Relaxed) > 1 {
+            return;
+        }
+
         let endpoint = &mut *self.0.state.lock().unwrap();
-        if let Some(x) = endpoint.ref_count.checked_sub(1) {
-            endpoint.ref_count = x;
-            if x == 0 {
-                // If the driver is about to be on its own, ensure it can shut down if the last
-                // connection is gone.
-                if let Some(task) = endpoint.driver.take() {
-                    task.wake();
-                }
-            }
+        // If the driver is about to be on its own, ensure it can shut down if the last
+        // connection is gone.
+        if let Some(task) = endpoint.driver.take() {
+            task.wake();
         }
     }
 }
