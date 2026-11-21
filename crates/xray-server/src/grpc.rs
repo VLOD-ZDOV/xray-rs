@@ -107,11 +107,7 @@ impl Handler {
 
         let path = req.uri().path();
         if !path_matches(path, &self.settings.service_name) {
-            crate::log::debug!(
-                "grpc: path mismatch {:?} from {}",
-                path,
-                log::mask(peer)
-            );
+            crate::log::debug!("grpc: path mismatch {:?} from {}", path, log::mask(peer));
             return status(StatusCode::NOT_FOUND);
         }
 
@@ -140,10 +136,7 @@ impl Handler {
                     ))
                     .await
                     {
-                        crate::log::info!(
-                            "trojan-grpc from {} rejected: {e}",
-                            log::mask(peer)
-                        );
+                        crate::log::info!("trojan-grpc from {} rejected: {e}", log::mask(peer));
                     }
                 });
             }
@@ -252,10 +245,7 @@ where
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(std::time::Duration::from_secs(4));
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
-        crate::log::debug!(
-            "grpc connection from {} ended: {e}",
-            log::mask(peer)
-        );
+        crate::log::debug!("grpc connection from {} ended: {e}", log::mask(peer));
     }
 }
 

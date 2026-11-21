@@ -488,7 +488,8 @@ pub async fn start(
             };
             crate::log::info!(
                 "listening {} (masque over h2) on {}",
-                inbound_tag, bind_addr
+                inbound_tag,
+                bind_addr
             );
 
             let acceptor = tokio_rustls::TlsAcceptor::from(rustls_cfg);
@@ -619,7 +620,8 @@ pub async fn start(
             };
             crate::log::info!(
                 "listening {} (masque over h3) on {}",
-                inbound_tag, bind_addr
+                inbound_tag,
+                bind_addr
             );
 
             let u = users.clone();

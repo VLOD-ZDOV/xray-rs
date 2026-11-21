@@ -1090,9 +1090,7 @@ pub const DEFAULT_FINAL_BLOCK: FinalBlock = FinalBlock {
 fn parse_final_block(raw: &Value, block: bool, at: &str) -> Result<FinalBlock, String> {
     let mut delay = raw.get("delay").filter(|v| !v.is_null());
     if let Some(old) = raw.get("blockDelay").filter(|v| !v.is_null()) {
-        crate::log::warn!(
-            "{at}: finalRules.blockDelay is deprecated, use finalRules.delay"
-        );
+        crate::log::warn!("{at}: finalRules.blockDelay is deprecated, use finalRules.delay");
         delay = Some(old);
     }
     let level = str_field(raw, "logLevel");
@@ -3343,7 +3341,9 @@ mod tests {
             ],
             "routing": {"rules": [{"port": "18973", "outboundTag": "block"}]}
         }));
-        let decision = r.route(&query(Some("127.0.0.1"), Some("127.0.0.1"), 18973)).await;
+        let decision = r
+            .route(&query(Some("127.0.0.1"), Some("127.0.0.1"), 18973))
+            .await;
         assert_eq!(decision.tag, "block");
         assert_eq!(decision.action, Action::Block(BlockAction::Http403));
     }

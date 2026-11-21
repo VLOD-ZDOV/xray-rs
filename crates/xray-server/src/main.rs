@@ -1060,10 +1060,7 @@ async fn accept_loop(
                         leftover
                     }
                     Ok(Err(e)) => {
-                        crate::log::info!(
-                            "proxy protocol from {} rejected: {e}",
-                            log::mask(peer)
-                        );
+                        crate::log::info!("proxy protocol from {} rejected: {e}", log::mask(peer));
                         return;
                     }
                     Err(_) => {
@@ -1110,10 +1107,9 @@ async fn accept_loop(
                         .await
                     }
                     Ok(None) => {}
-                    Err(e) => crate::log::debug!(
-                        "reality handling from {} failed: {e}",
-                        log::mask(peer)
-                    ),
+                    Err(e) => {
+                        crate::log::debug!("reality handling from {} failed: {e}", log::mask(peer))
+                    }
                 }
             } else {
                 match (tls, http_obfs) {
@@ -1139,7 +1135,9 @@ async fn accept_loop(
                             }
                         };
                         let acceptor = if !offered_alpn.is_empty()
-                            && !offered_alpn.iter().any(|offered| acceptor.alpn.contains(offered))
+                            && !offered_alpn
+                                .iter()
+                                .any(|offered| acceptor.alpn.contains(offered))
                         {
                             &acceptor.without_alpn
                         } else {
@@ -1188,10 +1186,9 @@ async fn accept_loop(
                                 )
                                 .await
                             }
-                            Ok(Err(e)) => crate::log::debug!(
-                                "http obfs from {} failed: {e}",
-                                log::mask(peer)
-                            ),
+                            Ok(Err(e)) => {
+                                crate::log::debug!("http obfs from {} failed: {e}", log::mask(peer))
+                            }
                             Err(_) => {
                                 crate::log::debug!("http obfs from {} timed out", log::mask(peer))
                             }
@@ -1410,10 +1407,7 @@ async fn dispatch(
                     }
                 }
                 Err(e) => {
-                    crate::log::info!(
-                        "httpupgrade handshake from {} failed: {e}",
-                        log::mask(peer)
-                    );
+                    crate::log::info!("httpupgrade handshake from {} failed: {e}", log::mask(peer));
                 }
             }
         }),
@@ -1465,10 +1459,7 @@ async fn dispatch(
                     }
                 }
                 Err(e) => {
-                    crate::log::info!(
-                        "httpupgrade handshake from {} failed: {e}",
-                        log::mask(peer)
-                    );
+                    crate::log::info!("httpupgrade handshake from {} failed: {e}", log::mask(peer));
                 }
             }
         }),
@@ -1508,10 +1499,7 @@ async fn dispatch(
                     }
                 }
                 Err(e) => {
-                    crate::log::info!(
-                        "httpupgrade handshake from {} failed: {e}",
-                        log::mask(peer)
-                    );
+                    crate::log::info!("httpupgrade handshake from {} failed: {e}", log::mask(peer));
                 }
             }
         }),
@@ -1530,10 +1518,7 @@ async fn dispatch(
         InboundHandler::Shadowsocks(ctx) => Box::pin(async move {
             let raw = stream.raw_tcp_socket();
             if let Err(e) = shadowsocks::serve_tcp(stream, &ctx, peer, raw).await {
-                crate::log::info!(
-                    "shadowsocks from {} rejected: {e}",
-                    log::mask(peer)
-                );
+                crate::log::info!("shadowsocks from {} rejected: {e}", log::mask(peer));
             }
         }),
         InboundHandler::Dokodemo(ctx, settings) => Box::pin(async move {
@@ -1626,10 +1611,7 @@ impl<I: AsyncRead + AsyncWrite + Unpin> AsyncRead for HeaderDeadline<I> {
                 self.head_len += head;
                 if self.head_len > self.limit + 4096 {
                     let _ = Pin::new(&mut self.io).poll_write(cx, HEADERS_TOO_LARGE);
-                    crate::log::debug!(
-                        "xhttp: request headers over {} bytes",
-                        self.head_len
-                    );
+                    crate::log::debug!("xhttp: request headers over {} bytes", self.head_len);
                     return std::task::Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "request headers too large",
@@ -1765,10 +1747,7 @@ where
         tail: [0; 3],
     };
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
-        crate::log::debug!(
-            "http connection from {} ended: {e}",
-            log::mask(peer)
-        );
+        crate::log::debug!("http connection from {} ended: {e}", log::mask(peer));
     }
 }
 

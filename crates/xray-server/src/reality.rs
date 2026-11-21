@@ -582,10 +582,7 @@ impl RealityServer {
                 return Ok(None);
             }
             Err(_) => {
-                crate::log::debug!(
-                    "reality handshake from {} timed out",
-                    log::mask(peer)
-                );
+                crate::log::debug!("reality handshake from {} timed out", log::mask(peer));
                 return Ok(None);
             }
         }
@@ -608,10 +605,7 @@ impl RealityServer {
                 return Ok(None);
             }
             Err(_) => {
-                crate::log::debug!(
-                    "reality handshake from {} timed out",
-                    log::mask(peer)
-                );
+                crate::log::debug!("reality handshake from {} timed out", log::mask(peer));
                 return Ok(None);
             }
         }
@@ -2219,7 +2213,10 @@ mod tests {
         assert_eq!(hybrid.map(|h| h.1), Some([2; 32]));
         assert!(find_client_key_shares(&hello_with_shares(&[h])).1.is_some());
         for bad in [&[x][..], &[x, h], &[h, h, x]] {
-            assert_eq!(find_client_key_shares(&hello_with_shares(bad)), (None, None));
+            assert_eq!(
+                find_client_key_shares(&hello_with_shares(bad)),
+                (None, None)
+            );
         }
     }
 

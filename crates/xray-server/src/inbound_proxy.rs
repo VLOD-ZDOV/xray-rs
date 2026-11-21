@@ -20,10 +20,10 @@ use xray_routing::{Target, TargetAddr};
 use crate::httpupgrade::PrefixedStream;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::Action;
+use crate::stats;
 use crate::vless::{
     copy_buf, host_label, read_first, relay_policy, Activity, Context, Host, RouteRequest,
 };
-use crate::stats;
 
 /// Xray's SOCKS inbound (also named `mixed`): the first byte picks SOCKS 5,
 /// SOCKS 4/4a, or HTTP on the same port.

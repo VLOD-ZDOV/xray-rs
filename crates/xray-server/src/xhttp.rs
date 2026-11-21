@@ -117,10 +117,7 @@ impl Handler {
         }
         let path = req.uri().path().to_owned();
         let Some(rest) = path.strip_prefix(s.path.as_str()) else {
-            crate::log::debug!(
-                "xhttp: path mismatch {path:?} from {}",
-                log::mask(peer)
-            );
+            crate::log::debug!("xhttp: path mismatch {path:?} from {}", log::mask(peer));
             return status(StatusCode::NOT_FOUND);
         };
 
@@ -313,10 +310,7 @@ impl Handler {
         }
         let path = req.uri().path().to_owned();
         let Some(rest) = path.strip_prefix(s.path.as_str()) else {
-            crate::log::debug!(
-                "xhttp: path mismatch {path:?} from {}",
-                log::mask(peer)
-            );
+            crate::log::debug!("xhttp: path mismatch {path:?} from {}", log::mask(peer));
             let _ = stream.send_response(h3_status(StatusCode::NOT_FOUND)).await;
             let _ = stream.finish().await;
             return;

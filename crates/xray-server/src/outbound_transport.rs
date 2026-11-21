@@ -627,7 +627,9 @@ pub(crate) fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, Str
             Host::Domain(d) => d.clone(),
             Host::Ip(ip) => ip.to_string(),
         });
-    if tls.get("allowInsecure").is_some_and(|value| !value.is_null())
+    if tls
+        .get("allowInsecure")
+        .is_some_and(|value| !value.is_null())
         && tls.get("allowInsecure").and_then(Value::as_bool).is_none()
     {
         return Err("tlsSettings.allowInsecure must be a boolean".into());

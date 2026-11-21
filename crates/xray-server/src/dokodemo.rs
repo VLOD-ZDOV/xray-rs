@@ -68,10 +68,7 @@ where
     let (host, port) = settings.target_for(ctx.port, original);
 
     if port == ctx.port && matches!(&host, Host::Ip(ip) if ip.is_loopback()) {
-        crate::log::info!(
-            "loopback connection detected from {}",
-            log::mask(peer)
-        );
+        crate::log::info!("loopback connection detected from {}", log::mask(peer));
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             "loopback connection detected",
@@ -224,10 +221,7 @@ impl DokodemoUdpHandler {
                 if let Err(e) =
                     serve_udp_session(reply, ctx, peer, (host, port), packet, rx, level).await
                 {
-                    crate::log::debug!(
-                        "dokodemo udp session {} ended: {e}",
-                        log::mask(peer)
-                    );
+                    crate::log::debug!("dokodemo udp session {} ended: {e}", log::mask(peer));
                 }
                 let mut map = map.lock().await;
                 if map.get(&key).is_some_and(|cur| cur.same_channel(&tx)) {

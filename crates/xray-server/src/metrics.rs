@@ -112,9 +112,7 @@ fn respond(path: &str) -> Response<Full<Bytes>> {
             let mut response = Response::new(Full::new(Bytes::from(prometheus_metrics())));
             response.headers_mut().insert(
                 hyper::header::CONTENT_TYPE,
-                hyper::header::HeaderValue::from_static(
-                    "text/plain; version=0.0.4; charset=utf-8",
-                ),
+                hyper::header::HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
             );
             response
         }
@@ -136,7 +134,10 @@ fn prometheus_metrics() -> String {
     let mut out = String::new();
     out.push_str("# HELP xray_uptime_seconds Process uptime in seconds\n");
     out.push_str("# TYPE xray_uptime_seconds gauge\n");
-    out.push_str(&format!("xray_uptime_seconds {}\n\n", stats::get().uptime_secs()));
+    out.push_str(&format!(
+        "xray_uptime_seconds {}\n\n",
+        stats::get().uptime_secs()
+    ));
 
     out.push_str("# HELP xray_traffic_bytes_total Total bytes transferred\n");
     out.push_str("# TYPE xray_traffic_bytes_total counter\n");
@@ -178,9 +179,7 @@ fn prometheus_metrics() -> String {
                     s.outbound_tag
                 ));
             }
-            out.push_str(
-                "\n# HELP xray_observatory_delay_ms Outbound delay in milliseconds\n",
-            );
+            out.push_str("\n# HELP xray_observatory_delay_ms Outbound delay in milliseconds\n");
             out.push_str("# TYPE xray_observatory_delay_ms gauge\n");
             for s in &statuses {
                 out.push_str(&format!(

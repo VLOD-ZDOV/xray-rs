@@ -15,10 +15,16 @@ use tokio::sync::{watch, Notify};
 use tokio::time;
 use xray_routing::{DnsHostTarget, DnsIpFilter, DomainHostIndex, DomainMatcherSet};
 
+use crate::dns_pool::{
+    exchange_pooled, DnsConnectionKey, DnsConnectionPool, DnsConnectionRoute, DnsExchangeFailure,
+    DnsPooledConnection, DnsPooledExchange, DNS_HTTPS_IDLE_TIMEOUT, DNS_HTTPS_READ_IDLE,
+    DNS_QUIC_IDLE_TIMEOUT, MAX_POOLED_DNS_CONNECTIONS,
+};
+use crate::stream::xhttp::{connect_h2_with_keepalive, H2Client, H2Error};
 use crate::{
     canonicalize_socket_addr, connect_tcp_happy_eyeballs, BoxedTransportStream,
-    HappyEyeballsConfig, RouteFamilies, RouteProbe, SocketHandle, SocketProtector, TlsClientConfig,
-    TlsConnector, TransportError,
+    HappyEyeballsConfig, NetworkChanges, RouteFamilies, RouteProbe, SocketHandle, SocketProtector,
+    TlsClientConfig, TlsConnector, TransportError,
 };
 
 /// A DNS lookup result containing every usable address and its remaining TTL.
@@ -772,7 +778,7 @@ impl DnsResolver for CachingDnsResolver {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum NameServer {
     Socket(SocketAddr),
     Domain { domain: String, port: u16 },
@@ -950,6 +956,9 @@ struct DirectDnsQueryTransport {
     bootstrap_resolver: Arc<dyn DnsResolver>,
     socket_protector: Option<Arc<dyn SocketProtector>>,
     tls_connector: Result<Arc<TlsConnector>, String>,
+    /// This transport has no network change signal: its connections go by
+    /// their idle timeouts and by the errors of the queries sent on them.
+    connections: DnsConnectionPools,
 }
 
 impl DirectDnsQueryTransport {
@@ -963,6 +972,7 @@ impl DirectDnsQueryTransport {
             tls_connector: TlsConnector::system()
                 .map(Arc::new)
                 .map_err(|error| error.to_string()),
+            connections: DnsConnectionPools::new(NetworkChanges::default()),
         }
     }
 
@@ -1033,6 +1043,7 @@ impl DnsQueryTransport for DirectDnsQueryTransport {
                     io::Error::other(format!("DNS TLS connector unavailable: {message}"))
                 })?;
                 exchange_direct_https_candidates(
+                    &self.connections,
                     server,
                     &server_addrs,
                     https_path,
@@ -1053,6 +1064,7 @@ impl DnsQueryTransport for DirectDnsQueryTransport {
                     io::Error::other(format!("DNS TLS connector unavailable: {message}"))
                 })?;
                 exchange_dns_quic_candidates(
+                    &self.connections,
                     server,
                     &server_addrs,
                     query,
@@ -1065,8 +1077,126 @@ impl DnsQueryTransport for DirectDnsQueryTransport {
     }
 }
 
-/// Exchanges one DNS message over the first usable protected QUIC candidate.
+/// The DNS-over-HTTPS and DNS-over-QUIC connections one DNS transport keeps
+/// between queries: one per server and route, dropped when it fails a query,
+/// closes, sits idle or outlives an OS network change. Dropping the pools
+/// closes every connection no query is still using.
+pub struct DnsConnectionPools {
+    https: DnsConnectionPool<H2Client>,
+    quic: DnsConnectionPool<DoqConnection>,
+}
+
+impl DnsConnectionPools {
+    /// Pools whose connections are dropped, not moved, when `network_changes`
+    /// report a change: the next query dials on the new network.
+    pub fn new(network_changes: NetworkChanges) -> Self {
+        Self::with_idle_timeouts(
+            network_changes,
+            DNS_HTTPS_IDLE_TIMEOUT,
+            DNS_QUIC_IDLE_TIMEOUT,
+        )
+    }
+
+    fn with_idle_timeouts(
+        network_changes: NetworkChanges,
+        https_idle_timeout: Duration,
+        quic_idle_timeout: Duration,
+    ) -> Self {
+        Self {
+            https: DnsConnectionPool::new(
+                network_changes.clone(),
+                https_idle_timeout,
+                MAX_POOLED_DNS_CONNECTIONS,
+            ),
+            quic: DnsConnectionPool::new(
+                network_changes,
+                quic_idle_timeout,
+                MAX_POOLED_DNS_CONNECTIONS,
+            ),
+        }
+    }
+
+    /// How many DNS-over-HTTPS connections are kept right now.
+    pub fn https_connections(&self) -> usize {
+        self.https.len()
+    }
+
+    /// How many DNS-over-QUIC connections are kept right now.
+    pub fn quic_connections(&self) -> usize {
+        self.quic.len()
+    }
+}
+
+impl DnsPooledConnection for H2Client {
+    fn is_live(&self) -> bool {
+        H2Client::is_live(self)
+    }
+}
+
+/// One DNS-over-QUIC connection and the endpoint that owns its socket. QUIC
+/// closes it with `DOQ_NO_ERROR` when the last clone is dropped.
+#[derive(Clone)]
+struct DoqConnection {
+    connection: quinn::Connection,
+    _endpoint: quinn::Endpoint,
+}
+
+impl DnsPooledConnection for DoqConnection {
+    fn is_live(&self) -> bool {
+        self.connection.close_reason().is_none()
+    }
+}
+
+struct DnsQuicExchange<'a> {
+    server_addrs: &'a [SocketAddr],
+    connect: crate::stream::H3ConnectConfig,
+    query: &'a [u8],
+}
+
+#[async_trait]
+impl DnsPooledExchange for DnsQuicExchange<'_> {
+    type Connection = DoqConnection;
+
+    async fn dial(&self, failed: &[SocketAddr]) -> io::Result<(DoqConnection, Option<SocketAddr>)> {
+        let mut last_error = None;
+        for remote_addr in self.server_addrs.iter().copied() {
+            if failed.contains(&remote_addr) {
+                continue;
+            }
+            let config = crate::stream::H3ConnectConfig {
+                remote_addr,
+                ..self.connect.clone()
+            };
+            match crate::stream::connect_quic_transport(config, b"doq").await {
+                Ok((endpoint, connection, _, _)) => {
+                    return Ok((
+                        DoqConnection {
+                            connection,
+                            _endpoint: endpoint,
+                        },
+                        Some(remote_addr),
+                    ));
+                }
+                Err(error) => last_error = Some(io::Error::other(error)),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "DNS-over-QUIC server has no usable address",
+            )
+        }))
+    }
+
+    async fn exchange(&self, connection: &DoqConnection) -> Result<Vec<u8>, DnsExchangeFailure> {
+        exchange_dns_quic_stream(&connection.connection, self.query).await
+    }
+}
+
+/// Exchanges one DNS message on its own stream of the QUIC connection kept
+/// for `server`, dialing the first usable protected candidate when none is.
 pub async fn exchange_dns_quic_candidates(
+    pools: &DnsConnectionPools,
     server: &NameServer,
     server_addrs: &[SocketAddr],
     query: &[u8],
@@ -1083,91 +1213,166 @@ pub async fn exchange_dns_quic_candidates(
     let tls_config = tls_connector
         .quic_client_config_for(&tls, b"doq")
         .map_err(io::Error::other)?;
-    let server_name = tls.server_name;
-    let mut last_error = None;
-    for remote_addr in server_addrs.iter().copied() {
-        let config = crate::stream::H3ConnectConfig {
-            remote_addr,
-            server_name: server_name.clone(),
-            tls_config: Arc::clone(&tls_config),
-            socket_protector: socket_protector.clone(),
-            quic: crate::stream::H3QuicConfig::default(),
+    let exchange = DnsQuicExchange {
+        server_addrs,
+        connect: crate::stream::H3ConnectConfig {
+            // Replaced by each candidate in turn.
+            remote_addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            server_name: tls.server_name,
+            tls_config,
+            socket_protector,
+            quic: crate::stream::H3QuicConfig {
+                max_idle_timeout: DNS_QUIC_IDLE_TIMEOUT,
+                ..crate::stream::H3QuicConfig::default()
+            },
             realm: None,
+            // A network change drops the connection; see `DnsConnectionPools`.
             network_changes: None,
-        };
-        let (endpoint, connection, _, _) =
-            match crate::stream::connect_quic_transport(config, b"doq").await {
-                Ok(connected) => connected,
-                Err(error) => {
-                    last_error = Some(io::Error::other(error));
-                    continue;
-                }
-            };
-        let result = exchange_dns_quic_stream(&connection, query).await;
-        let code = quinn::VarInt::from_u32(0);
-        connection.close(code, b"DNS-over-QUIC exchange complete");
-        endpoint.close(code, b"DNS-over-QUIC exchange complete");
-        match result {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "DNS-over-QUIC server has no usable address",
-        )
-    }))
+        },
+        query,
+    };
+    let key = DnsConnectionKey {
+        server: server.clone(),
+        route: DnsConnectionRoute::Local,
+    };
+    exchange_pooled(&pools.quic, &key, &exchange).await
 }
 
 async fn exchange_dns_quic_stream(
     connection: &quinn::Connection,
     query: &[u8],
-) -> io::Result<Vec<u8>> {
-    let (mut send, mut recv) = connection.open_bi().await.map_err(io::Error::other)?;
-    send.write_u16(u16::try_from(query.len()).map_err(|_| {
-        io::Error::new(
+) -> Result<Vec<u8>, DnsExchangeFailure> {
+    let query_len = u16::try_from(query.len()).map_err(|_| {
+        DnsExchangeFailure::rejected(io::Error::new(
             io::ErrorKind::InvalidInput,
             "DNS-over-QUIC query is too large",
-        )
-    })?)
-    .await?;
-    send.write_all(query).await?;
-    send.finish().map_err(io::Error::other)?;
-
-    let response_len = usize::from(recv.read_u16().await?);
+        ))
+    })?;
+    // Until the response length arrives the server has answered nothing.
+    let mut recv = async {
+        let (mut send, mut recv) = connection.open_bi().await.map_err(io::Error::other)?;
+        send.write_u16(query_len).await?;
+        send.write_all(query).await?;
+        send.finish().map_err(io::Error::other)?;
+        Ok::<_, io::Error>((recv.read_u16().await?, recv))
+    }
+    .await
+    .map_err(DnsExchangeFailure::unanswered)?;
+    let response_len = usize::from(recv.0);
     if response_len == 0 {
-        return Err(io::Error::new(
+        return Err(DnsExchangeFailure::rejected(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS-over-QUIC response is empty",
-        ));
+        )));
     }
     let mut response = vec![0; response_len];
-    recv.read_exact(&mut response)
+    recv.1
+        .read_exact(&mut response)
         .await
-        .map_err(io::Error::other)?;
-    let trailing = recv.read_to_end(0).await.map_err(io::Error::other)?;
+        .map_err(|error| DnsExchangeFailure::rejected(io::Error::other(error)))?;
+    let trailing = recv
+        .1
+        .read_to_end(0)
+        .await
+        .map_err(|error| DnsExchangeFailure::rejected(io::Error::other(error)))?;
     debug_assert!(trailing.is_empty());
     Ok(response)
 }
 
-/// Exchanges one RFC 8484 POST over an already authenticated HTTP/2 stream.
+/// Opens the stream a DNS-over-HTTPS connection runs on: TCP to the server,
+/// direct or through a proxy, then TLS that offers `h2`.
+#[async_trait]
+pub trait DnsHttpsDialer: Send + Sync {
+    /// Dials the server, passing over the `failed` addresses. The address
+    /// reached is `None` when the dialer cannot tell, as through a proxy;
+    /// such a connection is not replaced by another candidate when its first
+    /// query fails.
+    async fn dial(
+        &self,
+        failed: &[SocketAddr],
+    ) -> io::Result<(BoxedTransportStream, Option<SocketAddr>)>;
+}
+
+struct DnsHttpsExchange<'a> {
+    dialer: &'a dyn DnsHttpsDialer,
+    server: &'a NameServer,
+    https_path: &'a str,
+    query: &'a [u8],
+}
+
+#[async_trait]
+impl DnsPooledExchange for DnsHttpsExchange<'_> {
+    type Connection = H2Client;
+
+    async fn dial(&self, failed: &[SocketAddr]) -> io::Result<(H2Client, Option<SocketAddr>)> {
+        let mut failed = failed.to_vec();
+        loop {
+            let (stream, peer) = self.dialer.dial(&failed).await?;
+            match connect_h2_with_keepalive(stream, Some(DNS_HTTPS_READ_IDLE)).await {
+                Ok(client) => return Ok((client, peer)),
+                Err(error) => match peer {
+                    Some(peer) => failed.push(peer),
+                    None => return Err(io::Error::other(error)),
+                },
+            }
+        }
+    }
+
+    async fn exchange(&self, client: &H2Client) -> Result<Vec<u8>, DnsExchangeFailure> {
+        exchange_dns_https_request(client, self.server, self.https_path, self.query).await
+    }
+}
+
+/// Exchanges one RFC 8484 POST as a stream of the HTTP/2 connection kept for
+/// `key`, dialing it with `dialer` when none is.
+pub async fn exchange_dns_https_pooled(
+    pools: &DnsConnectionPools,
+    key: &DnsConnectionKey,
+    dialer: &dyn DnsHttpsDialer,
+    https_path: &str,
+    query: &[u8],
+) -> io::Result<Vec<u8>> {
+    let exchange = DnsHttpsExchange {
+        dialer,
+        server: &key.server,
+        https_path,
+        query,
+    };
+    exchange_pooled(&pools.https, key, &exchange).await
+}
+
+/// Exchanges one RFC 8484 POST over an already authenticated stream, on an
+/// HTTP/2 connection of its own.
 pub async fn exchange_dns_https_h2(
     stream: BoxedTransportStream,
     server: &NameServer,
     https_path: &str,
     query: &[u8],
 ) -> io::Result<Vec<u8>> {
+    let client = crate::stream::connect_h2(stream)
+        .await
+        .map_err(io::Error::other)?;
+    exchange_dns_https_request(&client, server, https_path, query)
+        .await
+        .map_err(|failure| failure.error)
+}
+
+async fn exchange_dns_https_request(
+    client: &H2Client,
+    server: &NameServer,
+    https_path: &str,
+    query: &[u8],
+) -> Result<Vec<u8>, DnsExchangeFailure> {
+    let invalid = |message: &'static str| {
+        DnsExchangeFailure::rejected(io::Error::new(io::ErrorKind::InvalidInput, message))
+    };
     if query.len() > usize::from(u16::MAX) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "DNS-over-HTTPS query is too large",
-        ));
+        return Err(invalid("DNS-over-HTTPS query is too large"));
     }
     let authority = dns_https_authority(server);
     let uri = format!("https://{authority}{https_path}")
         .parse::<http::Uri>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid DNS-over-HTTPS URI"))?;
+        .map_err(|_| invalid("invalid DNS-over-HTTPS URI"))?;
     let request = Request::builder()
         .method(Method::POST)
         .uri(uri)
@@ -1175,38 +1380,40 @@ pub async fn exchange_dns_https_h2(
         .header(header::ACCEPT, "application/dns-message")
         .header(header::CONTENT_LENGTH, query.len())
         .body(())
-        .map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid DNS-over-HTTPS request",
-            )
-        })?;
-    let client = crate::stream::connect_h2(stream)
-        .await
-        .map_err(io::Error::other)?;
+        .map_err(|_| invalid("invalid DNS-over-HTTPS request"))?;
     let body = client
         .send_fixed(request, Bytes::copy_from_slice(query))
         .await
-        .map_err(io::Error::other)?;
+        .map_err(|error| {
+            // A status is an answer; anything else failed before one came.
+            let answered = matches!(error, H2Error::UnexpectedStatus { .. });
+            let error = io::Error::other(error);
+            if answered {
+                DnsExchangeFailure::rejected(error)
+            } else {
+                DnsExchangeFailure::unanswered(error)
+            }
+        })?;
     let content_type = body
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok());
     if content_type != Some("application/dns-message") {
-        return Err(io::Error::new(
+        return Err(DnsExchangeFailure::rejected(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS-over-HTTPS response has an invalid content type",
-        ));
+        )));
     }
     let mut response = Vec::new();
     body.take((MAX_DNS_HTTPS_RESPONSE_SIZE + 1) as u64)
         .read_to_end(&mut response)
-        .await?;
+        .await
+        .map_err(DnsExchangeFailure::rejected)?;
     if response.len() > MAX_DNS_HTTPS_RESPONSE_SIZE {
-        return Err(io::Error::new(
+        return Err(DnsExchangeFailure::rejected(io::Error::new(
             io::ErrorKind::InvalidData,
             "DNS-over-HTTPS response is too large",
-        ));
+        )));
     }
     Ok(response)
 }
@@ -2803,6 +3010,7 @@ async fn exchange_direct_tls_candidates(
 }
 
 async fn exchange_direct_https_candidates(
+    pools: &DnsConnectionPools,
     server: &NameServer,
     server_addrs: &[SocketAddr],
     https_path: &str,
@@ -2810,37 +3018,63 @@ async fn exchange_direct_https_candidates(
     socket_protector: Option<&dyn SocketProtector>,
     tls_connector: &TlsConnector,
 ) -> io::Result<Vec<u8>> {
-    let tls = dns_https_tls_client_config(server);
-    let mut remaining = server_addrs.to_vec();
-    let mut last_error = None;
-    while !remaining.is_empty() {
-        let (stream, peer_addr) =
-            match open_direct_tcp_candidates_with_peer(&remaining, socket_protector).await {
-                Ok(connected) => connected,
-                Err(error) => {
-                    last_error = Some(error);
-                    break;
-                }
-            };
-        remaining.retain(|candidate| canonicalize_socket_addr(*candidate) != peer_addr);
-        let stream = match tls_connector.connect_stream(stream, &tls).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                last_error = Some(io::Error::other(error));
-                continue;
+    let dialer = DirectDnsHttpsDialer {
+        server,
+        server_addrs,
+        socket_protector,
+        tls_connector,
+    };
+    let key = DnsConnectionKey {
+        server: server.clone(),
+        route: DnsConnectionRoute::Local,
+    };
+    exchange_dns_https_pooled(pools, &key, &dialer, https_path, query).await
+}
+
+struct DirectDnsHttpsDialer<'a> {
+    server: &'a NameServer,
+    server_addrs: &'a [SocketAddr],
+    socket_protector: Option<&'a dyn SocketProtector>,
+    tls_connector: &'a TlsConnector,
+}
+
+#[async_trait]
+impl DnsHttpsDialer for DirectDnsHttpsDialer<'_> {
+    async fn dial(
+        &self,
+        failed: &[SocketAddr],
+    ) -> io::Result<(BoxedTransportStream, Option<SocketAddr>)> {
+        let tls = dns_https_tls_client_config(self.server);
+        let mut remaining: Vec<SocketAddr> = self
+            .server_addrs
+            .iter()
+            .copied()
+            .filter(|candidate| !failed.contains(&canonicalize_socket_addr(*candidate)))
+            .collect();
+        let mut last_error = None;
+        while !remaining.is_empty() {
+            let (stream, peer_addr) =
+                match open_direct_tcp_candidates_with_peer(&remaining, self.socket_protector).await
+                {
+                    Ok(connected) => connected,
+                    Err(error) => {
+                        last_error = Some(error);
+                        break;
+                    }
+                };
+            remaining.retain(|candidate| canonicalize_socket_addr(*candidate) != peer_addr);
+            match self.tls_connector.connect_stream(stream, &tls).await {
+                Ok(stream) => return Ok((stream, Some(peer_addr))),
+                Err(error) => last_error = Some(io::Error::other(error)),
             }
-        };
-        match exchange_dns_https_h2(stream, server, https_path, query).await {
-            Ok(response) => return Ok(response),
-            Err(error) => last_error = Some(error),
         }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "DNS-over-HTTPS server has no usable address",
+            )
+        }))
     }
-    Err(last_error.unwrap_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "DNS-over-HTTPS server has no usable address",
-        )
-    }))
 }
 
 fn dns_tls_client_config(server: &NameServer) -> TlsClientConfig {
@@ -3323,16 +3557,28 @@ pub(crate) fn read_dns_name(packet: &[u8], offset: &mut usize) -> io::Result<Str
     read_dns_name_limited(packet, offset, packet.len())
 }
 
+/// The longest name, its labels each with a dot after it, that Go's
+/// `dnsmessage` reads, as RFC 1035 bounds a name to 255 octets on the wire.
+/// A longer one fails the whole message here, where Xray-core's DNS client
+/// keeps the answers it read before the record that carries it.
+const DNS_NAME_MAX: usize = 254;
+
+/// The most compression pointers one name follows, as in Go's `dnsmessage`.
+/// Labels need no count of their own: `DNS_NAME_MAX` ends them first.
+const DNS_NAME_MAX_POINTERS: usize = 10;
+
 fn read_dns_name_limited(packet: &[u8], offset: &mut usize, limit: usize) -> io::Result<String> {
     if limit > packet.len() || *offset > limit {
         return Err(invalid_dns_response("invalid dns name limit"));
     }
 
     let mut labels = Vec::new();
+    let mut name_len = 0;
+    let mut pointers = 0;
     let mut cursor = *offset;
     let mut jumped = false;
 
-    for _ in 0..32 {
+    loop {
         if !jumped && cursor >= limit {
             return Err(invalid_dns_response("truncated dns name"));
         }
@@ -3347,6 +3593,12 @@ fn read_dns_name_limited(packet: &[u8], offset: &mut usize, limit: usize) -> io:
             let Some(&next) = packet.get(cursor + 1) else {
                 return Err(invalid_dns_response("truncated dns name pointer"));
             };
+            // Pointers that only lead to one another add no label, so
+            // nothing else would end their loop.
+            pointers += 1;
+            if pointers > DNS_NAME_MAX_POINTERS {
+                return Err(invalid_dns_response("too many dns name pointers"));
+            }
             if !jumped {
                 *offset = cursor + 2;
             }
@@ -3377,13 +3629,18 @@ fn read_dns_name_limited(packet: &[u8], offset: &mut usize, limit: usize) -> io:
         if label_end > packet.len() {
             return Err(invalid_dns_response("truncated dns label"));
         }
+        // This bounds the labels too, as each adds two octets or more.
+        // Without it a name could take as many labels as the message holds,
+        // and every record of a 64 KB answer could point at it and copy it.
+        name_len += label_len + 1;
+        if name_len > DNS_NAME_MAX {
+            return Err(invalid_dns_response("dns name exceeds 255 octets"));
+        }
         let label = std::str::from_utf8(&packet[cursor..label_end])
             .map_err(|_| invalid_dns_response("dns label is not utf-8"))?;
         labels.push(label.to_ascii_lowercase());
         cursor = label_end;
     }
-
-    Err(invalid_dns_response("dns name pointer loop"))
 }
 
 pub(crate) fn read_u16(packet: &[u8], offset: usize) -> io::Result<u16> {
@@ -3402,6 +3659,50 @@ fn read_u32(packet: &[u8], offset: usize) -> io::Result<u32> {
 
 fn invalid_dns_response(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// Feeds `data` to the resolver's response checks as a reply to an A or
+/// AAAA query. With the selector's second bit set the reply takes the
+/// query's ID and question, so the answer section is reached on every run.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_response(data: &[u8]) {
+    let Some((&selector, response)) = data.split_first() else {
+        return;
+    };
+    let record_type = if selector & 1 == 0 {
+        DnsRecordType::A
+    } else {
+        DnsRecordType::Aaaa
+    };
+    let id = u16::from_be_bytes([
+        response.first().copied().unwrap_or_default(),
+        response.get(1).copied().unwrap_or_default(),
+    ]);
+    let edns = if selector & 4 != 0 {
+        edns_opt_record(None, DOH_PADDING_MIN)
+    } else {
+        None
+    };
+    let Ok(query) = build_dns_query_with_id("origin.example", record_type, id, edns.as_deref())
+    else {
+        return;
+    };
+    let _ = dns_response_matches_query(&query, response);
+    let _ = parse_dns_response(&query, response, record_type);
+
+    if selector & 2 != 0 && response.len() >= 4 {
+        // The query's ID and question around the fuzzed flags, counts and
+        // records: what an on-path forger that saw the query sends.
+        let question_end = query.len() - edns.as_ref().map_or(0, Vec::len);
+        let mut forged = query[..2].to_vec();
+        forged.extend_from_slice(&[response[2] | 0x80, response[3]]);
+        forged.extend_from_slice(&1_u16.to_be_bytes());
+        forged.extend_from_slice(response.get(4..10).unwrap_or(&[0, 1, 0, 0, 0, 0]));
+        forged.extend_from_slice(&query[12..question_end]);
+        forged.extend_from_slice(response.get(10..).unwrap_or_default());
+        let _ = dns_response_matches_query(&query, &forged);
+        let _ = parse_dns_response(&query, &forged, record_type);
+    }
 }
 
 #[cfg(test)]
@@ -3431,13 +3732,14 @@ mod tests {
         exchange_direct_tls_candidates, exchange_dns_https_h2, exchange_dns_quic_candidates,
         parse_dns_response, query_udp_dns_server, select_name_server_indices, CachingDnsResolver,
         CompiledNameServerPolicies, ConfiguredDnsAddresses, ConfiguredDnsAnswer,
-        ConfiguredDnsResolver, DnsHostTarget, DnsLookup, DnsQueryDispatch, DnsQueryMetadata,
-        DnsQueryStrategy, DnsQueryTransport, DnsQueryTransportKind, DnsRecordType, DnsResolver,
-        NameServer, NameServerPolicy, NameServerTransport, SystemRouteDnsResolver,
-        DNS_CACHE_MAX_ENTRIES,
+        ConfiguredDnsResolver, DnsConnectionPools, DnsHostTarget, DnsLookup, DnsQueryDispatch,
+        DnsQueryMetadata, DnsQueryStrategy, DnsQueryTransport, DnsQueryTransportKind,
+        DnsRecordType, DnsResolver, NameServer, NameServerPolicy, NameServerTransport,
+        SystemRouteDnsResolver, DNS_CACHE_MAX_ENTRIES,
     };
     use crate::{
-        RouteFamilies, RouteProbe, SocketHandle, SocketProtector, TlsConnector, TransportError,
+        NetworkChanges, RouteFamilies, RouteProbe, SocketHandle, SocketProtector, TlsConnector,
+        TransportError,
     };
 
     /// `getaddrinfo` cannot be cancelled, and a runtime waits for its
@@ -3938,6 +4240,7 @@ mod tests {
         ));
 
         let actual = exchange_direct_https_candidates(
+            &DnsConnectionPools::new(NetworkChanges::default()),
             &NameServer::Domain {
                 domain: server_name.to_owned(),
                 port: 443,
@@ -3954,6 +4257,313 @@ mod tests {
         assert_eq!(actual, dns_response);
         broken.await.unwrap();
         healthy.await.unwrap();
+    }
+
+    const POOL_TEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Serves DNS over HTTPS on every connection it accepts and counts them.
+    /// The connection and request numbered by `hang_up` gets no answer: the
+    /// server drops that whole connection instead.
+    async fn spawn_counting_doh_server(
+        tls: Arc<rustls::ServerConfig>,
+        dns_response: Vec<u8>,
+        hang_up: Option<(usize, usize)>,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let number = counter.fetch_add(1, Ordering::Relaxed);
+                let tls = Arc::clone(&tls);
+                let dns_response = dns_response.clone();
+                tokio::spawn(async move {
+                    let Ok(stream) = tokio_rustls::TlsAcceptor::from(tls).accept(stream).await
+                    else {
+                        return;
+                    };
+                    let Ok(mut connection) = h2::server::handshake(stream).await else {
+                        return;
+                    };
+                    let mut requests = 0;
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        if hang_up == Some((number, requests)) {
+                            return;
+                        }
+                        requests += 1;
+                        let dns_response = dns_response.clone();
+                        tokio::spawn(async move {
+                            let mut body = request.into_body();
+                            while let Some(Ok(chunk)) = body.data().await {
+                                let _ = body.flow_control().release_capacity(chunk.len());
+                            }
+                            let response = Response::builder()
+                                .status(200)
+                                .header(header::CONTENT_TYPE, "application/dns-message")
+                                .body(())
+                                .unwrap();
+                            if let Ok(mut send) = respond.send_response(response, false) {
+                                let _ = send.send_data(Bytes::from(dns_response), true);
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        (address, accepted)
+    }
+
+    struct DohPoolFixture {
+        server: NameServer,
+        address: SocketAddr,
+        accepted: Arc<AtomicUsize>,
+        connector: TlsConnector,
+        query: Vec<u8>,
+        dns_response: Vec<u8>,
+    }
+
+    impl DohPoolFixture {
+        async fn new(hang_up: Option<(usize, usize)>) -> Self {
+            let server_name = "resolver.example";
+            let query = build_dns_query_with_id("pooled.example", DnsRecordType::A, 0xD050, None)
+                .expect("test query should encode");
+            let dns_response = build_test_a_response(&query, Ipv4Addr::new(192, 0, 2, 50));
+            let (server_tls, connector) = test_tls_pair(server_name, &[b"h2"]);
+            let (address, accepted) =
+                spawn_counting_doh_server(server_tls, dns_response.clone(), hang_up).await;
+            Self {
+                server: NameServer::Domain {
+                    domain: server_name.to_owned(),
+                    port: 443,
+                },
+                address,
+                accepted,
+                connector,
+                query,
+                dns_response,
+            }
+        }
+
+        async fn exchange(&self, pools: &DnsConnectionPools) {
+            let actual = tokio::time::timeout(
+                POOL_TEST_TIMEOUT,
+                exchange_direct_https_candidates(
+                    pools,
+                    &self.server,
+                    &[self.address],
+                    "/dns-query",
+                    &self.query,
+                    None,
+                    &self.connector,
+                ),
+            )
+            .await
+            .expect("DNS-over-HTTPS exchange should not stall")
+            .expect("DNS-over-HTTPS exchange should succeed");
+            assert_eq!(actual, self.dns_response);
+        }
+
+        fn accepted(&self) -> usize {
+            self.accepted.load(Ordering::Relaxed)
+        }
+    }
+
+    #[tokio::test]
+    async fn dns_over_https_queries_share_one_connection() {
+        let fixture = DohPoolFixture::new(None).await;
+        let pools = DnsConnectionPools::new(NetworkChanges::default());
+
+        fixture.exchange(&pools).await;
+        fixture.exchange(&pools).await;
+        tokio::join!(
+            fixture.exchange(&pools),
+            fixture.exchange(&pools),
+            fixture.exchange(&pools)
+        );
+
+        assert_eq!(fixture.accepted(), 1);
+        assert_eq!(pools.https_connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_over_https_first_queries_at_once_open_one_connection() {
+        let fixture = DohPoolFixture::new(None).await;
+        let pools = DnsConnectionPools::new(NetworkChanges::default());
+
+        tokio::join!(
+            fixture.exchange(&pools),
+            fixture.exchange(&pools),
+            fixture.exchange(&pools),
+            fixture.exchange(&pools)
+        );
+
+        assert_eq!(fixture.accepted(), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_over_https_idle_connection_is_closed_and_reopened() {
+        let fixture = DohPoolFixture::new(None).await;
+        let pools = DnsConnectionPools::with_idle_timeouts(
+            NetworkChanges::default(),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        );
+
+        fixture.exchange(&pools).await;
+        tokio::time::timeout(POOL_TEST_TIMEOUT, async {
+            while pools.https_connections() != 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the idle connection should leave the pool unasked");
+        fixture.exchange(&pools).await;
+
+        assert_eq!(fixture.accepted(), 2);
+    }
+
+    #[tokio::test]
+    async fn dns_over_https_query_dropped_by_a_reused_connection_goes_on_a_fresh_one() {
+        // The first connection answers one query and hangs up on the next.
+        let fixture = DohPoolFixture::new(Some((0, 1))).await;
+        let pools = DnsConnectionPools::new(NetworkChanges::default());
+
+        fixture.exchange(&pools).await;
+        assert_eq!(fixture.accepted(), 1);
+        fixture.exchange(&pools).await;
+
+        assert_eq!(fixture.accepted(), 2);
+        assert_eq!(pools.https_connections(), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_over_https_connection_does_not_outlive_a_network_change() {
+        let fixture = DohPoolFixture::new(None).await;
+        let network_changes = NetworkChanges::default();
+        let pools = DnsConnectionPools::new(network_changes.clone());
+
+        fixture.exchange(&pools).await;
+        network_changes.notify();
+        fixture.exchange(&pools).await;
+        fixture.exchange(&pools).await;
+
+        assert_eq!(fixture.accepted(), 2);
+    }
+
+    /// Serves DNS over QUIC on every connection it accepts and counts them.
+    /// With `close_after_answer` a connection is closed after one answer.
+    fn spawn_counting_doq_server(
+        server_config: quinn::ServerConfig,
+        dns_response: Vec<u8>,
+        close_after_answer: bool,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let endpoint =
+            quinn::Endpoint::server(server_config, SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+                .unwrap();
+        let address = endpoint.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                counter.fetch_add(1, Ordering::Relaxed);
+                let dns_response = dns_response.clone();
+                tokio::spawn(async move {
+                    let Ok(connection) = incoming.await else {
+                        return;
+                    };
+                    while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                        let Ok(query_len) = recv.read_u16().await else {
+                            return;
+                        };
+                        let mut query = vec![0; usize::from(query_len)];
+                        if recv.read_exact(&mut query).await.is_err() {
+                            return;
+                        }
+                        let response_len = u16::try_from(dns_response.len()).unwrap();
+                        let _ = send.write_u16(response_len).await;
+                        let _ = send.write_all(&dns_response).await;
+                        let _ = send.finish();
+                        if close_after_answer {
+                            let _ = send.stopped().await;
+                            connection.close(quinn::VarInt::from_u32(0), b"done");
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (address, accepted)
+    }
+
+    #[tokio::test]
+    async fn dns_over_quic_queries_share_one_connection_until_it_closes_or_the_network_changes() {
+        let server_name = "resolver.example";
+        let server = NameServer::Domain {
+            domain: server_name.to_owned(),
+            port: 853,
+        };
+        let query = build_dns_query_with_id("pooled.example", DnsRecordType::A, 0xD051, None)
+            .expect("test query should encode");
+        let dns_response = build_test_a_response(&query, Ipv4Addr::new(192, 0, 2, 51));
+        let (server_config, connector) = test_doq_pair(server_name);
+        let (address, accepted) =
+            spawn_counting_doq_server(server_config.clone(), dns_response.clone(), false);
+        let (closing_address, closing_accepted) =
+            spawn_counting_doq_server(server_config, dns_response.clone(), true);
+        let network_changes = NetworkChanges::default();
+        let pools = DnsConnectionPools::new(network_changes.clone());
+        let exchange = |address: SocketAddr| {
+            let (pools, server, query, connector) = (&pools, &server, &query, &connector);
+            let expected = dns_response.clone();
+            async move {
+                let actual = tokio::time::timeout(
+                    POOL_TEST_TIMEOUT,
+                    exchange_dns_quic_candidates(pools, server, &[address], query, None, connector),
+                )
+                .await
+                .expect("DNS-over-QUIC exchange should not stall")
+                .expect("DNS-over-QUIC exchange should succeed");
+                assert_eq!(actual, expected);
+            }
+        };
+
+        exchange(address).await;
+        exchange(address).await;
+        tokio::join!(exchange(address), exchange(address), exchange(address));
+        assert_eq!(accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(pools.quic_connections(), 1);
+
+        network_changes.notify();
+        exchange(address).await;
+        exchange(address).await;
+        assert_eq!(accepted.load(Ordering::Relaxed), 2);
+
+        // A server that closes its connection after an answer gets a new one
+        // for the next query, whether the close is seen before the query or
+        // fails it.
+        let closing_pools = DnsConnectionPools::new(NetworkChanges::default());
+        for expected_connections in 1..=3 {
+            let actual = tokio::time::timeout(
+                POOL_TEST_TIMEOUT,
+                exchange_dns_quic_candidates(
+                    &closing_pools,
+                    &server,
+                    &[closing_address],
+                    &query,
+                    None,
+                    &connector,
+                ),
+            )
+            .await
+            .expect("DNS-over-QUIC exchange should not stall")
+            .expect("DNS-over-QUIC exchange should succeed");
+            assert_eq!(actual, dns_response);
+            assert_eq!(
+                closing_accepted.load(Ordering::Relaxed),
+                expected_connections
+            );
+        }
     }
 
     #[tokio::test]
@@ -3993,6 +4603,7 @@ mod tests {
         });
 
         let actual = exchange_dns_quic_candidates(
+            &DnsConnectionPools::new(NetworkChanges::default()),
             &NameServer::Domain {
                 domain: server_name.to_owned(),
                 port: server_addr.port(),
@@ -4055,6 +4666,7 @@ mod tests {
         });
 
         let actual = exchange_dns_quic_candidates(
+            &DnsConnectionPools::new(NetworkChanges::default()),
             &NameServer::Domain {
                 domain: server_name.to_owned(),
                 port: 853,
@@ -4412,6 +5024,141 @@ mod tests {
                 },
             ))
         );
+    }
+
+    #[test]
+    fn dns_names_past_255_octets_do_not_parse() {
+        let wire_name = |last: usize| {
+            let mut name = Vec::new();
+            for length in [63, 63, 63, last] {
+                name.push(length as u8);
+                name.extend(std::iter::repeat_n(b'a', length));
+            }
+            name.push(0);
+            name
+        };
+        let longest = wire_name(61);
+        assert_eq!(longest.len(), 255);
+        let mut offset = 0;
+        assert_eq!(
+            super::read_dns_name(&longest, &mut offset).unwrap().len(),
+            253
+        );
+        assert_eq!(offset, 255);
+        assert!(super::read_dns_name(&wire_name(62), &mut 0).is_err());
+
+        // A forged answer whose records all point at one ~2 KB owner name:
+        // each would keep its own copy, some 8 MB for a 64 KB answer.
+        let query = build_dns_query_with_id("origin.example", DnsRecordType::A, 0xA181, None)
+            .expect("build query");
+        let answer = |owner: &[u8]| {
+            let mut record = owner.to_vec();
+            record.extend_from_slice(&1_u16.to_be_bytes());
+            record.extend_from_slice(&1_u16.to_be_bytes());
+            record.extend_from_slice(&60_u32.to_be_bytes());
+            record.extend_from_slice(&4_u16.to_be_bytes());
+            record.extend_from_slice(&[192, 0, 2, 87]);
+            record
+        };
+        let mut response = build_test_address_response(&query, &[]);
+        let long_owner = response.len();
+        let mut owner = Vec::new();
+        for _ in 0..30 {
+            owner.push(63);
+            owner.extend_from_slice(&[b'a'; 63]);
+        }
+        owner.push(0);
+        response.extend(answer(&owner));
+        let pointer = 0xC000 | u16::try_from(long_owner).unwrap();
+        let mut count = 1_u16;
+        while response.len() + 16 <= usize::from(u16::MAX) {
+            response.extend(answer(&pointer.to_be_bytes()));
+            count += 1;
+        }
+        response[6..8].copy_from_slice(&count.to_be_bytes());
+
+        let error = parse_dns_response(&query, &response, DnsRecordType::A).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "dns name exceeds 255 octets");
+    }
+
+    #[test]
+    fn dns_name_length_spans_compression_pointers() {
+        // A 129-octet suffix first, then a name of two inline labels and a
+        // pointer to that suffix: neither part reaches 255 octets, but the
+        // name they spell takes 255 or 256.
+        let label = |packet: &mut Vec<u8>, length: usize| {
+            packet.push(length as u8);
+            packet.extend(std::iter::repeat_n(b'b', length));
+        };
+        let packet = |last: usize| {
+            let mut packet = Vec::new();
+            label(&mut packet, 63);
+            label(&mut packet, 63);
+            packet.push(0);
+            let start = packet.len();
+            label(&mut packet, 63);
+            label(&mut packet, last);
+            packet.extend_from_slice(&[0xC0, 0x00]);
+            (packet, start)
+        };
+
+        let (longest, start) = packet(61);
+        // The suffix and the inline labels, without the pointer.
+        assert_eq!((start, longest.len() - 2), (129, 255));
+        let mut offset = start;
+        assert_eq!(
+            super::read_dns_name(&longest, &mut offset).unwrap().len(),
+            253
+        );
+        assert_eq!(offset, longest.len());
+
+        let (too_long, mut start) = packet(62);
+        assert_eq!(super::read_dns_name(&too_long, &mut 0).unwrap().len(), 127);
+        let error = super::read_dns_name(&too_long, &mut start).unwrap_err();
+        assert_eq!(error.to_string(), "dns name exceeds 255 octets");
+    }
+
+    #[test]
+    fn dns_names_count_pointer_jumps_not_labels() {
+        // Forty labels in 161 octets, inline and behind a pointer. An IPv6
+        // reverse name has 34.
+        let mut packet = Vec::new();
+        for _ in 0..40 {
+            packet.extend_from_slice(&[3, b'a', b'b', b'c']);
+        }
+        packet.push(0);
+        let compressed = packet.len();
+        packet.extend_from_slice(&[0xC0, 0x00]);
+        for (start, end) in [(0, compressed), (compressed, packet.len())] {
+            let mut offset = start;
+            let name = super::read_dns_name(&packet, &mut offset).unwrap();
+            assert_eq!(name.split('.').count(), 40);
+            assert!(name.split('.').all(|label| label == "abc"));
+            assert_eq!(offset, end);
+        }
+
+        // A chain of ten pointers to the root name reads, as in Go's
+        // `dnsmessage`; an eleventh pointer is refused.
+        let mut chain = vec![0];
+        let mut pointers = Vec::new();
+        for _ in 0..11 {
+            let target = pointers.last().copied().unwrap_or(0_u16);
+            pointers.push(u16::try_from(chain.len()).unwrap());
+            chain.extend_from_slice(&(0xC000 | target).to_be_bytes());
+        }
+        let mut offset = usize::from(pointers[9]);
+        assert_eq!(super::read_dns_name(&chain, &mut offset).unwrap(), "");
+        assert_eq!(offset, usize::from(pointers[9]) + 2);
+        let error = super::read_dns_name(&chain, &mut usize::from(pointers[10])).unwrap_err();
+        assert_eq!(error.to_string(), "too many dns name pointers");
+
+        // A pointer to itself, and a label with a pointer back to it.
+        for looped in [&[0xC0, 0x00][..], &[1, b'a', 0xC0, 0x00]] {
+            let error = super::read_dns_name(looped, &mut 0).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(error.to_string(), "too many dns name pointers");
+        }
     }
 
     #[test]

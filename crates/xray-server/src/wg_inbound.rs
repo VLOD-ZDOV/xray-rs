@@ -188,7 +188,8 @@ pub async fn start(
 
     crate::log::info!(
         "listening {} (wireguard) on {}",
-        inbound.tag, config.listen_addr
+        inbound.tag,
+        config.listen_addr
     );
 
     let users: Arc<Vec<PeerUser>> = Arc::new(peer_users(config));

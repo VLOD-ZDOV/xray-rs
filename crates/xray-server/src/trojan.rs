@@ -69,11 +69,7 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
     }
     let cmd = buf[pos];
     pos += 1;
-    let command = if cmd == 3 {
-        Command::Udp
-    } else {
-        Command::Tcp
-    };
+    let command = if cmd == 3 { Command::Udp } else { Command::Tcp };
 
     if buf.len() <= pos {
         return Err(ParseError::Incomplete);

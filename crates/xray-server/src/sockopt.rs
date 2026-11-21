@@ -253,9 +253,7 @@ fn apply_custom_sockopts(fd: &impl AsSock, sockopt: &SockoptSettings, network: &
     for custom in &sockopt.custom_sockopt {
         if let Some(sys) = &custom.system {
             if !sys.is_empty() && !sys.eq_ignore_ascii_case(os) {
-                crate::log::debug!(
-                    "CustomSockopt system not match: want {sys} got {os}"
-                );
+                crate::log::debug!("CustomSockopt system not match: want {sys} got {os}");
                 continue;
             }
         }

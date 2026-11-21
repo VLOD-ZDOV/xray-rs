@@ -2738,6 +2738,8 @@ impl OutboundSelectionOverlay {
 #[derive(Debug)]
 pub struct OutboundFactory {
     hysteria_stream_limits: crate::HysteriaStreamLimits,
+    /// The flow limits of each WireGuard device and MASQUE tunnel.
+    tunnel_flow_limits: xray_wireguard::FlowLimits,
     graph: Arc<OutboundGraph>,
     entries: Box<[CachedOutboundEntry]>,
     selection: Arc<OutboundSelectionOverlay>,
@@ -2763,6 +2765,7 @@ impl OutboundFactory {
         let selection = Arc::new(OutboundSelectionOverlay::new(Arc::clone(&graph)));
         Self {
             hysteria_stream_limits,
+            tunnel_flow_limits: xray_wireguard::FlowLimits::default(),
             graph,
             entries,
             selection,
@@ -2771,6 +2774,13 @@ impl OutboundFactory {
                 PARALLEL_VMESS_CONNECTIONS,
             )),
         }
+    }
+
+    /// Sets the flow limits of the WireGuard devices and MASQUE tunnels this
+    /// factory builds.
+    pub(crate) fn with_tunnel_flow_limits(mut self, limits: xray_wireguard::FlowLimits) -> Self {
+        self.tunnel_flow_limits = limits;
+        self
     }
 
     /// Shared by every router/inbound using this core. Relay I/O continues
@@ -3915,7 +3925,8 @@ impl OutboundFactory {
             .entry(node)?
             .wireguard
             .get_or_init(|| {
-                WireguardOutbound::new(configured).map_err(CachedOutboundError::from_core_error)
+                WireguardOutbound::with_flow_limits(configured, self.tunnel_flow_limits)
+                    .map_err(CachedOutboundError::from_core_error)
             })
             .clone();
         if self.sessions_closed.load(Ordering::Acquire) {
@@ -3942,7 +3953,8 @@ impl OutboundFactory {
             .entry(node)?
             .masque
             .get_or_init(|| {
-                MasqueOutbound::new(configured).map_err(CachedOutboundError::from_core_error)
+                MasqueOutbound::with_flow_limits(configured, self.tunnel_flow_limits)
+                    .map_err(CachedOutboundError::from_core_error)
             })
             .clone();
         if self.sessions_closed.load(Ordering::Acquire) {

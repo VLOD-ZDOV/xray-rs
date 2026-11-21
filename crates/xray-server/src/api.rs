@@ -994,7 +994,11 @@ fn serialize_proxy_settings(inbound: &Inbound) -> (String, Vec<u8>) {
     let mut buf = Vec::new();
     match inbound.protocol {
         InboundProtocol::Vless => {
-            let users = inbound.users.iter().map(protocol_user_from_config).collect();
+            let users = inbound
+                .users
+                .iter()
+                .map(protocol_user_from_config)
+                .collect();
             let fallbacks = inbound.fallbacks.iter().map(fallback_to_proto).collect();
             let cfg = VlessInboundConfigProto {
                 users,
@@ -1057,9 +1061,7 @@ fn serialize_proxy_settings(inbound: &Inbound) -> (String, Vec<u8>) {
                         crate::config::ShadowsocksMethod::Aead2017(_) => {
                             CipherType::Aes256Gcm as i32
                         }
-                        crate::config::ShadowsocksMethod::Ss2022(_) => {
-                            CipherType::Aes256Gcm as i32
-                        }
+                        crate::config::ShadowsocksMethod::Ss2022(_) => CipherType::Aes256Gcm as i32,
                     };
                     let account = ShadowsocksAccount {
                         password: String::new(),
@@ -3502,7 +3504,10 @@ mod tests {
                 name: "fb1".into(),
                 alpn: "h2".into(),
                 path: "/fallback".into(),
-                dest: crate::config::FallbackDest::Tcp(crate::vless::Host::Domain("127.0.0.1".into()), 8080),
+                dest: crate::config::FallbackDest::Tcp(
+                    crate::vless::Host::Domain("127.0.0.1".into()),
+                    8080,
+                ),
                 xver: 1,
             }],
             vmess_filter: Arc::new(std::sync::Mutex::new(
@@ -3537,7 +3542,10 @@ mod tests {
                 name: "fb1".into(),
                 alpn: "h2".into(),
                 path: "/fallback".into(),
-                dest: crate::config::FallbackDest::Tcp(crate::vless::Host::Domain("127.0.0.1".into()), 8080),
+                dest: crate::config::FallbackDest::Tcp(
+                    crate::vless::Host::Domain("127.0.0.1".into()),
+                    8080,
+                ),
                 xver: 1,
             }],
             socks_auth: xray_proxy::inbound::SocksInboundAuth::NoAuth,
@@ -3580,13 +3588,11 @@ mod tests {
         inbound_manager.insert_initial("vless-in".into(), ctx.clone(), None, None, inbound);
 
         // 1. ListInbounds with is_only_tags: false
-        let req = ListInboundsRequest { is_only_tags: false };
-        let resp = handle_handler(
-            "ListInbounds",
-            req.encode_to_vec().into(),
-            &inbound_manager,
-        )
-        .await;
+        let req = ListInboundsRequest {
+            is_only_tags: false,
+        };
+        let resp =
+            handle_handler("ListInbounds", req.encode_to_vec().into(), &inbound_manager).await;
         assert_eq!(resp.status(), 200);
         let collected = resp.into_body().collect().await.unwrap().to_bytes();
         let list_resp = ListInboundsResponse::decode(unframe(collected).unwrap()).unwrap();
@@ -3594,7 +3600,10 @@ mod tests {
         let inb = &list_resp.inbounds[0];
         assert_eq!(inb.tag, "vless-in");
 
-        let rec_msg = inb.receiver_settings.as_ref().expect("receiver_settings must be present");
+        let rec_msg = inb
+            .receiver_settings
+            .as_ref()
+            .expect("receiver_settings must be present");
         assert_eq!(rec_msg.r#type, "xray.app.proxyman.ReceiverConfig");
         let rec = ReceiverConfig::decode(rec_msg.value.clone()).unwrap();
         let port_range = &rec.port_list.unwrap().range[0];
@@ -3608,7 +3617,10 @@ mod tests {
         assert_eq!(sniff.destination_override, vec!["http", "tls"]);
         assert!(sniff.route_only);
 
-        let proxy_msg = inb.proxy_settings.as_ref().expect("proxy_settings must be present");
+        let proxy_msg = inb
+            .proxy_settings
+            .as_ref()
+            .expect("proxy_settings must be present");
         assert_eq!(proxy_msg.r#type, "xray.proxy.vless.inbound.Config");
         let vless_cfg = VlessInboundConfigProto::decode(proxy_msg.value.clone()).unwrap();
         assert_eq!(vless_cfg.decryption, "none");
@@ -3637,27 +3649,32 @@ mod tests {
         };
         assert!(add_user_to_inbound(new_user, &ctx).is_ok());
 
-        let req = ListInboundsRequest { is_only_tags: false };
-        let resp = handle_handler(
-            "ListInbounds",
-            req.encode_to_vec().into(),
-            &inbound_manager,
-        )
-        .await;
+        let req = ListInboundsRequest {
+            is_only_tags: false,
+        };
+        let resp =
+            handle_handler("ListInbounds", req.encode_to_vec().into(), &inbound_manager).await;
         let collected = resp.into_body().collect().await.unwrap().to_bytes();
         let list_resp = ListInboundsResponse::decode(unframe(collected).unwrap()).unwrap();
-        let vless_cfg = VlessInboundConfigProto::decode(list_resp.inbounds[0].proxy_settings.as_ref().unwrap().value.clone()).unwrap();
+        let vless_cfg = VlessInboundConfigProto::decode(
+            list_resp.inbounds[0]
+                .proxy_settings
+                .as_ref()
+                .unwrap()
+                .value
+                .clone(),
+        )
+        .unwrap();
         assert_eq!(vless_cfg.users.len(), 2);
-        assert!(vless_cfg.users.iter().any(|u| u.email == "dynamic@example.com"));
+        assert!(vless_cfg
+            .users
+            .iter()
+            .any(|u| u.email == "dynamic@example.com"));
 
         // 3. ListInbounds with is_only_tags: true
         let req = ListInboundsRequest { is_only_tags: true };
-        let resp = handle_handler(
-            "ListInbounds",
-            req.encode_to_vec().into(),
-            &inbound_manager,
-        )
-        .await;
+        let resp =
+            handle_handler("ListInbounds", req.encode_to_vec().into(), &inbound_manager).await;
         let collected = resp.into_body().collect().await.unwrap().to_bytes();
         let list_resp = ListInboundsResponse::decode(unframe(collected).unwrap()).unwrap();
         assert_eq!(list_resp.inbounds[0].tag, "vless-in");

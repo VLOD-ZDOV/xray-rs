@@ -677,11 +677,11 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         if api.is_none() && api_tag == Some(tag.as_str()) {
             let port = parse_port(item.get("port")).ok_or("api inbound: invalid port")?;
             if let Some(value) = item.get("listen") {
-        if !value.is_null() && value.as_str().is_none() {
-            return Err(format!("inbound {tag:?}: listen must be a string"));
-        }
-    }
-    let listen = match str_field(item, "listen") {
+                if !value.is_null() && value.as_str().is_none() {
+                    return Err(format!("inbound {tag:?}: listen must be a string"));
+                }
+            }
+            let listen = match str_field(item, "listen") {
                 "" => "127.0.0.1",
                 addr => addr,
             };
@@ -820,7 +820,9 @@ fn validate_inbound_settings(settings: &Value, tag: &str) -> Result<(), String> 
             continue;
         };
         let Some(entries) = value.as_array() else {
-            return Err(format!("inbound {tag:?}: settings.{field} must be an array"));
+            return Err(format!(
+                "inbound {tag:?}: settings.{field} must be an array"
+            ));
         };
         for (index, entry) in entries.iter().enumerate() {
             if !entry.is_object() {
@@ -829,7 +831,15 @@ fn validate_inbound_settings(settings: &Value, tag: &str) -> Result<(), String> 
                 ));
             }
             for key in [
-                "email", "id", "password", "pass", "user", "flow", "method", "encryption", "auth",
+                "email",
+                "id",
+                "password",
+                "pass",
+                "user",
+                "flow",
+                "method",
+                "encryption",
+                "auth",
             ] {
                 if let Some(value) = entry.get(key) {
                     if !value.is_null() && !value.is_string() {
@@ -856,7 +866,9 @@ fn validate_inbound_settings(settings: &Value, tag: &str) -> Result<(), String> 
     for field in string_fields {
         if let Some(value) = settings.get(field) {
             if !value.is_null() && value.as_str().is_none() {
-                return Err(format!("inbound {tag:?}: settings.{field} must be a string"));
+                return Err(format!(
+                    "inbound {tag:?}: settings.{field} must be a string"
+                ));
             }
         }
     }
@@ -867,13 +879,17 @@ fn validate_inbound_settings(settings: &Value, tag: &str) -> Result<(), String> 
             ));
         };
         if level > u64::from(u32::MAX) {
-            return Err(format!("inbound {tag:?}: settings.userLevel is out of range"));
+            return Err(format!(
+                "inbound {tag:?}: settings.userLevel is out of range"
+            ));
         }
     }
     for field in ["udp", "followRedirect"] {
         if let Some(value) = settings.get(field) {
             if !value.is_null() && value.as_bool().is_none() {
-                return Err(format!("inbound {tag:?}: settings.{field} must be a boolean"));
+                return Err(format!(
+                    "inbound {tag:?}: settings.{field} must be a boolean"
+                ));
             }
         }
     }
@@ -935,9 +951,7 @@ fn validate_policy(root: &Value) -> Result<(), String> {
         for field in ["statsUserUplink", "statsUserDownlink", "statsUserOnline"] {
             if let Some(value) = level.get(field).filter(|value| !value.is_null()) {
                 if value.as_bool().is_none() {
-                    return Err(format!(
-                        "policy.levels.{name}.{field} must be a boolean"
-                    ));
+                    return Err(format!("policy.levels.{name}.{field} must be a boolean"));
                 }
             }
         }
@@ -964,11 +978,11 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             let wg_cfg = crate::wg_inbound::parse(&tag, item)?;
             let port = parse_port(item.get("port")).unwrap_or(wg_cfg.listen_addr.port());
             if let Some(value) = item.get("listen") {
-        if !value.is_null() && value.as_str().is_none() {
-            return Err(format!("inbound {tag:?}: listen must be a string"));
-        }
-    }
-    let listen = match str_field(item, "listen") {
+                if !value.is_null() && value.as_str().is_none() {
+                    return Err(format!("inbound {tag:?}: listen must be a string"));
+                }
+            }
+            let listen = match str_field(item, "listen") {
                 "" => String::new(),
                 addr if addr.starts_with('/') || addr.starts_with('@') => {
                     return Err("unix socket listen is not supported".into());
@@ -1022,11 +1036,11 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             let masque_cfg = crate::masque_inbound::parse(&tag, item)?;
             let port = parse_port(item.get("port")).unwrap_or(443);
             if let Some(value) = item.get("listen") {
-        if !value.is_null() && value.as_str().is_none() {
-            return Err(format!("inbound {tag:?}: listen must be a string"));
-        }
-    }
-    let listen = match str_field(item, "listen") {
+                if !value.is_null() && value.as_str().is_none() {
+                    return Err(format!("inbound {tag:?}: listen must be a string"));
+                }
+            }
+            let listen = match str_field(item, "listen") {
                 "" => String::new(),
                 addr if addr.starts_with('/') || addr.starts_with('@') => {
                     return Err("unix socket listen is not supported".into());
@@ -1167,7 +1181,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     };
 
     if is_hysteria {
-        if let Some(h_settings) = stream.get("hysteriaSettings").filter(|value| !value.is_null()) {
+        if let Some(h_settings) = stream
+            .get("hysteriaSettings")
+            .filter(|value| !value.is_null())
+        {
             if h_settings.get("version").and_then(Value::as_i64) != Some(2) {
                 return Err("Failed to build Hysteria config. > version != 2".into());
             }
@@ -1193,9 +1210,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         if !supported_security {
             return Err(format!("unknown streamSettings.security {security:?}"));
         }
-        return Err(format!(
-            "Config: unknown transport protocol: {network}"
-        ));
+        return Err(format!("Config: unknown transport protocol: {network}"));
     }
     let raw = stream
         .get("rawSettings")
@@ -1461,9 +1476,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     if security == "tls" && array(tls_section, "certificates").is_empty() {
         // Xray starts such an inbound and fails every handshake; the others
         // keep running there too, so only this one is left out.
-        crate::log::warn!(
-            "skipping inbound {tag:?}: tlsSettings.certificates is empty"
-        );
+        crate::log::warn!("skipping inbound {tag:?}: tlsSettings.certificates is empty");
         return Ok(None);
     }
     let tls = if security == "tls" {
@@ -2694,10 +2707,7 @@ fn parse_sniffing(item: &Value, tag: &str) -> crate::vless::Sniffing {
     }
     sniffing.domains_excluded = std::sync::Arc::new(excluded);
     if !ignored.is_empty() {
-        crate::log::warn!(
-            "inbound {tag:?}: sniffing {} ignored",
-            ignored.join(", ")
-        );
+        crate::log::warn!("inbound {tag:?}: sniffing {} ignored", ignored.join(", "));
     }
     sniffing
 }
@@ -3733,7 +3743,8 @@ mod tests {
             ]
         );
 
-        let array = r#"{"inbounds": [{"port": [29500, 29501], "protocol": "socks", "settings": {}}]}"#;
+        let array =
+            r#"{"inbounds": [{"port": [29500, 29501], "protocol": "socks", "settings": {}}]}"#;
         assert!(parse(array).is_err(), "Xray rejects an array port");
     }
 

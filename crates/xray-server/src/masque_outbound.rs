@@ -366,7 +366,8 @@ impl MasqueOutbound {
 
         crate::log::info!(
             "MASQUE outbound {} connected over h2, assigned IP {}",
-            self.tag, assigned_ip
+            self.tag,
+            assigned_ip
         );
         Ok(client)
     }
@@ -545,7 +546,8 @@ impl MasqueOutbound {
 
         crate::log::info!(
             "MASQUE outbound {} connected over h3, assigned IP {}",
-            self.tag, assigned_ip
+            self.tag,
+            assigned_ip
         );
         Ok(client)
     }

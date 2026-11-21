@@ -359,7 +359,14 @@ fn sniff_needs_more(payload: &[u8]) -> bool {
         return 5 + record_len > payload.len() && 5 + record_len <= SNIFF_BUFFER_SIZE;
     }
     const METHODS: [&[u8]; 9] = [
-        b"GET ", b"POST ", b"HEAD ", b"PUT ", b"OPTIONS ", b"DELETE ", b"CONNECT ", b"PATCH ",
+        b"GET ",
+        b"POST ",
+        b"HEAD ",
+        b"PUT ",
+        b"OPTIONS ",
+        b"DELETE ",
+        b"CONNECT ",
+        b"PATCH ",
         b"TRACE ",
     ];
     if METHODS.iter().any(|method| payload.starts_with(method)) {

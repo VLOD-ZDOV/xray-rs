@@ -1,7 +1,9 @@
 # 0.10.1 release preparation
 
 Requested by the owner on 2026-11-16, after the review of the pull requests
-open since 0.10.0. Publication is pending. The shared steps are in the
+open since 0.10.0. 0.10.1 is published: the core and the SDK on 2026-11-18,
+the SDK's Maven Central package and the KMP library on 2026-11-19. See
+[Publication](#publication). The shared steps are in the
 [release process](release-process.md); this page holds what is specific to
 0.10.1.
 
@@ -16,6 +18,14 @@ was taken out again before the candidate (see
 later step binds to the commit and tree it merges as. An earlier release
 commit, `264efdc982b3e1ac4af1f9e1960e560841a0d59e`, still carried #310 and is
 not the candidate: nothing was tagged or published from it.
+
+The candidate is `3cef7c42c2fd296afd27ab0b6435c632842e1a26`, tree
+`d430ce5f1c106b48ba9ecc55a25455f0a201c50f`, the merge of
+[#321](https://github.com/aimalygin/xray-rust/pull/321). Its full CI, run
+[44003926752](https://github.com/aimalygin/xray-rust/actions/runs/44003926752),
+passed every job. The SDK pins it in commit mode
+([xray-rust-mobile#56](https://github.com/aimalygin/xray-rust-mobile/pull/56),
+merged as `5784afb6245511450d65207d69db08c824c85c22`).
 
 ## Scope
 
@@ -105,6 +115,23 @@ What the changes of this release touch on a device:
 The 0.10.0 known limitations stay as they are: this release fixes none of
 them.
 
+The campaign of 2026-11-16 to 2026-11-18 made every LAN run of both phones,
+the iPhone's WAN MASQUE and XHTTP H3 runs and every host measurement on the
+candidate's tree, and carried the iPhone's xicmp and WAN mKCP runs and
+Android's xicmp run over from the 0.10.0 release's build, on the owner's
+«Только затронутое». The
+[report](device-results/2026-11-17-v0101-candidate/README.md) names the build
+behind every transition and keeps every failed attempt. The candidate's
+`check-v010-release-evidence.py` accepts the
+[archive](releases/v0.10.1-device-evidence.zip) (SHA-256
+`108330e340fd33b6aa357adc8814342d07deb4dffb79a97794076c865f805652`), locally
+and in `v010-release-evidence.yml` on the candidate (run
+[44335212229](https://github.com/aimalygin/xray-rust/actions/runs/44335212229)). Asked on
+2026-11-18 «Выпускать 0.10.1 с этими ограничениями и публиковать
+свидетельства?», the owner answered «Да, публикуй»; the
+[decision record](releases/v0.10.1-owner-decisions.json) holds the owner's
+decisions and the ten accepted limitations.
+
 ## Left for 0.11.0
 
 TUN TCP sniffing for `destOverride`
@@ -130,8 +157,64 @@ are loaded.
 
 ## Publication
 
-Not started. In order, as in the [release process](release-process.md): full
-CI on the candidate, the SDK pinned to the candidate commit, the evidence and
-its publication on `main`, the annotated tag `v0.10.1` and its GitHub release,
-then the SDK's Prepare release, tag and packages, the KMP library, and the
-README install snippets.
+The owner gave the word for the whole sequence on 2026-11-16 («можешь
+работать автономно пока не сделаешь релиз 0.10.1? я даю тебе необходимые
+разрешения для этого»), for publication on 2026-11-18 («Да, публикуй») and
+for the packages the same day («делай, даю разрешения для этого»). The
+`maven-central` environment was approved by the owner in the workflow run.
+
+**Core.**
+
+- Full CI on the candidate: run
+  [44003926752](https://github.com/aimalygin/xray-rust/actions/runs/44003926752),
+  every job passed.
+- Evidence on `main`: [#322](https://github.com/aimalygin/xray-rust/pull/322),
+  merge `048e3e15b665162ce628eef2d1d4910a5e8dea2f`; `v010-release-evidence.yml`
+  passed on the candidate, run 44335212229.
+- Tag `v0.10.1`: annotated, tag object
+  `dce2ba1b35824225089c4f4b53c73cf629c1e875`, at the candidate
+  `3cef7c42c2fd296afd27ab0b6435c632842e1a26`.
+- Tag CI, run 44336323016, passed its four gates: the tag and changelog, the
+  tag's own history, the device evidence again, and the binding to candidate
+  CI run 44003926752.
+- [GitHub release](https://github.com/aimalygin/xray-rust/releases/tag/v0.10.1),
+  published 2026-11-18 15:34Z: the source archive, the evidence archive, the
+  report, the validation records and `SHA256SUMS`, made by
+  `scripts/make-release-records.py`. Every uploaded file was downloaded again
+  and checked before publishing.
+
+**SDK (xray-rust-mobile).**
+
+- The pin moved to the core candidate in
+  [#56](https://github.com/aimalygin/xray-rust-mobile/pull/56) and to the core
+  tag in [#57](https://github.com/aimalygin/xray-rust-mobile/pull/57). Prepare
+  release, run 44355010950, built the Apple artifact (SHA-256
+  `776a8badb8f461d388b3c8405c94a836e713379f80813a0b486f5b21813c0f6b`); its lock
+  is [#58](https://github.com/aimalygin/xray-rust-mobile/pull/58).
+- Tag `v0.10.1`: tag object `2e280fda672268a860b6d754df416ff65785e322`, commit
+  `df43af4e0ef58b794ab87ec489d18c2c62d28dac`.
+- Release run 44364788220 published the
+  [GitHub release](https://github.com/aimalygin/xray-rust-mobile/releases/tag/v0.10.1)
+  on 2026-11-18 19:16Z and the GitHub Packages coordinate, and, after the
+  owner's approval, `io.github.aimalygin:xray-rust-mobile:0.10.1` on Maven
+  Central. Central's AAR is byte-identical to the GitHub release asset
+  (`007aee812ef3beb4abfe4df6ce46d57b43bb21f630b59e1ac831b8e463a4ad83`).
+- Clean consumers passed: SwiftPM at exactly 0.10.1 (the tagged commit and the
+  locked checksum), and the SDK's minified Gradle consumer resolving the
+  coordinate from Maven Central alone with strict dependency verification.
+
+**KMP (xray-rust-kmp).** A tag and a GitHub release, without Maven Central,
+as for 0.10.0.
+
+- [xray-rust-kmp#3](https://github.com/aimalygin/xray-rust-kmp/pull/3) pins
+  SDK 0.10.1 and makes the library version 0.10.1; merge
+  `7e4d4739611530bb7121dd6d15d92325b0401f0e`. Its CI built the library, ran
+  its tests, verified the pinned AAR, linked both iOS frameworks and built
+  both samples.
+- Tag `v0.10.1`: tag object `d888707b004793d83e00ec2600075dd3fe3ff29e`.
+- [GitHub release](https://github.com/aimalygin/xray-rust-kmp/releases/tag/v0.10.1),
+  published 2026-11-19 01:37Z. The library has not been run on a device.
+
+**README.** The core's and the SDK's
+([xray-rust-mobile#59](https://github.com/aimalygin/xray-rust-mobile/pull/59))
+install examples name SDK 0.10.1.
