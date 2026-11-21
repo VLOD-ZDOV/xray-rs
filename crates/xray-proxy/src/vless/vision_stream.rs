@@ -70,6 +70,16 @@ pub trait VisionStreamIo: AsyncRead + AsyncWrite + Unpin {
     fn poll_shutdown_direct(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         AsyncWrite::poll_shutdown(self, cx)
     }
+
+    /// A transport-level goodbye after a rejected handshake. Default: nothing;
+    /// a WebSocket stream sends a close frame so the peer sees the same close
+    /// Xray's websocket server sends.
+    fn close_on_error(
+        &mut self,
+        _code: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async {})
+    }
 }
 
 impl VisionStreamIo for tokio::io::DuplexStream {

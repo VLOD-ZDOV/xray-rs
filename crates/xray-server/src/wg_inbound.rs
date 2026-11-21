@@ -5,7 +5,7 @@ use crate::log;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Query, Router};
 use crate::stats;
-use crate::vless::{copy, relay, Activity, Host};
+use crate::vless::{copy_buf, relay_policy, Activity, Host};
 use serde_json::Value;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -92,6 +92,12 @@ pub fn parse(tag: &str, item: &Value) -> Result<ServerConfig, String> {
                 endpoint: None,
                 allowed_ips,
                 keepalive,
+                email: p
+                    .get("email")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                level: p.get("level").and_then(Value::as_u64).unwrap_or(0) as u32,
             });
         }
     }
@@ -139,6 +145,33 @@ pub fn parse(tag: &str, item: &Value) -> Result<ServerConfig, String> {
     })
 }
 
+/// Xray's server-side user lookup: the first configured peer whose
+/// `allowedIPs` contains the traffic's source address.
+struct PeerUser {
+    allowed_ips: Vec<AllowedIp>,
+    email: String,
+    level: u32,
+}
+
+fn peer_users(config: &ServerConfig) -> Vec<PeerUser> {
+    config
+        .peers
+        .iter()
+        .map(|peer| PeerUser {
+            allowed_ips: peer.allowed_ips.clone(),
+            email: peer.email.clone(),
+            level: peer.level,
+        })
+        .collect()
+}
+
+fn user_for_source(peers: &[PeerUser], source: IpAddr) -> (&str, u32) {
+    peers
+        .iter()
+        .find(|peer| peer.allowed_ips.iter().any(|range| range.contains(source)))
+        .map_or(("", 0), |peer| (peer.email.as_str(), peer.level))
+}
+
 pub async fn start(
     inbound: &Inbound,
     ctx: Arc<crate::vless::Context>,
@@ -158,6 +191,8 @@ pub async fn start(
         inbound.tag, config.listen_addr
     ));
 
+    let users: Arc<Vec<PeerUser>> = Arc::new(peer_users(config));
+
     let server = Arc::new(server);
     let server_run = server.clone();
 
@@ -167,15 +202,17 @@ pub async fn start(
                 Some(tcp) = server_run.accept_tcp() => {
                     let ctx = ctx.clone();
                     let router = router.clone();
+                    let users = users.clone();
                     tokio::spawn(async move {
-                        handle_tcp(tcp, ctx, router).await;
+                        handle_tcp(tcp, ctx, router, users).await;
                     });
                 }
                 Some(udp) = server_run.accept_udp() => {
                     let ctx = ctx.clone();
                     let router = router.clone();
+                    let users = users.clone();
                     tokio::spawn(async move {
-                        Box::pin(handle_udp(udp, ctx, router)).await;
+                        Box::pin(handle_udp(udp, ctx, router, users)).await;
                     });
                 }
                 else => break,
@@ -186,11 +223,17 @@ pub async fn start(
     Ok(task.abort_handle())
 }
 
-async fn handle_tcp(tcp: IncomingTcpStream, ctx: Arc<crate::vless::Context>, router: Arc<Router>) {
+async fn handle_tcp(
+    tcp: IncomingTcpStream,
+    ctx: Arc<crate::vless::Context>,
+    router: Arc<Router>,
+    users: Arc<Vec<PeerUser>>,
+) {
+    let (user, level) = user_for_source(&users, tcp.src.ip());
     let query = Query {
         inbound: &ctx.tag,
         inbound_port: ctx.port,
-        user: "",
+        user,
         source: tcp.src,
         network: Network::Tcp,
         domain: None,
@@ -211,7 +254,7 @@ async fn handle_tcp(tcp: IncomingTcpStream, ctx: Arc<crate::vless::Context>, rou
         format!("tcp:{}:{}", tcp.dst.ip(), tcp.dst.port()),
         &ctx.tag,
         &decision.tag,
-        "",
+        user,
     );
     if !accepted {
         return;
@@ -224,14 +267,28 @@ async fn handle_tcp(tcp: IncomingTcpStream, ctx: Arc<crate::vless::Context>, rou
             return;
         }
     };
-    let traffic = stats::get().traffic(&ctx.tag, "", 0, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, user, level, &decision.tag);
+    let policy = crate::policy::for_level(level);
     let (mut client_r, mut client_w) = tokio::io::split(tcp.stream);
     let (mut target_r, mut target_w) = tokio::io::split(target_stream);
     let activity = Activity::new();
-    let _ = relay(
-        copy(&mut client_r, &mut target_w, &activity, |n| traffic.up(n)),
-        copy(&mut target_r, &mut client_w, &activity, |n| traffic.down(n)),
+    let _ = relay_policy(
+        copy_buf(
+            &mut client_r,
+            &mut target_w,
+            &activity,
+            |n| traffic.up(n),
+            policy.buffer_size,
+        ),
+        copy_buf(
+            &mut target_r,
+            &mut client_w,
+            &activity,
+            |n| traffic.down(n),
+            policy.buffer_size,
+        ),
         &activity,
+        policy,
     )
     .await;
 }
@@ -240,11 +297,13 @@ async fn handle_udp(
     mut udp: IncomingUdpSession,
     ctx: Arc<crate::vless::Context>,
     router: Arc<Router>,
+    users: Arc<Vec<PeerUser>>,
 ) {
+    let (user, level) = user_for_source(&users, udp.src.ip());
     let query = Query {
         inbound: &ctx.tag,
         inbound_port: ctx.port,
-        user: "",
+        user,
         source: udp.src,
         network: Network::Udp,
         domain: None,
@@ -265,7 +324,7 @@ async fn handle_udp(
         format!("udp:{}:{}", udp.dst.ip(), udp.dst.port()),
         &ctx.tag,
         &decision.tag,
-        "",
+        user,
     );
     if !accepted {
         return;
@@ -277,7 +336,7 @@ async fn handle_udp(
             return;
         }
     };
-    let traffic = stats::get().traffic(&ctx.tag, "", 0, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, user, level, &decision.tag);
     let activity = Activity::new();
     let host = Host::Ip(udp.dst.ip());
     let port = udp.dst.port();
@@ -322,7 +381,8 @@ async fn handle_udp(
         }
     };
 
-    let _ = Box::pin(relay(up, down, &activity)).await;
+    let policy = crate::policy::for_level(level);
+    let _ = Box::pin(relay_policy(up, down, &activity, policy)).await;
 }
 
 #[cfg(test)]
@@ -349,6 +409,33 @@ mod tests {
         assert!(ok.peers[0].allowed_ips.is_empty());
         assert!(parse("t", &item(json!({"address": ["garbage"]}))).is_err());
         assert_eq!(parse("t", &item(json!({}))).unwrap().addresses.len(), 2);
+    }
+
+    #[test]
+    fn peer_identity_follows_allowed_ips() {
+        let cfg = parse(
+            "t",
+            &item(json!({"peers": [
+                {"publicKey": KEY, "allowedIPs": ["10.0.0.5/32"], "email": "alice", "level": 2},
+                {"publicKey": KEY, "allowedIPs": ["10.0.0.0/24"], "email": "bob", "level": 3}
+            ]})),
+        )
+        .unwrap();
+        assert_eq!(cfg.peers[0].email, "alice");
+        assert_eq!(cfg.peers[0].level, 2);
+        let users = peer_users(&cfg);
+        assert_eq!(
+            user_for_source(&users, "10.0.0.5".parse().unwrap()),
+            ("alice", 2)
+        );
+        assert_eq!(
+            user_for_source(&users, "10.0.0.9".parse().unwrap()),
+            ("bob", 3)
+        );
+        assert_eq!(
+            user_for_source(&users, "192.0.2.1".parse().unwrap()),
+            ("", 0)
+        );
     }
 
     #[test]

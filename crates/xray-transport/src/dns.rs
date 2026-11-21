@@ -1253,6 +1253,11 @@ pub struct NameServerPolicy {
     /// Xray-core's policy id: servers with the same id next to each other in
     /// a lookup's plan race as one group under parallel query.
     pub policy_id: u32,
+    /// Per-server `disableCache`; `None` inherits the global setting.
+    pub disable_cache: Option<bool>,
+    /// Per-server `serveStale` / `serveExpiredTTL`.
+    pub serve_stale: Option<bool>,
+    pub serve_expired_ttl: Option<u32>,
 }
 
 impl NameServerPolicy {
@@ -1272,6 +1277,9 @@ impl NameServerPolicy {
             timeout: None,
             client_ip: None,
             policy_id: 0,
+            disable_cache: None,
+            serve_stale: None,
+            serve_expired_ttl: None,
         }
     }
 }
@@ -1295,6 +1303,8 @@ impl CompiledNameServerPolicies {
         let policies = policies
             .into_iter()
             .map(|policy| {
+                let cache_id =
+                    NEXT_SERVER_CACHE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let NameServerPolicy {
                     server,
                     tag,
@@ -1310,6 +1320,9 @@ impl CompiledNameServerPolicies {
                     timeout,
                     client_ip,
                     policy_id,
+                    disable_cache,
+                    serve_stale,
+                    serve_expired_ttl,
                 } = policy;
                 matcher_count += domains.matcher_count();
                 pattern_bytes += domains.pattern_bytes();
@@ -1328,6 +1341,10 @@ impl CompiledNameServerPolicies {
                     timeout,
                     client_ip,
                     policy_id,
+                    disable_cache,
+                    serve_stale,
+                    serve_expired_ttl,
+                    cache_id,
                 }
             })
             .collect();
@@ -1452,7 +1469,16 @@ struct CompiledNameServerPolicy {
     timeout: Option<Duration>,
     client_ip: Option<IpAddr>,
     policy_id: u32,
+    disable_cache: Option<bool>,
+    serve_stale: Option<bool>,
+    serve_expired_ttl: Option<u32>,
+    /// A process-unique identity for cache keys; policy vectors may be rebuilt,
+    /// so a pointer would not stay unique.
+    cache_id: usize,
 }
+
+static NEXT_SERVER_CACHE_ID: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(1);
 
 impl CompiledNameServerPolicy {
     fn apply_ip_filters(&self, addresses: &mut Vec<IpAddr>) -> bool {
@@ -1526,6 +1552,53 @@ pub struct ConfiguredDnsResolver {
     disable_fallback: bool,
     disable_fallback_if_match: bool,
     parallel_query: bool,
+    /// Global `dns.disableCache`, `serveStale` and `serveExpiredTTL`, which
+    /// each server may override.
+    default_disable_cache: bool,
+    default_serve_stale: bool,
+    default_serve_expired_ttl: u32,
+    server_cache: Mutex<HashMap<ServerCacheKey, CachedServerAnswer>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ServerCacheKey {
+    server: usize,
+    domain: String,
+    strategy: DnsQueryStrategy,
+}
+
+#[derive(Clone)]
+struct CachedServerAnswer {
+    result: ConfiguredServerResult,
+    expires_at: Instant,
+    stale_until: Instant,
+}
+
+const SERVER_CACHE_LIMIT: usize = 4096;
+
+impl CachedServerAnswer {
+    fn with_remaining_ttl(&self, now: Instant) -> ConfiguredServerResult {
+        let remaining = self.expires_at.saturating_duration_since(now);
+        match &self.result {
+            ConfiguredServerResult::Answer(ConfiguredDnsAnswer::Addresses(answer)) => {
+                ConfiguredServerResult::Answer(ConfiguredDnsAnswer::Addresses(
+                    ConfiguredDnsAddresses {
+                        addresses: answer.addresses.clone(),
+                        ttl: remaining,
+                    },
+                ))
+            }
+            ConfiguredServerResult::Answer(ConfiguredDnsAnswer::Cname { alias, .. }) => {
+                ConfiguredServerResult::Answer(ConfiguredDnsAnswer::Cname {
+                    alias: alias.clone(),
+                    ttl: remaining,
+                })
+            }
+            ConfiguredServerResult::Negative(negative) => {
+                ConfiguredServerResult::Negative(*negative)
+            }
+        }
+    }
 }
 
 impl ConfiguredDnsResolver {
@@ -1555,6 +1628,10 @@ impl ConfiguredDnsResolver {
             disable_fallback: false,
             disable_fallback_if_match: false,
             parallel_query: false,
+            default_disable_cache: false,
+            default_serve_stale: false,
+            default_serve_expired_ttl: 0,
+            server_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1593,6 +1670,30 @@ impl ConfiguredDnsResolver {
     pub fn with_parallel_query(mut self, enabled: bool) -> Self {
         self.parallel_query = enabled;
         self
+    }
+
+    /// The global `dns.disableCache` / `serveStale` / `serveExpiredTTL`
+    /// policy; each server's own fields override it.
+    pub fn with_server_cache_policy(
+        mut self,
+        disable_cache: bool,
+        serve_stale: bool,
+        serve_expired_ttl: u32,
+    ) -> Self {
+        self.default_disable_cache = disable_cache;
+        self.default_serve_stale = serve_stale;
+        self.default_serve_expired_ttl = serve_expired_ttl;
+        self
+    }
+
+    fn server_cache_policy(&self, server: &CompiledNameServerPolicy) -> (bool, bool, u32) {
+        (
+            server.disable_cache.unwrap_or(self.default_disable_cache),
+            server.serve_stale.unwrap_or(self.default_serve_stale),
+            server
+                .serve_expired_ttl
+                .unwrap_or(self.default_serve_expired_ttl),
+        )
     }
 
     /// The global `queryStrategy: "UseSystem"`: every lookup is narrowed to
@@ -1857,6 +1958,92 @@ impl ConfiguredDnsResolver {
     }
 
     async fn query_configured_server(
+        &self,
+        name_server: &CompiledNameServerPolicy,
+        domain: &str,
+        deadline: time::Instant,
+        query_strategy: DnsQueryStrategy,
+    ) -> io::Result<ConfiguredServerResult> {
+        let (disable_cache, serve_stale, serve_expired_ttl) = self.server_cache_policy(name_server);
+        let key = (!disable_cache).then(|| ServerCacheKey {
+            server: name_server.cache_id,
+            domain: domain.to_ascii_lowercase(),
+            strategy: query_strategy,
+        });
+        let now = Instant::now();
+        let mut stale = None;
+        if let Some(key) = &key {
+            let cache = self.server_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(entry) = cache.get(key) {
+                if now < entry.expires_at {
+                    return Ok(entry.with_remaining_ttl(now));
+                }
+                if serve_stale && now < entry.stale_until {
+                    stale = Some(entry.with_remaining_ttl(now));
+                }
+            }
+        }
+        match self
+            .query_configured_server_uncached(name_server, domain, deadline, query_strategy)
+            .await
+        {
+            Ok(result) => {
+                if let Some(key) = key {
+                    self.cache_server_answer(key, &result, serve_stale, serve_expired_ttl);
+                }
+                Ok(result)
+            }
+            Err(error) => match stale {
+                Some(stale) => Ok(stale),
+                None => Err(error),
+            },
+        }
+    }
+
+    fn cache_server_answer(
+        &self,
+        key: ServerCacheKey,
+        result: &ConfiguredServerResult,
+        serve_stale: bool,
+        serve_expired_ttl: u32,
+    ) {
+        let (ttl, cacheable) = match result {
+            ConfiguredServerResult::Answer(ConfiguredDnsAnswer::Addresses(answer)) => {
+                (answer.ttl, !answer.ttl.is_zero())
+            }
+            ConfiguredServerResult::Answer(ConfiguredDnsAnswer::Cname { ttl, .. }) => {
+                (*ttl, !ttl.is_zero())
+            }
+            ConfiguredServerResult::Negative(_) => (DNS_NEGATIVE_TTL, true),
+        };
+        if !cacheable {
+            return;
+        }
+        let now = Instant::now();
+        let expires_at = now + ttl;
+        let stale_until = if serve_stale && serve_expired_ttl > 0 {
+            expires_at + Duration::from_secs(u64::from(serve_expired_ttl))
+        } else {
+            expires_at
+        };
+        let mut cache = self.server_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= SERVER_CACHE_LIMIT {
+            cache.retain(|_, entry| entry.stale_until > now);
+            if cache.len() >= SERVER_CACHE_LIMIT {
+                cache.clear();
+            }
+        }
+        cache.insert(
+            key,
+            CachedServerAnswer {
+                result: result.clone(),
+                expires_at,
+                stale_until,
+            },
+        );
+    }
+
+    async fn query_configured_server_uncached(
         &self,
         name_server: &CompiledNameServerPolicy,
         domain: &str,
@@ -2453,6 +2640,7 @@ impl ConfiguredDnsNegative {
     }
 }
 
+#[derive(Clone)]
 enum ConfiguredServerResult {
     Answer(ConfiguredDnsAnswer),
     Negative(ConfiguredDnsNegative),
@@ -5729,6 +5917,120 @@ mod tests {
         assert!(lookup.ttl().is_some_and(|ttl| {
             ttl <= Duration::from_secs(30) && ttl > Duration::from_secs(29)
         }));
+    }
+
+    #[derive(Default)]
+    struct CountingQueryTransport {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl DnsQueryTransport for CountingQueryTransport {
+        async fn exchange(
+            &self,
+            _server: &NameServer,
+            _transport: DnsQueryTransportKind,
+            _metadata: DnsQueryMetadata<'_>,
+            query: &[u8],
+        ) -> io::Result<Vec<u8>> {
+            use std::sync::atomic::Ordering;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(io::Error::other("upstream down"));
+            }
+            let record_type = u16::from_be_bytes([query[query.len() - 4], query[query.len() - 3]]);
+            match record_type {
+                1 => Ok(build_test_address_response(
+                    query,
+                    &[(1, 1, Ipv4Addr::new(192, 0, 2, 120).octets().to_vec())],
+                )),
+                28 => Ok(build_test_address_response(
+                    query,
+                    &[(
+                        28,
+                        1,
+                        Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 120)
+                            .octets()
+                            .to_vec(),
+                    )],
+                )),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unexpected DNS query type",
+                )),
+            }
+        }
+    }
+
+    fn counted_resolver(
+        transport: Arc<CountingQueryTransport>,
+        policies: Option<Vec<NameServerPolicy>>,
+        disable_cache: bool,
+        serve_stale: bool,
+        serve_expired_ttl: u32,
+    ) -> ConfiguredDnsResolver {
+        let server = NameServer::Socket(SocketAddr::from(([192, 0, 2, 53], 53)));
+        let configured = ConfiguredDnsResolver::new(
+            DomainHostIndex::default(),
+            vec![server],
+            Arc::new(RejectingResolver),
+        )
+        .with_query_transport(transport)
+        .with_server_cache_policy(disable_cache, serve_stale, serve_expired_ttl);
+        match policies {
+            Some(policies) => configured.with_name_server_policies(policies),
+            None => configured,
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_dns_caches_server_answers_until_their_ttl() {
+        let transport = Arc::new(CountingQueryTransport::default());
+        let resolver = counted_resolver(transport.clone(), None, false, false, 0);
+
+        resolver.resolve_all("cache.example", 443).await.unwrap();
+        let calls = transport.calls.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(calls, 2);
+        resolver.resolve_all("cache.example", 443).await.unwrap();
+        assert_eq!(
+            transport.calls.load(std::sync::atomic::Ordering::Relaxed),
+            calls
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_dns_per_server_disable_cache_overrides_the_global_policy() {
+        let transport = Arc::new(CountingQueryTransport::default());
+        let server = NameServer::Socket(SocketAddr::from(([192, 0, 2, 53], 53)));
+        let mut policy = NameServerPolicy::new(server);
+        policy.disable_cache = Some(true);
+        let resolver = counted_resolver(transport.clone(), Some(vec![policy]), false, false, 0);
+
+        resolver.resolve_all("uncached.example", 443).await.unwrap();
+        resolver.resolve_all("uncached.example", 443).await.unwrap();
+        assert_eq!(
+            transport.calls.load(std::sync::atomic::Ordering::Relaxed),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_dns_serves_stale_when_the_upstream_fails() {
+        use std::sync::atomic::Ordering;
+        let transport = Arc::new(CountingQueryTransport::default());
+        let resolver = counted_resolver(transport.clone(), None, false, true, 60);
+
+        let fresh = resolver.resolve_all("stale.example", 443).await.unwrap();
+        assert_eq!(fresh.ips().count(), 2);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        transport.fail.store(true, Ordering::Relaxed);
+
+        let stale = resolver.resolve_all("stale.example", 443).await.unwrap();
+        assert_eq!(
+            stale.ips().collect::<Vec<_>>(),
+            fresh.ips().collect::<Vec<_>>()
+        );
     }
 
     #[derive(Default)]

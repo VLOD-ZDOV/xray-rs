@@ -99,20 +99,19 @@ pub async fn connect(
             tokio::spawn(crate::metrics::serve(server));
             Ok(Box::new(client))
         }
-        Action::Block(crate::routing::BlockAction::Http403) => {
+        Action::Block(block) => {
+            let Some(response) = block.response() else {
+                return Err(blocked(&decision.tag));
+            };
             // Xray's blackhole writes its response, waits a second, then closes.
+            let response = response.to_vec();
             let (client, mut server) = tokio::io::duplex(1024);
             tokio::spawn(async move {
-                let _ = tokio::io::AsyncWriteExt::write_all(
-                    &mut server,
-                    crate::routing::BLACKHOLE_HTTP_RESPONSE,
-                )
-                .await;
+                let _ = tokio::io::AsyncWriteExt::write_all(&mut server, &response).await;
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             });
             Ok(Box::new(client))
         }
-        Action::Block(_) => Err(blocked(&decision.tag)),
     }
 }
 

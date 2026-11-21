@@ -1041,14 +1041,28 @@ impl Balancer {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BlockAction {
     #[default]
     Drop,
     Http403,
+    /// `response.type: "custom"`: the decoded `customResponseData` is written
+    /// back before the connection closes, as Xray's blackhole does.
+    Custom(Arc<Vec<u8>>),
     /// freedom's `finalRules` block: the connection is held, its input
     /// discarded, for a random delay in seconds, then closed.
     Hold(FinalBlock),
+}
+
+impl BlockAction {
+    /// The bytes Xray's blackhole writes back, if any.
+    pub fn response(&self) -> Option<&[u8]> {
+        match self {
+            Self::Http403 => Some(BLACKHOLE_HTTP_RESPONSE),
+            Self::Custom(data) => Some(data),
+            Self::Drop | Self::Hold(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1407,6 +1421,24 @@ pub struct RouteCacheKey {
 pub type MatchedRule = (RuleTarget, Option<Arc<WebhookNotifier>>, usize, String);
 pub type RouteCache = HashMap<RouteCacheKey, Option<MatchedRule>>;
 
+/// One routed connection as `SubscribeRoutingStats` reports it.
+#[derive(Clone, Debug)]
+pub struct RoutingEvent {
+    pub inbound: String,
+    pub udp: bool,
+    pub source: std::net::SocketAddr,
+    pub ip: Option<std::net::IpAddr>,
+    pub domain: Option<String>,
+    pub port: u16,
+    pub protocol: Option<&'static str>,
+    pub user: String,
+    pub attributes: Option<HashMap<String, String>>,
+    pub local_ip: Option<std::net::IpAddr>,
+    pub inbound_port: u16,
+    pub vless_route: Option<u32>,
+    pub outbound: String,
+}
+
 pub struct Router {
     pub rules: std::sync::RwLock<Vec<Rule>>,
     pub strategy: RoutingDomainStrategy,
@@ -1421,6 +1453,7 @@ pub struct Router {
     pub reverse_portals: std::sync::RwLock<HashMap<String, Arc<crate::mux::ReversePortal>>>,
     pub inbound_protocols: std::sync::RwLock<HashMap<String, String>>,
     pub route_cache: std::sync::RwLock<RouteCache>,
+    routing_stats: tokio::sync::broadcast::Sender<RoutingEvent>,
 }
 
 pub struct Rule {
@@ -1622,14 +1655,29 @@ impl Router {
                 "blackhole" | "block" => {
                     let settings = outbound.get("settings").unwrap_or(&Value::Null);
                     let resp = settings.get("response").unwrap_or(&Value::Null);
-                    let block_action = match str_field(resp, "type") {
+                    let block_action = match str_field(resp, "type").to_ascii_lowercase().as_str() {
                         "" | "none" => BlockAction::Drop,
                         "http" => BlockAction::Http403,
+                        "custom" => {
+                            use base64::Engine;
+                            let encoded = str_field(resp, "customResponseData");
+                            let data = base64::engine::general_purpose::STANDARD
+                                .decode(encoded)
+                                .map_err(|e| {
+                                    format!(
+                                        "outbound {tag:?}: failed to decode custom response data: {e}"
+                                    )
+                                })?;
+                            if data.is_empty() {
+                                BlockAction::Drop
+                            } else {
+                                BlockAction::Custom(Arc::new(data))
+                            }
+                        }
                         other => {
-                            log::warn(format!(
-                                "outbound {tag:?}: unsupported blackhole response type {other:?}"
+                            return Err(format!(
+                                "outbound {tag:?}: unknown blackhole response: {other}"
                             ));
-                            BlockAction::Drop
                         }
                     };
                     Action::Block(block_action)
@@ -1665,15 +1713,21 @@ impl Router {
                 "masque" => Action::Masque(Arc::new(
                     crate::masque_outbound::MasqueOutbound::parse(&tag, outbound)?,
                 )),
-                "hysteria" | "hysteria2" => {
+                "hysteria" => {
                     let settings = outbound.get("settings").unwrap_or(&Value::Null);
-                    if let Some(v) = settings.get("version") {
-                        if v.as_i64() != Some(2) {
-                            return Err("version != 2".into());
-                        }
+                    if settings.get("version").and_then(Value::as_i64) != Some(2) {
+                        return Err("version != 2".into());
                     }
-                    if !matches!(network, "hysteria" | "hysteria2") {
+                    if network != "hysteria" {
                         return Err("not hysteria transport".into());
+                    }
+                    if let Some(hysteria_settings) = outbound
+                        .pointer("/streamSettings/hysteriaSettings")
+                        .filter(|value| !value.is_null())
+                    {
+                        if hysteria_settings.get("version").and_then(Value::as_i64) != Some(2) {
+                            return Err("Failed to build Hysteria config. > version != 2".into());
+                        }
                     }
                     Action::Hysteria(Arc::new(crate::hysteria_outbound::HysteriaOutbound::parse(
                         &tag, outbound,
@@ -1684,10 +1738,7 @@ impl Router {
                     let inbound_tag = str_field(settings, "inboundTag").to_owned();
                     Action::Loopback(inbound_tag)
                 }
-                other => {
-                    log::warn(format!("outbound {tag:?} ({other}) is not supported yet; traffic routed to it will be blocked"));
-                    Action::Block(BlockAction::Drop)
-                }
+                other => return Err(format!("unknown config id: {other}")),
             };
             default_tag.get_or_insert_with(|| tag.clone());
             crate::finalmask::validate_and_log_finalmask(outbound, &tag)?;
@@ -1809,6 +1860,7 @@ impl Router {
                     .collect(),
             ),
             route_cache: std::sync::RwLock::new(HashMap::new()),
+            routing_stats: tokio::sync::broadcast::channel(256).0,
         })
     }
 
@@ -2001,6 +2053,40 @@ impl Router {
         outbounds.remove(tag).is_some()
     }
 
+    /// The registered outbound handlers as `ListOutbounds` reports them:
+    /// tag and the protobuf name of the handler's config.
+    pub fn outbound_summaries(&self) -> Vec<(String, &'static str)> {
+        let outbounds = self
+            .outbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut summaries: Vec<(String, &'static str)> = outbounds
+            .iter()
+            .filter_map(|(tag, action)| {
+                let proxy = match action {
+                    Action::Direct(_) => "xray.proxy.freedom.Config",
+                    Action::Block(_) => "xray.proxy.blackhole.Config",
+                    Action::Socks(_) => "xray.proxy.socks.ClientConfig",
+                    Action::Vless(_) => "xray.proxy.vless.outbound.Config",
+                    Action::Vmess(_) => "xray.proxy.vmess.outbound.Config",
+                    Action::Trojan(_) => "xray.proxy.trojan.ClientConfig",
+                    Action::Shadowsocks(_) => "xray.proxy.shadowsocks.ClientConfig",
+                    Action::Http(_) => "xray.proxy.http.ClientConfig",
+                    Action::Dns(_) => "xray.proxy.dns.Config",
+                    Action::Hysteria(_) => "xray.proxy.hysteria.ClientConfig",
+                    Action::Masque(_) => "xray.proxy.masque.ClientConfig",
+                    Action::Wireguard(_) => "xray.proxy.wireguard.DeviceConfig",
+                    Action::Loopback(_) => "xray.proxy.loopback.Config",
+                    Action::Reverse(_) => "xray.app.proxyman.command.ReverseConfig",
+                    Action::Metrics => return None,
+                };
+                Some((tag.clone(), proxy))
+            })
+            .collect();
+        summaries.sort_by(|a, b| a.0.cmp(&b.0));
+        summaries
+    }
+
     pub fn set_inbound_protocol(&self, tag: &str, protocol: Option<&str>) {
         let mut protocols = self
             .inbound_protocols
@@ -2080,6 +2166,32 @@ impl Router {
     }
 
     pub async fn route(&self, query: &Query<'_>) -> Decision {
+        let decision = self.route_inner(query).await;
+        if self.routing_stats.receiver_count() > 0 {
+            let _ = self.routing_stats.send(RoutingEvent {
+                inbound: query.inbound.to_owned(),
+                udp: query.network == Network::Udp,
+                source: query.source,
+                ip: query.ip,
+                domain: query.domain.map(str::to_owned),
+                port: query.port,
+                protocol: query.protocol,
+                user: query.user.to_owned(),
+                attributes: query.attributes.cloned(),
+                local_ip: query.local_ip,
+                inbound_port: query.inbound_port,
+                vless_route: query.vless_route,
+                outbound: decision.tag.clone(),
+            });
+        }
+        decision
+    }
+
+    pub fn subscribe_routing_stats(&self) -> tokio::sync::broadcast::Receiver<RoutingEvent> {
+        self.routing_stats.subscribe()
+    }
+
+    async fn route_inner(&self, query: &Query<'_>) -> Decision {
         let resolve_first = self.strategy == RoutingDomainStrategy::IpOnDemand;
         let mut resolved = None;
         if resolve_first {
@@ -2979,7 +3091,7 @@ mod tests {
     #[tokio::test]
     async fn server_side_fields_and_unsupported_outbounds() {
         let r = router(json!({
-            "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "warp", "protocol": "unsupported-proto"}],
+            "outbounds": [{"tag": "direct", "protocol": "freedom"}, {"tag": "warp", "protocol": "blackhole"}],
             "routing": {"rules": [
                 {"type": "field", "outboundTag": "warp", "domain": ["domain:openai.com"]},
                 {"type": "field", "outboundTag": "warp", "user": ["regexp:^bob"]},
@@ -3007,6 +3119,18 @@ mod tests {
         assert_eq!(r.route(&src).await.tag, "warp");
         src.source = "198.51.100.7:5000".parse().unwrap();
         assert_eq!(r.route(&src).await.tag, "direct");
+    }
+
+    #[test]
+    fn unsupported_outbound_protocols_are_rejected_like_xray() {
+        let error = match Router::build(
+            &json!({"outbounds": [{"tag": "x", "protocol": "unsupported-proto"}]}),
+            &[],
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("unknown outbound protocol must reject the config"),
+        };
+        assert!(error.contains("unknown config id"), "{error}");
     }
 
     #[test]
@@ -3093,6 +3217,75 @@ mod tests {
         assert_eq!(
             r.final_action("plain", Network::Tcp, at("192.168.1.1:80"), false),
             Action::Block(BlockAction::Hold(DEFAULT_FINAL_BLOCK))
+        );
+    }
+
+    #[tokio::test]
+    async fn blackhole_http_response_by_port_rule() {
+        let r = router(json!({
+            "outbounds": [
+                {"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow", "ip": ["127.0.0.1"]}]}},
+                {"tag": "block", "protocol": "blackhole", "settings": {"response": {"type": "http"}}}
+            ],
+            "routing": {"rules": [{"port": "18973", "outboundTag": "block"}]}
+        }));
+        let decision = r.route(&query(Some("127.0.0.1"), Some("127.0.0.1"), 18973)).await;
+        assert_eq!(decision.tag, "block");
+        assert_eq!(decision.action, Action::Block(BlockAction::Http403));
+    }
+
+    #[tokio::test]
+    async fn blackhole_custom_response_is_decoded_and_unknown_types_fail() {
+        let r = router(json!({
+            "outbounds": [
+                {"tag": "custom", "protocol": "blackhole", "settings": {"response": {
+                    "type": "Custom",
+                    "customResponseData": "aGVsbG8="
+                }}}
+            ],
+            "routing": {"rules": [
+                {"type": "field", "outboundTag": "custom", "domain": ["example.com"]}
+            ]}
+        }));
+        let decision = r.route(&query(Some("example.com"), None, 80)).await;
+        assert_eq!(
+            decision.action,
+            Action::Block(BlockAction::Custom(Arc::new(b"hello".to_vec())))
+        );
+        assert_eq!(
+            BlockAction::Custom(Arc::new(b"hello".to_vec())).response(),
+            Some(b"hello".as_slice())
+        );
+
+        let error = match Router::build(
+            &json!({
+                "outbounds": [
+                    {"tag": "bad", "protocol": "blackhole", "settings": {"response": {"type": "bogus"}}}
+                ]
+            }),
+            &[],
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("expected an unknown response type to be rejected"),
+        };
+        assert!(error.contains("unknown blackhole response"), "{error}");
+
+        let error = match Router::build(
+            &json!({
+                "outbounds": [
+                    {"tag": "bad", "protocol": "blackhole", "settings": {"response": {
+                        "type": "custom", "customResponseData": "not base64!"
+                    }}}
+                ]
+            }),
+            &[],
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("expected invalid custom response data to be rejected"),
+        };
+        assert!(
+            error.contains("failed to decode custom response data"),
+            "{error}"
         );
     }
 

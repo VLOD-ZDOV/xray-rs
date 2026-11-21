@@ -235,15 +235,6 @@ pub(crate) async fn connect_unix(_: &str) -> io::Result<TcpStream> {
     ))
 }
 
-pub(crate) async fn write_proxy_header<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    xver: u8,
-    peer: SocketAddr,
-    inbound_port: u16,
-) -> io::Result<()> {
-    write_proxy_header_with_local(writer, xver, peer, inbound_port, None).await
-}
-
 pub(crate) async fn write_proxy_header_with_local<W: AsyncWrite + Unpin>(
     writer: &mut W,
     xver: u8,

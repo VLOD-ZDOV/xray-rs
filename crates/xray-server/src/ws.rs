@@ -12,7 +12,8 @@ use base64::Engine;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::time::timeout_at;
 
-const MAX_HEADER_SIZE: usize = 16 * 1024;
+// Xray's WebSocket listener uses `http.Server.MaxHeaderBytes = 8192`.
+const MAX_HEADER_SIZE: usize = 8192;
 const CHUNK_SIZE: usize = 4096;
 // Xray clients send one frame per write (a few KiB at most).
 const MAX_FRAME_SIZE: usize = 1 << 20;
@@ -32,19 +33,29 @@ pub fn accept_key_for(client_key: &str) -> String {
 pub struct WsSettings {
     pub path: String,
     pub host: Option<String>,
+    /// Xray's `heartbeatPeriod`: seconds between server pings; zero disables.
+    pub heartbeat_period: Option<std::time::Duration>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum FrameEvent {
     Payload(Vec<u8>),
     Pong(Vec<u8>),
-    Close,
+    /// The close payload, echoed back as Go's websocket default close handler
+    /// does. It carries the status code when the peer sent one.
+    Close(Vec<u8>),
+    /// A non-final data fragment: consumed, with its payload kept in the
+    /// decoder until the final continuation frame.
+    Fragment,
 }
 
 #[derive(Debug, Default)]
 pub struct ServerFrameDecoder {
     buffer: Vec<u8>,
     consumed: usize,
+    /// Payload of a fragmented data message still being assembled.
+    fragment: Vec<u8>,
+    fragmented: bool,
 }
 
 impl ServerFrameDecoder {
@@ -65,7 +76,8 @@ impl ServerFrameDecoder {
             self.consumed += length;
 
             match event {
-                FrameEvent::Payload(data) if data.is_empty() => continue,
+                FrameEvent::Fragment => continue,
+                FrameEvent::Payload(data) => return Ok(Some(FrameEvent::Payload(data))),
                 event => return Ok(Some(event)),
             }
         }
@@ -78,7 +90,7 @@ impl ServerFrameDecoder {
         }
     }
 
-    fn parse_frame(&self) -> io::Result<Option<(FrameEvent, usize)>> {
+    fn parse_frame(&mut self) -> io::Result<Option<(FrameEvent, usize)>> {
         let bytes = &self.buffer[self.consumed..];
         if bytes.len() < 2 {
             return Ok(None);
@@ -87,6 +99,7 @@ impl ServerFrameDecoder {
         let b0 = bytes[0];
         let b1 = bytes[1];
         let opcode = b0 & 0x0F;
+        let fin = b0 & 0x80 != 0;
         let masked = (b1 & 0x80) != 0;
         let len_code = b1 & 0x7F;
 
@@ -157,8 +170,36 @@ impl ServerFrameDecoder {
 
         let total_frame_len = payload_end;
         let event = match opcode {
-            0x0..=0x2 => FrameEvent::Payload(payload),
-            0x8 => FrameEvent::Close,
+            0x0 => {
+                if !self.fragmented {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "continuation after FIN",
+                    ));
+                }
+                self.fragment.extend_from_slice(&payload);
+                if !fin {
+                    return Ok(Some((FrameEvent::Fragment, total_frame_len)));
+                }
+                self.fragmented = false;
+                FrameEvent::Payload(std::mem::take(&mut self.fragment))
+            }
+            0x1 | 0x2 => {
+                if self.fragmented {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "new data frame during fragmented message",
+                    ));
+                }
+                if fin {
+                    FrameEvent::Payload(payload)
+                } else {
+                    self.fragmented = true;
+                    self.fragment = payload;
+                    return Ok(Some((FrameEvent::Fragment, total_frame_len)));
+                }
+            }
+            0x8 => FrameEvent::Close(payload),
             0x9 => FrameEvent::Pong(payload),
             0xA => FrameEvent::Payload(Vec::new()), // Pong: ignore
             other => {
@@ -211,6 +252,8 @@ pub struct WebSocketStream<S> {
     out: Vec<u8>,
     out_pos: usize,
     peer_closed: bool,
+    heartbeat_period: Option<std::time::Duration>,
+    heartbeat: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
 fn flush_buffer<S: AsyncWrite + Unpin>(
@@ -236,7 +279,12 @@ fn flush_buffer<S: AsyncWrite + Unpin>(
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
-    pub fn new(inner: S, leftover: Vec<u8>, early_data: Vec<u8>) -> Self {
+    pub fn new(
+        inner: S,
+        leftover: Vec<u8>,
+        early_data: Vec<u8>,
+        heartbeat_period: Option<std::time::Duration>,
+    ) -> Self {
         let mut decoder = ServerFrameDecoder::new();
         decoder.extend(&leftover);
         Self {
@@ -247,11 +295,49 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WebSocketStream<S> {
             out: Vec::new(),
             out_pos: 0,
             peer_closed: false,
+            heartbeat_period,
+            heartbeat: None,
         }
     }
 
     fn poll_flush_out(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         flush_buffer(&mut self.inner, &mut self.out, &mut self.out_pos, cx)
+    }
+
+    /// Queues a close frame and flushes it. Used when the protocol handler
+    /// rejects the session, before the stream is dropped.
+    pub async fn close(&mut self, code: u16) {
+        if self.peer_closed {
+            return;
+        }
+        encode_server_frame(&mut self.out, 0x88, &code.to_be_bytes());
+        let _ = tokio::io::AsyncWriteExt::flush(self).await;
+        self.peer_closed = true;
+    }
+
+    /// Xray's `heartbeatPeriod`: write an empty ping frame whenever the period
+    /// elapses, independent of traffic in either direction.
+    fn poll_heartbeat(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        use std::future::Future;
+
+        let Some(period) = self.heartbeat_period else {
+            return Poll::Ready(Ok(()));
+        };
+        let sleep = self
+            .heartbeat
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep(period)));
+        if sleep.as_mut().poll(cx).is_pending() {
+            return Poll::Pending;
+        }
+        self.heartbeat = None;
+        if self.out.len() > MAX_QUEUED_PONGS {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "websocket peer does not read its pings",
+            )));
+        }
+        encode_server_frame(&mut self.out, 0x89, &[]);
+        self.poll_flush_out(cx)
     }
 }
 
@@ -261,6 +347,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketStream<S> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if let Poll::Ready(Err(e)) = self.poll_heartbeat(cx) {
+            return Poll::Ready(Err(e));
+        }
         let WebSocketStream {
             inner,
             decoder,
@@ -269,6 +358,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketStream<S> {
             out,
             out_pos,
             peer_closed,
+            ..
         } = &mut *self;
 
         // Try flushing any buffered outgoing frames (e.g. Pong)
@@ -314,14 +404,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncRead for WebSocketStream<S> {
                     encode_server_frame(out, 0x8A, &ping_data);
                     let _ = flush_buffer(inner, out, out_pos, cx);
                 }
-                Ok(Some(FrameEvent::Close)) => {
+                Ok(Some(FrameEvent::Close(payload))) => {
                     *peer_closed = true;
-                    encode_server_frame(out, 0x88, &[]);
+                    encode_server_frame(out, 0x88, &payload);
                     let _ = flush_buffer(inner, out, out_pos, cx);
                     return Poll::Ready(Ok(()));
                 }
-                Ok(None) => {}
-                Err(e) => return Poll::Ready(Err(e)),
+                Ok(Some(FrameEvent::Fragment)) | Ok(None) => {}
+                Err(e) => {
+                    let reason = if e.to_string().contains("must be masked") {
+                        "bad MASK"
+                    } else if e.to_string().contains("continuation after FIN") {
+                        "continuation after FIN"
+                    } else if e.to_string().contains("reserved") {
+                        "unexpected reserved bits"
+                    } else {
+                        ""
+                    };
+                    let mut payload = Vec::with_capacity(2 + reason.len());
+                    payload.extend_from_slice(&1002u16.to_be_bytes());
+                    payload.extend_from_slice(reason.as_bytes());
+                    encode_server_frame(out, 0x88, &payload);
+                    let _ = flush_buffer(inner, out, out_pos, cx);
+                    return Poll::Ready(Err(e));
+                }
             }
 
             let mut read_slice = [0u8; 8192];
@@ -352,6 +458,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
         let this = &mut *self;
+        if let Poll::Ready(Err(e)) = this.poll_heartbeat(cx) {
+            return Poll::Ready(Err(e));
+        }
         if this.poll_flush_out(cx)?.is_pending() {
             return Poll::Pending;
         }
@@ -378,6 +487,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStream<S> {
     }
 }
 
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> xray_proxy::vless::VisionStreamIo
+    for WebSocketStream<S>
+{
+    fn poll_read_direct(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        output: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, output)
+    }
+
+    fn poll_write_direct(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        input: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, input)
+    }
+
+    fn close_on_error(
+        &mut self,
+        code: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(async move { self.close(code).await })
+    }
+}
+
 pub async fn accept<S>(
     mut stream: S,
     settings: &WsSettings,
@@ -397,6 +533,12 @@ where
             break pos;
         }
         if header_buf.len() >= MAX_HEADER_SIZE {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\n\r\n",
+                )
+                .await;
+            let _ = stream.flush().await;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "websocket header too large",
@@ -566,7 +708,10 @@ where
     stream.write_all(resp.as_bytes()).await?;
     stream.flush().await?;
 
-    Ok((WebSocketStream::new(stream, leftover, early_data), peer))
+    Ok((
+        WebSocketStream::new(stream, leftover, early_data, settings.heartbeat_period),
+        peer,
+    ))
 }
 
 fn decode_early_data(val: &str) -> Vec<u8> {
@@ -609,6 +754,33 @@ mod tests {
         decoder.extend(&frame);
         let event = decoder.next_event().unwrap().unwrap();
         assert_eq!(event, FrameEvent::Payload(b"hello".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_writes_an_empty_ping_while_idle() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (client, mut server) = tokio::io::duplex(64);
+        let mut stream = WebSocketStream::new(
+            client,
+            Vec::new(),
+            Vec::new(),
+            Some(std::time::Duration::from_millis(50)),
+        );
+        let receive = async {
+            let mut frame = [0u8; 2];
+            server.read_exact(&mut frame).await.map(|_| frame)
+        };
+        let drive = async {
+            let mut discard = [0u8; 16];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                stream.read(&mut discard),
+            )
+            .await;
+        };
+        let (_, frame) = tokio::join!(drive, receive);
+        assert_eq!(frame.unwrap(), [0x89, 0x00]);
     }
 
     #[test]

@@ -53,9 +53,6 @@ pub(super) fn parse_dns_https_server_uri(
     }
     let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
-    if authority.is_empty() {
-        return Err("dns HTTPS server URL must include a host".to_owned());
-    }
     if authority.contains('@') {
         return Err("dns HTTPS server URL must not include userinfo".to_owned());
     }
@@ -70,7 +67,14 @@ pub(super) fn parse_dns_https_server_uri(
         _ => return Err("dns HTTPS server URL contains an invalid path or query".to_owned()),
     };
 
-    let endpoint = if let Some(bracketed) = authority.strip_prefix('[') {
+    let endpoint = if authority.is_empty() {
+        // Xray accepts a host-less DoH URL such as `https:///dns-query`; the
+        // resulting client has an empty host and fails only when queried.
+        DnsServerEndpoint::Domain {
+            domain: String::new(),
+            port: 443,
+        }
+    } else if let Some(bracketed) = authority.strip_prefix('[') {
         let Some((host, suffix)) = bracketed.split_once(']') else {
             return Err("dns HTTPS server URL contains a malformed bracketed IPv6 host".to_owned());
         };
@@ -298,6 +302,10 @@ pub(super) fn dns_stream_server_policy(
         check_system_routes: false,
         final_query: false,
         client_ip: None,
+        id: String::new(),
+        disable_cache: None,
+        serve_stale: None,
+        serve_expired_ttl: None,
         policy_key: crate::DEFAULT_DNS_POLICY_KEY.to_owned(),
     }))
 }
@@ -599,6 +607,22 @@ impl Parser<'_> {
         let client_ip =
             self.parse_dns_client_ip(server.get("clientIp"), &format!("{path}.clientIp"));
         let policy_key = Self::dns_policy_key(server, client_ip, skip_fallback, &tag);
+        let disable_cache = match server.get("disableCache") {
+            None | Some(Value::Null) => None,
+            Some(_) => {
+                self.optional_bool_at(server, "disableCache", format!("{path}.disableCache"))
+            }
+        };
+        let serve_stale = match server.get("serveStale") {
+            None | Some(Value::Null) => None,
+            Some(_) => self.optional_bool_at(server, "serveStale", format!("{path}.serveStale")),
+        };
+        let serve_expired_ttl = match server.get("serveExpiredTTL") {
+            None | Some(Value::Null) => None,
+            Some(_) => {
+                self.optional_u32_at(server, "serveExpiredTTL", format!("{path}.serveExpiredTTL"))
+            }
+        };
         Some(DnsServerConfig::Policy(Box::new(DnsNameServerConfig {
             endpoint,
             transport,
@@ -615,6 +639,13 @@ impl Parser<'_> {
                 .optional_bool_at(server, "finalQuery", format!("{path}.finalQuery"))
                 .unwrap_or(false),
             client_ip,
+            id: self
+                .nullable_string_at(server, "id", format!("{path}.id"))
+                .unwrap_or_default()
+                .to_owned(),
+            disable_cache,
+            serve_stale,
+            serve_expired_ttl,
             policy_key,
         })))
     }

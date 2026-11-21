@@ -212,6 +212,14 @@ async fn response(
 }
 
 #[tokio::test]
+async fn blackhole_403_response_parses() {
+    let raw = b"HTTP/1.1 403 Forbidden\r\nCache-Control: max-age=3600, public\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
+    let (_, head, body, _) = response(raw, "GET").await.expect("403 response should parse");
+    assert!(head.starts_with("HTTP/1.1 403 Forbidden"));
+    assert_eq!(body, HttpBody::None);
+}
+
+#[tokio::test]
 async fn responses_come_back_as_go_writes_them() {
     let keep =
         "Connection: keep-alive\r\nKeep-Alive: timeout=60\r\nProxy-Connection: keep-alive\r\n";

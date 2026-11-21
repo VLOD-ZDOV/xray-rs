@@ -18,7 +18,7 @@ use xray_config::Network;
 
 use crate::log;
 use crate::outbound::{self, ConeUdp};
-use crate::routing::{Action, BlockAction, Decision, Router};
+use crate::routing::{Action, Decision, Router};
 use crate::stats::{self, Traffic};
 use crate::vless::{host_label, Host, RouteRequest, Sniffing, CONN_IDLE};
 
@@ -177,6 +177,8 @@ pub struct Info {
     pub level: u32,
     pub router: Arc<Router>,
     pub sniffing: Sniffing,
+    /// Xray's `VlessRoute` for the mux session's sub-connections.
+    pub vless_route: Option<u32>,
 }
 
 struct Packet {
@@ -275,6 +277,7 @@ where
                         host: &host,
                         port,
                         sniffing: &info.sniffing,
+                        vless_route: info.vless_route,
                     };
                     let Some(decision) = route
                         .allow(&info.router, frame.data.as_deref().unwrap_or_default())
@@ -283,18 +286,19 @@ where
                         let _ = out_tx.send(end_frame(frame.id, true)).await;
                         continue;
                     };
-                    if let Action::Block(BlockAction::Http403) = decision.action {
-                        if !udp {
-                            let resp = crate::routing::BLACKHOLE_HTTP_RESPONSE;
-                            let _ = out_tx
-                                .send(encode_frame(
-                                    frame.id,
-                                    STATUS_KEEP,
-                                    OPTION_DATA,
-                                    None,
-                                    Some(resp),
-                                ))
-                                .await;
+                    if let Action::Block(block) = &decision.action {
+                        if let Some(resp) = block.response() {
+                            if !udp {
+                                let _ = out_tx
+                                    .send(encode_frame(
+                                        frame.id,
+                                        STATUS_KEEP,
+                                        OPTION_DATA,
+                                        None,
+                                        Some(resp),
+                                    ))
+                                    .await;
+                            }
                         }
                         let _ = out_tx.send(end_frame(frame.id, false)).await;
                         continue;

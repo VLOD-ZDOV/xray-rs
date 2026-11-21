@@ -63,6 +63,15 @@ impl SocksOutbound {
         if users.is_some_and(|u| u.len() > 1) {
             return Err(err("\"users\" should have one member at most"));
         }
+        if let Some(users) = users {
+            for entry in users {
+                if let Some(level) = entry.get("level").filter(|value| !value.is_null()) {
+                    if level.as_u64().is_none() {
+                        return Err(err("user level must be a non-negative integer"));
+                    }
+                }
+            }
+        }
         let nested = users.and_then(|u| u.first());
         let user = nested.unwrap_or(server);
         let field = |key| {

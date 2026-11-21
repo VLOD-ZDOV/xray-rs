@@ -13,7 +13,7 @@ use tokio::time::timeout;
 
 use crate::config::User;
 use crate::outbound::{self, UdpLink};
-use crate::routing::{self, Action, BlockAction, Decision, Query, Router};
+use crate::routing::{self, Action, Decision, Query, Router};
 use crate::stats::{self, Traffic};
 use crate::{log, mux};
 use xray_config::Network;
@@ -33,7 +33,9 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // Xray policy level 0 defaults.
 pub(crate) const CONN_IDLE: Duration = Duration::from_secs(300);
 // How long to wait for the first payload when a rule needs to sniff it.
-const SNIFF_TIMEOUT: Duration = Duration::from_millis(300);
+// Xray's dispatcher uses a 200 ms cache deadline and a 32 KiB buffer.
+const SNIFF_TIMEOUT: Duration = Duration::from_millis(200);
+const SNIFF_BUFFER_SIZE: usize = 32767;
 const MAX_HEADER: usize = 1 + 16 + 1 + 255 + 1 + 2 + 1 + 1 + 255;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,6 +60,8 @@ pub struct Request {
     pub host: Host,
     pub port: u16,
     pub flow: Option<String>,
+    /// Xray's `VlessRoute`: the user-sent UUID bytes 6 and 7, big-endian.
+    pub vless_route: u16,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -74,17 +78,28 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
         return Err(ParseError::Invalid("unsupported version"));
     }
     let id = r.take(16)?;
+    // Xray's ProcessUUID zeroes the version/variant bytes before comparing,
+    // so a user may send any values there.
+    let mut masked = [0u8; 16];
+    masked.copy_from_slice(id);
+    masked[6] = 0;
+    masked[7] = 0;
     let user = users
         .iter()
-        .position(|u| u.id == id)
+        .position(|u| {
+            let mut user_id = u.id;
+            user_id[6] = 0;
+            user_id[7] = 0;
+            user_id == masked
+        })
         .ok_or(ParseError::Invalid("unknown user"))?;
+    let vless_route = u16::from_be_bytes([id[6], id[7]]);
     let addons_len = r.u8()? as usize;
     let addons_bytes = r.take(addons_len)?;
     let flow = if addons_len > 0 {
-        <Addons as prost::Message>::decode(addons_bytes)
-            .ok()
-            .map(|a| a.flow)
-            .filter(|f| !f.is_empty())
+        let addons = <Addons as prost::Message>::decode(addons_bytes)
+            .map_err(|_| ParseError::Invalid("bad addons"))?;
+        Some(addons.flow).filter(|flow| !flow.is_empty())
     } else {
         None
     };
@@ -102,6 +117,7 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
                     host,
                     port: 0,
                     flow,
+                    vless_route,
                 },
                 r.pos,
             ));
@@ -116,6 +132,7 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
                     host,
                     port: 0,
                     flow,
+                    vless_route,
                 },
                 r.pos,
             ));
@@ -149,6 +166,7 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
             host,
             port,
             flow,
+            vless_route,
         },
         r.pos,
     ))
@@ -297,10 +315,42 @@ impl Sniffing {
 
 /// Waits briefly for the client's first bytes, which routing and sniffing inspect.
 pub(crate) async fn read_first<R: AsyncRead + Unpin>(reader: &mut R, early: &mut Vec<u8>) {
-    let mut chunk = vec![0u8; 4096];
-    if let Ok(Ok(n)) = timeout(SNIFF_TIMEOUT, reader.read(&mut chunk)).await {
-        early.extend_from_slice(&chunk[..n]);
+    let deadline = tokio::time::Instant::now() + SNIFF_TIMEOUT;
+    let mut chunk = vec![0u8; 8192];
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        match timeout(left, reader.read(&mut chunk)).await {
+            Ok(Ok(0)) | Err(_) => return,
+            Ok(Ok(n)) => {
+                early.extend_from_slice(&chunk[..n]);
+                if early.len() >= SNIFF_BUFFER_SIZE || !sniff_needs_more(early) {
+                    return;
+                }
+            }
+            Ok(Err(_)) => return,
+        }
     }
+}
+
+/// Whether a sniffable payload is a prefix that may still grow into a complete
+/// TLS ClientHello or HTTP request head. Everything else stops at the first
+/// read, as Xray's sniffers do when they do not return `ErrProtoNeedMoreData`.
+fn sniff_needs_more(payload: &[u8]) -> bool {
+    if payload.len() >= 5 && payload[0] == 0x16 && payload[1] == 0x03 {
+        let record_len = usize::from(u16::from_be_bytes([payload[3], payload[4]]));
+        return 5 + record_len > payload.len() && 5 + record_len <= SNIFF_BUFFER_SIZE;
+    }
+    const METHODS: [&[u8]; 9] = [
+        b"GET ", b"POST ", b"HEAD ", b"PUT ", b"OPTIONS ", b"DELETE ", b"CONNECT ", b"PATCH ",
+        b"TRACE ",
+    ];
+    if METHODS.iter().any(|method| payload.starts_with(method)) {
+        return !payload.windows(4).any(|window| window == b"\r\n\r\n");
+    }
+    false
 }
 
 #[derive(Clone, Debug)]
@@ -334,7 +384,10 @@ impl Context {
     /// reader that builds the cache under the read lock never stores stale keys.
     fn users_mut(&self) -> std::sync::RwLockWriteGuard<'_, Vec<User>> {
         let users = self.users.write().unwrap_or_else(PoisonError::into_inner);
-        *self.vmess_keys.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        *self
+            .vmess_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         users
     }
 
@@ -557,12 +610,14 @@ where
                 let (r, w) = tokio::io::split(stream);
                 return crate::fallback::serve(r, w, fb, buf, peer, ctx.port).await;
             }
+            stream.close_on_error(1000).await;
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "vless handshake failed",
             ));
         }
         Err(_) => {
+            stream.close_on_error(1000).await;
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "vless handshake timeout",
@@ -612,6 +667,7 @@ where
             level: user.level,
             router: ctx.router.clone(),
             sniffing: ctx.sniffing.clone(),
+            vless_route: Some(u32::from(request.vless_route)),
         };
         if vision {
             // Mux under Vision (XUDP from a Vision client) keeps the padding but
@@ -658,6 +714,7 @@ where
         host: &request.host,
         port: request.port,
         sniffing: &ctx.sniffing,
+        vless_route: Some(u32::from(request.vless_route)),
     };
     let Some(decision) = route.allow(&ctx.router, payload).await else {
         // Xray writes the response header before the link turns out closed.
@@ -670,15 +727,15 @@ where
         return Ok(());
     };
     ctx.sniffing.override_host(payload, &mut request.host);
-    if let Action::Block(BlockAction::Http403) = decision.action {
-        if request.command == Command::Tcp {
-            stream.write_all(&[request.version, 0]).await?;
-            stream
-                .write_all(crate::routing::BLACKHOLE_HTTP_RESPONSE)
-                .await?;
-            stream.flush().await?;
+    if let Action::Block(block) = &decision.action {
+        if let Some(response) = block.response() {
+            if request.command == Command::Tcp {
+                stream.write_all(&[request.version, 0]).await?;
+                stream.write_all(response).await?;
+                stream.flush().await?;
+            }
+            return Ok(());
         }
-        return Ok(());
     }
     let traffic = stats::get().traffic(&ctx.tag, &user.email, user.level, &decision.tag);
 
@@ -780,6 +837,7 @@ pub(crate) struct RouteRequest<'a> {
     pub host: &'a Host,
     pub port: u16,
     pub sniffing: &'a Sniffing,
+    pub vless_route: Option<u32>,
 }
 
 impl RouteRequest<'_> {
@@ -824,7 +882,7 @@ impl RouteRequest<'_> {
             protocol,
             attributes: None,
             local_ip: None,
-            vless_route: None,
+            vless_route: self.vless_route,
             process_info: Some(&proc_cell),
         };
         let decision = router.route(&query).await;
@@ -849,8 +907,8 @@ impl RouteRequest<'_> {
             &decision.tag,
             self.email,
         );
-        match decision.action {
-            Action::Block(BlockAction::Http403) => Some(decision),
+        match &decision.action {
+            Action::Block(block) if block.response().is_some() => Some(decision),
             Action::Block(_) => None,
             _ => Some(decision),
         }
@@ -1341,7 +1399,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for MaybeEncrypted<S> {
     }
 }
 
-impl<S: VisionStreamIo> VisionStreamIo for MaybeEncrypted<S> {
+impl<S: VisionStreamIo + Send> VisionStreamIo for MaybeEncrypted<S> {
+    fn close_on_error(
+        &mut self,
+        code: u16,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>
+    where
+        Self: Send,
+    {
+        match self {
+            Self::Plain(s) => s.close_on_error(code),
+            Self::Encrypted(s) => s.get_mut().close_on_error(code),
+        }
+    }
+
     fn release_record_alignment(&mut self) {
         match self {
             Self::Plain(s) => s.release_record_alignment(),
@@ -1543,6 +1614,42 @@ mod tests {
     }
 
     #[test]
+    fn matches_uuid_with_any_version_and_variant_bytes() {
+        let mut buf = header(&[2, 11]);
+        buf.extend_from_slice(b"example.com");
+        // The client sends route bytes where ProcessUUID zeroes them.
+        buf[7] = 0x12;
+        buf[8] = 0x34;
+        let (req, _) = parse_request(&buf, &users()).expect("masked UUID should match");
+        assert_eq!(req.user, 0);
+        assert_eq!(req.vless_route, 0x1234);
+
+        let mut other = buf.clone();
+        other[1] = 0x11;
+        assert_eq!(
+            parse_request(&other, &users()),
+            Err(ParseError::Invalid("unknown user"))
+        );
+    }
+
+    #[test]
+    fn sniff_waits_only_for_partial_tls_or_http() {
+        let mut tls = vec![0x16, 0x03, 0x01, 0x00, 0x64];
+        assert!(sniff_needs_more(&tls));
+        tls.extend(std::iter::repeat_n(0u8, 100));
+        assert!(!sniff_needs_more(&tls));
+
+        let mut http = b"GET / HTTP/1.1\r\nHost: example".to_vec();
+        assert!(sniff_needs_more(&http));
+        http.extend_from_slice(b"\r\n\r\n");
+        assert!(!sniff_needs_more(&http));
+
+        assert!(!sniff_needs_more(b"\x13BitTorrent protocol"));
+        let oversized_tls = [0x16, 0x03, 0x01, 0xff, 0xff];
+        assert!(!sniff_needs_more(&oversized_tls));
+    }
+
+    #[test]
     fn private_ranges() {
         assert!(is_private("127.0.0.1".parse().unwrap()));
         assert!(is_private("10.1.2.3".parse().unwrap()));
@@ -1580,6 +1687,7 @@ mod tests {
             host: &host,
             port: 80,
             sniffing,
+            vless_route: None,
         };
         // routeOnly still dials 10.0.0.1; without it the sniffed domain is dialed instead.
         assert!(route(&sniff_route_only)

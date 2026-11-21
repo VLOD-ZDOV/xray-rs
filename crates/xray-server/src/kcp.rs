@@ -32,6 +32,9 @@ pub const OPT_CLOSE: u8 = 1;
 
 pub const DATA_HEADER_SIZE: usize = 18;
 
+/// Pre-authentication sessions kept per mKCP inbound.
+const MAX_KCP_SESSIONS: usize = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KcpHeaderType {
     #[default]
@@ -1024,6 +1027,9 @@ pub async fn start(
                 }
             } else if matches!(&segments[0], Segment::Cmd(c) if c.cmd == CMD_TERMINATE) {
                 // Xray opens no connection for a terminate.
+            } else if sess_map.len() >= MAX_KCP_SESSIONS {
+                // Cap pre-auth state: a new conv is cheap to send but not to keep.
+                continue;
             } else {
                 // New inbound connection
                 let (session, input_rx, duplex_app, duplex_internal) = KcpSession::new(

@@ -18,7 +18,7 @@ use crate::outbound::{self, ConeUdp};
 use crate::routing::Action;
 use crate::stats;
 use crate::tproxy_udp;
-use crate::vless::{copy, read_first, relay, Activity, Context, Host, RouteRequest};
+use crate::vless::{copy_buf, read_first, relay_policy, Activity, Context, Host, RouteRequest};
 
 impl DokodemoSettings {
     // Xray falls back to localhost and the listening port when they are not configured.
@@ -29,6 +29,29 @@ impl DokodemoSettings {
                 .unwrap_or(Host::Ip(std::net::Ipv4Addr::LOCALHOST.into())),
             self.port.unwrap_or(listen_port),
         )
+    }
+
+    /// The destination for one connection, including Xray's `portMap`, which
+    /// overrides either half of it by the connection's local port and only
+    /// applies without `followRedirect`.
+    fn target_for(&self, ctx_port: u16, original: Option<SocketAddr>) -> (Host, u16) {
+        if self.follow_redirect {
+            return match original {
+                Some(addr) => (Host::Ip(addr.ip().to_canonical()), addr.port()),
+                None => self.fallback_target(ctx_port),
+            };
+        }
+        let (mut host, mut port) = self.fallback_target(ctx_port);
+        let local_port = original.map_or(ctx_port, |addr| addr.port());
+        if let Some((mapped_host, mapped_port)) = self.port_map.get(&local_port) {
+            if let Some(mapped_host) = mapped_host {
+                host = mapped_host.clone();
+            }
+            if let Some(mapped_port) = mapped_port {
+                port = *mapped_port;
+            }
+        }
+        (host, port)
     }
 }
 
@@ -42,11 +65,7 @@ pub async fn serve_tcp<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let redirected = original.filter(|_| settings.follow_redirect);
-    let (host, port) = match redirected {
-        Some(addr) => (Host::Ip(addr.ip().to_canonical()), addr.port()),
-        None => settings.fallback_target(ctx.port),
-    };
+    let (host, port) = settings.target_for(ctx.port, original);
 
     if port == ctx.port && matches!(&host, Host::Ip(ip) if ip.is_loopback()) {
         log::info(format!(
@@ -73,6 +92,7 @@ where
         host: &host,
         port,
         sniffing: &ctx.sniffing,
+        vless_route: None,
     };
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());
@@ -82,8 +102,9 @@ where
     let mut route_host = host.clone();
     ctx.sniffing.override_host(&early, &mut route_host);
 
+    let policy = crate::policy::for_level(settings.user_level);
     let target_stream = outbound::connect(&ctx.router, &decision, &route_host, port).await?;
-    let traffic = stats::get().traffic(&ctx.tag, "", 0, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, "", settings.user_level, &decision.tag);
     let (mut client_r, mut client_w) = tokio::io::split(stream);
     let (mut target_r, mut target_w) = tokio::io::split(target_stream);
 
@@ -94,10 +115,23 @@ where
     }
 
     let activity = Activity::new();
-    relay(
-        copy(&mut client_r, &mut target_w, &activity, |n| traffic.up(n)),
-        copy(&mut target_r, &mut client_w, &activity, |n| traffic.down(n)),
+    relay_policy(
+        copy_buf(
+            &mut client_r,
+            &mut target_w,
+            &activity,
+            |n| traffic.up(n),
+            policy.buffer_size,
+        ),
+        copy_buf(
+            &mut target_r,
+            &mut client_w,
+            &activity,
+            |n| traffic.down(n),
+            policy.buffer_size,
+        ),
         &activity,
+        policy,
     )
     .await
 }
@@ -174,10 +208,7 @@ impl DokodemoUdpHandler {
             sessions.insert(key, tx.clone());
             drop(sessions);
 
-            let (host, port) = match original {
-                Some(addr) => (Host::Ip(addr.ip()), addr.port()),
-                None => self.settings.fallback_target(self.ctx.port),
-            };
+            let (host, port) = self.settings.target_for(self.ctx.port, original);
             let reply = match (self.tproxy, original) {
                 (Some(mark), Some(original)) => Reply::Forged {
                     original,
@@ -188,8 +219,11 @@ impl DokodemoUdpHandler {
             };
             let ctx = self.ctx.clone();
             let map = self.sessions.clone();
+            let level = self.settings.user_level;
             tokio::spawn(async move {
-                if let Err(e) = serve_udp_session(reply, ctx, peer, host, port, packet, rx).await {
+                if let Err(e) =
+                    serve_udp_session(reply, ctx, peer, (host, port), packet, rx, level).await
+                {
                     log::debug(format!(
                         "dokodemo udp session {} ended: {e}",
                         log::mask(peer)
@@ -266,11 +300,12 @@ async fn serve_udp_session(
     mut reply: Reply,
     ctx: Arc<Context>,
     peer: SocketAddr,
-    host: Host,
-    port: u16,
+    (host, port): (Host, u16),
     initial_payload: Bytes,
     mut rx: mpsc::Receiver<Bytes>,
+    level: u32,
 ) -> io::Result<()> {
+    let policy = crate::policy::for_level(level);
     let route = RouteRequest {
         ctx_tag: &ctx.tag,
         inbound_port: ctx.port,
@@ -280,6 +315,7 @@ async fn serve_udp_session(
         host: &host,
         port,
         sniffing: &ctx.sniffing,
+        vless_route: None,
     };
     let Some(decision) = route.allow(&ctx.router, &initial_payload).await else {
         return Ok(());
@@ -288,7 +324,7 @@ async fn serve_udp_session(
         return Ok(());
     }
     let cone = ConeUdp::open(ctx.router.clone(), &decision).await?;
-    let traffic = stats::get().traffic(&ctx.tag, "", 0, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, "", level, &decision.tag);
     let activity = Activity::new();
     // The destination is fixed, so resolve it once per session instead of per packet.
     let mut resolved = cone.target(&host, port).await.ok();
@@ -320,5 +356,61 @@ async fn serve_udp_session(
             traffic.down(n);
         }
     });
-    relay(up, down, &activity).await
+    relay_policy(up, down, &activity, policy).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DokodemoPortMap;
+
+    fn settings(follow_redirect: bool, port_map: DokodemoPortMap) -> DokodemoSettings {
+        DokodemoSettings {
+            address: Some(Host::Domain("target.example".into())),
+            port: Some(53),
+            follow_redirect,
+            port_map,
+            user_level: 0,
+            tcp: true,
+        }
+    }
+
+    #[test]
+    fn port_map_overrides_each_half_by_local_port() {
+        let mut map = DokodemoPortMap::new();
+        map.insert(
+            15353,
+            (Some(Host::Ip("8.8.8.8".parse().unwrap())), Some(5353)),
+        );
+        map.insert(16000, (None, Some(5300)));
+        let settings = settings(false, map);
+
+        assert_eq!(
+            settings.target_for(15353, None),
+            (Host::Ip("8.8.8.8".parse().unwrap()), 5353)
+        );
+        assert_eq!(
+            settings.target_for(16000, None),
+            (Host::Domain("target.example".into()), 5300)
+        );
+        assert_eq!(
+            settings.target_for(17000, None),
+            (Host::Domain("target.example".into()), 53)
+        );
+    }
+
+    #[test]
+    fn follow_redirect_ignores_port_map() {
+        let mut map = DokodemoPortMap::new();
+        map.insert(
+            443,
+            (Some(Host::Ip("8.8.8.8".parse().unwrap())), Some(5353)),
+        );
+        let settings = settings(true, map);
+        let original = Some("192.0.2.7:443".parse().unwrap());
+        assert_eq!(
+            settings.target_for(15353, original),
+            (Host::Ip("192.0.2.7".parse().unwrap()), 443)
+        );
+    }
 }

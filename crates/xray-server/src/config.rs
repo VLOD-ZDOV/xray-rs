@@ -148,11 +148,18 @@ impl Default for HappyEyeballsSettings {
     }
 }
 
+/// Xray's `portMap` value: the destination overrides for one local port.
+pub type DokodemoPortMap = HashMap<u16, (Option<crate::vless::Host>, Option<u16>)>;
+
 #[derive(Clone, Debug)]
 pub struct DokodemoSettings {
     pub address: Option<crate::vless::Host>,
     pub port: Option<u16>,
     pub follow_redirect: bool,
+    /// `portMap`: inbound local port to an overridden destination. Either half
+    /// may be absent, leaving the corresponding rewrite field in place.
+    pub port_map: DokodemoPortMap,
+    pub user_level: u32,
     /// Whether "tcp" is among the networks; Xray opens no TCP listener otherwise.
     pub tcp: bool,
 }
@@ -227,7 +234,7 @@ impl std::fmt::Display for FallbackDest {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Inbound {
     pub tag: String,
     pub listen: String,
@@ -239,6 +246,8 @@ pub struct Inbound {
     pub shadowsocks_top_password: Option<String>,
     pub fallbacks: Vec<Fallback>,
     pub socks_auth: xray_proxy::inbound::SocksInboundAuth,
+    /// Xray's `settings.userLevel`: the policy level of the inbound's users.
+    pub user_level: u32,
     pub udp: bool,
     pub sniffing: crate::vless::Sniffing,
     pub dokodemo: Option<DokodemoSettings>,
@@ -367,6 +376,8 @@ pub struct TlsSettings {
     pub min_version: Option<String>,
     pub max_version: Option<String>,
     pub cipher_suites: Vec<String>,
+    /// Xray's `curvePreferences`: TLS key exchange groups, in order.
+    pub curve_preferences: Vec<String>,
     pub ech_server_keys: Option<String>,
     pub ech_config_list: Option<String>,
 }
@@ -665,7 +676,12 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         }
         if api.is_none() && api_tag == Some(tag.as_str()) {
             let port = parse_port(item.get("port")).ok_or("api inbound: invalid port")?;
-            let listen = match str_field(item, "listen") {
+            if let Some(value) = item.get("listen") {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(format!("inbound {tag:?}: listen must be a string"));
+        }
+    }
+    let listen = match str_field(item, "listen") {
                 "" => "127.0.0.1",
                 addr => addr,
             };
@@ -681,12 +697,37 @@ pub fn parse(raw: &str) -> Result<Config, String> {
             tag.clone()
         };
         match parse_inbound(item, tag) {
-            Ok(Some(inbound)) => inbounds.push(inbound),
+            Ok(Some(inbound)) => match inbound_port_list(item)? {
+                Some(ports) if ports.len() > 1 => {
+                    for port in ports {
+                        let mut inbound = inbound.clone();
+                        inbound.port = port;
+                        inbounds.push(inbound);
+                    }
+                }
+                _ => inbounds.push(inbound),
+            },
             Ok(None) => {}
             Err(e) => return Err(format!("inbound {label}: {e}")),
         }
     }
     let router = Router::build(&root, &asset_dirs())?;
+    if let Some(log_section) = root.get("log").filter(|value| !value.is_null()) {
+        if !log_section.is_object() {
+            return Err("log must be an object".into());
+        }
+        if let Some(level) = log_section.get("loglevel") {
+            if !level.is_null() && level.as_str().is_none() {
+                return Err("log.loglevel must be a string".into());
+            }
+        }
+    }
+    if let Some(stats_section) = root.get("stats").filter(|value| !value.is_null()) {
+        if !stats_section.is_object() {
+            return Err("stats must be an object".into());
+        }
+    }
+    validate_policy(&root)?;
     let section = root.get("log").unwrap_or(&Value::Null);
     let dns_log = section
         .get("dnsLog")
@@ -703,6 +744,21 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     // it only sees `dns`.
     let dns = match root.get("dns") {
         Some(section) => {
+            match section.get("script") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(script)) if script.is_empty() => {}
+                Some(Value::String(_)) => {
+                    return Err(
+                        "dns.script is not supported: the Lua DNS engine is not implemented".into(),
+                    );
+                }
+                Some(_) => return Err("dns.script must be a string".into()),
+            }
+            let use_system_hosts = match section.get("useSystemHosts") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(enabled)) => *enabled,
+                Some(_) => return Err("dns.useSystemHosts must be a boolean".into()),
+            };
             let section = xray_dns_section(section);
             let only_dns = serde_json::json!({ "dns": section }).to_string();
             let parsed = xray_config::parse_xray_json_with_geodata_dirs(&only_dns, &asset_dirs())
@@ -711,7 +767,12 @@ pub fn parse(raw: &str) -> Result<Config, String> {
                     e.diagnostics.iter().map(|d| format!("{d:?}")).collect();
                 format!("dns: {}", messages.join("; "))
             })?;
-            Some(parsed.config.dns)
+            let mut dns = parsed.config.dns;
+            if use_system_hosts {
+                merge_system_hosts(&mut dns)
+                    .map_err(|e| format!("failed to read system hosts: {e}"))?;
+            }
+            Some(dns)
         }
         None => None,
     };
@@ -744,6 +805,146 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     })
 }
 
+/// Xray decodes these settings into typed Go structs, so a wrong JSON type is
+/// a config error rather than a silently defaulted value.
+fn validate_inbound_settings(settings: &Value, tag: &str) -> Result<(), String> {
+    if settings.is_null() {
+        return Ok(());
+    }
+    if !settings.is_object() {
+        return Err(format!("inbound {tag:?}: settings must be an object"));
+    }
+    let string_fields = ["auth", "method", "password", "email"];
+    for field in ["clients", "users", "accounts"] {
+        let Some(value) = settings.get(field).filter(|value| !value.is_null()) else {
+            continue;
+        };
+        let Some(entries) = value.as_array() else {
+            return Err(format!("inbound {tag:?}: settings.{field} must be an array"));
+        };
+        for (index, entry) in entries.iter().enumerate() {
+            if !entry.is_object() {
+                return Err(format!(
+                    "inbound {tag:?}: settings.{field}[{index}] must be an object"
+                ));
+            }
+            for key in [
+                "email", "id", "password", "pass", "user", "flow", "method", "encryption", "auth",
+            ] {
+                if let Some(value) = entry.get(key) {
+                    if !value.is_null() && !value.is_string() {
+                        return Err(format!(
+                            "inbound {tag:?}: settings.{field}[{index}].{key} must be a string"
+                        ));
+                    }
+                }
+            }
+            if let Some(level) = entry.get("level").filter(|value| !value.is_null()) {
+                let Some(level) = level.as_u64() else {
+                    return Err(format!(
+                        "inbound {tag:?}: settings.{field}[{index}].level must be a non-negative integer"
+                    ));
+                };
+                if level > u64::from(u32::MAX) {
+                    return Err(format!(
+                        "inbound {tag:?}: settings.{field}[{index}].level is out of range"
+                    ));
+                }
+            }
+        }
+    }
+    for field in string_fields {
+        if let Some(value) = settings.get(field) {
+            if !value.is_null() && value.as_str().is_none() {
+                return Err(format!("inbound {tag:?}: settings.{field} must be a string"));
+            }
+        }
+    }
+    if let Some(level) = settings.get("userLevel").filter(|value| !value.is_null()) {
+        let Some(level) = level.as_u64() else {
+            return Err(format!(
+                "inbound {tag:?}: settings.userLevel must be a non-negative integer"
+            ));
+        };
+        if level > u64::from(u32::MAX) {
+            return Err(format!("inbound {tag:?}: settings.userLevel is out of range"));
+        }
+    }
+    for field in ["udp", "followRedirect"] {
+        if let Some(value) = settings.get(field) {
+            if !value.is_null() && value.as_bool().is_none() {
+                return Err(format!("inbound {tag:?}: settings.{field} must be a boolean"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Xray's policy types: level names are numeric map keys and every field is a
+/// typed Go scalar, so wrong JSON types reject the config.
+fn validate_policy(root: &Value) -> Result<(), String> {
+    let Some(policy) = root.get("policy").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    if !policy.is_object() {
+        return Err("policy must be an object".into());
+    }
+    if let Some(system) = policy.get("system").filter(|value| !value.is_null()) {
+        if !system.is_object() {
+            return Err("policy.system must be an object".into());
+        }
+    }
+    let Some(levels) = policy.get("levels").filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let Some(levels) = levels.as_object() else {
+        return Err("policy.levels must be an object".into());
+    };
+    for (name, level) in levels {
+        if name.parse::<u32>().is_err() {
+            return Err(format!("policy.levels key {name:?} is not a number"));
+        }
+        if level.is_null() {
+            continue;
+        }
+        if !level.is_object() {
+            return Err(format!("policy.levels.{name} must be an object"));
+        }
+        for field in ["handshake", "connIdle", "uplinkOnly", "downlinkOnly"] {
+            if let Some(value) = level.get(field).filter(|value| !value.is_null()) {
+                let Some(value) = value.as_u64() else {
+                    return Err(format!(
+                        "policy.levels.{name}.{field} must be a non-negative integer"
+                    ));
+                };
+                if value > u64::from(u32::MAX) {
+                    return Err(format!("policy.levels.{name}.{field} is out of range"));
+                }
+            }
+        }
+        if let Some(value) = level.get("bufferSize").filter(|value| !value.is_null()) {
+            let Some(value) = value.as_i64() else {
+                return Err(format!(
+                    "policy.levels.{name}.bufferSize must be an integer"
+                ));
+            };
+            if i64::from(i32::MIN) > value || value > i64::from(i32::MAX) {
+                return Err(format!("policy.levels.{name}.bufferSize is out of range"));
+            }
+        }
+        for field in ["statsUserUplink", "statsUserDownlink", "statsUserOnline"] {
+            if let Some(value) = level.get(field).filter(|value| !value.is_null()) {
+                if value.as_bool().is_none() {
+                    return Err(format!(
+                        "policy.levels.{name}.{field} must be a boolean"
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     crate::finalmask::warn_inbound_finalmask(
         item.get("streamSettings").unwrap_or(&Value::Null),
@@ -758,11 +959,16 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         "http" => InboundProtocol::Http,
         "shadowsocks" => InboundProtocol::Shadowsocks,
         "dokodemo-door" | "dokodemo" | "tunnel" => InboundProtocol::Dokodemo,
-        "hysteria" | "hysteria2" => InboundProtocol::Hysteria,
+        "hysteria" => InboundProtocol::Hysteria,
         "wireguard" => {
             let wg_cfg = crate::wg_inbound::parse(&tag, item)?;
             let port = parse_port(item.get("port")).unwrap_or(wg_cfg.listen_addr.port());
-            let listen = match str_field(item, "listen") {
+            if let Some(value) = item.get("listen") {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(format!("inbound {tag:?}: listen must be a string"));
+        }
+    }
+    let listen = match str_field(item, "listen") {
                 "" => String::new(),
                 addr if addr.starts_with('/') || addr.starts_with('@') => {
                     return Err("unix socket listen is not supported".into());
@@ -789,6 +995,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 shadowsocks_top_password: None,
                 fallbacks: Vec::new(),
                 socks_auth: xray_proxy::inbound::SocksInboundAuth::NoAuth,
+                user_level: 0,
                 udp: true,
                 sniffing,
                 dokodemo: None,
@@ -814,7 +1021,12 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         "masque" => {
             let masque_cfg = crate::masque_inbound::parse(&tag, item)?;
             let port = parse_port(item.get("port")).unwrap_or(443);
-            let listen = match str_field(item, "listen") {
+            if let Some(value) = item.get("listen") {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(format!("inbound {tag:?}: listen must be a string"));
+        }
+    }
+    let listen = match str_field(item, "listen") {
                 "" => String::new(),
                 addr if addr.starts_with('/') || addr.starts_with('@') => {
                     return Err("unix socket listen is not supported".into());
@@ -851,6 +1063,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 shadowsocks_top_password: None,
                 fallbacks: Vec::new(),
                 socks_auth: xray_proxy::inbound::SocksInboundAuth::NoAuth,
+                user_level: 0,
                 udp: true,
                 sniffing,
                 dokodemo: None,
@@ -873,12 +1086,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 masque: Some(Arc::new(masque_cfg)),
             }));
         }
-        other => {
-            log::warn(format!(
-                "skipping inbound {tag:?}: protocol {other:?} is not supported yet"
-            ));
-            return Ok(None);
-        }
+        other => return Err(format!("unknown config id: {other}")),
     };
     let stream = item.get("streamSettings").unwrap_or(&Value::Null);
     let network = stream_network(stream);
@@ -915,21 +1123,14 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         }
     }
     if protocol == InboundProtocol::Hysteria {
-        if !matches!(network, "hysteria" | "hysteria2") {
+        if network != "hysteria" {
             return Err("not hysteria transport".into());
         }
         let settings = item.get("settings").unwrap_or(&Value::Null);
-        if let Some(v) = settings.get("version") {
-            if v.as_i64() != Some(2) {
-                return Err("version != 2".into());
-            }
+        if settings.get("version").and_then(Value::as_i64) != Some(2) {
+            return Err("version != 2".into());
         }
         let h_settings = stream.get("hysteriaSettings").unwrap_or(&Value::Null);
-        if let Some(v) = h_settings.get("version") {
-            if v.as_i64() != Some(2) {
-                return Err("version != 2".into());
-            }
-        }
         let timeout_val = h_settings
             .get("udpIdleTimeout")
             .or_else(|| settings.get("udpIdleTimeout"))
@@ -942,8 +1143,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         let _ = parse_hysteria_masq(h_settings, settings)?;
     }
 
-    let is_hysteria =
-        protocol == InboundProtocol::Hysteria || matches!(network, "hysteria" | "hysteria2");
+    let is_hysteria = protocol == InboundProtocol::Hysteria || network == "hysteria";
     let is_tcp = matches!(network, "" | "tcp" | "raw");
     let is_ws = matches!(network, "ws" | "websocket");
     let is_httpupgrade = network == "httpupgrade";
@@ -967,6 +1167,11 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     };
 
     if is_hysteria {
+        if let Some(h_settings) = stream.get("hysteriaSettings").filter(|value| !value.is_null()) {
+            if h_settings.get("version").and_then(Value::as_i64) != Some(2) {
+                return Err("Failed to build Hysteria config. > version != 2".into());
+            }
+        }
         if security != "tls" {
             log::warn(format!("skipping inbound {tag:?}: Hysteria requires TLS"));
             return Ok(None);
@@ -980,17 +1185,17 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         && !is_xdrive)
         || !supported_security
     {
-        log::warn(format!(
-            "skipping inbound {tag:?}: {:?}/{}/{} is not supported yet",
-            protocol,
-            if network.is_empty() { "tcp" } else { network },
-            if security.is_empty() {
-                "none"
-            } else {
-                security
-            },
+        if matches!(network, "h2" | "h3" | "http" | "quic") {
+            return Err(
+                "The feature HTTP transport (without header padding, etc.) has been removed and migrated to XHTTP stream-one H2 & H3. Please update your config(s) according to release note and documentation.".into(),
+            );
+        }
+        if !supported_security {
+            return Err(format!("unknown streamSettings.security {security:?}"));
+        }
+        return Err(format!(
+            "Config: unknown transport protocol: {network}"
         ));
-        return Ok(None);
     }
     let raw = stream
         .get("rawSettings")
@@ -1008,17 +1213,25 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         None
     };
 
-    if is_port_list(item.get("port")) {
-        log::warn(format!(
-            "skipping inbound {tag:?}: port lists and ranges are not supported yet"
-        ));
-        return Ok(None);
+    let ports = inbound_port_list(item)?;
+    if is_xdrive && ports.as_ref().is_some_and(|ports| ports.len() > 1) {
+        return Err("the xdrive transport can only listen on one port".into());
     }
     let port = if is_xdrive {
         parse_port(item.get("port")).unwrap_or(0)
+    } else if let Some(ports) = &ports {
+        ports
+            .first()
+            .copied()
+            .ok_or_else(|| "invalid or missing port".to_owned())?
     } else {
-        parse_port(item.get("port")).ok_or("invalid or missing port")?
+        return Err("invalid or missing port".into());
     };
+    if let Some(value) = item.get("listen") {
+        if !value.is_null() && value.as_str().is_none() {
+            return Err(format!("inbound {tag:?}: listen must be a string"));
+        }
+    }
     let listen = match str_field(item, "listen") {
         "" => String::new(),
         addr if !is_xdrive && (addr.starts_with('/') || addr.starts_with('@')) => {
@@ -1028,6 +1241,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     };
 
     let settings = item.get("settings").unwrap_or(&Value::Null);
+    validate_inbound_settings(settings, &tag)?;
     let mut vless_encryption = None;
     if protocol == InboundProtocol::Vless {
         let decryption = str_field(settings, "decryption");
@@ -1062,7 +1276,16 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         settings.get("testseed"),
         xray_proxy::vless::DEFAULT_VISION_SEED,
     );
-    for client in array(settings, "clients") {
+    let client_entries = if settings
+        .get("clients")
+        .is_some_and(|value| !value.is_null())
+    {
+        array(settings, "clients")
+    } else {
+        // Xray's `users` is the same list under an older name; `clients` wins.
+        array(settings, "users")
+    };
+    for client in client_entries {
         let testseed = parse_testseed(client.get("testseed"), default_testseed);
         let flow = match (protocol, str_field(client, "flow")) {
             (InboundProtocol::Vless, "") => default_flow,
@@ -1128,13 +1351,26 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     }
 
     let mut socks_accounts = Vec::new();
-    for account in array(settings, "accounts") {
+    // Xray reads `accounts` and `users` as the same list; `accounts` wins.
+    let sock_entries = if settings
+        .get("accounts")
+        .is_some_and(|value| !value.is_null())
+    {
+        array(settings, "accounts")
+    } else {
+        array(settings, "users")
+    };
+    for account in sock_entries {
         let u = str_field(account, "user");
         let p = str_field(account, "pass");
         if let Some(acc) = xray_proxy::inbound::SocksAccount::new(u.as_bytes(), p.as_bytes()) {
             socks_accounts.push(acc);
         }
     }
+    let user_level = settings
+        .get("userLevel")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as u32;
     let auth_str = str_field(settings, "auth");
     let socks_auth = if auth_str == "password" || !socks_accounts.is_empty() {
         xray_proxy::inbound::SocksInboundAuth::Password(socks_accounts)
@@ -1152,7 +1388,15 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     if protocol == InboundProtocol::Shadowsocks {
         let top_method = str_field(settings, "method");
         let top_password = str_field(settings, "password");
-        let clients = array(settings, "clients");
+        // Xray's `clients` overrides `users`; both name the user list.
+        let clients = if settings
+            .get("clients")
+            .is_some_and(|value| !value.is_null())
+        {
+            array(settings, "clients")
+        } else {
+            array(settings, "users")
+        };
         let is_ss2022 = top_method.starts_with("2022-blake3-");
 
         if is_ss2022 {
@@ -1199,11 +1443,8 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 let password = str_field(entry, "password");
                 let m = match xray_proxy::shadowsocks::aead2017::Method::new(method, password) {
                     Ok(m) => m,
-                    Err(e) => {
-                        log::warn(format!(
-                            "skipping inbound {tag:?}: shadowsocks {method:?}: {e}"
-                        ));
-                        return Ok(None);
+                    Err(_) => {
+                        return Err(format!("unknown cipher method: {method}"));
                     }
                 };
                 let level = entry.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
@@ -1309,6 +1550,11 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             address,
             port,
             follow_redirect,
+            port_map: parse_dokodemo_port_map(settings.get("portMap"))?,
+            user_level: settings
+                .get("userLevel")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as u32,
             tcp: networks.iter().any(|n| n == "tcp"),
         })
     } else {
@@ -1466,6 +1712,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         shadowsocks_top_password,
         fallbacks,
         socks_auth,
+        user_level,
         udp,
         sniffing,
         dokodemo,
@@ -1487,6 +1734,62 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         wireguard: None,
         masque: None,
     }))
+}
+
+/// Xray's `portMap`: keys are inbound port numbers, values are `host:port`
+/// where either half may be empty. `net.SplitHostPort` semantics are kept, so
+/// an IPv6 host needs brackets; malformed entries reject the config.
+fn parse_dokodemo_port_map(raw: Option<&Value>) -> Result<DokodemoPortMap, String> {
+    let Some(raw) = raw.filter(|value| !value.is_null()) else {
+        return Ok(HashMap::new());
+    };
+    let Some(entries) = raw.as_object() else {
+        return Err("dokodemo settings: \"portMap\" must be an object".into());
+    };
+    let mut map = HashMap::new();
+    for (key, value) in entries {
+        let Some(value) = value.as_str() else {
+            return Err(format!("invalid portMap: {value}"));
+        };
+        let (host, port) =
+            split_host_port(value).ok_or_else(|| format!("invalid portMap: {value}"))?;
+        // Xray accepts any key and only a decimal local port can ever match.
+        if let Ok(local_port) = key.parse::<u16>() {
+            if local_port != 0 {
+                map.insert(local_port, (host, port));
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// `net.SplitHostPort` as Xray's portMap validator uses it: the host may be
+/// empty, the port must be numeric, and IPv6 hosts need brackets.
+fn split_host_port(value: &str) -> Option<(Option<crate::vless::Host>, Option<u16>)> {
+    let (host, port) = if let Some(rest) = value.strip_prefix('[') {
+        let (host, rest) = rest.split_once(']')?;
+        if host.is_empty() {
+            return None;
+        }
+        let port = rest.strip_prefix(':')?;
+        (Some(host), port)
+    } else {
+        let (host, port) = value.rsplit_once(':')?;
+        if host.contains(':') || host.contains(['[', ']']) {
+            return None;
+        }
+        (if host.is_empty() { None } else { Some(host) }, port)
+    };
+    let host = host.map(|host| match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => crate::vless::Host::Ip(ip),
+        Err(_) => crate::vless::Host::Domain(host.to_owned()),
+    });
+    let port = if port.is_empty() {
+        None
+    } else {
+        Some(port.parse::<u16>().ok()?)
+    };
+    Some((host, port))
 }
 
 fn parse_quic_params_from_stream(
@@ -1680,12 +1983,15 @@ pub fn parse_sockopt(sockopt: &Value, _owner: &str) -> Result<Option<SockoptSett
                     .as_deref()
                     .is_none_or(|s| s.is_empty() || s == "linux");
                 let typ = obj.get("type").and_then(Value::as_str).unwrap_or("");
-                if applies && !matches!(typ, "int" | "str") {
-                    return Err(format!("unknown CustomSockopt type: {typ}"));
+                if !matches!(typ, "int" | "str") {
+                    if applies {
+                        log::warn(format!("customSockopt: unsupported type {typ:?}, ignored"));
+                    }
+                    continue;
                 }
                 let Some(opt) = parse_i32_val(obj.get("opt")) else {
                     if applies {
-                        return Err("No opt!".into());
+                        log::warn("customSockopt: missing \"opt\", ignored");
                     }
                     continue;
                 };
@@ -1912,6 +2218,29 @@ fn parse_tls(tls: &Value) -> Result<TlsSettings, String> {
             cipher_suites.push(item.to_owned());
         }
     }
+    let mut curve_preferences = Vec::new();
+    match tls.get("curvePreferences") {
+        Some(Value::String(list)) => {
+            curve_preferences.extend(
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        Some(Value::Array(items)) => {
+            curve_preferences.extend(
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned),
+            );
+        }
+        None | Some(Value::Null) => {}
+        Some(_) => return Err("tlsSettings.curvePreferences must be a string or an array".into()),
+    }
     let ech_server_keys = if let Some(ech_keys) = tls.get("echServerKeys").and_then(Value::as_str) {
         if !ech_keys.is_empty() {
             use base64::Engine;
@@ -1939,6 +2268,7 @@ fn parse_tls(tls: &Value) -> Result<TlsSettings, String> {
         min_version,
         max_version,
         cipher_suites,
+        curve_preferences,
         ech_server_keys,
         ech_config_list,
     })
@@ -1959,22 +2289,27 @@ fn inline_or_file(cert: &Value, inline_key: &str, file_key: &str) -> Result<Vec<
     fs::read(path).map_err(|e| format!("failed to read {path}: {e}"))
 }
 
-fn parse_fakedns_pool(item: &Value) -> Result<crate::fakedns::FakeDnsPoolConfig, String> {
-    let ip_pool = str_field(item, "ipPool");
-    if ip_pool.is_empty() {
-        return Err("invalid fakeDNS setting".to_owned());
+fn parse_fakedns_pool(item: &Value) -> Result<Option<crate::fakedns::FakeDnsPoolConfig>, String> {
+    let ip_pool = match item.get("ipPool") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(value)) => value.clone(),
+        Some(_) => return Err("invalid fakeDNS setting".into()),
+    };
+    let pool_size = match item.get("poolSize") {
+        None | Some(Value::Null) => 65535,
+        Some(value) => value
+            .as_i64()
+            .ok_or_else(|| "invalid fakeDNS setting".to_owned())?,
+    };
+    // Xray ignores a pool with an empty ipPool or a zero LRU size at runtime.
+    if ip_pool.is_empty() || pool_size == 0 {
+        return Ok(None);
     }
-    let pool_size = item
-        .get("poolSize")
-        .and_then(Value::as_u64)
-        .unwrap_or(65535) as usize;
-    if pool_size == 0 {
-        return Err("invalid fakeDNS setting".to_owned());
-    }
-    Ok(crate::fakedns::FakeDnsPoolConfig {
-        ip_pool: ip_pool.to_owned(),
+    let pool_size = usize::try_from(pool_size).map_err(|_| "invalid fakeDNS setting".to_owned())?;
+    Ok(Some(crate::fakedns::FakeDnsPoolConfig {
+        ip_pool,
         pool_size,
-    })
+    }))
 }
 
 /// Int32Range as in Xray: a number, or "from-to" in a string.
@@ -2004,6 +2339,51 @@ fn gecko_packet_size(
         .ok_or_else(|| "gecko: invalid min/max packet size".to_owned())
 }
 
+/// Xray's `dns.useSystemHosts`: `/etc/hosts` entries appended to `dns.hosts`,
+/// configured entries first. Comments, non-IP rules and empty names are
+/// skipped, as in Xray's reader.
+fn merge_system_hosts(dns: &mut xray_config::DnsConfig) -> std::io::Result<()> {
+    let text = fs::read_to_string("/etc/hosts")?;
+    merge_system_hosts_text(dns, &text);
+    Ok(())
+}
+
+fn merge_system_hosts_text(dns: &mut xray_config::DnsConfig, text: &str) {
+    let mut by_name: HashMap<String, Vec<std::net::IpAddr>> = HashMap::new();
+    let mut order: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let mut fields = line.split_whitespace();
+        let Some(address) = fields.next() else {
+            continue;
+        };
+        let Ok(ip) = address.parse::<std::net::IpAddr>() else {
+            continue;
+        };
+        for name in fields {
+            let name = name.trim_end_matches('.').to_ascii_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            if !by_name.contains_key(&name) {
+                order.push(name.clone());
+            }
+            by_name.entry(name).or_default().push(ip);
+        }
+    }
+    for name in order {
+        let ips = by_name.remove(&name).unwrap_or_default();
+        if ips.is_empty() {
+            continue;
+        }
+        // `insert` keeps the first full match, so `dns.hosts` wins.
+        dns.hosts.insert(
+            xray_config::DomainMatcher::Full(name),
+            xray_config::DnsHostTarget::Ips(ips),
+        );
+    }
+}
+
 // `dns` fields as Xray's DNSConfig and NameServerConfig name them, and whether
 // this core implements them. Go's JSON decoding matches keys case-insensitively
 // and drops unknown ones, so Xray starts with fields it does not know.
@@ -2019,8 +2399,8 @@ const DNS_FIELDS: &[(&str, bool)] = &[
     ("disableFallback", true),
     ("disableFallbackIfMatch", true),
     ("enableParallelQuery", true),
-    ("script", false),
-    ("useSystemHosts", false),
+    ("script", true),
+    ("useSystemHosts", true),
 ];
 const DNS_SERVER_FIELDS: &[(&str, bool)] = &[
     ("address", true),
@@ -2035,10 +2415,10 @@ const DNS_SERVER_FIELDS: &[(&str, bool)] = &[
     ("queryStrategy", true),
     ("finalQuery", true),
     ("clientIp", true),
-    ("id", false),
-    ("disableCache", false),
-    ("serveStale", false),
-    ("serveExpiredTTL", false),
+    ("id", true),
+    ("disableCache", true),
+    ("serveStale", true),
+    ("serveExpiredTTL", true),
 ];
 const DNS_QUERY_STRATEGIES: &[&str] = &[
     "useip",
@@ -2218,11 +2598,15 @@ fn parse_fakedns(
     if let Some(fakedns_val) = root.get("fakedns").filter(|v| !v.is_null()) {
         match fakedns_val {
             Value::Object(_) => {
-                pools.push(parse_fakedns_pool(fakedns_val)?);
+                if let Some(pool) = parse_fakedns_pool(fakedns_val)? {
+                    pools.push(pool);
+                }
             }
             Value::Array(arr) => {
                 for item in arr {
-                    pools.push(parse_fakedns_pool(item)?);
+                    if let Some(pool) = parse_fakedns_pool(item)? {
+                        pools.push(pool);
+                    }
                 }
             }
             _ => return Err("invalid fakedns config".to_owned()),
@@ -2830,7 +3214,16 @@ fn parse_ws(settings: &Value) -> Result<crate::ws::WsSettings, String> {
     } else {
         Some(host.to_owned())
     };
-    Ok(crate::ws::WsSettings { path, host })
+    let heartbeat_period = settings
+        .get("heartbeatPeriod")
+        .and_then(Value::as_u64)
+        .filter(|seconds| *seconds > 0)
+        .map(std::time::Duration::from_secs);
+    Ok(crate::ws::WsSettings {
+        path,
+        host,
+        heartbeat_period,
+    })
 }
 
 fn parse_httpupgrade(settings: &Value) -> Result<crate::httpupgrade::HttpUpgradeSettings, String> {
@@ -2934,9 +3327,71 @@ fn parse_port(value: Option<&Value>) -> Option<u16> {
     }
 }
 
-/// Xray's inbound port is a list of ranges; only a single port is served here.
-fn is_port_list(value: Option<&Value>) -> bool {
-    matches!(value, Some(Value::String(s)) if s.contains(',') || s.trim().trim_start_matches("env:").contains('-'))
+/// Xray's inbound `port`: a number, a range, a comma-separated list, or an
+/// array of numbers and ranges. Returns `None` when no port is configured.
+fn inbound_port_list(item: &Value) -> Result<Option<Vec<u16>>, String> {
+    let Some(value) = item.get("port").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let mut ports = Vec::new();
+    match value {
+        Value::Number(_) | Value::String(_) => ports.extend(parse_port_spec(value)?),
+        _ => return Err("invalid or missing port".into()),
+    }
+    if ports.is_empty() {
+        return Err("invalid or missing port".into());
+    }
+    Ok(Some(ports))
+}
+
+fn parse_port_spec(value: &Value) -> Result<Vec<u16>, String> {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .and_then(|value| u16::try_from(value).ok())
+            .map(|port| vec![port])
+            .ok_or_else(|| "invalid or missing port".to_owned()),
+        Value::String(text) => {
+            let text = text.trim();
+            if let Some(name) = text.strip_prefix("env:") {
+                let expanded = std::env::var(name)
+                    .or_else(|_| std::env::var(name.to_uppercase().replace('.', "_")))
+                    .map_err(|_| format!("invalid or missing port {text:?}"))?;
+                return parse_port_spec(&Value::String(expanded));
+            }
+            let mut ports = Vec::new();
+            for part in text.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                if let Some((from, to)) = part.split_once('-') {
+                    let from: u16 = from
+                        .trim()
+                        .parse()
+                        .map_err(|_| "invalid or missing port".to_owned())?;
+                    let to: u16 = to
+                        .trim()
+                        .parse()
+                        .map_err(|_| "invalid or missing port".to_owned())?;
+                    if from > to {
+                        return Err("invalid port range".into());
+                    }
+                    ports.extend(from..=to);
+                } else {
+                    ports.push(
+                        part.parse()
+                            .map_err(|_| "invalid or missing port".to_owned())?,
+                    );
+                }
+            }
+            if ports.is_empty() {
+                return Err("invalid or missing port".into());
+            }
+            Ok(ports)
+        }
+        _ => Err("invalid or missing port".into()),
+    }
 }
 
 /// Where geoip.dat/geosite.dat live; the parser also adds the binary's directory.
@@ -2988,7 +3443,8 @@ mod tests {
             dns,
             serde_json::json!({
                 "queryStrategy": "UseIP",
-                "servers": ["1.1.1.1", {"address": "8.8.8.8"}]
+                "servers": ["1.1.1.1", {"address": "8.8.8.8", "serveStale": true}],
+                "useSystemHosts": true
             })
         );
     }
@@ -3200,6 +3656,181 @@ mod tests {
         assert!(config.inbounds[0].udp);
         assert_eq!(config.inbounds[1].protocol, InboundProtocol::Http);
         assert_eq!(config.inbounds[1].port, 8080);
+    }
+
+    #[test]
+    fn parses_socks_users_alias_and_user_level() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "socks-in", "port": 1080, "protocol": "socks",
+             "settings": {"auth": "password", "userLevel": 2,
+                          "users": [{"user": "alice", "pass": "secret"}]}}
+          ]
+        }"#;
+        let inbound = &parse(raw).unwrap().inbounds[0];
+        assert_eq!(inbound.user_level, 2);
+        let xray_proxy::inbound::SocksInboundAuth::Password(accounts) = &inbound.socks_auth else {
+            panic!("expected password auth");
+        };
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].user(), b"alice");
+        assert_eq!(accounts[0].pass(), b"secret");
+    }
+
+    #[test]
+    fn parses_users_as_the_clients_alias() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "vless-users", "port": 1001, "protocol": "vless",
+             "settings": {"users": [{"id": "b831381d-6324-4d53-ad4f-8cda48b30811", "email": "v"}]}},
+            {"tag": "trojan-users", "port": 1002, "protocol": "trojan",
+             "settings": {"users": [{"password": "pass", "email": "t"}]}},
+            {"tag": "ss-users", "port": 1003, "protocol": "shadowsocks",
+             "settings": {"method": "aes-128-gcm", "password": "top",
+                          "users": [{"method": "aes-128-gcm", "password": "u", "email": "s"}]}}
+          ]
+        }"#;
+        let inbounds = parse(raw).unwrap().inbounds;
+        assert_eq!(inbounds[0].users.len(), 1);
+        assert_eq!(inbounds[0].users[0].email, "v");
+        assert_eq!(inbounds[1].users.len(), 1);
+        assert_eq!(inbounds[1].users[0].email, "t");
+        assert_eq!(inbounds[2].shadowsocks_users.len(), 1);
+        assert_eq!(inbounds[2].shadowsocks_users[0].email, "s");
+    }
+
+    #[test]
+    fn rejects_out_of_range_ports_instead_of_wrapping_them() {
+        // Official Xray truncates 70000 to u16 and listens on 4464. Rejecting
+        // is deliberate: silently binding another port hides an operator typo.
+        let raw = r#"{"inbounds": [{"port": 70000, "protocol": "socks", "settings": {}}]}"#;
+        assert!(parse(raw).is_err());
+    }
+
+    #[test]
+    fn expands_inbound_port_lists_and_ranges() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "range", "port": "29500-29502", "protocol": "socks", "settings": {}},
+            {"tag": "list", "port": "29510,29511-29512", "protocol": "socks", "settings": {}}
+          ]
+        }"#;
+        let config = parse(raw).unwrap();
+        let ports: Vec<(String, u16)> = config
+            .inbounds
+            .iter()
+            .map(|inbound| (inbound.tag.clone(), inbound.port))
+            .collect();
+        assert_eq!(
+            ports,
+            vec![
+                ("range".to_owned(), 29500),
+                ("range".to_owned(), 29501),
+                ("range".to_owned(), 29502),
+                ("list".to_owned(), 29510),
+                ("list".to_owned(), 29511),
+                ("list".to_owned(), 29512),
+            ]
+        );
+
+        let array = r#"{"inbounds": [{"port": [29500, 29501], "protocol": "socks", "settings": {}}]}"#;
+        assert!(parse(array).is_err(), "Xray rejects an array port");
+    }
+
+    #[test]
+    fn parses_dokodemo_port_map() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "doko", "port": 15353, "protocol": "dokodemo-door",
+             "settings": {"address": "1.1.1.1", "port": 53,
+                          "portMap": {"15353": "8.8.8.8:5353", "16000": "[2001:db8::1]:53",
+                                      "17000": ":5300", "18000": "localhost:"}}}
+          ]
+        }"#;
+        let doko = parse(raw).unwrap().inbounds[0].dokodemo.clone().unwrap();
+        assert_eq!(
+            doko.port_map.get(&15353),
+            Some(&(
+                Some(crate::vless::Host::Ip("8.8.8.8".parse().unwrap())),
+                Some(5353)
+            ))
+        );
+        assert_eq!(
+            doko.port_map.get(&16000),
+            Some(&(
+                Some(crate::vless::Host::Ip("2001:db8::1".parse().unwrap())),
+                Some(53)
+            ))
+        );
+        assert_eq!(doko.port_map.get(&17000), Some(&(None, Some(5300))));
+        assert_eq!(
+            doko.port_map.get(&18000),
+            Some(&(Some(crate::vless::Host::Domain("localhost".into())), None))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_dokodemo_port_map() {
+        let raw = r#"{"inbounds": [{"port": 1, "protocol": "dokodemo-door",
+          "settings": {"address": "1.1.1.1", "port": 53, "portMap": {"1": "no-port"}}}]}"#;
+        let error = match parse(raw) {
+            Err(error) => error,
+            Ok(_) => panic!("expected invalid portMap to be rejected"),
+        };
+        assert!(error.contains("invalid portMap"), "{error}");
+    }
+
+    #[test]
+    fn parses_dns_server_cache_overrides() {
+        let raw = r#"{"dns": {"servers": [
+            {"address": "1.1.1.1", "id": "primary", "disableCache": true,
+             "serveStale": true, "serveExpiredTTL": 42}
+        ]}}"#;
+        let dns = parse(raw).unwrap().dns.unwrap();
+        let xray_config::DnsServerConfig::Policy(server) = &dns.servers[0] else {
+            panic!("expected policy server");
+        };
+        assert_eq!(server.id, "primary");
+        assert_eq!(server.disable_cache, Some(true));
+        assert_eq!(server.serve_stale, Some(true));
+        assert_eq!(server.serve_expired_ttl, Some(42));
+    }
+
+    #[test]
+    fn merges_system_hosts_after_configured_ones() {
+        let mut dns = xray_config::DnsConfig::default();
+        dns.hosts.insert(
+            xray_config::DomainMatcher::Full("configured.example".into()),
+            xray_config::DnsHostTarget::Ip("203.0.113.1".parse().unwrap()),
+        );
+        merge_system_hosts_text(
+            &mut dns,
+            "# comment\n10.0.0.1 configured.example alias.example # tail\n::1 alias.example\nnot-an-ip skipped\n",
+        );
+        assert_eq!(
+            dns.hosts.lookup("configured.example"),
+            Some(&xray_config::DnsHostTarget::Ip(
+                "203.0.113.1".parse().unwrap()
+            ))
+        );
+        assert_eq!(
+            dns.hosts.lookup("alias.example"),
+            Some(&xray_config::DnsHostTarget::Ips(vec![
+                "10.0.0.1".parse().unwrap(),
+                "::1".parse().unwrap()
+            ]))
+        );
+        assert!(dns.hosts.lookup("skipped").is_none());
+    }
+
+    #[test]
+    fn rejects_dns_script() {
+        let raw = r#"{"dns": {"script": "function main() end"}}"#;
+        let error = match parse(raw) {
+            Err(error) => error,
+            Ok(_) => panic!("expected dns.script to be rejected"),
+        };
+        assert!(error.contains("dns.script is not supported"), "{error}");
     }
 
     #[test]
@@ -3513,6 +4144,33 @@ mod tests {
         assert_eq!(
             tls.server_names,
             vec!["example.com", "api.example.com", "*.internal.net"]
+        );
+    }
+
+    #[test]
+    fn parses_tls_curve_preferences_and_ws_heartbeat() {
+        let raw = r#"{
+          "inbounds": [
+            {"tag": "tls-curves", "port": 10444, "protocol": "vless",
+             "streamSettings": {"network": "ws", "security": "tls",
+               "wsSettings": {"path": "/ws", "heartbeatPeriod": 30},
+               "tlsSettings": {
+                 "certificates": [{"certificate": ["CERT"], "key": ["KEY"]}],
+                 "curvePreferences": ["X25519", "CurveP256"]
+               }}}
+          ]
+        }"#;
+        let inbound = &parse(raw).unwrap().inbounds[0];
+        assert_eq!(
+            inbound.tls.as_ref().unwrap().curve_preferences,
+            vec!["X25519", "CurveP256"]
+        );
+        let InboundTransport::Websocket(ws) = &inbound.transport else {
+            panic!("expected websocket transport");
+        };
+        assert_eq!(
+            ws.heartbeat_period,
+            Some(std::time::Duration::from_secs(30))
         );
     }
 
@@ -3990,14 +4648,17 @@ mod tests {
     }
 
     #[test]
-    fn custom_sockopt_errors_match_xray() {
+    fn custom_sockopt_accepts_unknown_entries_like_xray() {
         let sock = |entry: &str| {
             let v: Value =
                 serde_json::from_str(&format!(r#"{{"customSockopt": [{entry}]}}"#)).unwrap();
             parse_sockopt(&v, "t").map(|_| ())
         };
-        assert!(sock(r#"{"level": "6", "opt": "13", "value": "1"}"#).is_err());
-        assert!(sock(r#"{"type": "int", "level": "6", "value": "1"}"#).is_err());
+        // Xray accepts every entry at config build; runtime applies only the
+        // entries it understands.
+        assert!(sock(r#"{"level": "6", "opt": "13", "value": "1"}"#).is_ok());
+        assert!(sock(r#"{"type": "int", "level": "6", "value": "1"}"#).is_ok());
+        assert!(sock(r#"{"type": "vector", "level": "6", "opt": "13"}"#).is_ok());
         assert!(sock(r#"{"type": "int", "system": "windows", "level": "6"}"#).is_ok());
         assert!(sock(r#"{"type": "int", "level": "6", "opt": "13", "value": "1"}"#).is_ok());
     }

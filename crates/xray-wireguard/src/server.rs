@@ -35,6 +35,10 @@ pub struct ServerPeerConfig {
     pub endpoint: Option<SocketAddr>,
     pub allowed_ips: Vec<AllowedIp>,
     pub keepalive: u16,
+    /// Xray's `peers[].email`, used as the inbound user of the peer's traffic.
+    pub email: String,
+    /// Xray's `peers[].level`, used for policy and per-user stats.
+    pub level: u32,
 }
 
 #[derive(Clone, Debug)]

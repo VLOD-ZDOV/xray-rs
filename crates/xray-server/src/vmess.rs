@@ -13,7 +13,7 @@ use xray_proxy::vmess::server::{self, ServerHandshake, ServerStream, ServerUser}
 use xray_routing::TargetAddr;
 
 use crate::outbound::{self, ConeUdp};
-use crate::routing::{Action, BlockAction};
+use crate::routing::Action;
 use crate::stats;
 use crate::vless::{read_first, Activity, Context, Host, RouteRequest};
 
@@ -30,7 +30,10 @@ impl Keys {
     pub(crate) fn get(ctx: &Context) -> Arc<Self> {
         // Built under the users read lock; Context::users_mut clears it under the write lock.
         let users = ctx.users.read().unwrap_or_else(PoisonError::into_inner);
-        let mut cache = ctx.vmess_keys.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut cache = ctx
+            .vmess_keys
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(keys) = cache.as_ref() {
             return keys.clone();
         }
@@ -127,6 +130,7 @@ where
         host: &host,
         port,
         sniffing: &ctx.sniffing,
+        vless_route: None,
     };
 
     // Xray writes the response header even when the request goes nowhere.
@@ -138,16 +142,13 @@ where
     let mut route_host = host.clone();
     ctx.sniffing.override_host(&early, &mut route_host);
 
-    if let Action::Block(BlockAction::Http403) = decision.action {
-        if network == Network::Tcp {
-            server_w
-                .write_all(crate::routing::BLACKHOLE_HTTP_RESPONSE)
-                .await?;
-            server_w.flush().await?;
+    if let Action::Block(block) = &decision.action {
+        if let Some(response) = block.response() {
+            if network == Network::Tcp {
+                server_w.write_all(response).await?;
+                server_w.flush().await?;
+            }
         }
-        return Ok(());
-    }
-    if let Action::Block(_) = decision.action {
         let _ = server_w.flush().await;
         return Ok(());
     }

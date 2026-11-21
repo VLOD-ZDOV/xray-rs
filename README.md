@@ -29,6 +29,15 @@ The server crate and every workspace crate it is built from (`xray-config`,
 Tested against the official Xray-core 26.11.9 as client, outbound peer,
 WireGuard peer and `xray api` client.
 
+### Known divergences
+
+- `dns.script` (the Lua DNS engine) is refused with a clear configuration error.
+  It is not silently ignored, and no Lua runtime is embedded.
+- An inbound `port` above 65535 is rejected. Official Xray truncates it to
+  `uint16` and listens on a different port, which hides operator typos.
+- `AlterOutbound` with no operation returns a gRPC status; official Xray panics
+  on that request.
+
 ## Resource use
 
 Same server config for every core, the official Xray-core as the client, only

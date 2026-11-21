@@ -59,6 +59,11 @@ impl VisionTransportStream {
             if self.header_written < hdr.len() {
                 match Pin::new(&mut *self.inner).poll_write(cx, &hdr[self.header_written..]) {
                     Poll::Ready(Ok(0)) => {
+                        crate::log::warn(format!(
+                            "vless outbound transport made no progress on header: {}/{} bytes written",
+                            self.header_written,
+                            hdr.len()
+                        ));
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::WriteZero,
                             "failed to write header",
@@ -113,25 +118,55 @@ impl AsyncWrite for VisionTransportStream {
                 let mut combined = Vec::with_capacity(remaining_hdr.len() + input.len());
                 combined.extend_from_slice(remaining_hdr);
                 combined.extend_from_slice(input);
-                match Pin::new(&mut *this.inner).poll_write(cx, &combined) {
+                return match Pin::new(&mut *this.inner).poll_write(cx, &combined) {
+                    Poll::Ready(Ok(0)) => {
+                        crate::log::warn(format!(
+                            "vless outbound header write: inner made no progress, header {}/{}, input {}",
+                            this.header_written,
+                            hdr.len(),
+                            input.len()
+                        ));
+                        Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "failed to write header",
+                        )))
+                    }
+                    Poll::Ready(Ok(n)) if n < remaining_hdr.len() => {
+                        // Only part of the request header was accepted. No
+                        // caller byte has been written yet, so `Ok(0)` would
+                        // be mistaken for a closed writer by `write_all`;
+                        // retry the same input after the progress is kept.
+                        this.header_written += n;
+                        cx.waker().wake_by_ref();
+                        Poll::Pending
+                    }
                     Poll::Ready(Ok(n)) => {
-                        if n < remaining_hdr.len() {
-                            this.header_written += n;
+                        let written_input = n - remaining_hdr.len();
+                        this.pending_header = None;
+                        this.header_written = 0;
+                        if written_input == 0 && !input.is_empty() {
+                            // The transport took the whole header and none of
+                            // the caller's bytes. `Ok(0)` would look like a
+                            // closed writer, so retry the payload.
                             cx.waker().wake_by_ref();
-                            return Poll::Ready(Ok(0));
+                            Poll::Pending
                         } else {
-                            let written_input = n - remaining_hdr.len();
-                            this.pending_header = None;
-                            this.header_written = 0;
-                            return Poll::Ready(Ok(written_input));
+                            Poll::Ready(Ok(written_input))
                         }
                     }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => return Poll::Pending,
-                }
+                    Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+                    Poll::Pending => Poll::Pending,
+                };
             }
         }
-        Pin::new(&mut *this.inner).poll_write(cx, input)
+        let poll = Pin::new(&mut *this.inner).poll_write(cx, input);
+        if let Poll::Ready(Ok(0)) = poll {
+            crate::log::warn(format!(
+                "vless outbound payload write: inner made no progress, input {}",
+                input.len()
+            ));
+        }
+        poll
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -317,12 +352,22 @@ impl VlessOutbound {
             DEFAULT_VISION_SEED,
         );
 
-        let enc_str = user
-            .get("encryption")
-            .or_else(|| settings.get("encryption"))
-            .and_then(Value::as_str)
-            .unwrap_or("none");
-        let encryption = if enc_str != "none" && !enc_str.is_empty() {
+        let enc_value = user.get("encryption").or_else(|| settings.get("encryption"));
+        let enc_str = match enc_value {
+            Some(Value::String(value)) => value.as_str(),
+            Some(Value::Null) | None => {
+                return Err(
+                    r#"VLESS users: please add/set "encryption":"none" for every user"#.into(),
+                )
+            }
+            Some(_) => return Err("VLESS users: invalid user".into()),
+        };
+        if enc_str.is_empty() {
+            return Err(
+                r#"VLESS users: please add/set "encryption":"none" for every user"#.into(),
+            );
+        }
+        let encryption = if enc_str != "none" {
             let enc: xray_vless_encryption::Encryption = enc_str
                 .parse()
                 .map_err(|e| err(&format!("invalid vless encryption {enc_str:?}: {e:?}")))?;
@@ -602,6 +647,7 @@ impl VlessOutbound {
                             level: 0,
                             router: router.clone(),
                             sniffing: crate::vless::Sniffing::default(),
+                            vless_route: None,
                         };
                         let _ = crate::mux::serve(&mut r, &mut w, &info).await;
                     }
@@ -1284,6 +1330,11 @@ fn parse_tls(tls: &Value, host: &Host) -> Result<ConnectorConfig, String> {
             Host::Domain(d) => d.clone(),
             Host::Ip(ip) => ip.to_string(),
         });
+    if tls.get("allowInsecure").is_some_and(|value| !value.is_null())
+        && tls.get("allowInsecure").and_then(Value::as_bool).is_none()
+    {
+        return Err("tlsSettings.allowInsecure must be a boolean".into());
+    }
     if tls
         .get("allowInsecure")
         .and_then(Value::as_bool)
@@ -1499,7 +1550,8 @@ mod tests {
             "settings": {
                 "address": "1.2.3.4",
                 "port": 8443,
-                "id": "5055b881-2090-410e-b762-fe36e4f16b25"
+                "id": "5055b881-2090-410e-b762-fe36e4f16b25",
+                "encryption": "none"
             },
             "streamSettings": {
                 "network": "ws",
@@ -1536,7 +1588,7 @@ mod tests {
                 "vnext": [{
                     "address": "127.0.0.1",
                     "port": 50051,
-                    "users": [{"id": "5055b881-2090-410e-b762-fe36e4f16b25"}]
+                    "users": [{"id": "5055b881-2090-410e-b762-fe36e4f16b25", "encryption": "none"}]
                 }]
             },
             "streamSettings": {
@@ -1584,7 +1636,8 @@ mod tests {
             "settings": {
                 "address": server_addr.ip().to_string(),
                 "port": server_addr.port(),
-                "id": user_id.to_string()
+                "id": user_id.to_string(),
+                "encryption": "none"
             },
             "streamSettings": {
                 "network": "tcp",
@@ -1640,7 +1693,8 @@ mod tests {
             "settings": {
                 "address": server_addr.ip().to_string(),
                 "port": server_addr.port(),
-                "id": user_id.to_string()
+                "id": user_id.to_string(),
+                "encryption": "none"
             },
             "streamSettings": {
                 "network": "tcp",
@@ -1724,6 +1778,7 @@ mod tests {
                 "address": server_addr.ip().to_string(),
                 "port": server_addr.port(),
                 "id": user_id.to_string(),
+                "encryption": "none",
                 "packetEncoding": "xudp"
             },
             "streamSettings": {
@@ -1759,7 +1814,8 @@ mod tests {
             "settings": {
                 "address": "1.2.3.4",
                 "port": 443,
-                "id": "5055b881-2090-410e-b762-fe36e4f16b25"
+                "id": "5055b881-2090-410e-b762-fe36e4f16b25",
+                "encryption": "none"
             },
             "streamSettings": {
                 "method": "ws",

@@ -29,6 +29,8 @@ pub type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes
 
 const PIPE_SIZE: usize = 256 * 1024;
 const SESSION_TTL: Duration = Duration::from_secs(30);
+/// Pre-authentication sessions kept per XHTTP inbound.
+const MAX_SESSIONS: usize = 4096;
 
 pub struct Handler {
     settings: XhttpSettings,
@@ -160,7 +162,9 @@ impl Handler {
         let is_uplink = req.method() != Method::GET || !seq.is_empty();
 
         if is_uplink && !session_id.is_empty() {
-            let session = self.upsert(&session_id);
+            let Some(session) = self.upsert(&session_id) else {
+                return status(StatusCode::SERVICE_UNAVAILABLE);
+            };
             if seq.is_empty() {
                 if !allowed("stream-up") {
                     return status(StatusCode::BAD_REQUEST);
@@ -256,7 +260,9 @@ impl Handler {
             });
             (reader, None)
         } else {
-            let session = self.upsert(&session_id);
+            let Some(session) = self.upsert(&session_id) else {
+                return status(StatusCode::SERVICE_UNAVAILABLE);
+            };
             session.connected.store(true, Ordering::Relaxed);
             let Some(uplink) = lock(&session.uplink).take() else {
                 return status(StatusCode::CONFLICT);
@@ -365,7 +371,13 @@ impl Handler {
         let is_uplink = req.method() != Method::GET || !seq.is_empty();
 
         if is_uplink && !session_id.is_empty() {
-            let session = self.upsert(&session_id);
+            let Some(session) = self.upsert(&session_id) else {
+                let _ = stream
+                    .send_response(h3_status(StatusCode::SERVICE_UNAVAILABLE))
+                    .await;
+                let _ = stream.finish().await;
+                return;
+            };
             if seq.is_empty() {
                 if !allowed("stream-up") {
                     let _ = stream
@@ -585,7 +597,13 @@ impl Handler {
             return;
         }
 
-        let session = self.upsert(&session_id);
+        let Some(session) = self.upsert(&session_id) else {
+            let _ = stream
+                .send_response(h3_status(StatusCode::SERVICE_UNAVAILABLE))
+                .await;
+            let _ = stream.finish().await;
+            return;
+        };
         session.connected.store(true, Ordering::Relaxed);
         let Some(uplink) = lock(&session.uplink).take() else {
             let _ = stream.send_response(h3_status(StatusCode::CONFLICT)).await;
@@ -699,10 +717,13 @@ impl Handler {
             .to_owned()
     }
 
-    fn upsert(self: &Arc<Self>, id: &str) -> Arc<Session> {
+    fn upsert(self: &Arc<Self>, id: &str) -> Option<Arc<Session>> {
         let mut sessions = lock(&self.sessions);
         if let Some(session) = sessions.get(id) {
-            return session.clone();
+            return Some(session.clone());
+        }
+        if sessions.len() >= MAX_SESSIONS {
+            return None;
         }
         let (writer, reader) = tokio::io::duplex(PIPE_SIZE);
         let (tx, rx) = mpsc::channel(self.settings.max_buffered_posts);
@@ -732,7 +753,7 @@ impl Handler {
                 reaped.close();
             }
         });
-        session
+        Some(session)
     }
 
     /// Drops the session from the map and stops its upload task, which would

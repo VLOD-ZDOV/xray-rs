@@ -15,10 +15,10 @@ use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto;
-use prost::Message;
+use prost::{Message, Oneof};
 use tokio::net::TcpListener;
 
-use crate::config::{user_id, User as InboundUser};
+use crate::config::{user_id, Inbound, InboundProtocol, User as InboundUser};
 use crate::routing::Router;
 use crate::vless::Context;
 use crate::{log, stats, xhttp::Body};
@@ -28,6 +28,9 @@ const HANDLER: &str = "/xray.app.proxyman.command.HandlerService/";
 const LOGGER: &str = "/xray.app.log.command.LoggerService/";
 const ROUTER: &str = "/xray.app.router.command.RoutingService/";
 const OBSERVATORY: &str = "/xray.core.app.observatory.command.ObservatoryService/";
+const REFLECTION_V1ALPHA: &str = "/grpc.reflection.v1alpha.ServerReflection/";
+const REFLECTION_V1: &str = "/grpc.reflection.v1.ServerReflection/";
+const MAX_REFLECTION_MESSAGE: usize = 4 << 20;
 const ADD_USER: &str = "xray.app.proxyman.command.AddUserOperation";
 const REMOVE_USER: &str = "xray.app.proxyman.command.RemoveUserOperation";
 const VLESS_ACCOUNT: &str = "xray.proxy.vless.Account";
@@ -316,6 +319,39 @@ pub struct OutboundHandlerConfig {
 pub struct AddOutboundResponse {}
 
 #[derive(Clone, PartialEq, Message)]
+pub struct ListInboundsRequest {
+    #[prost(bool, tag = "1")]
+    pub is_only_tags: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListInboundsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub inbounds: Vec<InboundHandlerConfig>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListOutboundsRequest {}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListOutboundsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub outbounds: Vec<OutboundHandlerConfig>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AlterOutboundRequest {
+    #[prost(string, tag = "1")]
+    pub tag: String,
+    #[prost(message, optional, tag = "2")]
+    pub operation: Option<TypedMessage>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+#[allow(dead_code)] // Xray has no outbound operation, so this is never sent.
+pub struct AlterOutboundResponse {}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct RemoveOutboundRequest {
     #[prost(string, tag = "1")]
     pub tag: String,
@@ -564,6 +600,12 @@ pub struct TestRouteRequest {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct SubscribeRoutingStatsRequest {
+    #[prost(string, repeated, tag = "1")]
+    pub field_selectors: Vec<String>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct RestartLoggerRequest {}
 
 #[derive(Clone, PartialEq, Message)]
@@ -685,6 +727,136 @@ impl ServiceType<'_> {
 #[derive(Clone, PartialEq, Message)]
 pub struct Empty {}
 
+// gRPC server reflection (`google.golang.org/grpc/reflection`), which Xray
+// registers for `api.services: ["reflectionService"]`. The v1 and v1alpha
+// packages have identical wire formats.
+#[derive(Clone, PartialEq, Message)]
+pub struct ServerReflectionRequest {
+    #[prost(string, tag = "1")]
+    pub host: String,
+    #[prost(
+        oneof = "server_reflection_request::MessageRequest",
+        tags = "3,4,5,6,7"
+    )]
+    pub message_request: Option<server_reflection_request::MessageRequest>,
+}
+
+pub mod server_reflection_request {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub enum MessageRequest {
+        #[prost(string, tag = "3")]
+        FileByFilename(String),
+        #[prost(string, tag = "4")]
+        FileContainingSymbol(String),
+        #[prost(message, tag = "5")]
+        FileContainingExtension(ExtensionRequest),
+        #[prost(string, tag = "6")]
+        AllExtensionNumbersOfType(String),
+        #[prost(string, tag = "7")]
+        ListServices(String),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ExtensionRequest {
+    #[prost(string, tag = "1")]
+    pub containing_type: String,
+    #[prost(int32, tag = "2")]
+    pub extension_number: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ServerReflectionResponse {
+    #[prost(string, tag = "1")]
+    pub valid_host: String,
+    #[prost(message, optional, tag = "2")]
+    pub original_request: Option<ServerReflectionRequest>,
+    #[prost(
+        oneof = "server_reflection_response::MessageResponse",
+        tags = "4,5,6,7"
+    )]
+    pub message_response: Option<server_reflection_response::MessageResponse>,
+}
+
+pub mod server_reflection_response {
+    use super::*;
+
+    #[derive(Clone, PartialEq, Oneof)]
+    pub enum MessageResponse {
+        #[prost(message, tag = "4")]
+        Files(FileDescriptorResponse),
+        #[prost(message, tag = "5")]
+        Extensions(ExtensionNumberResponse),
+        #[prost(message, tag = "6")]
+        Services(ListServiceResponse),
+        #[prost(message, tag = "7")]
+        Error(ErrorResponse),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FileDescriptorResponse {
+    #[prost(bytes = "vec", repeated, tag = "1")]
+    pub file_descriptor_proto: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ExtensionNumberResponse {
+    #[prost(string, tag = "1")]
+    pub base_type_name: String,
+    #[prost(int32, repeated, tag = "2")]
+    pub extension_number: Vec<i32>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ListServiceResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub service: Vec<ServiceResponse>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ServiceResponse {
+    #[prost(string, tag = "1")]
+    pub name: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ErrorResponse {
+    #[prost(int32, tag = "1")]
+    pub error_code: i32,
+    #[prost(string, tag = "2")]
+    pub error_message: String,
+}
+
+/// Xray's registered services, as reflection lists them.
+const REGISTERED_SERVICES: &[(&str, &str)] = &[
+    ("statsservice", "xray.app.stats.command.StatsService"),
+    ("handlerservice", "xray.app.proxyman.command.HandlerService"),
+    ("loggerservice", "xray.app.log.command.LoggerService"),
+    ("routingservice", "xray.app.router.command.RoutingService"),
+    (
+        "observatoryservice",
+        "xray.core.app.observatory.command.ObservatoryService",
+    ),
+];
+
+static DESCRIPTOR_FILES: std::sync::OnceLock<Vec<Vec<u8>>> = std::sync::OnceLock::new();
+
+fn descriptor_files() -> &'static [Vec<u8>] {
+    DESCRIPTOR_FILES.get_or_init(|| {
+        #[derive(Clone, PartialEq, Message)]
+        struct FileDescriptorSet {
+            #[prost(bytes = "vec", repeated, tag = "1")]
+            file: Vec<Vec<u8>>,
+        }
+        FileDescriptorSet::decode(include_bytes!("api_descriptor.bin").as_slice())
+            .map(|set| set.file)
+            .unwrap_or_default()
+    })
+}
+
 pub struct InboundManager {
     inbounds: RwLock<HashMap<String, InboundEntry>>,
     router: Arc<Router>,
@@ -694,6 +866,56 @@ pub struct InboundEntry {
     pub ctx: Arc<Context>,
     pub tcp_abort: Option<tokio::task::AbortHandle>,
     pub udp_abort: Option<tokio::task::AbortHandle>,
+    pub config: InboundHandlerConfig,
+}
+
+/// The protobuf name Xray registers for an inbound protocol's server config.
+fn inbound_proxy_type_name(protocol: InboundProtocol) -> &'static str {
+    match protocol {
+        InboundProtocol::Vless => "xray.proxy.vless.inbound.Config",
+        InboundProtocol::Trojan => "xray.proxy.trojan.ServerConfig",
+        InboundProtocol::Vmess => "xray.proxy.vmess.inbound.Config",
+        InboundProtocol::Socks => "xray.proxy.socks.ServerConfig",
+        InboundProtocol::Http => "xray.proxy.http.ServerConfig",
+        InboundProtocol::Shadowsocks => "xray.proxy.shadowsocks.ServerConfig",
+        InboundProtocol::Dokodemo => "xray.proxy.dokodemo.Config",
+        InboundProtocol::Hysteria => "xray.proxy.hysteria.ServerConfig",
+        InboundProtocol::Wireguard => "xray.proxy.wireguard.DeviceConfig",
+        InboundProtocol::Masque => "xray.proxy.masque.ServerConfig",
+    }
+}
+
+pub fn inbound_handler_config(inbound: &Inbound) -> InboundHandlerConfig {
+    let receiver = ReceiverConfig {
+        port_list: Some(PortListProto {
+            range: vec![PortRangeProto {
+                from: u32::from(inbound.port),
+                to: u32::from(inbound.port),
+            }],
+        }),
+        listen: (!inbound.listen.is_empty()).then(|| IpOrDomainProto {
+            ip: None,
+            domain: Some(inbound.listen.clone()),
+        }),
+        stream_settings: None,
+        receive_original_destination: false,
+        sniffing_settings: None,
+    };
+    let mut value = Vec::new();
+    if receiver.encode(&mut value).is_err() {
+        value.clear();
+    }
+    InboundHandlerConfig {
+        tag: inbound.tag.clone(),
+        receiver_settings: Some(TypedMessage {
+            r#type: "xray.app.proxyman.ReceiverConfig".into(),
+            value: Bytes::from(value),
+        }),
+        proxy_settings: Some(TypedMessage {
+            r#type: inbound_proxy_type_name(inbound.protocol).into(),
+            value: Bytes::new(),
+        }),
+    }
 }
 
 impl InboundManager {
@@ -710,6 +932,7 @@ impl InboundManager {
         ctx: Arc<Context>,
         tcp_abort: Option<tokio::task::AbortHandle>,
         udp_abort: Option<tokio::task::AbortHandle>,
+        config: InboundHandlerConfig,
     ) {
         let mut map = self
             .inbounds
@@ -721,8 +944,19 @@ impl InboundManager {
                 ctx,
                 tcp_abort,
                 udp_abort,
+                config,
             },
         );
+    }
+
+    pub fn configs(&self) -> Vec<InboundHandlerConfig> {
+        let map = self
+            .inbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut configs: Vec<_> = map.values().map(|entry| entry.config.clone()).collect();
+        configs.sort_by(|a, b| a.tag.cmp(&b.tag));
+        configs
     }
 
     pub fn get_ctx(&self, tag: &str) -> Option<Arc<Context>> {
@@ -769,6 +1003,7 @@ impl InboundManager {
         ctx: Arc<Context>,
         tcp_abort: Option<tokio::task::AbortHandle>,
         udp_abort: Option<tokio::task::AbortHandle>,
+        config: InboundHandlerConfig,
     ) -> Result<(), String> {
         let mut map = self
             .inbounds
@@ -783,6 +1018,7 @@ impl InboundManager {
                 ctx,
                 tcp_abort,
                 udp_abort,
+                config,
             },
         );
         Ok(())
@@ -840,6 +1076,29 @@ async fn handle(
     observatory: &Option<Arc<crate::observatory::Observatory>>,
 ) -> Response<Body> {
     let path = req.uri().path().to_owned();
+    if let Some(method) = path
+        .strip_prefix(REFLECTION_V1ALPHA)
+        .or_else(|| path.strip_prefix(REFLECTION_V1))
+    {
+        if !services
+            .iter()
+            .any(|service| service == "reflectionservice")
+        {
+            return status(UNIMPLEMENTED, "unknown service");
+        }
+        if method != "ServerReflectionInfo" {
+            return status(UNIMPLEMENTED, "unknown method");
+        }
+        return handle_reflection(req, services).await;
+    }
+    if let Some(method) = path.strip_prefix(ROUTER) {
+        if method == "SubscribeRoutingStats" {
+            if !services.iter().any(|service| service == "routingservice") {
+                return status(UNIMPLEMENTED, "unknown service");
+            }
+            return handle_subscribe_routing_stats(req, router).await;
+        }
+    }
     let svc = if let Some(m) = path.strip_prefix(STATS) {
         ServiceType::Stats(m)
     } else if let Some(m) = path.strip_prefix(HANDLER) {
@@ -881,6 +1140,254 @@ async fn handle(
         ServiceType::Router(method) => handle_router(method, message, router).await,
         ServiceType::Observatory(method) => handle_observatory(method, message, observatory).await,
         ServiceType::Stats(method) => handle_stats(method, message),
+    }
+}
+
+fn framed_bytes(message: &impl Message) -> Bytes {
+    let mut data = BytesMut::with_capacity(5 + message.encoded_len());
+    data.put_u8(0);
+    data.put_u32(message.encoded_len() as u32);
+    message
+        .encode(&mut data)
+        .unwrap_or_else(|_| unreachable!("buffer reserved"));
+    data.freeze()
+}
+
+/// The reflection stream: one request message in, one response message out,
+/// for as long as the client keeps the stream open.
+async fn handle_reflection(req: Request<Incoming>, services: &[String]) -> Response<Body> {
+    let services = services.to_vec();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(8);
+    let mut body = req.into_body();
+    tokio::spawn(async move {
+        let mut buffer = BytesMut::new();
+        let mut status = 0u8;
+        'read: loop {
+            let frame = match body.frame().await {
+                None => break,
+                Some(Err(e)) => {
+                    status = UNKNOWN;
+                    let _ = e;
+                    break;
+                }
+                Some(Ok(frame)) => frame,
+            };
+            if let Some(data) = frame.data_ref() {
+                if buffer.len() + data.len() > MAX_REFLECTION_MESSAGE {
+                    status = 8; // RESOURCE_EXHAUSTED
+                    break;
+                }
+                buffer.extend_from_slice(data);
+            }
+            let trailers = frame.is_trailers();
+            while buffer.len() >= 5 {
+                let len = u32::from_be_bytes([buffer[1], buffer[2], buffer[3], buffer[4]]) as usize;
+                if len > MAX_REFLECTION_MESSAGE {
+                    status = 8;
+                    break 'read;
+                }
+                if buffer.len() < 5 + len {
+                    break;
+                }
+                let message = buffer.split_to(5 + len);
+                if message[0] != 0 {
+                    status = INVALID_ARGUMENT;
+                    break 'read;
+                }
+                let reply = reflection_reply(&message[5..], &services);
+                if tx
+                    .send(Ok(Frame::data(framed_bytes(&reply))))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            if trailers {
+                break;
+            }
+        }
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from(u16::from(status)));
+        let _ = tx.send(Ok(Frame::trailers(trailers))).await;
+    });
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|frame| (frame, rx))
+    });
+    let mut response = Response::new(StreamBody::new(stream).boxed());
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/grpc"));
+    response
+}
+
+fn reflection_reply(data: &[u8], services: &[String]) -> ServerReflectionResponse {
+    use server_reflection_request::MessageRequest;
+    use server_reflection_response::MessageResponse;
+
+    let Ok(request) = ServerReflectionRequest::decode(data) else {
+        return ServerReflectionResponse {
+            valid_host: String::new(),
+            original_request: None,
+            message_response: Some(MessageResponse::Error(ErrorResponse {
+                error_code: i32::from(INVALID_ARGUMENT),
+                error_message: "bad reflection request".to_owned(),
+            })),
+        };
+    };
+    let response = match &request.message_request {
+        Some(MessageRequest::ListServices(_)) => {
+            let mut names: Vec<String> = REGISTERED_SERVICES
+                .iter()
+                .filter(|(config_name, _)| services.iter().any(|s| s == config_name))
+                .map(|(_, full_name)| (*full_name).to_owned())
+                .collect();
+            names.push("grpc.reflection.v1alpha.ServerReflection".to_owned());
+            names.push("grpc.reflection.v1.ServerReflection".to_owned());
+            MessageResponse::Services(ListServiceResponse {
+                service: names
+                    .into_iter()
+                    .map(|name| ServiceResponse { name })
+                    .collect(),
+            })
+        }
+        Some(MessageRequest::FileByFilename(_)) | Some(MessageRequest::FileContainingSymbol(_)) => {
+            MessageResponse::Files(FileDescriptorResponse {
+                file_descriptor_proto: descriptor_files().to_vec(),
+            })
+        }
+        Some(MessageRequest::AllExtensionNumbersOfType(name)) => {
+            MessageResponse::Extensions(ExtensionNumberResponse {
+                base_type_name: name.clone(),
+                extension_number: Vec::new(),
+            })
+        }
+        Some(MessageRequest::FileContainingExtension(_)) => MessageResponse::Error(ErrorResponse {
+            error_code: i32::from(NOT_FOUND),
+            error_message: "extensions are not supported".to_owned(),
+        }),
+        None => MessageResponse::Error(ErrorResponse {
+            error_code: i32::from(INVALID_ARGUMENT),
+            error_message: "empty reflection request".to_owned(),
+        }),
+    };
+    ServerReflectionResponse {
+        valid_host: request.host.clone(),
+        original_request: Some(request),
+        message_response: Some(response),
+    }
+}
+
+async fn handle_subscribe_routing_stats(
+    req: Request<Incoming>,
+    router: &Arc<Router>,
+) -> Response<Body> {
+    let body = match http_body_util::Limited::new(req.into_body(), MAX_REQUEST)
+        .collect()
+        .await
+    {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return status(INVALID_ARGUMENT, "request too large"),
+    };
+    let Some(message) = unframe(body) else {
+        return status(INVALID_ARGUMENT, "bad grpc frame");
+    };
+    let Ok(request) = SubscribeRoutingStatsRequest::decode(message) else {
+        return status(INVALID_ARGUMENT, "bad request");
+    };
+    let selectors = request.field_selectors;
+    let receiver = router.subscribe_routing_stats();
+    let stream = futures_util::stream::unfold(receiver, move |mut receiver| {
+        let selectors = selectors.clone();
+        async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(event) => {
+                        let context = routing_context_for_event(event, &selectors);
+                        return Some((Ok(Frame::data(framed_bytes(&context))), receiver));
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        }
+    });
+    let mut response = Response::new(StreamBody::new(stream).boxed());
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/grpc"));
+    response
+}
+
+fn routing_context_for_event(
+    event: crate::routing::RoutingEvent,
+    selectors: &[String],
+) -> RoutingContext {
+    let wants = |field: &str| {
+        selectors.is_empty()
+            || selectors
+                .iter()
+                .any(|selector| field.starts_with(selector.as_str()))
+    };
+    let mut context = RoutingContext::default();
+    if wants("inbound") {
+        context.inbound_tag = event.inbound;
+    }
+    if wants("network") {
+        context.network = if event.udp {
+            Network::Udp as i32
+        } else {
+            Network::Tcp as i32
+        };
+    }
+    if wants("ip_source") {
+        context.source_ips = vec![Bytes::copy_from_slice(&ip_octets(event.source.ip()))];
+    }
+    if wants("ip_target") {
+        if let Some(ip) = event.ip {
+            context.target_ips = vec![Bytes::copy_from_slice(&ip_octets(ip))];
+        }
+    }
+    if wants("ip_local") {
+        if let Some(ip) = event.local_ip {
+            context.local_ips = vec![Bytes::copy_from_slice(&ip_octets(ip))];
+        }
+    }
+    if wants("port_source") {
+        context.source_port = u32::from(event.source.port());
+    }
+    if wants("port_target") {
+        context.target_port = u32::from(event.port);
+    }
+    if wants("port_local") {
+        context.local_port = u32::from(event.inbound_port);
+    }
+    if wants("domain") {
+        if let Some(domain) = event.domain {
+            context.target_domain = domain;
+        }
+    }
+    if wants("protocol") {
+        if let Some(protocol) = event.protocol {
+            context.protocol = protocol.to_owned();
+        }
+    }
+    if wants("user") {
+        context.user = event.user;
+    }
+    if wants("attributes") {
+        context.attributes = event.attributes.unwrap_or_default();
+    }
+    if wants("outbound") {
+        context.outbound_tag = event.outbound;
+    }
+    context
+}
+
+fn ip_octets(ip: std::net::IpAddr) -> Vec<u8> {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+        std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
     }
 }
 
@@ -1397,6 +1904,62 @@ async fn handle_handler(
             let users = users.into_iter().map(protocol_user).collect();
             reply(&GetInboundUserResponse { users })
         }
+        "ListInbounds" => {
+            let Ok(request) = ListInboundsRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            let mut inbounds = inbound_manager.configs();
+            if request.is_only_tags {
+                for config in &mut inbounds {
+                    config.receiver_settings = None;
+                    config.proxy_settings = None;
+                }
+            }
+            reply(&ListInboundsResponse { inbounds })
+        }
+        "ListOutbounds" => {
+            let Ok(_) = ListOutboundsRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            let outbounds = inbound_manager
+                .router
+                .outbound_summaries()
+                .into_iter()
+                .map(|(tag, proxy_type)| OutboundHandlerConfig {
+                    tag,
+                    sender_settings: Some(TypedMessage {
+                        r#type: "xray.app.proxyman.SenderConfig".into(),
+                        value: Bytes::new(),
+                    }),
+                    proxy_settings: Some(TypedMessage {
+                        r#type: proxy_type.into(),
+                        value: Bytes::new(),
+                    }),
+                    expire: 0,
+                    comment: String::new(),
+                })
+                .collect();
+            reply(&ListOutboundsResponse { outbounds })
+        }
+        "AlterOutbound" => {
+            let Ok(request) = AlterOutboundRequest::decode(message) else {
+                return status(INVALID_ARGUMENT, "bad request");
+            };
+            let Some(operation) = request.operation else {
+                // Official Xray dereferences the nil operation and panics; a
+                // status is the safe equivalent.
+                return status(UNKNOWN, "app/proxyman/command: unknown operation");
+            };
+            if operation.r#type == ADD_USER || operation.r#type == REMOVE_USER {
+                // Xray's AddUser/RemoveUser implement only the inbound half of
+                // the operation interface, so AlterOutbound rejects them.
+                return status(UNKNOWN, "app/proxyman/command: not an outbound operation");
+            }
+            status(
+                UNKNOWN,
+                "app/proxyman/command: unknown operation > proto:\u{a0}not found",
+            )
+        }
         "AddInbound" => {
             let Ok(r) = AddInboundRequest::decode(message) else {
                 return status(INVALID_ARGUMENT, "bad request");
@@ -1517,6 +2080,7 @@ async fn handle_handler(
                             crate::config::InboundTransport::Websocket(crate::ws::WsSettings {
                                 path: "/".into(),
                                 host: None,
+                                heartbeat_period: None,
                             })
                         }
                         Some("grpc") => {
@@ -1684,6 +2248,7 @@ async fn handle_handler(
                 shadowsocks_top_password: ss_pass,
                 fallbacks: Vec::new(),
                 socks_auth: xray_proxy::inbound::SocksInboundAuth::NoAuth,
+                user_level: 0,
                 udp: true,
                 sniffing,
                 dokodemo: None,
@@ -1705,14 +2270,19 @@ async fn handle_handler(
                 wireguard: None,
                 masque: None,
             };
+            let handler_config = inbound_handler_config(&inbound);
             match crate::start_inbound(&inbound, None, inbound_manager.router().clone()).await {
                 Ok((ctx, tcp_abort, udp_abort)) => {
                     inbound_manager
                         .router()
                         .set_inbound_protocol(&tag, Some(proxy_name));
-                    if let Err(e) =
-                        inbound_manager.add_entry(tag, ctx, tcp_abort.clone(), udp_abort.clone())
-                    {
+                    if let Err(e) = inbound_manager.add_entry(
+                        tag,
+                        ctx,
+                        tcp_abort.clone(),
+                        udp_abort.clone(),
+                        handler_config,
+                    ) {
                         for handle in [tcp_abort, udp_abort].into_iter().flatten() {
                             handle.abort();
                         }
@@ -2015,6 +2585,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn routing_stats_events_apply_field_selectors() {
+        let event = crate::routing::RoutingEvent {
+            inbound: "socks-in".into(),
+            udp: false,
+            source: "203.0.113.5:40000".parse().unwrap(),
+            ip: Some("198.51.100.7".parse().unwrap()),
+            domain: Some("example.com".into()),
+            port: 443,
+            protocol: Some("tls"),
+            user: "u@example.com".into(),
+            attributes: None,
+            local_ip: Some("127.0.0.1".parse().unwrap()),
+            inbound_port: 1080,
+            vless_route: Some(7),
+            outbound: "direct".into(),
+        };
+        let all = routing_context_for_event(event.clone(), &[]);
+        assert_eq!(all.inbound_tag, "socks-in");
+        assert_eq!(all.network, Network::Tcp as i32);
+        assert_eq!(all.source_port, 40000);
+        assert_eq!(all.target_port, 443);
+        assert_eq!(all.target_domain, "example.com");
+        assert_eq!(all.outbound_tag, "direct");
+
+        let only_inbound = routing_context_for_event(event.clone(), &["inbound".into()]);
+        assert_eq!(only_inbound.inbound_tag, "socks-in");
+        assert!(only_inbound.target_ips.is_empty());
+        assert_eq!(only_inbound.target_port, 0);
+        assert!(only_inbound.outbound_tag.is_empty());
+
+        let only_ip = routing_context_for_event(event.clone(), &["ip".into()]);
+        assert_eq!(only_ip.source_ips.len(), 1);
+        assert_eq!(only_ip.target_ips.len(), 1);
+        assert_eq!(only_ip.local_ips.len(), 1);
+        assert!(only_ip.inbound_tag.is_empty());
+
+        let only_outbound = routing_context_for_event(event, &["outbound".into()]);
+        assert_eq!(only_outbound.outbound_tag, "direct");
+        assert!(only_outbound.inbound_tag.is_empty());
+    }
+
+    #[test]
+    fn reflection_lists_only_enabled_services() {
+        use server_reflection_request::MessageRequest;
+        use server_reflection_response::MessageResponse;
+
+        let request = ServerReflectionRequest {
+            host: "api".into(),
+            message_request: Some(MessageRequest::ListServices(String::new())),
+        };
+        let reply = reflection_reply(
+            &request.encode_to_vec(),
+            &["statsservice".to_owned(), "reflectionservice".to_owned()],
+        );
+        let Some(MessageResponse::Services(list)) = reply.message_response else {
+            panic!("expected a service list");
+        };
+        let names: Vec<&str> = list.service.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"xray.app.stats.command.StatsService"));
+        assert!(names.contains(&"grpc.reflection.v1.ServerReflection"));
+        assert!(names.contains(&"grpc.reflection.v1alpha.ServerReflection"));
+        assert!(!names.contains(&"xray.app.proxyman.command.HandlerService"));
+    }
+
+    #[test]
+    fn reflection_returns_the_registered_descriptor_set() {
+        use server_reflection_request::MessageRequest;
+        use server_reflection_response::MessageResponse;
+
+        let request = ServerReflectionRequest {
+            host: String::new(),
+            message_request: Some(MessageRequest::FileContainingSymbol(
+                "xray.app.stats.command.StatsService".into(),
+            )),
+        };
+        let reply = reflection_reply(&request.encode_to_vec(), &["statsservice".to_owned()]);
+        let Some(MessageResponse::Files(files)) = reply.message_response else {
+            panic!("expected file descriptors");
+        };
+        assert!(!files.file_descriptor_proto.is_empty());
+
+        #[derive(Clone, PartialEq, Message)]
+        struct FileDescriptorProto {
+            #[prost(string, optional, tag = "1")]
+            name: Option<String>,
+        }
+        let names: Vec<String> = files
+            .file_descriptor_proto
+            .iter()
+            .filter_map(|file| FileDescriptorProto::decode(file.as_slice()).ok())
+            .filter_map(|file| file.name)
+            .collect();
+        assert!(names
+            .iter()
+            .any(|name| name == "app/stats/command/command.proto"));
+        assert!(names
+            .iter()
+            .any(|name| name == "grpc/reflection/v1/reflection.proto"));
+    }
+
+    #[test]
     fn frames_round_trip() {
         let message = QueryStatsRequest {
             pattern: "user>>>".into(),
@@ -2091,7 +2762,11 @@ mod tests {
         let vmess_count = || crate::vmess::Keys::get(&ctx).users.len();
         let before = vmess_count();
         assert!(add_user_to_inbound(p_user.clone(), &ctx).is_ok());
-        assert_eq!(vmess_count(), before + 1, "VMess key cache must see new users");
+        assert_eq!(
+            vmess_count(),
+            before + 1,
+            "VMess key cache must see new users"
+        );
         // Duplicate VMess user
         let err = add_user_to_inbound(p_user, &ctx).unwrap_err();
         assert!(err.contains("already exists"), "got: {err}");
@@ -2118,7 +2793,11 @@ mod tests {
         // Remove users
         assert!(ctx.remove_user("vmess_user@test").is_ok());
         assert!(ctx.remove_user("ss_user@test").is_ok());
-        assert_eq!(vmess_count(), before, "VMess key cache must drop removed users");
+        assert_eq!(
+            vmess_count(),
+            before,
+            "VMess key cache must drop removed users"
+        );
         // Remove non-existent user
         let err = ctx.remove_user("nonexistent").unwrap_err();
         assert!(err.contains("not found"), "got: {err}");
@@ -2364,13 +3043,14 @@ mod tests {
             });
             crate::policy::init(crate::policy::PolicyManager::from_config(&cfg));
         }
-        let stats: &'static crate::stats::Stats = Box::leak(Box::new(crate::stats::Stats::new(crate::stats::Policy {
-            enabled: true,
-            user_uplink: true,
-            user_downlink: true,
-            user_online: true,
-            ..Default::default()
-        })));
+        let stats: &'static crate::stats::Stats =
+            Box::leak(Box::new(crate::stats::Stats::new(crate::stats::Policy {
+                enabled: true,
+                user_uplink: true,
+                user_downlink: true,
+                user_online: true,
+                ..Default::default()
+            })));
 
         // Register an offline user
         stats.register_user("offline_user@test", 0);
@@ -2390,7 +3070,8 @@ mod tests {
         let resp = handle_stats_inner(stats, "GetStatsOnlineIpList", req.encode_to_vec().into());
         assert_eq!(resp.status(), 200);
         let collected = resp.into_body().collect().await.unwrap().to_bytes();
-        let iplist_resp = GetStatsOnlineIpListResponse::decode(unframe(collected).unwrap()).unwrap();
+        let iplist_resp =
+            GetStatsOnlineIpListResponse::decode(unframe(collected).unwrap()).unwrap();
         assert!(iplist_resp.ips.is_empty());
 
         // 3. GetUsersStats with include_traffic: true reports offline users with their counters

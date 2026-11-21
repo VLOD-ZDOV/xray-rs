@@ -154,7 +154,7 @@ fn main() -> ExitCode {
             let is_grpc = matches!(i.transport, InboundTransport::Grpc(_));
             i.tls
                 .as_ref()
-                .map(|s| tls_acceptor(s, is_xhttp, is_grpc))
+                .map(|s| tls_acceptors(s, is_xhttp, is_grpc))
                 .transpose()
         })
         .collect();
@@ -210,6 +210,18 @@ fn main() -> ExitCode {
     }
 }
 
+/// Both ALPN variants of one inbound's TLS acceptor. Go's crypto/tls keeps
+/// the handshake when the client offers no common ALPN and selects none;
+/// rustls refuses with `no_application_protocol`, so the caller picks the
+/// no-ALPN acceptor when the ClientHello has no overlap with the configured
+/// list.
+#[derive(Clone)]
+pub(crate) struct TlsAcceptors {
+    pub with_alpn: TlsAcceptor,
+    pub without_alpn: TlsAcceptor,
+    pub alpn: Vec<Vec<u8>>,
+}
+
 #[derive(Clone)]
 enum InboundHandler {
     VlessTcp(Arc<vless::Context>),
@@ -239,8 +251,13 @@ enum InboundHandler {
         Arc<vless::Context>,
         xray_proxy::inbound::SocksInboundAuth,
         bool,
+        u32,
     ),
-    Http(Arc<vless::Context>, xray_proxy::inbound::SocksInboundAuth),
+    Http(
+        Arc<vless::Context>,
+        xray_proxy::inbound::SocksInboundAuth,
+        u32,
+    ),
     Shadowsocks(Arc<vless::Context>),
     Dokodemo(Arc<vless::Context>, Arc<config::DokodemoSettings>),
     VlessXhttp(Arc<xhttp::Handler>),
@@ -248,7 +265,7 @@ enum InboundHandler {
 
 async fn run(
     config: Config,
-    tls: Vec<Option<TlsAcceptor>>,
+    tls: Vec<Option<TlsAcceptors>>,
     _realities: Vec<Option<Arc<reality::RealityServer>>>,
 ) -> Result<(), String> {
     start_ocsp_stapling();
@@ -278,8 +295,9 @@ async fn run(
     let inbound_manager = Arc::new(api::InboundManager::new(router.clone()));
     for (inbound, acceptor) in config.inbounds.into_iter().zip(tls) {
         let tag = inbound.tag.clone();
+        let config = api::inbound_handler_config(&inbound);
         let (ctx, tcp_abort, udp_abort) = start_inbound(&inbound, acceptor, router.clone()).await?;
-        inbound_manager.insert_initial(tag, ctx, tcp_abort, udp_abort);
+        inbound_manager.insert_initial(tag, ctx, tcp_abort, udp_abort, config);
     }
     if let Some(addr) = config.api {
         api::serve(
@@ -363,12 +381,17 @@ pub(crate) fn select_inbound_handler(
         (InboundProtocol::Vmess, InboundTransport::HttpUpgrade(settings)) => Ok(
             InboundHandler::VmessHttpUpgrade(ctx, settings, trusted_xff.to_vec()),
         ),
-        (InboundProtocol::Socks, InboundTransport::Tcp | InboundTransport::Kcp(_)) => Ok(
-            InboundHandler::Socks(ctx, inbound.socks_auth.clone(), inbound.udp),
-        ),
-        (InboundProtocol::Http, InboundTransport::Tcp | InboundTransport::Kcp(_)) => {
-            Ok(InboundHandler::Http(ctx, inbound.socks_auth.clone()))
+        (InboundProtocol::Socks, InboundTransport::Tcp | InboundTransport::Kcp(_)) => {
+            Ok(InboundHandler::Socks(
+                ctx,
+                inbound.socks_auth.clone(),
+                inbound.udp,
+                inbound.user_level,
+            ))
         }
+        (InboundProtocol::Http, InboundTransport::Tcp | InboundTransport::Kcp(_)) => Ok(
+            InboundHandler::Http(ctx, inbound.socks_auth.clone(), inbound.user_level),
+        ),
         (InboundProtocol::Shadowsocks, InboundTransport::Tcp | InboundTransport::Kcp(_)) => {
             Ok(InboundHandler::Shadowsocks(ctx))
         }
@@ -380,6 +403,8 @@ pub(crate) fn select_inbound_handler(
                     address: None,
                     port: None,
                     follow_redirect: false,
+                    port_map: Default::default(),
+                    user_level: 0,
                     tcp: true,
                 });
             Ok(InboundHandler::Dokodemo(ctx, Arc::new(settings)))
@@ -422,7 +447,7 @@ pub(crate) fn select_inbound_handler(
 
 pub(crate) async fn start_inbound(
     inbound: &Inbound,
-    acceptor: Option<TlsAcceptor>,
+    acceptor: Option<TlsAcceptors>,
     router: Arc<Router>,
 ) -> Result<
     (
@@ -507,7 +532,14 @@ pub(crate) async fn start_inbound(
         let InboundTransport::Kcp(settings) = &inbound.transport else {
             unreachable!()
         };
-        let abort = kcp::start(inbound, ctx.clone(), settings.clone(), acceptor, router).await?;
+        let abort = kcp::start(
+            inbound,
+            ctx.clone(),
+            settings.clone(),
+            acceptor.clone().map(|acceptors| acceptors.with_alpn),
+            router,
+        )
+        .await?;
         return Ok((ctx, Some(abort), None));
     }
 
@@ -981,7 +1013,7 @@ async fn accept_loop(
     listener: TcpListener,
     tproxy: config::TproxyMode,
     accept_proxy_protocol: proxy_proto::ProxyProtocolAccept,
-    tls: Option<TlsAcceptor>,
+    tls: Option<TlsAcceptors>,
     reality: Option<Arc<reality::RealityServer>>,
     handler: InboundHandler,
     http_obfs: Option<Arc<http_obfs::HttpObfsSettings>>,
@@ -1086,10 +1118,13 @@ async fn accept_loop(
             } else {
                 match (tls, http_obfs) {
                     (Some(acceptor), _) => {
-                        match tokio::time::timeout(handshake_timeout, first_record(&mut stream))
-                            .await
+                        let offered_alpn = match tokio::time::timeout(
+                            handshake_timeout,
+                            first_record(&mut stream),
+                        )
+                        .await
                         {
-                            Ok(Ok(FirstRecord::Tls)) => {}
+                            Ok(Ok(FirstRecord::Tls(alpn))) => alpn,
                             Ok(Ok(FirstRecord::OldTls)) => {
                                 use tokio::io::AsyncWriteExt;
                                 let _ = stream.write_all(&TLS_PROTOCOL_VERSION_ALERT).await;
@@ -1102,7 +1137,14 @@ async fn accept_loop(
                                 ));
                                 return;
                             }
-                        }
+                        };
+                        let acceptor = if !offered_alpn.is_empty()
+                            && !offered_alpn.iter().any(|offered| acceptor.alpn.contains(offered))
+                        {
+                            &acceptor.without_alpn
+                        } else {
+                            &acceptor.with_alpn
+                        };
                         let captured = penetrating_tls::CapturedStream::new(stream);
                         match tokio::time::timeout(handshake_timeout, acceptor.accept(captured))
                             .await
@@ -1165,7 +1207,7 @@ async fn accept_loop(
 }
 
 enum FirstRecord {
-    Tls,
+    Tls(Vec<Vec<u8>>),
     NotTls,
     /// A ClientHello offering nothing newer than TLS 1.1.
     OldTls,
@@ -1184,13 +1226,22 @@ async fn first_record(
             return Ok(FirstRecord::NotTls);
         }
     }
+    // Read the rest of the first handshake record so the ALPN extension can be
+    // inspected. Bound it: the header check below is what rejects non-TLS.
+    let record_len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+    let want = 5 + record_len.min(16 * 1024);
+    while head.len() < want {
+        if stream.read_buf(&mut head).await? == 0 {
+            break;
+        }
+    }
     let vers = u16::from_be_bytes([head[1], head[2]]);
     let kind = if !matches!(head[0], 0x15 | 0x16) || vers >= 0x1000 {
         FirstRecord::NotTls
     } else if client_hello_max_version(&head).is_some_and(|v| v < 0x0303) {
         FirstRecord::OldTls
     } else {
-        FirstRecord::Tls
+        FirstRecord::Tls(client_hello_alpn(&head))
     };
     stream.unread(head);
     Ok(kind)
@@ -1234,6 +1285,77 @@ fn client_hello_max_version(record: &[u8]) -> Option<u16> {
     Some(legacy)
 }
 
+/// ALPN protocol names in a ClientHello record, in the client's order.
+fn client_hello_alpn(record: &[u8]) -> Vec<Vec<u8>> {
+    let u16_at = |b: &[u8], i: usize| Some(u16::from_be_bytes([*b.get(i)?, *b.get(i + 1)?]));
+    let Some(body) = record
+        .get(5..)
+        .and_then(|body| body.get(..usize::from(u16_at(record, 3)?)))
+    else {
+        return Vec::new();
+    };
+    if body.first() != Some(&1) {
+        return Vec::new();
+    }
+    let Some(len) = body
+        .get(1)
+        .zip(u16_at(body, 2))
+        .map(|(high, low)| usize::from(*high) << 16 | usize::from(low))
+    else {
+        return Vec::new();
+    };
+    let Some(hello) = body.get(4..4 + len) else {
+        return Vec::new();
+    };
+    let Some(mut i) = u16_at(hello, 0).map(|_| 34usize) else {
+        return Vec::new();
+    };
+    let Some(session) = hello.get(i).copied() else {
+        return Vec::new();
+    };
+    i += 1 + usize::from(session);
+    let Some(ciphers) = u16_at(hello, i) else {
+        return Vec::new();
+    };
+    i += 2 + usize::from(ciphers);
+    let Some(compression) = hello.get(i).copied() else {
+        return Vec::new();
+    };
+    i += 1 + usize::from(compression);
+    let Some(ext_len) = u16_at(hello, i) else {
+        return Vec::new();
+    };
+    let Some(exts) = hello.get(i + 2..i + 2 + usize::from(ext_len)) else {
+        return Vec::new();
+    };
+    let mut protocols = Vec::new();
+    let mut j = 0;
+    while j + 4 <= exts.len() {
+        let Some(kind) = u16_at(exts, j) else {
+            break;
+        };
+        let Some(size) = u16_at(exts, j + 2) else {
+            break;
+        };
+        let data = &exts[j + 4..(j + 4 + usize::from(size)).min(exts.len())];
+        if kind == 16 && data.len() >= 2 {
+            let total = usize::from(u16::from_be_bytes([data[0], data[1]]));
+            let mut k = 2;
+            while k < 2 + total && k < data.len() {
+                let n = usize::from(data[k]);
+                k += 1;
+                if k + n > data.len() {
+                    break;
+                }
+                protocols.push(data[k..k + n].to_vec());
+                k += n;
+            }
+        }
+        j += 4 + usize::from(size);
+    }
+    protocols
+}
+
 /// Go's answer to a hello without TLS 1.2: protocol_version in a TLS 1.0 record.
 const TLS_PROTOCOL_VERSION_ALERT: [u8; 7] = [0x15, 0x03, 0x01, 0x00, 0x02, 0x02, 0x46];
 
@@ -1260,8 +1382,14 @@ async fn dispatch(
         InboundHandler::VlessWs(ctx, ws_settings, trusted_xff) => Box::pin(async move {
             match ws::accept(stream, &ws_settings, &trusted_xff, peer).await {
                 Ok((ws_stream, peer)) => {
-                    let (uplink, downlink) = tokio::io::split(ws_stream);
-                    if let Err(e) = vless::serve(uplink, downlink, &ctx, peer).await {
+                    if let Err(e) = vless::serve_stream(
+                        ws_stream,
+                        &ctx,
+                        peer,
+                        &crate::fallback::TlsInfo::default(),
+                    )
+                    .await
+                    {
                         log::info(format!("vless-ws from {} rejected: {e}", log::mask(peer)));
                     }
                 }
@@ -1387,14 +1515,15 @@ async fn dispatch(
                 }
             }
         }),
-        InboundHandler::Socks(ctx, auth, udp) => Box::pin(async move {
-            if let Err(e) = inbound_proxy::serve_socks(stream, &auth, udp, &ctx, peer, local).await
+        InboundHandler::Socks(ctx, auth, udp, level) => Box::pin(async move {
+            if let Err(e) =
+                inbound_proxy::serve_socks(stream, &auth, udp, &ctx, peer, local, level).await
             {
                 log::info(format!("socks from {} rejected: {e}", log::mask(peer)));
             }
         }),
-        InboundHandler::Http(ctx, auth) => Box::pin(async move {
-            if let Err(e) = inbound_proxy::serve_http(stream, &auth, &ctx, peer).await {
+        InboundHandler::Http(ctx, auth, level) => Box::pin(async move {
+            if let Err(e) = inbound_proxy::serve_http(stream, &auth, &ctx, peer, level).await {
                 log::info(format!("http from {} rejected: {e}", log::mask(peer)));
             }
         }),
@@ -1948,6 +2077,39 @@ impl rustls::server::ResolvesServerCert for SniCheckingResolver {
     }
 }
 
+/// Xray's `ParseCurveName`: unknown names are skipped with a warning and the
+/// surviving groups keep the configured order.
+fn selected_kx_groups(
+    names: &[String],
+    available: &[&'static dyn rustls::crypto::SupportedKxGroup],
+) -> Vec<&'static dyn rustls::crypto::SupportedKxGroup> {
+    let mut wanted: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = Vec::new();
+    for name in names {
+        let group = match name.to_ascii_lowercase().as_str() {
+            "curvep256" => Some(rustls::NamedGroup::secp256r1),
+            "curvep384" => Some(rustls::NamedGroup::secp384r1),
+            "curvep521" => Some(rustls::NamedGroup::secp521r1),
+            "x25519" => Some(rustls::NamedGroup::X25519),
+            "x25519mlkem768" => Some(rustls::NamedGroup::X25519MLKEM768),
+            "secp256r1mlkem768" => Some(rustls::NamedGroup::secp256r1MLKEM768),
+            _ => None,
+        };
+        let Some(group) = group else {
+            log::warn(format!("unsupported curve name: {name}"));
+            continue;
+        };
+        match available.iter().find(|candidate| candidate.name() == group) {
+            Some(candidate) => {
+                if !wanted.iter().any(|chosen| chosen.name() == group) {
+                    wanted.push(*candidate);
+                }
+            }
+            None => log::warn(format!("unsupported curve name: {name}")),
+        }
+    }
+    wanted
+}
+
 pub(crate) fn build_rustls_server_config(
     settings: &TlsSettings,
     alpn: Vec<Vec<u8>>,
@@ -1959,6 +2121,12 @@ pub(crate) fn build_rustls_server_config(
     provider_builder
         .kx_groups
         .sort_by_key(|g| g.name() != rustls::NamedGroup::X25519MLKEM768);
+    if !settings.curve_preferences.is_empty() {
+        let wanted = selected_kx_groups(&settings.curve_preferences, &provider_builder.kx_groups);
+        if !wanted.is_empty() {
+            provider_builder.kx_groups = wanted;
+        }
+    }
     if !settings.cipher_suites.is_empty() {
         provider_builder.cipher_suites.retain(|cs| {
             let name = format!("{:?}", cs.suite());
@@ -2091,32 +2259,46 @@ pub(crate) fn build_rustls_server_config(
     Ok(config)
 }
 
-fn tls_acceptor(
+fn tls_acceptors(
     settings: &TlsSettings,
     is_xhttp: bool,
     is_grpc: bool,
-) -> Result<TlsAcceptor, String> {
-    if is_xhttp && settings.alpn.as_slice() == ["h3"] {
-        let config = build_rustls_server_config(settings, vec![b"h3".to_vec()], true)?;
-        return Ok(TlsAcceptor::from(Arc::new(config)));
-    }
-    let alpn: Vec<Vec<u8>> = settings
-        .alpn
-        .iter()
-        .filter(|p| *p != "h3")
-        .map(|p| p.as_bytes().to_vec())
-        .collect();
-    // Xray's GetTLSConfig: grpc-go asks for h2, everything else gets h2 and http/1.1,
-    // which the fallbacks' "alpn" match against.
-    let alpn = if !alpn.is_empty() {
-        alpn
-    } else if is_grpc {
-        vec![b"h2".to_vec()]
+) -> Result<TlsAcceptors, String> {
+    let (alpn, only_tls13) = if is_xhttp && settings.alpn.as_slice() == ["h3"] {
+        (vec![b"h3".to_vec()], true)
     } else {
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        let alpn: Vec<Vec<u8>> = settings
+            .alpn
+            .iter()
+            .filter(|p| *p != "h3")
+            .map(|p| p.as_bytes().to_vec())
+            .collect();
+        // Xray's GetTLSConfig: grpc-go asks for h2, everything else gets h2 and
+        // http/1.1, which the fallbacks' "alpn" match against.
+        let alpn = if !alpn.is_empty() {
+            alpn
+        } else if is_grpc {
+            vec![b"h2".to_vec()]
+        } else {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        };
+        (alpn, false)
     };
-    let config = build_rustls_server_config(settings, alpn, false)?;
-    Ok(TlsAcceptor::from(Arc::new(config)))
+    let with_alpn = TlsAcceptor::from(Arc::new(build_rustls_server_config(
+        settings,
+        alpn.clone(),
+        only_tls13,
+    )?));
+    let without_alpn = TlsAcceptor::from(Arc::new(build_rustls_server_config(
+        settings,
+        Vec::new(),
+        only_tls13,
+    )?));
+    Ok(TlsAcceptors {
+        with_alpn,
+        without_alpn,
+        alpn,
+    })
 }
 
 fn run_test_route(args: &[String]) -> ExitCode {
@@ -2281,19 +2463,13 @@ fn generate_or_derive_x25519(args: &[String]) -> Result<(String, String), String
             .map_err(|e| format!("failed to parse private key: {e}"))?;
         let secret = x25519_dalek::StaticSecret::from(priv_bytes);
         let public = x25519_dalek::PublicKey::from(&secret);
-        let msg = format!(
-            "Custom private key: {}",
-            URL_SAFE_NO_PAD.encode(priv_bytes)
-        );
+        let msg = format!("Custom private key: {}", URL_SAFE_NO_PAD.encode(priv_bytes));
         let pub_str = URL_SAFE_NO_PAD.encode(public.as_bytes());
         Ok((msg, pub_str))
     } else {
         let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let public = x25519_dalek::PublicKey::from(&secret);
-        let msg = format!(
-            "Private key: {}",
-            URL_SAFE_NO_PAD.encode(secret.to_bytes())
-        );
+        let msg = format!("Private key: {}", URL_SAFE_NO_PAD.encode(secret.to_bytes()));
         let pub_str = URL_SAFE_NO_PAD.encode(public.as_bytes());
         Ok((msg, pub_str))
     }
@@ -2333,6 +2509,22 @@ mod tests {
         let mislabeled = pem.replace("PRIVATE KEY", "RSA PRIVATE KEY");
         assert!(load_signing_key(&provider, mislabeled.as_bytes()).is_ok());
         assert!(load_signing_key(&provider, b"not a key").is_err());
+    }
+
+    #[test]
+    fn curve_preferences_keep_configured_order_and_skip_unknown() {
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let names = vec![
+            "CurveP256".to_owned(),
+            "madeup".to_owned(),
+            "X25519".to_owned(),
+            "CurveP256".to_owned(),
+        ];
+        let groups = selected_kx_groups(&names, &provider.kx_groups);
+        assert_eq!(
+            groups.iter().map(|group| group.name()).collect::<Vec<_>>(),
+            vec![rustls::NamedGroup::secp256r1, rustls::NamedGroup::X25519]
+        );
     }
 
     #[test]
@@ -2434,6 +2626,7 @@ mod tests {
             min_version: None,
             max_version: None,
             cipher_suites: vec![],
+            curve_preferences: vec![],
             ech_server_keys: Some("ACD2AjC5yuBQ3430geNDLdIRndloCry/DBb9ZeYp0TmeowBB/g0APQAAIAAgc4hPORS8ScksWQD0R7PAgwm7s9Ye+iPaS4XLQv5IEnAABAABAAEADnB1YmxpYy5leGFtcGxlAAA=".to_string()),
             ech_config_list: None,
         };

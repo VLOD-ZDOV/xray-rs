@@ -13,7 +13,7 @@ use xray_routing::{Target, TargetAddr};
 
 use crate::config::User;
 use crate::outbound::{self, ConeUdp};
-use crate::routing::{Action, BlockAction};
+use crate::routing::Action;
 use crate::stats;
 use crate::vless::{read_first, Activity, Context, Host, RouteRequest};
 
@@ -57,9 +57,7 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
         return Err(ParseError::Incomplete);
     }
     let token = &buf[..56];
-    if &buf[56..58] != b"\r\n" {
-        return Err(ParseError::Invalid("invalid password delimiter"));
-    }
+    // Xray reads the two delimiter bytes without checking their contents.
     let user_index = users
         .iter()
         .position(|u| u.hash.as_slice() == token)
@@ -71,10 +69,10 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
     }
     let cmd = buf[pos];
     pos += 1;
-    let command = match cmd {
-        1 => Command::Tcp,
-        3 => Command::Udp,
-        _ => return Err(ParseError::Invalid("unsupported command")),
+    let command = if cmd == 3 {
+        Command::Udp
+    } else {
+        Command::Tcp
     };
 
     if buf.len() <= pos {
@@ -127,9 +125,7 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
     if buf.len() < pos + 2 {
         return Err(ParseError::Incomplete);
     }
-    if &buf[pos..pos + 2] != b"\r\n" {
-        return Err(ParseError::Invalid("invalid header delimiter"));
-    }
+    // Xray again reads the delimiter without checking its contents.
     pos += 2;
 
     Ok((
@@ -250,6 +246,7 @@ where
         host: &request.host,
         port: request.port,
         sniffing: &ctx.sniffing,
+        vless_route: None,
     };
 
     let Some(decision) = route.allow(&ctx.router, payload).await else {
@@ -258,14 +255,14 @@ where
 
     ctx.sniffing.override_host(payload, &mut request.host);
 
-    if let Action::Block(BlockAction::Http403) = decision.action {
-        if request.command == Command::Tcp {
-            downlink
-                .write_all(crate::routing::BLACKHOLE_HTTP_RESPONSE)
-                .await?;
-            downlink.flush().await?;
+    if let Action::Block(block) = &decision.action {
+        if let Some(response) = block.response() {
+            if request.command == Command::Tcp {
+                downlink.write_all(response).await?;
+                downlink.flush().await?;
+            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     let traffic = stats::get().traffic(&ctx.tag, &user.email, user.level, &decision.tag);
@@ -444,7 +441,33 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_user_or_invalid_delimiter() {
+    fn accepts_xray_delimiter_and_command_leniency() {
+        let user = User {
+            id: [0; 16],
+            hash: trojan_password_hash("secret"),
+            email: "bob@example.com".into(),
+            level: 0,
+            flow: String::new(),
+            reverse: None,
+            testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
+        };
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&user.hash);
+        wire.extend_from_slice(b"xx"); // Xray ignores these two bytes
+        wire.push(2); // any byte other than 3 is TCP
+        wire.push(1);
+        wire.extend_from_slice(&[127, 0, 0, 1]);
+        wire.extend_from_slice(&80u16.to_be_bytes());
+        wire.extend_from_slice(b"yy"); // and these two
+
+        let (req, len) = parse_request(&wire, &[user]).expect("Xray accepts this header");
+        assert_eq!(req.command, Command::Tcp);
+        assert_eq!(req.port, 80);
+        assert_eq!(len, wire.len());
+    }
+
+    #[test]
+    fn rejects_unknown_user() {
         let user = User {
             id: [0; 16],
             hash: trojan_password_hash("secret"),

@@ -85,6 +85,9 @@ pub fn init(config: Option<DnsConfig>) {
                     if p.timeout_ms > 0 {
                         policy.timeout = Some(Duration::from_millis(p.timeout_ms));
                     }
+                    policy.disable_cache = p.disable_cache;
+                    policy.serve_stale = p.serve_stale;
+                    policy.serve_expired_ttl = p.serve_expired_ttl;
                 }
                 name_servers.push(policy);
             }
@@ -103,6 +106,11 @@ pub fn init(config: Option<DnsConfig>) {
                 .with_name_server_fallback_policy(
                     dns.disable_fallback,
                     dns.disable_fallback_if_match,
+                )
+                .with_server_cache_policy(
+                    dns.disable_cache,
+                    dns.serve_stale,
+                    dns.serve_expired_ttl,
                 );
 
         (

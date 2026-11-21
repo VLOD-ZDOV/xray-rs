@@ -21,7 +21,7 @@ use crate::httpupgrade::PrefixedStream;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::Action;
 use crate::vless::{
-    copy, host_label, read_first, relay, Activity, Context, Host, RouteRequest, CONN_IDLE,
+    copy_buf, host_label, read_first, relay_policy, Activity, Context, Host, RouteRequest,
 };
 use crate::{log, stats};
 
@@ -34,24 +34,34 @@ pub async fn serve_socks<S>(
     ctx: &Context,
     peer: SocketAddr,
     local: Option<SocketAddr>,
+    level: u32,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut first = [0u8; 1];
     timeout(
-        crate::policy::get().handshake,
+        crate::policy::for_level(level).handshake,
         stream.read_exact(&mut first),
     )
     .await
     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks handshake timeout"))??;
     match first[0] {
-        SOCKS4_VERSION => serve_socks4(stream, auth, ctx, peer).await,
+        SOCKS4_VERSION => serve_socks4(stream, auth, ctx, peer, level).await,
         5 => {
             let stream = PrefixedStream::new(stream, first.to_vec());
-            serve_socks5(stream, auth, udp_enabled, ctx, peer, local).await
+            serve_socks5(stream, auth, udp_enabled, ctx, peer, local, level).await
         }
-        _ => serve_http(PrefixedStream::new(stream, first.to_vec()), auth, ctx, peer).await,
+        _ => {
+            serve_http(
+                PrefixedStream::new(stream, first.to_vec()),
+                auth,
+                ctx,
+                peer,
+                level,
+            )
+            .await
+        }
     }
 }
 
@@ -60,6 +70,7 @@ async fn serve_socks4<S>(
     auth: &SocksInboundAuth,
     ctx: &Context,
     peer: SocketAddr,
+    level: u32,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -72,7 +83,7 @@ where
         ));
     }
     let request = timeout(
-        crate::policy::get().handshake,
+        crate::policy::for_level(level).handshake,
         parse_socks4_connect(&mut stream),
     )
     .await
@@ -89,9 +100,9 @@ where
     };
     stream.write_all(&SOCKS4_GRANTED).await?;
     stream.flush().await?;
-    let _online = stats::get().connect("", 0, peer.ip());
+    let _online = stats::get().connect("", level, peer.ip());
     let (host, port) = target_to_host_port(&target);
-    relay_tcp(stream, ctx, "", peer, host, port, Vec::new()).await
+    relay_tcp(stream, ctx, ("", level), peer, host, port, Vec::new()).await
 }
 
 async fn serve_socks5<S>(
@@ -101,12 +112,13 @@ async fn serve_socks5<S>(
     ctx: &Context,
     peer: SocketAddr,
     local: Option<SocketAddr>,
+    level: u32,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let auth_user = timeout(
-        crate::policy::get().handshake,
+        crate::policy::for_level(level).handshake,
         negotiate_socks5(&mut stream, auth),
     )
     .await
@@ -117,10 +129,10 @@ where
         .as_ref()
         .map(|u| u.as_str().to_owned())
         .unwrap_or_default();
-    let _online = stats::get().connect(&email, 0, peer.ip());
+    let _online = stats::get().connect(&email, level, peer.ip());
 
     let req = timeout(
-        crate::policy::get().handshake,
+        crate::policy::for_level(level).handshake,
         parse_socks5_request_message(&mut stream),
     )
     .await
@@ -151,7 +163,7 @@ where
                 .map_err(|e| io::Error::other(format!("{e}")))?;
             stream.flush().await?;
             let (host, port) = target_to_host_port(&req.target);
-            relay_tcp(stream, ctx, &email, peer, host, port, Vec::new()).await
+            relay_tcp(stream, ctx, (&email, level), peer, host, port, Vec::new()).await
         }
         SocksCommand::UdpAssociate => {
             if !udp_enabled {
@@ -172,7 +184,7 @@ where
                 Ok(())
             };
             tokio::select! {
-                r = relay_udp(&udp_relay, ctx, &email, peer) => r,
+                r = relay_udp(&udp_relay, ctx, &email, peer, level) => r,
                 r = tcp_closed => r,
             }
         }
@@ -186,10 +198,12 @@ async fn relay_udp(
     ctx: &Context,
     email: &str,
     peer: SocketAddr,
+    level: u32,
 ) -> io::Result<()> {
+    let policy = crate::policy::for_level(level);
     let mut buf = vec![0u8; 65535];
     let (first, client) = loop {
-        let (n, from) = timeout(CONN_IDLE, udp_relay.recv_from(&mut buf))
+        let (n, from) = timeout(policy.conn_idle, udp_relay.recv_from(&mut buf))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
         if from.ip().to_canonical() != peer.ip().to_canonical() {
@@ -209,6 +223,7 @@ async fn relay_udp(
         host: &host,
         port,
         sniffing: &ctx.sniffing,
+        vless_route: None,
     };
     let decision = match route.allow(&ctx.router, &first.payload).await {
         Some(d) if !matches!(d.action, Action::Block(_)) => d,
@@ -216,7 +231,7 @@ async fn relay_udp(
         _ => return std::future::pending().await,
     };
     let cone = ConeUdp::open(ctx.router.clone(), &decision).await?;
-    let traffic = stats::get().traffic(&ctx.tag, email, 0, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, email, level, &decision.tag);
     let activity = Activity::new();
     if let Ok(target) = cone.target(&host, port).await {
         cone.send_to(&first.payload, target).await?;
@@ -256,14 +271,14 @@ async fn relay_udp(
             }
         }
     });
-    relay(up, down, &activity).await
+    relay_policy(up, down, &activity, policy).await
 }
 
 /// Waits for the first payload, routes it and relays a proxied TCP connection.
 async fn relay_tcp<S>(
     stream: S,
     ctx: &Context,
-    email: &str,
+    (email, level): (&str, u32),
     peer: SocketAddr,
     mut host: Host,
     port: u16,
@@ -272,6 +287,7 @@ async fn relay_tcp<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    let policy = crate::policy::for_level(level);
     let (mut uplink, mut downlink) = tokio::io::split(stream);
     if early.is_empty() && (ctx.router.needs_sniff() || ctx.sniffing.enabled()) {
         read_first(&mut uplink, &mut early).await;
@@ -285,6 +301,7 @@ where
         host: &host,
         port,
         sniffing: &ctx.sniffing,
+        vless_route: None,
     };
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());
@@ -292,17 +309,41 @@ where
     // Only blackhole's http response gets here; connect plays it back.
     ctx.sniffing.override_host(&early, &mut host);
     let target = outbound::connect(&ctx.router, &decision, &host, port).await?;
-    let traffic = stats::get().traffic(&ctx.tag, email, 0, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, email, level, &decision.tag);
     let (mut target_r, mut target_w) = tokio::io::split(target);
     if !early.is_empty() {
-        target_w.write_all(&early).await?;
+        target_w
+            .write_all(&early)
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("target early write: {e}")))?;
         traffic.up(early.len());
     }
     let activity = Activity::new();
-    relay(
-        copy(&mut uplink, &mut target_w, &activity, |n| traffic.up(n)),
-        copy(&mut target_r, &mut downlink, &activity, |n| traffic.down(n)),
+    relay_policy(
+        async {
+            copy_buf(
+                &mut uplink,
+                &mut target_w,
+                &activity,
+                |n| traffic.up(n),
+                policy.buffer_size,
+            )
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("uplink copy: {e}")))
+        },
+        async {
+            copy_buf(
+                &mut target_r,
+                &mut downlink,
+                &activity,
+                |n| traffic.down(n),
+                policy.buffer_size,
+            )
+            .await
+            .map_err(|e| io::Error::new(e.kind(), format!("downlink copy: {e}")))
+        },
         &activity,
+        policy,
     )
     .await
 }
@@ -326,14 +367,16 @@ pub async fn serve_http<S>(
     auth: &SocksInboundAuth,
     ctx: &Context,
     peer: SocketAddr,
+    level: u32,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let policy = crate::policy::for_level(level);
     let accounts = HttpInboundAccounts::from(auth);
     loop {
         let head = timeout(
-            crate::policy::get().handshake,
+            policy.handshake,
             read_http_request_head(&mut (&mut stream).take(MAX_HTTP_HEAD)),
         )
         .await
@@ -361,7 +404,7 @@ where
             .as_ref()
             .map(|u| u.as_str().to_owned())
             .unwrap_or_default();
-        let _online = stats::get().connect(&email, 0, peer.ip());
+        let _online = stats::get().connect(&email, level, peer.ip());
 
         if let Some(target) = head.connect_target() {
             let target = target.map_err(|e| {
@@ -370,7 +413,7 @@ where
             stream.write_all(HTTP_CONNECT_ESTABLISHED).await?;
             stream.flush().await?;
             let (host, port) = target_to_host_port(&target);
-            return relay_tcp(stream, ctx, &email, peer, host, port, Vec::new()).await;
+            return relay_tcp(stream, ctx, (&email, level), peer, host, port, Vec::new()).await;
         }
         let request = match PlainHttpRequest::new(&head) {
             Ok(request) => request,
@@ -386,7 +429,7 @@ where
                 ))
             }
         };
-        let reusable = forward_plain(&mut stream, &request, ctx, &email, peer).await?;
+        let reusable = forward_plain(&mut stream, &request, ctx, &email, peer, level).await?;
         if !(reusable && request.keep_alive) {
             return Ok(());
         }
@@ -402,6 +445,7 @@ async fn forward_plain<S>(
     ctx: &Context,
     email: &str,
     peer: SocketAddr,
+    level: u32,
 ) -> io::Result<bool>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -417,17 +461,21 @@ where
         host: &host,
         port,
         sniffing: &crate::vless::Sniffing::default(),
+        vless_route: None,
     };
     let Some(decision) = route.allow(&ctx.router, &forwarded).await else {
         stream.write_all(HTTP_SERVICE_UNAVAILABLE).await?;
         return Ok(false);
     };
-    let target: Box<dyn outbound::Stream> = match decision.action {
+    let target: Box<dyn outbound::Stream> = match &decision.action {
         // Xray reads the blackhole's `http` answer back like any response.
-        Action::Block(_) => Box::new(tokio::io::join(
-            crate::routing::BLACKHOLE_HTTP_RESPONSE,
-            tokio::io::sink(),
-        )),
+        Action::Block(block) => match block.response() {
+            Some(response) => Box::new(tokio::io::join(
+                std::io::Cursor::new(response.to_vec()),
+                tokio::io::sink(),
+            )),
+            None => return Ok(false),
+        },
         _ => match outbound::connect(&ctx.router, &decision, &host, port).await {
             Ok(target) => target,
             Err(e) => {
@@ -437,7 +485,7 @@ where
             }
         },
     };
-    let traffic = stats::get().traffic(&ctx.tag, email, 0, &decision.tag);
+    let traffic = stats::get().traffic(&ctx.tag, email, level, &decision.tag);
     let activity = Activity::new();
     let (target_r, mut target_w) = tokio::io::split(Touch {
         inner: target,
@@ -461,9 +509,13 @@ where
         target_w.flush().await
     };
     let download = async {
-        let Ok(response) = read_http_response(&mut target_r, &request.method).await else {
-            client_w.write_all(HTTP_SERVICE_UNAVAILABLE).await?;
-            return Ok(false);
+        let response = match read_http_response(&mut target_r, &request.method).await {
+            Ok(response) => response,
+            Err(e) => {
+                log::info(format!("http response from {}:{port}: {e}", host_label(&host)));
+                client_w.write_all(HTTP_SERVICE_UNAVAILABLE).await?;
+                return Ok(false);
+            }
         };
         if let Some(informational) = &response.informational {
             client_w.write_all(informational).await?;
@@ -484,7 +536,7 @@ where
         client_w.flush().await?;
         io::Result::Ok(head.keeps_alive())
     };
-    let policy = crate::policy::get();
+    let policy = crate::policy::for_level(level);
     tokio::select! {
         (uploaded, downloaded) = async { tokio::join!(upload, download) } => {
             Ok(uploaded.is_ok() && downloaded.unwrap_or(false))

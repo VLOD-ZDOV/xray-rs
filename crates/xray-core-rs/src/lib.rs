@@ -1714,6 +1714,14 @@ fn take_name_server_policy_set(config: &mut CoreConfig) -> Arc<CompiledNameServe
                 .or_insert(next_policy_id);
             let timeout = Some(Duration::from_millis(server.timeout_ms()));
             let tag = server.effective_tag(&global_dns_tag).to_owned();
+            let (disable_cache, serve_stale, serve_expired_ttl) = match server {
+                DnsServerConfig::Policy(policy) => (
+                    policy.disable_cache,
+                    policy.serve_stale,
+                    policy.serve_expired_ttl,
+                ),
+                DnsServerConfig::Ip(_) | DnsServerConfig::Domain { .. } => (None, None, None),
+            };
             let (domains, expected_ips, unexpected_ips) = match server {
                 DnsServerConfig::Policy(policy) => (
                     std::mem::take(&mut policy.domains),
@@ -1741,6 +1749,9 @@ fn take_name_server_policy_set(config: &mut CoreConfig) -> Arc<CompiledNameServe
                 final_query,
                 client_ip,
                 policy_id,
+                disable_cache,
+                serve_stale,
+                serve_expired_ttl,
             })
         })
         .collect();
@@ -1897,7 +1908,12 @@ fn configured_dns_resolver_from_config_with_transport_mode(
             config.dns.disable_fallback_if_match,
         )
         .with_query_strategy(query_strategy)
-        .with_parallel_query(config.dns.enable_parallel_query);
+        .with_parallel_query(config.dns.enable_parallel_query)
+        .with_server_cache_policy(
+            config.dns.disable_cache,
+            config.dns.serve_stale,
+            config.dns.serve_expired_ttl,
+        );
     if let Some(probe) = dns_rules.route_probe {
         // Servers that check their own routes read the probe here. The
         // global `UseSystem` narrows ahead of the destination cache instead,

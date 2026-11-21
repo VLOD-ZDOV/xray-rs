@@ -30,7 +30,7 @@ pub struct RealityServer {
     ed25519_key_pair: Arc<aws_lc_rs::signature::Ed25519KeyPair>,
     ed25519_pub: [u8; 32],
     alpn_protocols: Vec<Vec<u8>>,
-    inbound_port: u16,
+    _inbound_port: u16,
     mldsa65_key: Option<ml_dsa::SigningKey<ml_dsa::MlDsa65>>,
 }
 
@@ -389,16 +389,10 @@ async fn connect_dest_stream(dest: &FallbackDest) -> io::Result<Box<dyn Stream>>
 
 async fn probe_dest_post_handshake_lens(
     dest: &FallbackDest,
-    xver: u8,
     sni: &str,
     alpn: u8,
 ) -> io::Result<Vec<usize>> {
-    let mut stream = connect_dest_stream(dest).await?;
-
-    if xver > 0 {
-        let peer: SocketAddr = "127.0.0.1:12345".parse().unwrap();
-        crate::fallback::write_proxy_header(&mut stream, xver, peer, 443).await?;
-    }
+    let stream = connect_dest_stream(dest).await?;
 
     let alpn_list: Vec<Vec<u8>> = match alpn {
         2 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
@@ -506,13 +500,8 @@ pub fn detect_post_handshake_records_lens(settings: Arc<RealityInboundSettings>)
                 let sni = sni.clone();
                 let key = key.clone();
                 tokio::spawn(async move {
-                    let lens = probe_dest_post_handshake_lens(
-                        &settings_clone.dest,
-                        settings_clone.xver,
-                        &sni,
-                        alpn,
-                    )
-                    .await;
+                    let lens =
+                        probe_dest_post_handshake_lens(&settings_clone.dest, &sni, alpn).await;
                     let mut map = GLOBAL_POST_HANDSHAKE_RECORDS_LENS.write().unwrap();
                     map.insert(key, Some(lens.unwrap_or_default()));
                 });
@@ -566,7 +555,7 @@ impl RealityServer {
             ed25519_key_pair: Arc::new(key_pair),
             ed25519_pub,
             alpn_protocols,
-            inbound_port,
+            _inbound_port: inbound_port,
             mldsa65_key,
         })
     }
@@ -589,7 +578,7 @@ impl RealityServer {
         match tokio::time::timeout(handshake_timeout, stream.read_exact(&mut record_header)).await {
             Ok(Ok(_)) => {}
             Ok(Err(_)) => {
-                self.fallback(stream, &[], peer).await?;
+                self.fallback(stream, &[]).await?;
                 return Ok(None);
             }
             Err(_) => {
@@ -604,7 +593,7 @@ impl RealityServer {
         let content_type = record_header[0];
         let payload_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
         if content_type != 0x16 || payload_len == 0 || payload_len > 16384 {
-            self.fallback(stream, &record_header, peer).await?;
+            self.fallback(stream, &record_header).await?;
             return Ok(None);
         }
 
@@ -615,7 +604,7 @@ impl RealityServer {
             Ok(Err(_)) => {
                 let mut early = record_header.to_vec();
                 early.extend_from_slice(&payload);
-                self.fallback(stream, &early, peer).await?;
+                self.fallback(stream, &early).await?;
                 return Ok(None);
             }
             Err(_) => {
@@ -642,21 +631,6 @@ impl RealityServer {
                 return Ok(None);
             }
         };
-
-        if let Err(e) = crate::fallback::write_proxy_header(
-            &mut dest,
-            self.settings.xver,
-            peer,
-            self.inbound_port,
-        )
-        .await
-        {
-            log::info(format!(
-                "REALITY remoteAddr: {peer} failed to write proxy header: {e}",
-                peer = log::mask(peer),
-            ));
-            return Ok(None);
-        }
 
         if let Err(e) = dest.write_all(&full_record).await {
             log::info(format!(
@@ -1254,14 +1228,9 @@ impl RealityServer {
         let lens = match cached_lens {
             Some(l) => l,
             None => {
-                let probed = probe_dest_post_handshake_lens(
-                    &self.settings.dest,
-                    self.settings.xver,
-                    sni,
-                    alpn_code,
-                )
-                .await
-                .unwrap_or_default();
+                let probed = probe_dest_post_handshake_lens(&self.settings.dest, sni, alpn_code)
+                    .await
+                    .unwrap_or_default();
                 let mut map = GLOBAL_POST_HANDSHAKE_RECORDS_LENS.write().unwrap();
                 map.insert(key, Some(probed.clone()));
                 probed
@@ -1355,14 +1324,13 @@ impl RealityServer {
         self.relay_fallback(client, dest).await
     }
 
-    async fn fallback<S>(&self, client: S, early: &[u8], peer: SocketAddr) -> io::Result<()>
+    async fn fallback<S>(&self, client: S, early: &[u8]) -> io::Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let mut dest: Box<dyn Stream> = self.connect_dest().await?;
-        crate::fallback::write_proxy_header(&mut dest, self.settings.xver, peer, self.inbound_port)
-            .await?;
-
+        // Xray parses `realitySettings.xver` but never uses it: its REALITY
+        // fallback is plain TCP, with no PROXY protocol header.
         if !early.is_empty() {
             dest.write_all(early).await?;
         }
@@ -2418,7 +2386,7 @@ mod tests {
             crate::vless::Host::Ip("127.0.0.1".parse().unwrap()),
             dest_port,
         );
-        let lens = probe_dest_post_handshake_lens(&dest, 0, "test.local", 2)
+        let lens = probe_dest_post_handshake_lens(&dest, "test.local", 2)
             .await
             .unwrap();
         // 184 is rustls server's automatic NewSessionTicket, followed by the two dummy records

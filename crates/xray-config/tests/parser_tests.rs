@@ -3080,6 +3080,10 @@ fn parses_tcp_dns_string_shorthand_as_default_policy() {
             check_system_routes: false,
             final_query: false,
             client_ip: None,
+            id: String::new(),
+            disable_cache: None,
+            serve_stale: None,
+            serve_expired_ttl: None,
             policy_key: xray_config::DEFAULT_DNS_POLICY_KEY.to_owned(),
         }))]
     );
@@ -3238,7 +3242,6 @@ fn parses_dns_over_https_urls_with_path_query_and_port_443_default() {
 #[test]
 fn rejects_malformed_dns_over_https_urls() {
     for address in [
-        "https://",
         "https:/resolver.example/dns-query",
         "https://user@resolver.example/dns-query",
         "https://resolver.example:0/dns-query",
@@ -3254,6 +3257,22 @@ fn rejects_malformed_dns_over_https_urls() {
 
         assert_parse_error_path(&raw, "$.dns.servers[0]");
     }
+}
+
+#[test]
+fn accepts_hostless_dns_over_https_url_like_xray() {
+    let raw = raw_with_dns_servers(r#""https://""#);
+    let parsed = parse_xray_json(&raw).expect("Xray accepts a host-less DoH URL");
+    let DnsServerConfig::Policy(server) = &parsed.config.dns.servers[0] else {
+        panic!("expected a policy server");
+    };
+    assert_eq!(
+        server.endpoint,
+        DnsServerEndpoint::Domain {
+            domain: String::new(),
+            port: 443,
+        }
+    );
 }
 
 #[test]
@@ -3548,6 +3567,10 @@ fn parses_xray_dns_server_objects_and_fallback_policy() {
             check_system_routes: false,
             final_query: false,
             client_ip: None,
+            id: String::new(),
+            disable_cache: None,
+            serve_stale: None,
+            serve_expired_ttl: None,
             policy_key: second.policy_key.clone(),
         }
     );
@@ -3954,16 +3977,19 @@ fn rejects_unbounded_or_contradictory_global_dns_cache_policy() {
 }
 
 #[test]
-fn rejects_per_server_dns_cache_policy_until_cache_ownership_is_per_upstream() {
-    for (field, name) in [
-        (r#""disableCache": false"#, "disableCache"),
-        (r#""serveStale": true"#, "serveStale"),
-        (r#""serveExpiredTTL": 60"#, "serveExpiredTTL"),
-    ] {
-        let raw = raw_with_dns_servers(&format!(r#"{{ "address": "192.0.2.53", {field} }}"#));
+fn parses_per_server_dns_cache_policy() {
+    let raw = raw_with_dns_servers(
+        r#"{ "address": "192.0.2.53", "id": "primary", "disableCache": false, "serveStale": true, "serveExpiredTTL": 60 }"#,
+    );
 
-        assert_parse_error_path(&raw, &format!("$.dns.servers[0].{name}"));
-    }
+    let parsed = parse_xray_json(&raw).expect("per-server cache policy should parse");
+    let DnsServerConfig::Policy(server) = &parsed.config.dns.servers[0] else {
+        panic!("expected a policy server");
+    };
+    assert_eq!(server.id, "primary");
+    assert_eq!(server.disable_cache, Some(false));
+    assert_eq!(server.serve_stale, Some(true));
+    assert_eq!(server.serve_expired_ttl, Some(60));
 }
 
 #[test]

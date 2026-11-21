@@ -229,6 +229,12 @@ pub struct DnsNameServerConfig {
     pub final_query: bool,
     /// This server's own `clientIp`, which replaces `dns.clientIp`.
     pub client_ip: Option<IpAddr>,
+    /// Xray's `id`, visible to Lua DNS scripts.
+    pub id: String,
+    /// Per-server overrides of the global cache policy; `None` inherits it.
+    pub disable_cache: Option<bool>,
+    pub serve_stale: Option<bool>,
+    pub serve_expired_ttl: Option<u32>,
     /// The policy key Xray-core's config builder derives from this entry's
     /// raw fields; see [`DnsServerConfig::policy_key`].
     pub policy_key: String,
