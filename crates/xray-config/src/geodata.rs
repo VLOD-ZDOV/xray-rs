@@ -1094,7 +1094,7 @@ fn ensure_ip_matcher_budget(
 }
 
 fn check_decoded_code(decoded: &str, code: &str, path: &Path) -> Result<(), GeodataError> {
-    if decoded != code {
+    if !decoded.eq_ignore_ascii_case(code) {
         return Err(GeodataError::InvalidFile {
             path: path.to_path_buf(),
             message: "decoded geodata code does not match its index entry".to_owned(),
