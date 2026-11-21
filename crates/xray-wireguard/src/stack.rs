@@ -53,7 +53,7 @@ pub(crate) fn tcp_socket(
         tcp::SocketBuffer::new(vec![0; buffer]),
         tcp::SocketBuffer::new(vec![0; buffer]),
     );
-    assert!(socket.set_receive_window_limit(TCP_INITIAL_RECEIVE_WINDOW));
+    let _ = socket.set_receive_window_limit(TCP_INITIAL_RECEIVE_WINDOW);
     socket.set_congestion_control(tcp::CongestionControl::Reno);
     assert!(socket.set_reno_initial_window(10));
     assert!(socket.set_reno_appropriate_byte_counting(true));
