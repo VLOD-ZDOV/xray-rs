@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 
 use crate::observatory::Observatory;
-use crate::{log, stats};
+use crate::stats;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
@@ -64,7 +64,7 @@ pub async fn listen(addr: SocketAddr) -> Result<(), String> {
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| format!("metrics: failed to listen on {addr}: {e}"))?;
-    log::info(format!("Metrics server listening on {addr}"));
+    crate::log::info!("Metrics server listening on {addr}");
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
@@ -72,7 +72,7 @@ pub async fn listen(addr: SocketAddr) -> Result<(), String> {
                     tokio::spawn(serve(stream));
                 }
                 Err(e) => {
-                    log::warn(format!("metrics accept failed: {e}"));
+                    crate::log::warn!("metrics accept failed: {e}");
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             }

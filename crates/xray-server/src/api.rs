@@ -18,7 +18,7 @@ use hyper_util::server::conn::auto;
 use prost::{Message, Oneof};
 use tokio::net::TcpListener;
 
-use crate::config::{user_id, Inbound, InboundProtocol, User as InboundUser};
+use crate::config::{user_id, Inbound, InboundProtocol, InboundTransport, User as InboundUser};
 use crate::routing::Router;
 use crate::vless::Context;
 use crate::{log, stats, xhttp::Body};
@@ -535,10 +535,86 @@ pub struct SniffingConfigProto {
     pub enabled: bool,
     #[prost(string, repeated, tag = "2")]
     pub destination_override: Vec<String>,
-    #[prost(bool, tag = "3")]
-    pub metadata_only: bool,
     #[prost(bool, tag = "4")]
+    pub metadata_only: bool,
+    #[prost(bool, tag = "5")]
     pub route_only: bool,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct FallbackProto {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub alpn: String,
+    #[prost(string, tag = "3")]
+    pub path: String,
+    #[prost(string, tag = "4")]
+    pub r#type: String,
+    #[prost(string, tag = "5")]
+    pub dest: String,
+    #[prost(uint64, tag = "6")]
+    pub xver: u64,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct VlessInboundConfigProto {
+    #[prost(message, repeated, tag = "1")]
+    pub users: Vec<ProtocolUser>,
+    #[prost(message, repeated, tag = "2")]
+    pub fallbacks: Vec<FallbackProto>,
+    #[prost(string, tag = "3")]
+    pub decryption: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct TrojanServerConfigProto {
+    #[prost(message, repeated, tag = "1")]
+    pub users: Vec<ProtocolUser>,
+    #[prost(message, repeated, tag = "3")]
+    pub fallbacks: Vec<FallbackProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct VmessInboundConfigProto {
+    #[prost(message, repeated, tag = "1")]
+    pub user: Vec<ProtocolUser>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct ShadowsocksServerConfigProto {
+    #[prost(message, repeated, tag = "1")]
+    pub users: Vec<ProtocolUser>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct DokodemoConfigProto {
+    #[prost(uint32, tag = "2")]
+    pub rewrite_port: u32,
+    #[prost(map = "string, string", tag = "3")]
+    pub port_map: HashMap<String, String>,
+    #[prost(bool, tag = "5")]
+    pub follow_redirect: bool,
+    #[prost(uint32, tag = "6")]
+    pub user_level: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HysteriaServerConfigProto {
+    #[prost(message, repeated, tag = "1")]
+    pub users: Vec<ProtocolUser>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct SocksServerConfigProto {
+    #[prost(uint32, tag = "6")]
+    pub user_level: u32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct HttpServerConfigProto {
+    #[prost(uint32, tag = "4")]
+    pub user_level: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -866,7 +942,7 @@ pub struct InboundEntry {
     pub ctx: Arc<Context>,
     pub tcp_abort: Option<tokio::task::AbortHandle>,
     pub udp_abort: Option<tokio::task::AbortHandle>,
-    pub config: InboundHandlerConfig,
+    pub inbound: Inbound,
 }
 
 /// The protobuf name Xray registers for an inbound protocol's server config.
@@ -885,7 +961,237 @@ fn inbound_proxy_type_name(protocol: InboundProtocol) -> &'static str {
     }
 }
 
+fn protocol_user_from_config(user: &crate::config::User) -> ProtocolUser {
+    let account = VlessAccount {
+        id: uuid::Uuid::from_bytes(user.id).to_string(),
+        flow: user.flow.clone(),
+        encryption: "none".into(),
+        testseed: user.testseed.to_vec(),
+    };
+    ProtocolUser {
+        level: user.level,
+        email: user.email.clone(),
+        account: Some(TypedMessage {
+            r#type: VLESS_ACCOUNT.into(),
+            value: account.encode_to_vec().into(),
+        }),
+    }
+}
+
+fn fallback_to_proto(f: &crate::config::Fallback) -> FallbackProto {
+    FallbackProto {
+        name: f.name.clone(),
+        alpn: f.alpn.clone(),
+        path: f.path.clone(),
+        r#type: String::new(),
+        dest: format!("{}", f.dest),
+        xver: u64::from(f.xver),
+    }
+}
+
+fn serialize_proxy_settings(inbound: &Inbound) -> (String, Vec<u8>) {
+    let type_name = inbound_proxy_type_name(inbound.protocol).to_string();
+    let mut buf = Vec::new();
+    match inbound.protocol {
+        InboundProtocol::Vless => {
+            let users = inbound.users.iter().map(protocol_user_from_config).collect();
+            let fallbacks = inbound.fallbacks.iter().map(fallback_to_proto).collect();
+            let cfg = VlessInboundConfigProto {
+                users,
+                fallbacks,
+                decryption: "none".into(),
+            };
+            let _ = cfg.encode(&mut buf);
+        }
+        InboundProtocol::Trojan => {
+            let users = inbound
+                .users
+                .iter()
+                .map(|u| {
+                    let password = uuid::Uuid::from_bytes(u.id).to_string();
+                    let account = TrojanAccount { password };
+                    ProtocolUser {
+                        level: u.level,
+                        email: u.email.clone(),
+                        account: Some(TypedMessage {
+                            r#type: TROJAN_ACCOUNT.into(),
+                            value: account.encode_to_vec().into(),
+                        }),
+                    }
+                })
+                .collect();
+            let fallbacks = inbound.fallbacks.iter().map(fallback_to_proto).collect();
+            let cfg = TrojanServerConfigProto { users, fallbacks };
+            let _ = cfg.encode(&mut buf);
+        }
+        InboundProtocol::Vmess => {
+            let user = inbound
+                .users
+                .iter()
+                .map(|u| {
+                    let id = uuid::Uuid::from_bytes(u.id).to_string();
+                    let account = VmessAccount {
+                        id,
+                        alter_id: 0,
+                        tests_enabled: String::new(),
+                    };
+                    ProtocolUser {
+                        level: u.level,
+                        email: u.email.clone(),
+                        account: Some(TypedMessage {
+                            r#type: VMESS_ACCOUNT.into(),
+                            value: account.encode_to_vec().into(),
+                        }),
+                    }
+                })
+                .collect();
+            let cfg = VmessInboundConfigProto { user };
+            let _ = cfg.encode(&mut buf);
+        }
+        InboundProtocol::Shadowsocks => {
+            let users = inbound
+                .shadowsocks_users
+                .iter()
+                .map(|u| {
+                    let cipher_type = match &u.method {
+                        crate::config::ShadowsocksMethod::Aead2017(_) => {
+                            CipherType::Aes256Gcm as i32
+                        }
+                        crate::config::ShadowsocksMethod::Ss2022(_) => {
+                            CipherType::Aes256Gcm as i32
+                        }
+                    };
+                    let account = ShadowsocksAccount {
+                        password: String::new(),
+                        cipher_type,
+                        iv_check: false,
+                    };
+                    ProtocolUser {
+                        level: u.level,
+                        email: u.email.clone(),
+                        account: Some(TypedMessage {
+                            r#type: SHADOWSOCKS_ACCOUNT.into(),
+                            value: account.encode_to_vec().into(),
+                        }),
+                    }
+                })
+                .collect();
+            let cfg = ShadowsocksServerConfigProto { users };
+            let _ = cfg.encode(&mut buf);
+        }
+        InboundProtocol::Dokodemo => {
+            let doko = inbound.dokodemo.as_ref();
+            let cfg = DokodemoConfigProto {
+                rewrite_port: doko.and_then(|d| d.port).map_or(0, u32::from),
+                port_map: doko.map_or_else(HashMap::new, |d| {
+                    d.port_map
+                        .iter()
+                        .map(|(k, (h, p))| {
+                            let val = match (h, p) {
+                                (Some(h), Some(p)) => format!("{h}:{p}"),
+                                (Some(h), None) => format!("{h}:"),
+                                (None, Some(p)) => format!(":{p}"),
+                                (None, None) => ":".to_string(),
+                            };
+                            (k.to_string(), val)
+                        })
+                        .collect()
+                }),
+                follow_redirect: false,
+                user_level: inbound.user_level,
+            };
+            let _ = cfg.encode(&mut buf);
+        }
+        InboundProtocol::Hysteria => {
+            let users = inbound
+                .hysteria_users
+                .iter()
+                .map(|u| {
+                    let account = HysteriaAccount {
+                        auth: u.auth.clone(),
+                    };
+                    ProtocolUser {
+                        level: u.level,
+                        email: u.email.clone(),
+                        account: Some(TypedMessage {
+                            r#type: HYSTERIA_ACCOUNT.into(),
+                            value: account.encode_to_vec().into(),
+                        }),
+                    }
+                })
+                .collect();
+            let cfg = HysteriaServerConfigProto { users };
+            let _ = cfg.encode(&mut buf);
+        }
+        InboundProtocol::Socks => {
+            let cfg = SocksServerConfigProto {
+                user_level: inbound.user_level,
+            };
+            let _ = cfg.encode(&mut buf);
+        }
+        InboundProtocol::Http => {
+            let cfg = HttpServerConfigProto {
+                user_level: inbound.user_level,
+            };
+            let _ = cfg.encode(&mut buf);
+        }
+        _ => {}
+    }
+    (type_name, buf)
+}
+
 pub fn inbound_handler_config(inbound: &Inbound) -> InboundHandlerConfig {
+    let protocol_name = match &inbound.transport {
+        InboundTransport::Tcp => "tcp",
+        InboundTransport::Websocket(_) => "websocket",
+        InboundTransport::HttpUpgrade(_) => "httpupgrade",
+        InboundTransport::Grpc(_) => "grpc",
+        InboundTransport::Xhttp(_) => "splithttp",
+        InboundTransport::Hysteria => "hysteria",
+        InboundTransport::Kcp(_) => "mkcp",
+        InboundTransport::Xdrive(_) => "xdrive",
+    };
+    let security_type = if inbound.tls.is_some() {
+        "tls"
+    } else if inbound.reality.is_some() {
+        "reality"
+    } else {
+        "none"
+    };
+    let stream_settings = Some(StreamConfigProto {
+        protocol_name: protocol_name.into(),
+        security_type: security_type.into(),
+    });
+
+    let sniffing_settings = if inbound.sniffing.http
+        || inbound.sniffing.tls
+        || inbound.sniffing.quic
+        || inbound.sniffing.fakedns
+        || inbound.sniffing.fakedns_other
+    {
+        let mut dests = Vec::new();
+        if inbound.sniffing.http {
+            dests.push("http".into());
+        }
+        if inbound.sniffing.tls {
+            dests.push("tls".into());
+        }
+        if inbound.sniffing.quic {
+            dests.push("quic".into());
+        }
+        if inbound.sniffing.fakedns || inbound.sniffing.fakedns_other {
+            dests.push("fakedns".into());
+        }
+        Some(SniffingConfigProto {
+            enabled: true,
+            destination_override: dests,
+            metadata_only: inbound.sniffing.metadata_only,
+            route_only: inbound.sniffing.route_only,
+        })
+    } else {
+        None
+    };
+
     let receiver = ReceiverConfig {
         port_list: Some(PortListProto {
             range: vec![PortRangeProto {
@@ -897,14 +1203,15 @@ pub fn inbound_handler_config(inbound: &Inbound) -> InboundHandlerConfig {
             ip: None,
             domain: Some(inbound.listen.clone()),
         }),
-        stream_settings: None,
+        stream_settings,
         receive_original_destination: false,
-        sniffing_settings: None,
+        sniffing_settings,
     };
     let mut value = Vec::new();
     if receiver.encode(&mut value).is_err() {
         value.clear();
     }
+    let (proxy_type, proxy_val) = serialize_proxy_settings(inbound);
     InboundHandlerConfig {
         tag: inbound.tag.clone(),
         receiver_settings: Some(TypedMessage {
@@ -912,8 +1219,8 @@ pub fn inbound_handler_config(inbound: &Inbound) -> InboundHandlerConfig {
             value: Bytes::from(value),
         }),
         proxy_settings: Some(TypedMessage {
-            r#type: inbound_proxy_type_name(inbound.protocol).into(),
-            value: Bytes::new(),
+            r#type: proxy_type,
+            value: Bytes::from(proxy_val),
         }),
     }
 }
@@ -932,7 +1239,7 @@ impl InboundManager {
         ctx: Arc<Context>,
         tcp_abort: Option<tokio::task::AbortHandle>,
         udp_abort: Option<tokio::task::AbortHandle>,
-        config: InboundHandlerConfig,
+        inbound: Inbound,
     ) {
         let mut map = self
             .inbounds
@@ -944,7 +1251,7 @@ impl InboundManager {
                 ctx,
                 tcp_abort,
                 udp_abort,
-                config,
+                inbound,
             },
         );
     }
@@ -954,7 +1261,31 @@ impl InboundManager {
             .inbounds
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut configs: Vec<_> = map.values().map(|entry| entry.config.clone()).collect();
+        let mut configs: Vec<_> = map
+            .values()
+            .map(|entry| {
+                let mut inbound = entry.inbound.clone();
+                inbound.users = entry
+                    .ctx
+                    .users
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                inbound.shadowsocks_users = entry
+                    .ctx
+                    .ss_users
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                inbound.hysteria_users = entry
+                    .ctx
+                    .hysteria_users
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                inbound_handler_config(&inbound)
+            })
+            .collect();
         configs.sort_by(|a, b| a.tag.cmp(&b.tag));
         configs
     }
@@ -1003,7 +1334,7 @@ impl InboundManager {
         ctx: Arc<Context>,
         tcp_abort: Option<tokio::task::AbortHandle>,
         udp_abort: Option<tokio::task::AbortHandle>,
-        config: InboundHandlerConfig,
+        inbound: Inbound,
     ) -> Result<(), String> {
         let mut map = self
             .inbounds
@@ -1018,7 +1349,7 @@ impl InboundManager {
                 ctx,
                 tcp_abort,
                 udp_abort,
-                config,
+                inbound,
             },
         );
         Ok(())
@@ -1035,7 +1366,7 @@ pub async fn serve(
     let listener = TcpListener::bind(addr)
         .await
         .map_err(|e| format!("failed to listen on api {addr}: {e}"))?;
-    log::info(format!("api listening on {addr}"));
+    crate::log::info!("api listening on {addr}");
     let services: Arc<[String]> = services.into();
     tokio::spawn(async move {
         loop {
@@ -1874,11 +2205,11 @@ async fn handle_handler(
             };
             match result {
                 Ok(()) => {
-                    log::info(format!(
+                    crate::log::info!(
                         "api: {} on inbound {:?}",
                         operation.r#type.rsplit('.').next().unwrap_or_default(),
                         r.tag
-                    ));
+                    );
                     reply(&Empty {})
                 }
                 Err(e) => status(UNKNOWN, &e),
@@ -2270,7 +2601,6 @@ async fn handle_handler(
                 wireguard: None,
                 masque: None,
             };
-            let handler_config = inbound_handler_config(&inbound);
             match crate::start_inbound(&inbound, None, inbound_manager.router().clone()).await {
                 Ok((ctx, tcp_abort, udp_abort)) => {
                     inbound_manager
@@ -2281,7 +2611,7 @@ async fn handle_handler(
                         ctx,
                         tcp_abort.clone(),
                         udp_abort.clone(),
-                        handler_config,
+                        inbound,
                     ) {
                         for handle in [tcp_abort, udp_abort].into_iter().flatten() {
                             handle.abort();
@@ -2743,6 +3073,7 @@ mod tests {
             )),
             vless_encryption: None,
             vmess_keys: Default::default(),
+            ss_users_version: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Add VMess user
@@ -3125,5 +3456,212 @@ mod tests {
         assert_eq!(stat_resp.stat.unwrap().value, 1);
 
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn list_inbounds_full_payloads_and_tags_only() {
+        let router = Arc::new(
+            crate::routing::Router::build(
+                &serde_json::json!({
+                    "outbounds": [{"tag": "direct", "protocol": "freedom"}],
+                    "routing": {"rules": []}
+                }),
+                &[],
+            )
+            .unwrap(),
+        );
+        let inbound_manager = Arc::new(InboundManager::new(router.clone()));
+        let ctx = Arc::new(Context {
+            tag: "vless-in".into(),
+            port: 443,
+            users: std::sync::RwLock::new(vec![crate::config::User {
+                id: [1u8; 16],
+                hash: [0u8; 56],
+                email: "user1@example.com".into(),
+                level: 1,
+                flow: crate::config::VISION_FLOW.into(),
+                reverse: None,
+                testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
+            }]),
+            hysteria_users: std::sync::RwLock::new(Vec::new()),
+            ss_users: std::sync::RwLock::new(Vec::new()),
+            ss_method: std::sync::RwLock::new(None),
+            ss_password: std::sync::RwLock::new(None),
+            router,
+            sniffing: crate::vless::Sniffing {
+                http: true,
+                tls: true,
+                quic: false,
+                fakedns: false,
+                fakedns_other: false,
+                route_only: true,
+                metadata_only: false,
+                domains_excluded: Arc::new(Vec::new()),
+            },
+            fallbacks: vec![crate::config::Fallback {
+                name: "fb1".into(),
+                alpn: "h2".into(),
+                path: "/fallback".into(),
+                dest: crate::config::FallbackDest::Tcp(crate::vless::Host::Domain("127.0.0.1".into()), 8080),
+                xver: 1,
+            }],
+            vmess_filter: Arc::new(std::sync::Mutex::new(
+                xray_proxy::vmess::server::AuthIdFilter::default_vmess(),
+            )),
+            ss2022_salt_pool: Arc::new(std::sync::Mutex::new(
+                xray_proxy::shadowsocks2022::SaltPool::default_ss2022(),
+            )),
+            vless_encryption: None,
+            vmess_keys: Default::default(),
+            ss_users_version: std::sync::atomic::AtomicU64::new(0),
+        });
+
+        let inbound = crate::config::Inbound {
+            tag: "vless-in".into(),
+            listen: "0.0.0.0".into(),
+            port: 443,
+            protocol: InboundProtocol::Vless,
+            users: vec![crate::config::User {
+                id: [1u8; 16],
+                hash: [0u8; 56],
+                email: "user1@example.com".into(),
+                level: 1,
+                flow: crate::config::VISION_FLOW.into(),
+                reverse: None,
+                testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
+            }],
+            shadowsocks_users: Vec::new(),
+            shadowsocks_top_method: None,
+            shadowsocks_top_password: None,
+            fallbacks: vec![crate::config::Fallback {
+                name: "fb1".into(),
+                alpn: "h2".into(),
+                path: "/fallback".into(),
+                dest: crate::config::FallbackDest::Tcp(crate::vless::Host::Domain("127.0.0.1".into()), 8080),
+                xver: 1,
+            }],
+            socks_auth: xray_proxy::inbound::SocksInboundAuth::NoAuth,
+            user_level: 0,
+            udp: true,
+            sniffing: ctx.sniffing.clone(),
+            dokodemo: None,
+            http_obfs: None,
+            tls: Some(crate::config::TlsSettings {
+                cert_pem: Vec::new(),
+                key_pem: Vec::new(),
+                certificates: Vec::new(),
+                alpn: vec!["h2".into()],
+                reject_unknown_sni: false,
+                server_names: vec!["example.com".into()],
+                min_version: Some("1.2".into()),
+                max_version: Some("1.3".into()),
+                cipher_suites: Vec::new(),
+                curve_preferences: Vec::new(),
+                ech_server_keys: None,
+                ech_config_list: None,
+            }),
+            reality: None,
+            transport: InboundTransport::Tcp,
+            accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept::None,
+            tcp_masks: None,
+            hysteria_users: Vec::new(),
+            hysteria_salamander: None,
+            hysteria_gecko: None,
+            hysteria_udp_idle_timeout: None,
+            hysteria_masq: None,
+            has_udphop: false,
+            vless_encryption: None,
+            sockopt: None,
+            quic_params: None,
+            wireguard: None,
+            masque: None,
+        };
+
+        inbound_manager.insert_initial("vless-in".into(), ctx.clone(), None, None, inbound);
+
+        // 1. ListInbounds with is_only_tags: false
+        let req = ListInboundsRequest { is_only_tags: false };
+        let resp = handle_handler(
+            "ListInbounds",
+            req.encode_to_vec().into(),
+            &inbound_manager,
+        )
+        .await;
+        assert_eq!(resp.status(), 200);
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let list_resp = ListInboundsResponse::decode(unframe(collected).unwrap()).unwrap();
+        assert_eq!(list_resp.inbounds.len(), 1);
+        let inb = &list_resp.inbounds[0];
+        assert_eq!(inb.tag, "vless-in");
+
+        let rec_msg = inb.receiver_settings.as_ref().expect("receiver_settings must be present");
+        assert_eq!(rec_msg.r#type, "xray.app.proxyman.ReceiverConfig");
+        let rec = ReceiverConfig::decode(rec_msg.value.clone()).unwrap();
+        let port_range = &rec.port_list.unwrap().range[0];
+        assert_eq!(port_range.from, 443);
+        assert_eq!(port_range.to, 443);
+        let stream = rec.stream_settings.unwrap();
+        assert_eq!(stream.protocol_name, "tcp");
+        assert_eq!(stream.security_type, "tls");
+        let sniff = rec.sniffing_settings.unwrap();
+        assert!(sniff.enabled);
+        assert_eq!(sniff.destination_override, vec!["http", "tls"]);
+        assert!(sniff.route_only);
+
+        let proxy_msg = inb.proxy_settings.as_ref().expect("proxy_settings must be present");
+        assert_eq!(proxy_msg.r#type, "xray.proxy.vless.inbound.Config");
+        let vless_cfg = VlessInboundConfigProto::decode(proxy_msg.value.clone()).unwrap();
+        assert_eq!(vless_cfg.decryption, "none");
+        assert_eq!(vless_cfg.users.len(), 1);
+        assert_eq!(vless_cfg.users[0].email, "user1@example.com");
+        assert_eq!(vless_cfg.users[0].level, 1);
+        assert_eq!(vless_cfg.fallbacks.len(), 1);
+        assert_eq!(vless_cfg.fallbacks[0].name, "fb1");
+        assert_eq!(vless_cfg.fallbacks[0].alpn, "h2");
+
+        // 2. Dynamic user addition appears in ListInbounds
+        let new_user = ProtocolUser {
+            level: 2,
+            email: "dynamic@example.com".into(),
+            account: Some(TypedMessage {
+                r#type: VLESS_ACCOUNT.into(),
+                value: VlessAccount {
+                    id: "a1a2a3a4-b1b2-c1c2-d1d2-d3d4d5d6d7d8".into(),
+                    flow: String::new(),
+                    encryption: "none".into(),
+                    testseed: vec![1, 2, 3, 4],
+                }
+                .encode_to_vec()
+                .into(),
+            }),
+        };
+        assert!(add_user_to_inbound(new_user, &ctx).is_ok());
+
+        let req = ListInboundsRequest { is_only_tags: false };
+        let resp = handle_handler(
+            "ListInbounds",
+            req.encode_to_vec().into(),
+            &inbound_manager,
+        )
+        .await;
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let list_resp = ListInboundsResponse::decode(unframe(collected).unwrap()).unwrap();
+        let vless_cfg = VlessInboundConfigProto::decode(list_resp.inbounds[0].proxy_settings.as_ref().unwrap().value.clone()).unwrap();
+        assert_eq!(vless_cfg.users.len(), 2);
+        assert!(vless_cfg.users.iter().any(|u| u.email == "dynamic@example.com"));
+
+        // 3. ListInbounds with is_only_tags: true
+        let req = ListInboundsRequest { is_only_tags: true };
+        let resp = handle_handler(
+            "ListInbounds",
+            req.encode_to_vec().into(),
+            &inbound_manager,
+        )
+        .await;
+        let collected = resp.into_body().collect().await.unwrap().to_bytes();
+        let list_resp = ListInboundsResponse::decode(unframe(collected).unwrap()).unwrap();
+        assert_eq!(list_resp.inbounds[0].tag, "vless-in");
+        assert!(list_resp.inbounds[0].receiver_settings.is_none());
+        assert!(list_resp.inbounds[0].proxy_settings.is_none());
     }
 }

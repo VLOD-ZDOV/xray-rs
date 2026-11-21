@@ -112,15 +112,15 @@ impl Handler {
         );
         let s = &self.settings;
         if !s.host.is_empty() && !host_matches(&req, &s.host) {
-            log::debug(format!("xhttp: host mismatch from {}", log::mask(peer)));
+            crate::log::debug!("xhttp: host mismatch from {}", log::mask(peer));
             return status(StatusCode::NOT_FOUND);
         }
         let path = req.uri().path().to_owned();
         let Some(rest) = path.strip_prefix(s.path.as_str()) else {
-            log::debug(format!(
+            crate::log::debug!(
                 "xhttp: path mismatch {path:?} from {}",
                 log::mask(peer)
-            ));
+            );
             return status(StatusCode::NOT_FOUND);
         };
 
@@ -141,11 +141,11 @@ impl Handler {
         let pad = self.request_padding(&req, referer.as_deref());
         let tokenish = s.padding_obfs.as_ref().is_some_and(|o| o.tokenish);
         if !padding::is_valid(&pad, s.padding, tokenish) {
-            log::debug(format!(
+            crate::log::debug!(
                 "xhttp: invalid padding (length {}) from {}",
                 pad.len(),
                 log::mask(peer)
-            ));
+            );
             return status(StatusCode::BAD_REQUEST);
         }
         let obfs_padding_accepted = s.padding_obfs.is_some();
@@ -277,7 +277,7 @@ impl Handler {
         let on_drop = session.clone().map(CloseOnDrop);
         tokio::spawn(async move {
             if let Err(e) = vless::serve(uplink, downlink, &this.vless, peer).await {
-                log::info(format!("from {} rejected: {e}", log::mask(peer)));
+                crate::log::info!("from {} rejected: {e}", log::mask(peer));
             }
             if let Some(session) = session {
                 this.remove(&session_id, &session);
@@ -306,17 +306,17 @@ impl Handler {
         );
         let s = &self.settings;
         if !s.host.is_empty() && !host_matches(&req, &s.host) {
-            log::debug(format!("xhttp: host mismatch from {}", log::mask(peer)));
+            crate::log::debug!("xhttp: host mismatch from {}", log::mask(peer));
             let _ = stream.send_response(h3_status(StatusCode::NOT_FOUND)).await;
             let _ = stream.finish().await;
             return;
         }
         let path = req.uri().path().to_owned();
         let Some(rest) = path.strip_prefix(s.path.as_str()) else {
-            log::debug(format!(
+            crate::log::debug!(
                 "xhttp: path mismatch {path:?} from {}",
                 log::mask(peer)
-            ));
+            );
             let _ = stream.send_response(h3_status(StatusCode::NOT_FOUND)).await;
             let _ = stream.finish().await;
             return;
@@ -342,11 +342,11 @@ impl Handler {
         let pad = self.request_padding(&req, referer.as_deref());
         let tokenish = s.padding_obfs.as_ref().is_some_and(|o| o.tokenish);
         if !padding::is_valid(&pad, s.padding, tokenish) {
-            log::debug(format!(
+            crate::log::debug!(
                 "xhttp: invalid padding (length {}) from {}",
                 pad.len(),
                 log::mask(peer)
-            ));
+            );
             let _ = stream
                 .send_response(h3_status(StatusCode::BAD_REQUEST))
                 .await;
@@ -562,7 +562,7 @@ impl Handler {
                 if let Err(e) =
                     vless::serve(uplink_reader, downlink_writer, &this.vless, peer).await
                 {
-                    log::info(format!("from {} rejected: {e}", log::mask(peer)));
+                    crate::log::info!("from {} rejected: {e}", log::mask(peer));
                 }
             });
 
@@ -617,7 +617,7 @@ impl Handler {
         let sess_id = session_id.clone();
         tokio::spawn(async move {
             if let Err(e) = vless::serve(uplink, downlink, &this.vless, peer).await {
-                log::info(format!("from {} rejected: {e}", log::mask(peer)));
+                crate::log::info!("from {} rejected: {e}", log::mask(peer));
             }
             this.remove(&sess_id, &sess);
         });
@@ -1103,7 +1103,7 @@ pub async fn start_h3(
     )
     .map_err(|e| format!("failed to listen QUIC for XHTTP/3 on {}: {e}", listen_addr))?;
 
-    crate::log::info(format!("listening {} on {}", inbound.tag, listen_addr));
+    crate::log::info!("listening {} on {}", inbound.tag, listen_addr);
 
     let mut handler = Handler::new(settings, ctx);
     let trusted_xff = inbound
@@ -1117,7 +1117,7 @@ pub async fn start_h3(
             let connection = match incoming.await {
                 Ok(c) => c,
                 Err(e) => {
-                    crate::log::debug(format!("quic handshake failed: {e}"));
+                    crate::log::debug!("quic handshake failed: {e}");
                     continue;
                 }
             };
@@ -1130,7 +1130,7 @@ pub async fn start_h3(
                 {
                     Ok(c) => c,
                     Err(e) => {
-                        crate::log::debug(format!("h3 handshake failed: {e}"));
+                        crate::log::debug!("h3 handshake failed: {e}");
                         return;
                     }
                 };
@@ -1140,14 +1140,14 @@ pub async fn start_h3(
                         Ok(Some(resolver)) => resolver,
                         Ok(None) => break,
                         Err(e) => {
-                            crate::log::debug(format!("h3 accept failed: {e}"));
+                            crate::log::debug!("h3 accept failed: {e}");
                             break;
                         }
                     };
                     let (req, stream) = match resolver.resolve_request().await {
                         Ok(pair) => pair,
                         Err(e) => {
-                            crate::log::debug(format!("h3 resolve request failed: {e}"));
+                            crate::log::debug!("h3 resolve request failed: {e}");
                             continue;
                         }
                     };

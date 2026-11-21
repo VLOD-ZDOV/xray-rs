@@ -186,10 +186,10 @@ pub async fn start(
         .await
         .map_err(|e| format!("failed to start wireguard server: {e}"))?;
 
-    log::info(format!(
+    crate::log::info!(
         "listening {} (wireguard) on {}",
         inbound.tag, config.listen_addr
-    ));
+    );
 
     let users: Arc<Vec<PeerUser>> = Arc::new(peer_users(config));
 
@@ -263,7 +263,7 @@ async fn handle_tcp(
     let target_stream = match outbound::connect(&router, &decision, &host, tcp.dst.port()).await {
         Ok(s) => s,
         Err(e) => {
-            log::warn(format!("wireguard tcp connect {}: {e}", tcp.dst));
+            crate::log::warn!("wireguard tcp connect {}: {e}", tcp.dst);
             return;
         }
     };
@@ -332,7 +332,7 @@ async fn handle_udp(
     let cone = match ConeUdp::open(router.clone(), &decision).await {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            log::warn(format!("wireguard udp open {}: {e}", udp.dst));
+            crate::log::warn!("wireguard udp open {}: {e}", udp.dst);
             return;
         }
     };

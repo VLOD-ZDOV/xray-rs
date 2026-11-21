@@ -52,6 +52,21 @@ pub enum Host {
     Domain(String),
 }
 
+impl std::fmt::Display for Host {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ip(ip) => {
+                if ip.is_ipv6() {
+                    write!(f, "[{ip}]")
+                } else {
+                    write!(f, "{ip}")
+                }
+            }
+            Self::Domain(d) => write!(f, "{d}"),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct Request {
     pub version: u8,
@@ -377,6 +392,7 @@ pub struct Context {
     pub vless_encryption: Option<Arc<xray_vless_encryption::Server>>,
     /// VMess keys derived from `users`; rebuilt lazily after any change to them.
     pub vmess_keys: std::sync::Mutex<Option<Arc<crate::vmess::Keys>>>,
+    pub ss_users_version: std::sync::atomic::AtomicU64,
 }
 
 impl Context {
@@ -428,6 +444,8 @@ impl Context {
         }
         let level = ss_user.level;
         ss_users.push(ss_user);
+        self.ss_users_version
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         if !users.iter().any(|u| u.email.eq_ignore_ascii_case(&email)) {
             users.push(User {
                 id: crate::config::user_id(&email),
@@ -504,6 +522,10 @@ impl Context {
         users.retain(|u| !u.email.eq_ignore_ascii_case(email));
         let before_ss = ss_users.len();
         ss_users.retain(|u| !u.email.eq_ignore_ascii_case(email));
+        if before_ss != ss_users.len() {
+            self.ss_users_version
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         let before_h = h_users.len();
         h_users.retain(|u| !u.email.eq_ignore_ascii_case(email));
         if users.len() == before_u && ss_users.len() == before_ss && h_users.len() == before_h {
@@ -1809,6 +1831,7 @@ mod tests {
             )),
             vless_encryption: None,
             vmess_keys: Default::default(),
+            ss_users_version: std::sync::atomic::AtomicU64::new(0),
         };
 
         let _lock = crate::policy::TEST_LOCK.lock().unwrap();

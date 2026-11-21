@@ -59,11 +59,11 @@ impl VisionTransportStream {
             if self.header_written < hdr.len() {
                 match Pin::new(&mut *self.inner).poll_write(cx, &hdr[self.header_written..]) {
                     Poll::Ready(Ok(0)) => {
-                        crate::log::warn(format!(
+                        crate::log::warn!(
                             "vless outbound transport made no progress on header: {}/{} bytes written",
                             self.header_written,
                             hdr.len()
-                        ));
+                        );
                         return Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::WriteZero,
                             "failed to write header",
@@ -120,12 +120,12 @@ impl AsyncWrite for VisionTransportStream {
                 combined.extend_from_slice(input);
                 return match Pin::new(&mut *this.inner).poll_write(cx, &combined) {
                     Poll::Ready(Ok(0)) => {
-                        crate::log::warn(format!(
+                        crate::log::warn!(
                             "vless outbound header write: inner made no progress, header {}/{}, input {}",
                             this.header_written,
                             hdr.len(),
                             input.len()
-                        ));
+                        );
                         Poll::Ready(Err(io::Error::new(
                             io::ErrorKind::WriteZero,
                             "failed to write header",
@@ -161,10 +161,10 @@ impl AsyncWrite for VisionTransportStream {
         }
         let poll = Pin::new(&mut *this.inner).poll_write(cx, input);
         if let Poll::Ready(Ok(0)) = poll {
-            crate::log::warn(format!(
+            crate::log::warn!(
                 "vless outbound payload write: inner made no progress, input {}",
                 input.len()
-            ));
+            );
         }
         poll
     }
@@ -652,7 +652,7 @@ impl VlessOutbound {
                         let _ = crate::mux::serve(&mut r, &mut w, &info).await;
                     }
                     Err(e) => {
-                        crate::log::warn(format!("reverse bridge {tag} connect error: {e}"));
+                        crate::log::warn!("reverse bridge {tag} connect error: {e}");
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;

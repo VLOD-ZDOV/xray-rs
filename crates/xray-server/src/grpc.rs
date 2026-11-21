@@ -76,11 +76,11 @@ impl Handler {
             peer,
         );
         if req.method() != Method::POST {
-            log::debug(format!(
+            crate::log::debug!(
                 "grpc: non-POST method {:?} from {}",
                 req.method(),
                 log::mask(peer)
-            ));
+            );
             return status(StatusCode::METHOD_NOT_ALLOWED);
         }
 
@@ -90,28 +90,28 @@ impl Handler {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if !content_type.starts_with("application/grpc") {
-            log::debug(format!(
+            crate::log::debug!(
                 "grpc: invalid content-type {:?} from {}",
                 content_type,
                 log::mask(peer)
-            ));
+            );
             return status(StatusCode::UNSUPPORTED_MEDIA_TYPE);
         }
 
         if let Some(ref authority) = self.settings.authority {
             if !host_matches(&req, authority) {
-                log::debug(format!("grpc: authority mismatch from {}", log::mask(peer)));
+                crate::log::debug!("grpc: authority mismatch from {}", log::mask(peer));
                 return status(StatusCode::NOT_FOUND);
             }
         }
 
         let path = req.uri().path();
         if !path_matches(path, &self.settings.service_name) {
-            log::debug(format!(
+            crate::log::debug!(
                 "grpc: path mismatch {:?} from {}",
                 path,
                 log::mask(peer)
-            ));
+            );
             return status(StatusCode::NOT_FOUND);
         }
 
@@ -124,7 +124,7 @@ impl Handler {
                 let ctx = ctx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = vless::serve(client_r, client_w, &ctx, peer).await {
-                        log::info(format!("vless-grpc from {} rejected: {e}", log::mask(peer)));
+                        crate::log::info!("vless-grpc from {} rejected: {e}", log::mask(peer));
                     }
                 });
             }
@@ -140,10 +140,10 @@ impl Handler {
                     ))
                     .await
                     {
-                        log::info(format!(
+                        crate::log::info!(
                             "trojan-grpc from {} rejected: {e}",
                             log::mask(peer)
-                        ));
+                        );
                     }
                 });
             }
@@ -167,9 +167,9 @@ impl Handler {
                         incoming_buf[4],
                     ]) as usize;
                     if compressed != 0 || msg_len > MAX_MESSAGE_SIZE {
-                        log::debug(format!(
+                        crate::log::debug!(
                             "grpc message rejected: compressed {compressed}, {msg_len} bytes"
-                        ));
+                        );
                         break 'read;
                     }
                     if incoming_buf.len() < 5 + msg_len {
@@ -178,7 +178,7 @@ impl Handler {
                     incoming_buf.advance(5);
                     let payload = incoming_buf.split_to(msg_len);
                     if let Err(e) = decode_hunk_payload(&payload, &mut duplex_w).await {
-                        log::debug(format!("error decoding hunk: {e}"));
+                        crate::log::debug!("error decoding hunk: {e}");
                         break 'read;
                     }
                 }
@@ -206,7 +206,7 @@ impl Handler {
                         break;
                     }
                     Err(e) => {
-                        log::debug(format!("grpc downlink read error: {e}"));
+                        crate::log::debug!("grpc downlink read error: {e}");
                         let mut trailers = http::HeaderMap::new();
                         trailers.insert("grpc-status", HeaderValue::from_static("0"));
                         let _ = tx.send(Ok(Frame::trailers(trailers))).await;
@@ -252,10 +252,10 @@ where
         .timer(hyper_util::rt::TokioTimer::new())
         .header_read_timeout(std::time::Duration::from_secs(4));
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
-        log::debug(format!(
+        crate::log::debug!(
             "grpc connection from {} ended: {e}",
             log::mask(peer)
-        ));
+        );
     }
 }
 

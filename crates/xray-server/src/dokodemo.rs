@@ -68,10 +68,10 @@ where
     let (host, port) = settings.target_for(ctx.port, original);
 
     if port == ctx.port && matches!(&host, Host::Ip(ip) if ip.is_loopback()) {
-        log::info(format!(
+        crate::log::info!(
             "loopback connection detected from {}",
             log::mask(peer)
-        ));
+        );
         return Err(io::Error::new(
             io::ErrorKind::ConnectionRefused,
             "loopback connection detected",
@@ -180,7 +180,7 @@ impl DokodemoUdpHandler {
             let (n, peer, original) = match received {
                 Ok(res) => res,
                 Err(e) => {
-                    log::warn(format!("dokodemo udp recv error: {e}"));
+                    crate::log::warn!("dokodemo udp recv error: {e}");
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
@@ -224,10 +224,10 @@ impl DokodemoUdpHandler {
                 if let Err(e) =
                     serve_udp_session(reply, ctx, peer, (host, port), packet, rx, level).await
                 {
-                    log::debug(format!(
+                    crate::log::debug!(
                         "dokodemo udp session {} ended: {e}",
                         log::mask(peer)
-                    ));
+                    );
                 }
                 let mut map = map.lock().await;
                 if map.get(&key).is_some_and(|cur| cur.same_channel(&tx)) {
@@ -282,7 +282,7 @@ impl Reply {
                     let socket = match tproxy_udp::reply_socket(from, *mark) {
                         Ok(socket) => Arc::new(socket),
                         Err(e) => {
-                            log::debug(format!("tproxy udp reply from {from}: {e}"));
+                            crate::log::debug!("tproxy udp reply from {from}: {e}");
                             sockets[original].clone()
                         }
                     };

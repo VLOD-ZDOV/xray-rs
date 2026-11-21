@@ -38,9 +38,9 @@ impl DnsOutbound {
         let settings = outbound.get("settings").unwrap_or(outbound);
         for key in ["nonIPQuery", "blockTypes", "rules"] {
             if settings.get(key).is_some_and(|v| !v.is_null()) {
-                crate::log::warn(format!(
+                crate::log::warn!(
                     "dns outbound {tag:?}: {key:?} is not supported and is ignored"
-                ));
+                );
             }
         }
         let address = settings
@@ -166,7 +166,7 @@ impl DnsOutbound {
                 .collect(),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
             Err(e) => {
-                crate::log::debug(format!("dns outbound lookup of {qname}: {e}"));
+                crate::log::debug!("dns outbound lookup of {qname}: {e}");
                 let mut resp = Vec::with_capacity(qend);
                 resp.extend_from_slice(&id);
                 resp.extend_from_slice(&0x8182u16.to_be_bytes()); // SERVFAIL

@@ -20,7 +20,6 @@ use xray_transport::TcpFragmentConfig;
 
 use crate::dns_outbound::DnsOutbound;
 use crate::http_outbound::HttpOutbound;
-use crate::log;
 use crate::shadowsocks_outbound::ShadowsocksOutbound;
 use crate::socks::SocksOutbound;
 use crate::trojan_outbound::TrojanOutbound;
@@ -1091,9 +1090,9 @@ pub const DEFAULT_FINAL_BLOCK: FinalBlock = FinalBlock {
 fn parse_final_block(raw: &Value, block: bool, at: &str) -> Result<FinalBlock, String> {
     let mut delay = raw.get("delay").filter(|v| !v.is_null());
     if let Some(old) = raw.get("blockDelay").filter(|v| !v.is_null()) {
-        log::warn(format!(
+        crate::log::warn!(
             "{at}: finalRules.blockDelay is deprecated, use finalRules.delay"
-        ));
+        );
         delay = Some(old);
     }
     let level = str_field(raw, "logLevel");
@@ -1418,8 +1417,89 @@ pub struct RouteCacheKey {
     pub vless_route: Option<u32>,
 }
 
+impl RouteCacheKey {
+    #[inline]
+    pub fn matches(&self, query: &Query<'_>, ip: Option<IpAddr>, source_port: u16) -> bool {
+        self.inbound == query.inbound
+            && self.inbound_port == query.inbound_port
+            && self.user == query.user
+            && self.source_ip == Some(query.source.ip())
+            && self.source_port == source_port
+            && self.network == query.network
+            && self.domain.as_deref() == query.domain
+            && self.ip == ip
+            && self.port == query.port
+            && self.protocol.as_deref() == query.protocol
+            && self.local_ip == query.local_ip
+            && self.vless_route == query.vless_route
+    }
+}
+
 pub type MatchedRule = (RuleTarget, Option<Arc<WebhookNotifier>>, usize, String);
-pub type RouteCache = HashMap<RouteCacheKey, Option<MatchedRule>>;
+
+#[derive(Default)]
+pub struct RouteCache {
+    current: HashMap<u64, (RouteCacheKey, Option<Arc<MatchedRule>>)>,
+    previous: HashMap<u64, (RouteCacheKey, Option<Arc<MatchedRule>>)>,
+}
+
+impl RouteCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.current.clear();
+        self.previous.clear();
+    }
+
+    pub fn get(
+        &mut self,
+        hash: u64,
+        query: &Query<'_>,
+        ip: Option<IpAddr>,
+        source_port: u16,
+    ) -> Option<Option<Arc<MatchedRule>>> {
+        if let Some((k, res)) = self.current.get(&hash) {
+            if k.matches(query, ip, source_port) {
+                return Some(res.clone());
+            }
+        }
+        if let Some((k, res)) = self.previous.remove(&hash) {
+            if k.matches(query, ip, source_port) {
+                let r = res.clone();
+                self.current.insert(hash, (k, res));
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    pub fn insert(&mut self, hash: u64, key: RouteCacheKey, res: Option<Arc<MatchedRule>>) {
+        if self.current.len() >= 2048 {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        self.current.insert(hash, (key, res));
+    }
+}
+
+fn hash_route_query(query: &Query<'_>, ip: Option<IpAddr>, source_port: u16) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    query.inbound.hash(&mut hasher);
+    query.inbound_port.hash(&mut hasher);
+    query.user.hash(&mut hasher);
+    query.source.ip().hash(&mut hasher);
+    source_port.hash(&mut hasher);
+    query.network.hash(&mut hasher);
+    query.domain.hash(&mut hasher);
+    ip.hash(&mut hasher);
+    query.port.hash(&mut hasher);
+    query.protocol.hash(&mut hasher);
+    query.local_ip.hash(&mut hasher);
+    query.vless_route.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// One routed connection as `SubscribeRoutingStats` reports it.
 #[derive(Clone, Debug)]
@@ -1453,6 +1533,7 @@ pub struct Router {
     pub reverse_portals: std::sync::RwLock<HashMap<String, Arc<crate::mux::ReversePortal>>>,
     pub inbound_protocols: std::sync::RwLock<HashMap<String, String>>,
     pub route_cache: std::sync::RwLock<RouteCache>,
+    pub has_source_port: std::sync::atomic::AtomicBool,
     routing_stats: tokio::sync::broadcast::Sender<RoutingEvent>,
 }
 
@@ -1772,9 +1853,9 @@ impl Router {
             match &rule.target {
                 RuleTarget::Outbound(tag) => {
                     if !outbounds.contains_key(tag) {
-                        log::debug(format!(
+                        crate::log::debug!(
                             "routing: outbound {tag:?} is not defined; matching traffic will be blocked"
-                        ));
+                        );
                         outbounds.insert(tag.clone(), Action::Block(BlockAction::Drop));
                     }
                 }
@@ -1837,7 +1918,12 @@ impl Router {
             }
         }
 
+        let has_source_port = rules
+            .iter()
+            .any(|r| r.source.as_ref().is_some_and(|s| s.port_ranges.is_some()));
+
         Ok(Self {
+            has_source_port: std::sync::atomic::AtomicBool::new(has_source_port),
             rules: std::sync::RwLock::new(rules),
             strategy,
             outbounds: std::sync::RwLock::new(outbounds),
@@ -1859,7 +1945,7 @@ impl Router {
                     })
                     .collect(),
             ),
-            route_cache: std::sync::RwLock::new(HashMap::new()),
+            route_cache: std::sync::RwLock::new(RouteCache::new()),
             routing_stats: tokio::sync::broadcast::channel(256).0,
         })
     }
@@ -1978,6 +2064,11 @@ impl Router {
         } else {
             rules.insert(0, rule);
         }
+        let has_source = rules
+            .iter()
+            .any(|r| r.source.as_ref().is_some_and(|s| s.port_ranges.is_some()));
+        self.has_source_port
+            .store(has_source, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn remove_rule(&self, rule_tag: &str) -> usize {
@@ -1994,6 +2085,11 @@ impl Router {
             .clear();
         let before = rules.len();
         rules.retain(|r| r.rule_tag != rule_tag);
+        let has_source = rules
+            .iter()
+            .any(|r| r.source.as_ref().is_some_and(|s| s.port_ranges.is_some()));
+        self.has_source_port
+            .store(has_source, std::sync::atomic::Ordering::Relaxed);
         before - rules.len()
     }
 
@@ -2247,11 +2343,6 @@ impl Router {
     }
 
     async fn route_once(&self, query: &Query<'_>, resolved: Option<IpAddr>) -> Decision {
-        let dest = match (query.domain, query.ip) {
-            (Some(d), _) => format!("{d}:{}", query.port),
-            (None, Some(ip)) => format!("{ip}:{}", query.port),
-            _ => format!(":{}", query.port),
-        };
         let matched = {
             let rules = self
                 .rules
@@ -2259,12 +2350,20 @@ impl Router {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             self.first_match(&rules, query, query.ip.or(resolved))
         };
-        if let Some((target, webhook, idx, rule_tag)) = matched {
-            let decision = self.resolve_target(&target, Some(query.source.ip())).await;
-            crate::log::info(format!(
-                "routing: {dest} matched rule #{idx} [{rule_tag}] -> outbound [{}]",
-                decision.tag
-            ));
+        if let Some(ref m) = matched {
+            let (ref target, ref webhook, idx, ref rule_tag) = **m;
+            let decision = self.resolve_target(target, Some(query.source.ip())).await;
+            if crate::log::is_info_enabled() {
+                let dest = match (query.domain, query.ip) {
+                    (Some(d), _) => format!("{d}:{}", query.port),
+                    (None, Some(ip)) => format!("{ip}:{}", query.port),
+                    _ => format!(":{}", query.port),
+                };
+                crate::log::info!(
+                    "routing: {dest} matched rule #{idx} [{rule_tag}] -> outbound [{}]",
+                    decision.tag
+                );
+            }
             if let Some(wh) = webhook {
                 wh.fire(query, &decision.tag);
             }
@@ -2283,12 +2382,20 @@ impl Router {
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     self.first_match(&rules, query, Some(ip))
                 };
-                if let Some((target, webhook, idx, rule_tag)) = matched {
-                    let decision = self.resolve_target(&target, Some(query.source.ip())).await;
-                    crate::log::info(format!(
-                        "routing: {dest} (resolved {ip}) matched rule #{idx} [{rule_tag}] -> outbound [{}]",
-                        decision.tag
-                    ));
+                if let Some(ref m) = matched {
+                    let (ref target, ref webhook, idx, ref rule_tag) = **m;
+                    let decision = self.resolve_target(target, Some(query.source.ip())).await;
+                    if crate::log::is_info_enabled() {
+                        let dest = match (query.domain, query.ip) {
+                            (Some(d), _) => format!("{d}:{}", query.port),
+                            (None, Some(ip)) => format!("{ip}:{}", query.port),
+                            _ => format!(":{}", query.port),
+                        };
+                        crate::log::info!(
+                            "routing: {dest} (resolved {ip}) matched rule #{idx} [{rule_tag}] -> outbound [{}]",
+                            decision.tag
+                        );
+                    }
                     if let Some(wh) = webhook {
                         wh.fire(query, &decision.tag);
                     }
@@ -2305,9 +2412,16 @@ impl Router {
             .outbounds
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        crate::log::info(format!(
-            "routing: {dest} did not match any rule, fallback to default outbound [{default_tag}]"
-        ));
+        if crate::log::is_info_enabled() {
+            let dest = match (query.domain, query.ip) {
+                (Some(d), _) => format!("{d}:{}", query.port),
+                (None, Some(ip)) => format!("{ip}:{}", query.port),
+                _ => format!(":{}", query.port),
+            };
+            crate::log::info!(
+                "routing: {dest} did not match any rule, fallback to default outbound [{default_tag}]"
+            );
+        }
         self.decision(&outbounds, &default_tag)
     }
 
@@ -2316,42 +2430,31 @@ impl Router {
         rules: &'a [Rule],
         query: &Query<'_>,
         ip: Option<IpAddr>,
-    ) -> Option<MatchedRule> {
+    ) -> Option<Arc<MatchedRule>> {
         let is_cacheable = query.attributes.is_none() && query.process_info.is_none();
 
-        let key = if is_cacheable {
-            let has_source_port = rules
-                .iter()
-                .any(|r| r.source.as_ref().is_some_and(|s| s.port_ranges.is_some()));
-            Some(RouteCacheKey {
-                inbound: query.inbound.to_string(),
-                inbound_port: query.inbound_port,
-                user: query.user.to_string(),
-                source_ip: Some(query.source.ip()),
-                source_port: if has_source_port {
-                    query.source.port()
-                } else {
-                    0
-                },
-                network: query.network,
-                domain: query.domain.map(str::to_string),
-                ip,
-                port: query.port,
-                protocol: query.protocol.map(str::to_string),
-                local_ip: query.local_ip,
-                vless_route: query.vless_route,
-            })
+        let (cache_hash, source_port) = if is_cacheable {
+            let has_source_port = self
+                .has_source_port
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let source_port = if has_source_port {
+                query.source.port()
+            } else {
+                0
+            };
+            let hash = hash_route_query(query, ip, source_port);
+            (Some(hash), source_port)
         } else {
-            None
+            (None, 0)
         };
 
-        if let Some(ref k) = key {
-            let cache = self
+        if let Some(h) = cache_hash {
+            let mut cache = self
                 .route_cache
-                .read()
+                .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(res) = cache.get(k) {
-                return res.clone();
+            if let Some(res) = cache.get(h, query, ip, source_port) {
+                return res;
             }
         }
 
@@ -2360,23 +2463,34 @@ impl Router {
             .enumerate()
             .find(|(_, rule)| rule.matches(query, ip))
             .map(|(idx, rule)| {
-                (
+                Arc::new((
                     rule.target.clone(),
                     rule.webhook.clone(),
                     idx,
                     rule.tag.clone(),
-                )
+                ))
             });
 
-        if let Some(k) = key {
+        if let Some(h) = cache_hash {
+            let key = RouteCacheKey {
+                inbound: query.inbound.to_string(),
+                inbound_port: query.inbound_port,
+                user: query.user.to_string(),
+                source_ip: Some(query.source.ip()),
+                source_port,
+                network: query.network,
+                domain: query.domain.map(str::to_string),
+                ip,
+                port: query.port,
+                protocol: query.protocol.map(str::to_string),
+                local_ip: query.local_ip,
+                vless_route: query.vless_route,
+            };
             let mut cache = self
                 .route_cache
                 .write()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if cache.len() >= 2048 {
-                cache.clear();
-            }
-            cache.insert(k, res.clone());
+            cache.insert(h, key, res.clone());
         }
 
         res
@@ -2634,7 +2748,7 @@ pub fn parse_single_rule(raw: &Value, asset_dirs: &[PathBuf]) -> Result<Rule, St
         .cloned()
         .collect();
     for key in unknown {
-        log::warn(format!("routing rule field {key:?} is unknown, ignored"));
+        crate::log::warn!("routing rule field {key:?} is unknown, ignored");
         rule.remove(&key);
     }
     // The parser rejects a rule without conditions; this one matches everything.

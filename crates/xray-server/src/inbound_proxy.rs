@@ -23,7 +23,7 @@ use crate::routing::Action;
 use crate::vless::{
     copy_buf, host_label, read_first, relay_policy, Activity, Context, Host, RouteRequest,
 };
-use crate::{log, stats};
+use crate::stats;
 
 /// Xray's SOCKS inbound (also named `mixed`): the first byte picks SOCKS 5,
 /// SOCKS 4/4a, or HTTP on the same port.
@@ -479,7 +479,7 @@ where
         _ => match outbound::connect(&ctx.router, &decision, &host, port).await {
             Ok(target) => target,
             Err(e) => {
-                log::info(format!("http forward to {}:{port}: {e}", host_label(&host)));
+                crate::log::info!("http forward to {}:{port}: {e}", host_label(&host));
                 stream.write_all(HTTP_SERVICE_UNAVAILABLE).await?;
                 return Ok(false);
             }
@@ -512,7 +512,7 @@ where
         let response = match read_http_response(&mut target_r, &request.method).await {
             Ok(response) => response,
             Err(e) => {
-                log::info(format!("http response from {}:{port}: {e}", host_label(&host)));
+                crate::log::info!("http response from {}:{port}: {e}", host_label(&host));
                 client_w.write_all(HTTP_SERVICE_UNAVAILABLE).await?;
                 return Ok(false);
             }

@@ -409,7 +409,7 @@ pub async fn start(
                     Ok(connection) => {
                         handle_connection(connection, ctx, udp_idle_timeout, masq).await
                     }
-                    Err(e) => crate::log::debug(format!("quic handshake failed: {e}")),
+                    Err(e) => crate::log::debug!("quic handshake failed: {e}"),
                 }
             });
         }

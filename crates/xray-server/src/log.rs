@@ -98,6 +98,65 @@ fn open_sink(target: &str) -> Result<Option<Sink>, String> {
     }
 }
 
+#[allow(dead_code)]
+pub fn is_debug_enabled() -> bool {
+    LEVEL.load(Ordering::Relaxed) == DEBUG
+}
+
+#[allow(dead_code)]
+pub fn is_info_enabled() -> bool {
+    LEVEL.load(Ordering::Relaxed) <= INFO
+}
+
+#[allow(dead_code)]
+pub fn is_warn_enabled() -> bool {
+    LEVEL.load(Ordering::Relaxed) <= WARNING
+}
+
+#[allow(dead_code)]
+pub fn is_error_enabled() -> bool {
+    LEVEL.load(Ordering::Relaxed) <= ERROR
+}
+
+#[macro_export]
+macro_rules! log_debug {
+    ($($arg:tt)*) => {
+        if $crate::log::is_debug_enabled() {
+            $crate::log::debug(format_args!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        if $crate::log::is_info_enabled() {
+            $crate::log::info(format_args!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_warn {
+    ($($arg:tt)*) => {
+        if $crate::log::is_warn_enabled() {
+            $crate::log::warn(format_args!($($arg)*));
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        if $crate::log::is_error_enabled() {
+            $crate::log::error(format_args!($($arg)*));
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub use crate::{log_debug as debug, log_error as error, log_info as info, log_warn as warn};
+
 pub fn debug(message: impl Display) {
     write_error(DEBUG, "Debug", message);
 }

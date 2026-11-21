@@ -981,11 +981,11 @@ pub async fn start(
             .map_err(|e| format!("failed to bind udp socket on {bind_addr}: {e}"))?
     };
 
-    crate::log::info(format!(
+    crate::log::info!(
         "listening {} (mkcp) on {}",
         inbound.tag,
         socket.local_addr().unwrap()
-    ));
+    );
     let socket = Arc::new(socket);
     let obfuscator = Arc::new(PacketObfuscator::new(&settings));
 
@@ -1000,7 +1000,7 @@ pub async fn start(
             let (n, peer) = match socket.recv_from(&mut buf).await {
                 Ok(res) => res,
                 Err(e) => {
-                    crate::log::warn(format!("mkcp socket recv error: {e}"));
+                    crate::log::warn!("mkcp socket recv error: {e}");
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }

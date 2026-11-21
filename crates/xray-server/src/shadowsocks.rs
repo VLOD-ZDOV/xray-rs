@@ -222,7 +222,13 @@ type SessionsMap = Arc<Mutex<HashMap<SessionKey, UdpSessionEntry>>>;
 
 // Replay state outlives the per-peer session: the timestamp window is 30 s.
 const REPLAY_KEEP: Duration = Duration::from_secs(120);
-type ReplayMap = Arc<std::sync::Mutex<HashMap<(usize, u64), (Instant, ServerUdpSession)>>>;
+
+struct ReplayState {
+    last_prune: Instant,
+    entries: HashMap<(usize, u64), (Instant, ServerUdpSession)>,
+}
+
+type ReplayMap = Arc<std::sync::Mutex<ReplayState>>;
 
 struct UdpInit2022 {
     peer: SocketAddr,
@@ -264,7 +270,10 @@ impl ShadowsocksUdpHandler {
             socket,
             ctx,
             sessions: Arc::new(Mutex::new(HashMap::new())),
-            replay: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            replay: Arc::new(std::sync::Mutex::new(ReplayState {
+                last_prune: Instant::now(),
+                entries: HashMap::new(),
+            })),
             next_id: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -289,35 +298,46 @@ impl ShadowsocksUdpHandler {
 
     async fn run_2022(self) {
         let mut buf = vec![0u8; 65535];
+        let mut cached_version = u64::MAX;
+        let mut cached_users: Arc<Vec<ShadowsocksUser>> = Arc::new(Vec::new());
+        let mut cached_methods: Arc<Vec<Arc<xray_proxy::shadowsocks2022::Method>>> =
+            Arc::new(Vec::new());
+
         loop {
             let (n, peer) = match self.socket.recv_from(&mut buf).await {
                 Ok(res) => res,
                 Err(e) => {
-                    log::warn(format!("shadowsocks 2022 udp recv error: {e}"));
+                    crate::log::warn!("shadowsocks 2022 udp recv error: {e}");
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
             };
-            let users = same_kind_users(
-                self.ctx
-                    .ss_users
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-            );
-            let methods: Vec<Arc<xray_proxy::shadowsocks2022::Method>> = users
-                .iter()
-                .filter_map(|u| match &u.method {
-                    ShadowsocksMethod::Ss2022(m) => Some(m.clone()),
-                    _ => None,
-                })
-                .collect();
+            let current_version = self.ctx.ss_users_version.load(Ordering::Acquire);
+            if current_version != cached_version {
+                let users = same_kind_users(
+                    self.ctx
+                        .ss_users
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                );
+                let methods: Vec<Arc<xray_proxy::shadowsocks2022::Method>> = users
+                    .iter()
+                    .filter_map(|u| match &u.method {
+                        ShadowsocksMethod::Ss2022(m) => Some(m.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                cached_users = Arc::new(users);
+                cached_methods = Arc::new(methods);
+                cached_version = current_version;
+            }
             let Ok((user_idx, target, payload, client_id, packet_id)) =
-                ServerUdpSession::decode_request(&methods, &buf[..n])
+                ServerUdpSession::decode_request(&cached_methods, &buf[..n])
             else {
                 continue;
             };
-            let Some(user) = users.get(user_idx).cloned() else {
+            let Some(user) = cached_users.get(user_idx).cloned() else {
                 continue;
             };
             let ShadowsocksMethod::Ss2022(method) = &user.method else {
@@ -356,7 +376,7 @@ impl ShadowsocksUdpHandler {
             let handler = self.clone();
             tokio::spawn(async move {
                 if let Err(e) = Box::pin(handler.serve_udp_session_2022(init, rx)).await {
-                    log::debug(format!("shadowsocks 2022 udp session {peer} ended: {e}"));
+                    crate::log::debug!("shadowsocks 2022 udp session {peer} ended: {e}");
                 }
                 remove_session(&handler.sessions, key, id).await;
             });
@@ -371,20 +391,25 @@ impl ShadowsocksUdpHandler {
         method: &Arc<xray_proxy::shadowsocks2022::Method>,
     ) -> bool {
         let now = Instant::now();
-        let mut map = self
+        let mut state = self
             .replay
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !map.contains_key(&(user_key, client_id)) {
-            if map.len() >= 256 {
-                map.retain(|_, (seen, _)| now.duration_since(*seen) < REPLAY_KEEP);
+        if !state.entries.contains_key(&(user_key, client_id)) {
+            if state.entries.len() >= 256
+                && now.duration_since(state.last_prune) >= Duration::from_secs(5)
+            {
+                state
+                    .entries
+                    .retain(|_, (seen, _)| now.duration_since(*seen) < REPLAY_KEEP);
+                state.last_prune = now;
             }
             let Ok(session) = ServerUdpSession::new(method.clone(), client_id) else {
                 return false;
             };
-            map.insert((user_key, client_id), (now, session));
+            state.entries.insert((user_key, client_id), (now, session));
         }
-        let Some((seen, session)) = map.get_mut(&(user_key, client_id)) else {
+        let Some((seen, session)) = state.entries.get_mut(&(user_key, client_id)) else {
             return false;
         };
         *seen = now;
@@ -433,7 +458,7 @@ impl ShadowsocksUdpHandler {
         let activity = Activity::new();
         if let Ok(target) = cone.target(&host, port).await {
             if let Err(e) = cone.send_to(&init.payload, target).await {
-                log::debug(format!("shadowsocks 2022 udp send error: {e}"));
+                crate::log::debug!("shadowsocks 2022 udp send error: {e}");
             }
             traffic.up(init.payload.len());
         }
@@ -504,24 +529,32 @@ impl ShadowsocksUdpHandler {
 
     async fn run_2017(self) {
         let mut buf = vec![0u8; 65535];
+        let mut cached_version = u64::MAX;
+        let mut cached_users: Arc<Vec<ShadowsocksUser>> = Arc::new(Vec::new());
+
         loop {
             let (n, peer) = match self.socket.recv_from(&mut buf).await {
                 Ok(res) => res,
                 Err(e) => {
-                    log::warn(format!("shadowsocks udp recv error: {e}"));
+                    crate::log::warn!("shadowsocks udp recv error: {e}");
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
             };
-            let users = same_kind_users(
-                self.ctx
-                    .ss_users
-                    .read()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-            );
+            let current_version = self.ctx.ss_users_version.load(Ordering::Acquire);
+            if current_version != cached_version {
+                let users = same_kind_users(
+                    self.ctx
+                        .ss_users
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone(),
+                );
+                cached_users = Arc::new(users);
+                cached_version = current_version;
+            }
             let mut matched = None;
-            for user in &users {
+            for user in cached_users.iter() {
                 let ShadowsocksMethod::Aead2017(m) = &user.method else {
                     continue;
                 };
@@ -561,7 +594,7 @@ impl ShadowsocksUdpHandler {
                 if let Err(e) =
                     Box::pin(handler.serve_udp_session_2017(peer, user, target, payload, rx)).await
                 {
-                    log::debug(format!("shadowsocks udp session {peer} ended: {e}"));
+                    crate::log::debug!("shadowsocks udp session {peer} ended: {e}");
                 }
                 remove_session(&handler.sessions, key, id).await;
             });
@@ -606,7 +639,7 @@ impl ShadowsocksUdpHandler {
         let activity = Activity::new();
         if let Ok(target) = cone.target(&host, port).await {
             if let Err(e) = cone.send_to(&initial_payload, target).await {
-                log::debug(format!("shadowsocks udp send error: {e}"));
+                crate::log::debug!("shadowsocks udp send error: {e}");
             }
             traffic.up(initial_payload.len());
         }

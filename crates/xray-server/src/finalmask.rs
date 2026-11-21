@@ -352,9 +352,9 @@ pub fn warn_inbound_finalmask(stream: &Value, protocol: &str, tag: &str) {
                 _ => false,
             };
             if !supported {
-                crate::log::warn(format!(
+                crate::log::warn!(
                     "inbound {tag:?}: streamSettings.finalmask.{layer}: mask type {kind:?} is not supported yet, ignored"
-                ));
+                );
             }
         }
     }
@@ -373,9 +373,9 @@ pub fn validate_and_log_finalmask(outbound: &Value, tag: &str) -> Result<(), Str
                 .iter()
                 .any(|kind| mask_type.eq_ignore_ascii_case(kind))
             {
-                crate::log::warn(format!(
+                crate::log::warn!(
                     "outbound {tag:?}: streamSettings.finalmask.tcp: mask type {mask_type:?} is not supported yet, ignored"
-                ));
+                );
             }
         }
     }
@@ -384,9 +384,9 @@ pub fn validate_and_log_finalmask(outbound: &Value, tag: &str) -> Result<(), Str
             let mask_type = mask.get("type").and_then(Value::as_str).unwrap_or("");
             if !mask_type.eq_ignore_ascii_case("noise") && !mask_type.eq_ignore_ascii_case("udphop")
             {
-                crate::log::warn(format!(
+                crate::log::warn!(
                     "outbound {tag:?}: streamSettings.finalmask.udp: mask type {mask_type:?} is not supported yet, ignored"
-                ));
+                );
             }
         }
     }

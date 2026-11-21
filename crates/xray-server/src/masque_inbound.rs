@@ -475,21 +475,21 @@ pub async fn start(
             ) {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
-                    log::warn(format!("MASQUE failed to build TLS config: {e}"));
+                    crate::log::warn!("MASQUE failed to build TLS config: {e}");
                     return;
                 }
             };
             let listener = match tokio::net::TcpListener::bind(bind_addr).await {
                 Ok(l) => l,
                 Err(e) => {
-                    log::warn(format!("MASQUE failed to bind TCP {bind_addr}: {e}"));
+                    crate::log::warn!("MASQUE failed to bind TCP {bind_addr}: {e}");
                     return;
                 }
             };
-            log::info(format!(
+            crate::log::info!(
                 "listening {} (masque over h2) on {}",
                 inbound_tag, bind_addr
-            ));
+            );
 
             let acceptor = tokio_rustls::TlsAcceptor::from(rustls_cfg);
             let u = h2_users.clone();
@@ -505,7 +505,7 @@ pub async fn start(
                         r = listener.accept() => match r {
                             Ok((stream, _peer)) => stream,
                             Err(e) => {
-                                log::warn(format!("MASQUE accept: {e}"));
+                                crate::log::warn!("MASQUE accept: {e}");
                                 tokio::time::sleep(Duration::from_millis(50)).await;
                                 continue;
                             }
@@ -574,14 +574,14 @@ pub async fn start(
             let h3_quic = match crate::xhttp_outbound::xhttp_h3_quic_config(quic_params.as_ref()) {
                 Ok(c) => c,
                 Err(e) => {
-                    log::warn(format!("MASQUE H3 config error: {e}"));
+                    crate::log::warn!("MASQUE H3 config error: {e}");
                     return;
                 }
             };
             let mut transport_cfg = match crate::xhttp::build_quic_transport_config(&h3_quic) {
                 Ok(c) => c,
                 Err(e) => {
-                    log::warn(format!("MASQUE H3 transport error: {e}"));
+                    crate::log::warn!("MASQUE H3 transport error: {e}");
                     return;
                 }
             };
@@ -595,7 +595,7 @@ pub async fn start(
             ) {
                 Ok(c) => Arc::new(c),
                 Err(e) => {
-                    log::warn(format!("MASQUE H3 TLS error: {e}"));
+                    crate::log::warn!("MASQUE H3 TLS error: {e}");
                     return;
                 }
             };
@@ -603,7 +603,7 @@ pub async fn start(
                 match quinn::crypto::rustls::QuicServerConfig::try_from(rustls_cfg) {
                     Ok(c) => c,
                     Err(e) => {
-                        log::warn(format!("MASQUE H3 crypto error: {e}"));
+                        crate::log::warn!("MASQUE H3 crypto error: {e}");
                         return;
                     }
                 };
@@ -613,14 +613,14 @@ pub async fn start(
             let endpoint = match quinn::Endpoint::server(server_cfg, bind_addr) {
                 Ok(ep) => ep,
                 Err(e) => {
-                    log::warn(format!("MASQUE failed to bind UDP {bind_addr}: {e}"));
+                    crate::log::warn!("MASQUE failed to bind UDP {bind_addr}: {e}");
                     return;
                 }
             };
-            log::info(format!(
+            crate::log::info!(
                 "listening {} (masque over h3) on {}",
                 inbound_tag, bind_addr
-            ));
+            );
 
             let u = users.clone();
             let p = path.clone();
@@ -1050,7 +1050,7 @@ async fn handle_tcp(tcp: IncomingTcpStream, ctx: Arc<crate::vless::Context>, rou
     let target_stream = match outbound::connect(&router, &decision, &host, tcp.dst.port()).await {
         Ok(s) => s,
         Err(e) => {
-            log::warn(format!("masque tcp connect {}: {e}", tcp.dst));
+            crate::log::warn!("masque tcp connect {}: {e}", tcp.dst);
             return;
         }
     };
@@ -1099,7 +1099,7 @@ async fn handle_udp(udp: IncomingUdpSession, ctx: Arc<crate::vless::Context>, ro
     let cone = match ConeUdp::open(router.clone(), &decision).await {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            log::warn(format!("masque udp open {}: {e}", udp.dst));
+            crate::log::warn!("masque udp open {}: {e}", udp.dst);
             return;
         }
     };

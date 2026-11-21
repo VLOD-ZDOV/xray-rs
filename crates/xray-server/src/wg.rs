@@ -186,7 +186,7 @@ impl WgOutbound {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 if let Err(e) = self.client().await {
-                    log::warn(format!("wireguard outbound {:?}: {e}", self.tag));
+                    crate::log::warn!("wireguard outbound {:?}: {e}", self.tag);
                 }
             });
         }
@@ -221,7 +221,7 @@ impl WgOutbound {
         let client = Client::start_with_options(self.config(endpoints), protector, options)
             .await
             .map_err(to_io)?;
-        log::info(format!("wireguard outbound {:?} started", self.tag));
+        crate::log::info!("wireguard outbound {:?} started", self.tag);
         *slot = Some(client.clone());
         Ok(client)
     }
@@ -272,7 +272,7 @@ impl WgOutbound {
                 .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            log::warn(format!("wireguard outbound {:?}: connection limit ({TCP_FLOWS}) reached, new connections are refused", self.tag));
+            crate::log::warn!("wireguard outbound {:?}: connection limit ({TCP_FLOWS}) reached, new connections are refused", self.tag);
         }
     }
 

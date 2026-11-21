@@ -134,7 +134,7 @@ fn main() -> ExitCode {
     let config = match config::load(&config_path) {
         Ok(config) => config,
         Err(e) => {
-            log::error(format!("failed to load config: {e}"));
+            crate::log::error!("failed to load config: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -197,7 +197,7 @@ fn main() -> ExitCode {
     {
         Ok(runtime) => runtime,
         Err(e) => {
-            log::error(format!("failed to start runtime: {e}"));
+            crate::log::error!("failed to start runtime: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -269,7 +269,7 @@ async fn run(
     _realities: Vec<Option<Arc<reality::RealityServer>>>,
 ) -> Result<(), String> {
     start_ocsp_stapling();
-    log::info(format!("xray-rs {} started", env!("CARGO_PKG_VERSION")));
+    crate::log::info!("xray-rs {} started", env!("CARGO_PKG_VERSION"));
     stats::init(config.stats);
     if let Some(fakedns) = config.fakedns {
         fakedns::init(fakedns);
@@ -295,9 +295,8 @@ async fn run(
     let inbound_manager = Arc::new(api::InboundManager::new(router.clone()));
     for (inbound, acceptor) in config.inbounds.into_iter().zip(tls) {
         let tag = inbound.tag.clone();
-        let config = api::inbound_handler_config(&inbound);
         let (ctx, tcp_abort, udp_abort) = start_inbound(&inbound, acceptor, router.clone()).await?;
-        inbound_manager.insert_initial(tag, ctx, tcp_abort, udp_abort, config);
+        inbound_manager.insert_initial(tag, ctx, tcp_abort, udp_abort, inbound);
     }
     if let Some(addr) = config.api {
         api::serve(
@@ -323,7 +322,7 @@ async fn shutdown_signal() {
     ) {
         (Ok(interrupt), Ok(terminate)) => (interrupt, terminate),
         (Err(error), _) | (_, Err(error)) => {
-            log::warn(format!("failed to wait for shutdown signal: {error}"));
+            crate::log::warn!("failed to wait for shutdown signal: {error}");
             return;
         }
     };
@@ -486,6 +485,7 @@ pub(crate) async fn start_inbound(
         )),
         vless_encryption: inbound.vless_encryption.clone(),
         vmess_keys: Default::default(),
+        ss_users_version: std::sync::atomic::AtomicU64::new(0),
     });
 
     if inbound.protocol != InboundProtocol::Hysteria
@@ -554,11 +554,11 @@ pub(crate) async fn start_inbound(
     }
 
     let listener = bind(inbound).await?;
-    log::info(format!(
+    crate::log::info!(
         "listening {} on {}",
         inbound.tag,
         listener.local_addr().map_err(|e| e.to_string())?
-    ));
+    );
     let is_ss_udp = inbound.protocol == InboundProtocol::Shadowsocks && inbound.udp;
     let is_dokodemo_udp = inbound.protocol == InboundProtocol::Dokodemo && inbound.udp;
     let dokodemo_settings = inbound.dokodemo.clone();
@@ -608,11 +608,11 @@ pub(crate) async fn start_inbound(
                 return Err(e);
             }
         };
-        log::info(format!(
+        crate::log::info!(
             "listening udp {} on {}",
             ss_inbound_tag,
             udp_socket.local_addr().map_err(|e| e.to_string())?
-        ));
+        );
         let udp_handler =
             shadowsocks::ShadowsocksUdpHandler::new(Arc::new(udp_socket), ctx.clone());
         let udp_task = tokio::spawn(udp_handler.run());
@@ -655,11 +655,11 @@ async fn start_dokodemo_udp(
         })?,
         None => bind_udp_addr(&inbound.listen, inbound.port).await?,
     };
-    log::info(format!(
+    crate::log::info!(
         "listening udp {} on {}",
         inbound.tag,
         udp_socket.local_addr().map_err(|e| e.to_string())?
-    ));
+    );
     let udp_handler = dokodemo::DokodemoUdpHandler::new(
         Arc::new(udp_socket),
         Arc::new(settings),
@@ -1023,7 +1023,7 @@ async fn accept_loop(
         let (mut stream, mut peer) = match listener.accept().await {
             Ok(accepted) => accepted,
             Err(e) => {
-                log::warn(format!("accept failed: {e}"));
+                crate::log::warn!("accept failed: {e}");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 continue;
             }
@@ -1060,14 +1060,14 @@ async fn accept_loop(
                         leftover
                     }
                     Ok(Err(e)) => {
-                        log::info(format!(
+                        crate::log::info!(
                             "proxy protocol from {} rejected: {e}",
                             log::mask(peer)
-                        ));
+                        );
                         return;
                     }
                     Err(_) => {
-                        log::info(format!("proxy protocol from {} timed out", log::mask(peer)));
+                        crate::log::info!("proxy protocol from {} timed out", log::mask(peer));
                         return;
                     }
                 }
@@ -1088,11 +1088,11 @@ async fn accept_loop(
                             httpupgrade::PrefixedStream::new(InboundIo::Masked(masked), Vec::new())
                     }
                     Ok(Err(e)) => {
-                        log::debug(format!("finalmask from {} failed: {e}", log::mask(peer)));
+                        crate::log::debug!("finalmask from {} failed: {e}", log::mask(peer));
                         return;
                     }
                     Err(_) => {
-                        log::debug(format!("finalmask from {} timed out", log::mask(peer)));
+                        crate::log::debug!("finalmask from {} timed out", log::mask(peer));
                         return;
                     }
                 }
@@ -1110,10 +1110,10 @@ async fn accept_loop(
                         .await
                     }
                     Ok(None) => {}
-                    Err(e) => log::debug(format!(
+                    Err(e) => crate::log::debug!(
                         "reality handling from {} failed: {e}",
                         log::mask(peer)
-                    )),
+                    ),
                 }
             } else {
                 match (tls, http_obfs) {
@@ -1131,10 +1131,10 @@ async fn accept_loop(
                                 return;
                             }
                             _ => {
-                                log::debug(format!(
+                                crate::log::debug!(
                                     "tls from {}: first record does not look like a TLS handshake",
                                     log::mask(peer)
-                                ));
+                                );
                                 return;
                             }
                         };
@@ -1161,14 +1161,14 @@ async fn accept_loop(
                                 )
                                 .await
                             }
-                            Ok(Err(e)) => log::debug(format!(
+                            Ok(Err(e)) => crate::log::debug!(
                                 "tls handshake from {} failed: {e}",
                                 log::mask(peer)
-                            )),
-                            Err(_) => log::debug(format!(
+                            ),
+                            Err(_) => crate::log::debug!(
                                 "tls handshake from {} timed out",
                                 log::mask(peer)
-                            )),
+                            ),
                         }
                     }
                     (None, Some(obfs)) => {
@@ -1188,12 +1188,12 @@ async fn accept_loop(
                                 )
                                 .await
                             }
-                            Ok(Err(e)) => log::debug(format!(
+                            Ok(Err(e)) => crate::log::debug!(
                                 "http obfs from {} failed: {e}",
                                 log::mask(peer)
-                            )),
+                            ),
                             Err(_) => {
-                                log::debug(format!("http obfs from {} timed out", log::mask(peer)))
+                                crate::log::debug!("http obfs from {} timed out", log::mask(peer))
                             }
                         }
                     }
@@ -1376,7 +1376,7 @@ async fn dispatch(
         InboundHandler::VlessTcp(ctx) => Box::pin(async move {
             let tls = stream.handshake_info();
             if let Err(e) = vless::serve_stream(stream, &ctx, peer, &tls).await {
-                log::info(format!("vless from {} rejected: {e}", log::mask(peer)));
+                crate::log::info!("vless from {} rejected: {e}", log::mask(peer));
             }
         }),
         InboundHandler::VlessWs(ctx, ws_settings, trusted_xff) => Box::pin(async move {
@@ -1390,11 +1390,11 @@ async fn dispatch(
                     )
                     .await
                     {
-                        log::info(format!("vless-ws from {} rejected: {e}", log::mask(peer)));
+                        crate::log::info!("vless-ws from {} rejected: {e}", log::mask(peer));
                     }
                 }
                 Err(e) => {
-                    log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
+                    crate::log::info!("ws handshake from {} failed: {e}", log::mask(peer));
                 }
             }
         }),
@@ -1403,17 +1403,17 @@ async fn dispatch(
                 Ok((prefixed_stream, peer)) => {
                     let (uplink, downlink) = tokio::io::split(prefixed_stream);
                     if let Err(e) = vless::serve(uplink, downlink, &ctx, peer).await {
-                        log::info(format!(
+                        crate::log::info!(
                             "vless-httpupgrade from {} rejected: {e}",
                             log::mask(peer)
-                        ));
+                        );
                     }
                 }
                 Err(e) => {
-                    log::info(format!(
+                    crate::log::info!(
                         "httpupgrade handshake from {} failed: {e}",
                         log::mask(peer)
-                    ));
+                    );
                 }
             }
         }),
@@ -1421,7 +1421,7 @@ async fn dispatch(
             let tls = stream.handshake_info();
             let (r, w) = tokio::io::split(stream);
             if let Err(e) = Box::pin(trojan::serve(r, w, &ctx, peer, &tls)).await {
-                log::info(format!("trojan from {} rejected: {e}", log::mask(peer)));
+                crate::log::info!("trojan from {} rejected: {e}", log::mask(peer));
             }
         }),
         InboundHandler::TrojanWs(ctx, ws_settings, trusted_xff) => Box::pin(async move {
@@ -1437,11 +1437,11 @@ async fn dispatch(
                     ))
                     .await
                     {
-                        log::info(format!("trojan-ws from {} rejected: {e}", log::mask(peer)));
+                        crate::log::info!("trojan-ws from {} rejected: {e}", log::mask(peer));
                     }
                 }
                 Err(e) => {
-                    log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
+                    crate::log::info!("ws handshake from {} failed: {e}", log::mask(peer));
                 }
             }
         }),
@@ -1458,17 +1458,17 @@ async fn dispatch(
                     ))
                     .await
                     {
-                        log::info(format!(
+                        crate::log::info!(
                             "trojan-httpupgrade from {} rejected: {e}",
                             log::mask(peer)
-                        ));
+                        );
                     }
                 }
                 Err(e) => {
-                    log::info(format!(
+                    crate::log::info!(
                         "httpupgrade handshake from {} failed: {e}",
                         log::mask(peer)
-                    ));
+                    );
                 }
             }
         }),
@@ -1476,7 +1476,7 @@ async fn dispatch(
             let drain = stream.is_raw_tcp();
             let (r, w) = tokio::io::split(stream);
             if let Err(e) = Box::pin(vmess::serve(r, w, &ctx, peer, drain)).await {
-                log::info(format!("vmess from {} rejected: {e}", log::mask(peer)));
+                crate::log::info!("vmess from {} rejected: {e}", log::mask(peer));
             }
         }),
         InboundHandler::VmessWs(ctx, ws_settings, trusted_xff) => Box::pin(async move {
@@ -1486,11 +1486,11 @@ async fn dispatch(
                     if let Err(e) =
                         Box::pin(vmess::serve(uplink, downlink, &ctx, peer, false)).await
                     {
-                        log::info(format!("vmess-ws from {} rejected: {e}", log::mask(peer)));
+                        crate::log::info!("vmess-ws from {} rejected: {e}", log::mask(peer));
                     }
                 }
                 Err(e) => {
-                    log::info(format!("ws handshake from {} failed: {e}", log::mask(peer)));
+                    crate::log::info!("ws handshake from {} failed: {e}", log::mask(peer));
                 }
             }
         }),
@@ -1501,17 +1501,17 @@ async fn dispatch(
                     if let Err(e) =
                         Box::pin(vmess::serve(uplink, downlink, &ctx, peer, false)).await
                     {
-                        log::info(format!(
+                        crate::log::info!(
                             "vmess-httpupgrade from {} rejected: {e}",
                             log::mask(peer)
-                        ));
+                        );
                     }
                 }
                 Err(e) => {
-                    log::info(format!(
+                    crate::log::info!(
                         "httpupgrade handshake from {} failed: {e}",
                         log::mask(peer)
-                    ));
+                    );
                 }
             }
         }),
@@ -1519,26 +1519,26 @@ async fn dispatch(
             if let Err(e) =
                 inbound_proxy::serve_socks(stream, &auth, udp, &ctx, peer, local, level).await
             {
-                log::info(format!("socks from {} rejected: {e}", log::mask(peer)));
+                crate::log::info!("socks from {} rejected: {e}", log::mask(peer));
             }
         }),
         InboundHandler::Http(ctx, auth, level) => Box::pin(async move {
             if let Err(e) = inbound_proxy::serve_http(stream, &auth, &ctx, peer, level).await {
-                log::info(format!("http from {} rejected: {e}", log::mask(peer)));
+                crate::log::info!("http from {} rejected: {e}", log::mask(peer));
             }
         }),
         InboundHandler::Shadowsocks(ctx) => Box::pin(async move {
             let raw = stream.raw_tcp_socket();
             if let Err(e) = shadowsocks::serve_tcp(stream, &ctx, peer, raw).await {
-                log::info(format!(
+                crate::log::info!(
                     "shadowsocks from {} rejected: {e}",
                     log::mask(peer)
-                ));
+                );
             }
         }),
         InboundHandler::Dokodemo(ctx, settings) => Box::pin(async move {
             if let Err(e) = dokodemo::serve_tcp(stream, &settings, &ctx, peer, original).await {
-                log::warn(format!("dokodemo from {} rejected: {e}", log::mask(peer)));
+                crate::log::warn!("dokodemo from {} rejected: {e}", log::mask(peer));
             }
         }),
         InboundHandler::VlessGrpc(h) | InboundHandler::TrojanGrpc(h) => Box::pin(async move {
@@ -1626,10 +1626,10 @@ impl<I: AsyncRead + AsyncWrite + Unpin> AsyncRead for HeaderDeadline<I> {
                 self.head_len += head;
                 if self.head_len > self.limit + 4096 {
                     let _ = Pin::new(&mut self.io).poll_write(cx, HEADERS_TOO_LARGE);
-                    log::debug(format!(
+                    crate::log::debug!(
                         "xhttp: request headers over {} bytes",
                         self.head_len
-                    ));
+                    );
                     return std::task::Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         "request headers too large",
@@ -1765,10 +1765,10 @@ where
         tail: [0; 3],
     };
     if let Err(e) = builder.serve_connection(TokioIo::new(io), service).await {
-        log::debug(format!(
+        crate::log::debug!(
             "http connection from {} ended: {e}",
             log::mask(peer)
-        ));
+        );
     }
 }
 
@@ -1954,7 +1954,7 @@ fn spawn_ocsp_stapling(resolver: &Arc<SniCheckingResolver>, index: usize) {
                         cert.certified_key = Arc::new(key);
                     }
                 }
-                Err(e) => log::warn(format!("ignoring invalid OCSP: {e}")),
+                Err(e) => crate::log::warn!("ignoring invalid OCSP: {e}"),
             }
         }
     };
@@ -2095,7 +2095,7 @@ fn selected_kx_groups(
             _ => None,
         };
         let Some(group) = group else {
-            log::warn(format!("unsupported curve name: {name}"));
+            crate::log::warn!("unsupported curve name: {name}");
             continue;
         };
         match available.iter().find(|candidate| candidate.name() == group) {
@@ -2104,7 +2104,7 @@ fn selected_kx_groups(
                     wanted.push(*candidate);
                 }
             }
-            None => log::warn(format!("unsupported curve name: {name}")),
+            None => crate::log::warn!("unsupported curve name: {name}"),
         }
     }
     wanted

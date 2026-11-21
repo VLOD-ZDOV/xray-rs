@@ -11,7 +11,6 @@ use tokio::net::{TcpListener, TcpSocket, UdpSocket};
 use tokio_tfo::{TfoListener, TfoStream};
 
 use crate::config::{SockoptSettings, TproxyMode};
-use crate::log;
 use crate::raw_sockopt::AsSock;
 
 fn max_backlog() -> i32 {
@@ -245,7 +244,7 @@ mod os {
 
 fn warn(option: &str, result: io::Result<()>) {
     if let Err(e) = result {
-        log::warn(format!("sockopt {option}: {e}"));
+        crate::log::warn!("sockopt {option}: {e}");
     }
 }
 
@@ -254,9 +253,9 @@ fn apply_custom_sockopts(fd: &impl AsSock, sockopt: &SockoptSettings, network: &
     for custom in &sockopt.custom_sockopt {
         if let Some(sys) = &custom.system {
             if !sys.is_empty() && !sys.eq_ignore_ascii_case(os) {
-                log::debug(format!(
+                crate::log::debug!(
                     "CustomSockopt system not match: want {sys} got {os}"
-                ));
+                );
                 continue;
             }
         }
@@ -373,13 +372,13 @@ fn apply_trusted_x_forwarded_for_value(
         }
     }
     if trusted.is_empty() {
-        log::warn(format!(
+        crate::log::warn!(
             "received \"X-Forwarded-For\" from {remote_addr} but \"sockopt.trustedXForwardedFor\" is not configured; ignoring it and using the real remote address"
-        ));
+        );
     } else {
-        log::error(format!(
+        crate::log::error!(
             "ignored potentially forged \"X-Forwarded-For\" from {remote_addr}: {value}"
-        ));
+        );
     }
     remote_addr
 }

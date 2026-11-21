@@ -582,10 +582,10 @@ impl RealityServer {
                 return Ok(None);
             }
             Err(_) => {
-                log::debug(format!(
+                crate::log::debug!(
                     "reality handshake from {} timed out",
                     log::mask(peer)
-                ));
+                );
                 return Ok(None);
             }
         }
@@ -608,10 +608,10 @@ impl RealityServer {
                 return Ok(None);
             }
             Err(_) => {
-                log::debug(format!(
+                crate::log::debug!(
                     "reality handshake from {} timed out",
                     log::mask(peer)
-                ));
+                );
                 return Ok(None);
             }
         }
@@ -624,19 +624,19 @@ impl RealityServer {
         let mut dest: Box<dyn Stream> = match self.connect_dest().await {
             Ok(d) => d,
             Err(e) => {
-                log::info(format!(
+                crate::log::info!(
                     "REALITY remoteAddr: {peer} failed to connect dest: {e}",
                     peer = log::mask(peer),
-                ));
+                );
                 return Ok(None);
             }
         };
 
         if let Err(e) = dest.write_all(&full_record).await {
-            log::info(format!(
+            crate::log::info!(
                 "REALITY remoteAddr: {peer} failed to write ClientHello to dest: {e}",
                 peer = log::mask(peer),
-            ));
+            );
             return Ok(None);
         }
 
@@ -656,7 +656,7 @@ impl RealityServer {
             Ok(dh) => dh,
             Err((s2c_saved, reason)) => {
                 if self.settings.show {
-                    log::info(format!("REALITY remoteAddr: {peer} dest not TLS 1.3 or bad hello ({reason}), forwarding client to dest", peer = log::mask(peer)));
+                    crate::log::info!("REALITY remoteAddr: {peer} dest not TLS 1.3 or bad hello ({reason}), forwarding client to dest", peer = log::mask(peer));
                 }
                 self.forward_client_to_dest(stream, dest, &s2c_saved)
                     .await?;
@@ -681,10 +681,10 @@ impl RealityServer {
                 Ok(Some(tls_stream))
             }
             Err(e) => {
-                log::debug(format!(
+                crate::log::debug!(
                     "REALITY handshake from {peer} failed: {e}",
                     peer = log::mask(peer)
-                ));
+                );
                 Ok(None)
             }
         }
@@ -705,11 +705,11 @@ impl RealityServer {
         };
         if !is_sni_match {
             if self.settings.show {
-                log::info(format!(
+                crate::log::info!(
                     "REALITY remoteAddr: {peer} forwarded SNI: {:?}",
                     client_hello.server_name,
                     peer = log::mask(peer),
-                ));
+                );
             }
             return None;
         }
@@ -754,11 +754,11 @@ impl RealityServer {
         }
 
         if self.settings.show {
-            log::info(format!(
+            crate::log::info!(
                 "REALITY remoteAddr: {peer} valid REALITY client: ver={:?}, time={}, short_id={:02x?}",
                 decrypted.version, decrypted.unix_time, decrypted.short_id,
                 peer = log::mask(peer),
-            ));
+            );
         }
 
         Some(decrypted.auth_key)
@@ -1260,7 +1260,7 @@ impl RealityServer {
                 stream.write_all(&header).await?;
                 stream.write_all(&ciphertext).await?;
                 if self.settings.show {
-                    log::info(format!("REALITY len(postHandshakeRecord): {length}"));
+                    crate::log::info!("REALITY len(postHandshakeRecord): {length}");
                 }
             }
         }

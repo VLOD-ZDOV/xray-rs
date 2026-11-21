@@ -16,7 +16,6 @@ use tokio::time::timeout;
 
 use xray_config::Network;
 
-use crate::log;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, Decision, Router};
 use crate::stats::{self, Traffic};
@@ -525,7 +524,7 @@ async fn tcp_session(
     }
     .await;
     if let Err(e) = &result {
-        log::debug(format!("mux tcp session {id} ended: {e}"));
+        crate::log::debug!("mux tcp session {id} ended: {e}");
     }
     let _ = out.send(end_frame(id, result.is_err())).await;
 }
@@ -566,14 +565,14 @@ async fn xudp_worker(
                     None => match cone.target(host, port).await {
                         Ok(addr) => *resolved.entry(key).or_insert(addr),
                         Err(e) => {
-                            log::debug(format!("mux xudp {gid:?}: {e}"));
+                            crate::log::debug!("mux xudp {gid:?}: {e}");
                             continue;
                         }
                     },
                 };
                 match cone.send_to(&packet.data, addr).await {
                     Ok(()) => dial.traffic.up(packet.data.len()),
-                    Err(e) => log::debug(format!("mux xudp {gid:?} send to {addr}: {e}")),
+                    Err(e) => crate::log::debug!("mux xudp {gid:?} send to {addr}: {e}"),
                 }
             }
             Ok::<(), io::Error>(())
@@ -633,7 +632,7 @@ async fn xudp_worker(
     }
     .await;
     if let Err(e) = &result {
-        log::debug(format!("mux xudp worker {gid:?} ended: {e}"));
+        crate::log::debug!("mux xudp worker {gid:?} ended: {e}");
     }
     let mut mgr = XUDP_MANAGER.write().unwrap();
     if mgr
@@ -671,14 +670,14 @@ async fn udp_session(
                     None => match cone.target(host, port).await {
                         Ok(addr) => *resolved.entry(key).or_insert(addr),
                         Err(e) => {
-                            log::debug(format!("mux udp {id}: {e}"));
+                            crate::log::debug!("mux udp {id}: {e}");
                             continue;
                         }
                     },
                 };
                 match cone.send_to(&packet.data, addr).await {
                     Ok(()) => dial.traffic.up(packet.data.len()),
-                    Err(e) => log::debug(format!("mux udp {id} send to {addr}: {e}")),
+                    Err(e) => crate::log::debug!("mux udp {id} send to {addr}: {e}"),
                 }
             }
             Ok::<(), io::Error>(())
@@ -703,7 +702,7 @@ async fn udp_session(
     }
     .await;
     if let Err(e) = &result {
-        log::debug(format!("mux udp session {id} ended: {e}"));
+        crate::log::debug!("mux udp session {id} ended: {e}");
     }
     let _ = out.send(end_frame(id, result.is_err())).await;
 }

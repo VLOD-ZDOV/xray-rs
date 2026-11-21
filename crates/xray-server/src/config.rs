@@ -1173,7 +1173,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
             }
         }
         if security != "tls" {
-            log::warn(format!("skipping inbound {tag:?}: Hysteria requires TLS"));
+            crate::log::warn!("skipping inbound {tag:?}: Hysteria requires TLS");
             return Ok(None);
         }
     } else if (!is_tcp
@@ -1205,9 +1205,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     let http_obfs = if is_tcp && header_type == "http" {
         Some(parse_http_obfs(header))
     } else if is_tcp && !matches!(header_type, "" | "none") {
-        log::warn(format!(
+        crate::log::warn!(
             "skipping inbound {tag:?}: tcp header obfuscation {header_type:?} is not supported yet"
-        ));
+        );
         return Ok(None);
     } else {
         None
@@ -1461,9 +1461,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     if security == "tls" && array(tls_section, "certificates").is_empty() {
         // Xray starts such an inbound and fails every handshake; the others
         // keep running there too, so only this one is left out.
-        log::warn(format!(
+        crate::log::warn!(
             "skipping inbound {tag:?}: tlsSettings.certificates is empty"
-        ));
+        );
         return Ok(None);
     }
     let tls = if security == "tls" {
@@ -1473,7 +1473,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     };
     let reality = if security == "reality" {
         let Some(settings) = stream.get("realitySettings") else {
-            log::warn(format!("skipping inbound {tag:?}: missing realitySettings"));
+            crate::log::warn!("skipping inbound {tag:?}: missing realitySettings");
             return Ok(None);
         };
         match parse_reality(settings, &tag)? {
@@ -1523,9 +1523,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     };
     for (i, fb) in array(settings, "fallbacks").iter().enumerate() {
         if str_field(fb, "dest") == "serve-ws-none" {
-            log::warn(format!(
+            crate::log::warn!(
                 "inbound {tag:?}: fallback {i} skipped: serve-ws-none is not supported"
-            ));
+            );
             continue;
         }
         fallbacks.push(parse_fallback(fb).map_err(|e| format!("{fallback_owner} fallbacks: {e}"))?);
@@ -1985,7 +1985,7 @@ pub fn parse_sockopt(sockopt: &Value, _owner: &str) -> Result<Option<SockoptSett
                 let typ = obj.get("type").and_then(Value::as_str).unwrap_or("");
                 if !matches!(typ, "int" | "str") {
                     if applies {
-                        log::warn(format!("customSockopt: unsupported type {typ:?}, ignored"));
+                        crate::log::warn!("customSockopt: unsupported type {typ:?}, ignored");
                     }
                     continue;
                 }
@@ -2466,16 +2466,16 @@ fn xray_dns_section(section: &Value) -> Value {
                     out.insert((*name).to_owned(), value.clone());
                 }
                 Some((name, false)) => {
-                    log::warn(format!("{path}.{name} is not supported yet, ignored"));
+                    crate::log::warn!("{path}.{name} is not supported yet, ignored");
                 }
-                None => log::warn(format!("unknown field {path}.{key} ignored")),
+                None => crate::log::warn!("unknown field {path}.{key} ignored"),
             }
         }
         if let Some(Value::String(strategy)) = out.get("queryStrategy") {
             if !DNS_QUERY_STRATEGIES.contains(&strategy.to_ascii_lowercase().as_str()) {
-                log::warn(format!(
+                crate::log::warn!(
                     "{path}.queryStrategy {strategy:?} is unknown, using UseIP as Xray does"
-                ));
+                );
                 out.insert("queryStrategy".to_owned(), Value::from("UseIP"));
             }
         }
@@ -2694,10 +2694,10 @@ fn parse_sniffing(item: &Value, tag: &str) -> crate::vless::Sniffing {
     }
     sniffing.domains_excluded = std::sync::Arc::new(excluded);
     if !ignored.is_empty() {
-        log::warn(format!(
+        crate::log::warn!(
             "inbound {tag:?}: sniffing {} ignored",
             ignored.join(", ")
-        ));
+        );
     }
     sniffing
 }

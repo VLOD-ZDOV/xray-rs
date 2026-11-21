@@ -1307,7 +1307,7 @@ pub async fn start_inbound(
             let (accepted, sessions) = match listener.accept_pending().await {
                 Ok(res) => res,
                 Err(e) => {
-                    crate::log::warn(format!("xdrive listener: failed to list sessions: {e}"));
+                    crate::log::warn!("xdrive listener: failed to list sessions: {e}");
                     (false, Vec::new())
                 }
             };
@@ -1328,7 +1328,7 @@ pub async fn start_inbound(
 
                     let res = crate::vless::serve_stream(stream, &vless_ctx, peer, &tls).await;
                     if let Err(e) = res {
-                        crate::log::debug(format!("xdrive session {sess} closed: {e}"));
+                        crate::log::debug!("xdrive session {sess} closed: {e}");
                     }
                     active_set.lock().await.remove(&sess);
                 });
