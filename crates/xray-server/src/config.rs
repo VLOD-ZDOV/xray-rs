@@ -2004,7 +2004,7 @@ pub fn parse_sockopt(sockopt: &Value, _owner: &str) -> Result<Option<SockoptSett
                 }
                 let Some(opt) = parse_i32_val(obj.get("opt")) else {
                     if applies {
-                        log::warn("customSockopt: missing \"opt\", ignored");
+                        crate::log::warn!("customSockopt: missing \"opt\", ignored");
                     }
                     continue;
                 };
@@ -2533,9 +2533,8 @@ fn drop_trailing_localhost(servers: &mut Vec<Value>) {
         if is_plain_localhost(server) {
             if !later_plain {
                 keep[i] = false;
-                log::warn(
+                crate::log::warn!(
                     "dns.servers[]: localhost is answered by the system resolver fallback"
-                        .to_owned(),
                 );
             }
         } else if !filtered(server) {
@@ -2672,7 +2671,9 @@ fn parse_fakedns(
         inbound.sniffing.enabled() && (inbound.sniffing.fakedns || inbound.sniffing.fakedns_other)
     });
     if !has_fakedns_sniffer {
-        log::warn("Defined FakeDNS but haven't enabled FakeDNS destOverride at any inbound.");
+        crate::log::warn!(
+            "Defined FakeDNS but haven't enabled FakeDNS destOverride at any inbound."
+        );
     }
 
     let multi = crate::fakedns::FakeDnsMulti::from_configs(&pools)?;
@@ -3156,7 +3157,7 @@ fn parse_xhttp(x: &Value) -> Result<XhttpSettings, String> {
         .filter(|r| r.1 > 0)
         .map_or((20, 80), |(a, b)| (a as u64, b as u64));
     if x.get("h2Params").is_some_and(|v| !v.is_null()) {
-        log::warn("xhttpSettings.h2Params is ignored");
+        crate::log::warn!("xhttpSettings.h2Params is ignored");
     }
     let max_each_post = parse_range(x.get("scMaxEachPostBytes"))
         .filter(|r| r.1 > 0)

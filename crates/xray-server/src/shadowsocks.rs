@@ -16,7 +16,6 @@ use xray_proxy::shadowsocks2022::ServerUdpSession;
 use xray_routing::{Target, TargetAddr};
 
 use crate::config::{ShadowsocksMethod, ShadowsocksUser};
-use crate::log;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, Query};
 use crate::stats;
@@ -492,8 +491,8 @@ impl ShadowsocksUdpHandler {
                     process_info: Some(&proc_cell),
                 };
                 if self.ctx.router.route(&query).await.tag != decision.tag {
-                    log::debug(
-                        "shadowsocks udp: packet dropped, its route differs from the session",
+                    crate::log::debug!(
+                        "shadowsocks udp: packet dropped, its route differs from the session"
                     );
                     continue;
                 }
@@ -671,8 +670,8 @@ impl ShadowsocksUdpHandler {
                     process_info: Some(&proc_cell),
                 };
                 if self.ctx.router.route(&query).await.tag != decision.tag {
-                    log::debug(
-                        "shadowsocks udp: packet dropped, its route differs from the session",
+                    crate::log::debug!(
+                        "shadowsocks udp: packet dropped, its route differs from the session"
                     );
                     continue;
                 }

@@ -10,7 +10,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 use xray_config::parse_xray_duration;
 
-use crate::log;
 use crate::outbound::{self, Stream};
 use crate::routing::Router;
 use crate::vless::Host;
@@ -266,7 +265,7 @@ impl Observatory {
                 .and_then(parse_xray_duration)
                 .unwrap_or(DEFAULT_BURST_INTERVAL);
             if interval < MIN_BURST_INTERVAL {
-                log::warn("health check interval is too small, 10s is applied");
+                crate::log::warn!("health check interval is too small, 10s is applied");
                 interval = MIN_BURST_INTERVAL;
             }
             let sampling_count = match ping_config.get("sampling").and_then(Value::as_u64) {

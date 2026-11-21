@@ -14,7 +14,6 @@ use tokio::sync::{mpsc, Mutex};
 use xray_transport::{ConnectorConfig, TlsClientConfig, TlsConnector};
 use xray_wireguard::{Client, Ip, Packet, TcpStream, UdpSession};
 
-use crate::log;
 use crate::masque_capsule::{
     decode_address_assign_value, decode_datagram_value, encode_datagram_capsule, first_assigned_ip,
     read_capsule, CAPSULE_ADDRESS_ASSIGN, CAPSULE_DATAGRAM,
@@ -100,7 +99,7 @@ impl MasqueOutbound {
             return Err(err("MASQUE: \"warp\" in masqueSettings is not supported"));
         }
         if masque_settings.get("xmux").is_some_and(|w| !w.is_null()) {
-            log::warn("MASQUE: masqueSettings \"xmux\" is not supported and is ignored");
+            crate::log::warn!("MASQUE: masqueSettings \"xmux\" is not supported and is ignored");
         }
         let path = crate::masque_capsule::normalize_path(
             masque_settings

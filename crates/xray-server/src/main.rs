@@ -2223,7 +2223,9 @@ pub(crate) fn build_rustls_server_config(
     };
 
     if settings.ech_server_keys.is_some() {
-        log::warn("tlsSettings.echServerKeys is not supported yet, ECH is off for this inbound");
+        crate::log::warn!(
+            "tlsSettings.echServerKeys is not supported yet, ECH is off for this inbound"
+        );
     }
 
     let mut config = rustls::ServerConfig::builder_with_provider(provider)

@@ -13,7 +13,6 @@ use tokio::sync::Mutex;
 use xray_proxy::wireguard::{AllowedIp, KeyMaterial};
 use xray_wireguard::{Client, Config, Options, PeerConfig, TcpStream, UdpSession};
 
-use crate::log;
 use crate::vless::{resolve_all, Host};
 
 const DEFAULT_MTU: u16 = 1420;
@@ -121,9 +120,7 @@ impl WgOutbound {
             .and_then(Value::as_u64)
             .map_or(DEFAULT_MTU, |m| m.min(u64::from(u16::MAX)) as u16);
         if !(1280..=1420).contains(&mtu) {
-            log::warn(err(format!(
-                "mtu {mtu} is outside 1280..1420, using {DEFAULT_MTU}"
-            )));
+            crate::log::warn!("mtu {mtu} is outside 1280..1420, using {DEFAULT_MTU}");
             mtu = DEFAULT_MTU;
         }
         let reserved = parse_reserved(settings.get("reserved"))

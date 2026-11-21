@@ -785,7 +785,7 @@ async fn upload_task(
                 }
                 pending.insert(seq, data);
                 if pending.len() > max_buffered {
-                    log::info("xhttp: packet queue is too large");
+                    crate::log::info!("xhttp: packet queue is too large");
                     return;
                 }
                 while let Some(data) = pending.remove(&next) {

@@ -171,7 +171,7 @@ fn apply_tcp(sock: &Socket, sockopt: &SockoptSettings) {
         #[cfg(not(unix))]
         {
             let _ = mss;
-            log::warn("sockopt tcpMaxSeg: not supported on this platform");
+            crate::log::warn!("sockopt tcpMaxSeg: not supported on this platform");
         }
     }
 }
@@ -219,7 +219,7 @@ mod os {
         io::Error::new(io::ErrorKind::Unsupported, "not supported on this platform")
     }
     pub fn mptcp() -> Option<Protocol> {
-        log::warn("sockopt mptcp: not supported on this platform");
+        crate::log::warn!("sockopt mptcp: not supported on this platform");
         None
     }
     pub fn set_mark(_: &Socket, _: u32) -> io::Result<()> {
