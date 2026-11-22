@@ -2004,6 +2004,7 @@ struct SniCheckingResolver {
     ca_certs: Vec<RwLock<ManagedCa>>,
     reject_unknown_sni: bool,
     provider: Arc<rustls::crypto::CryptoProvider>,
+    last_reload_check: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for SniCheckingResolver {
@@ -2019,9 +2020,28 @@ impl rustls::server::ResolvesServerCert for SniCheckingResolver {
         &self,
         client_hello: rustls::server::ClientHello,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        for m in &self.encipherment_certs {
-            if let Ok(mut cert) = m.write() {
-                cert.check_and_reload(&self.provider);
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let last = self
+            .last_reload_check
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if now >= last.saturating_add(5)
+            && self
+                .last_reload_check
+                .compare_exchange(
+                    last,
+                    now,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            for m in &self.encipherment_certs {
+                if let Ok(mut cert) = m.write() {
+                    cert.check_and_reload(&self.provider);
+                }
             }
         }
         let sni = client_hello.server_name().map(str::to_ascii_lowercase);
@@ -2199,11 +2219,16 @@ pub(crate) fn build_rustls_server_config(
         return Err("certificate file has no certificates".into());
     }
 
+    let now = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let resolver = Arc::new(SniCheckingResolver {
         encipherment_certs,
         ca_certs,
         reject_unknown_sni: settings.reject_unknown_sni,
         provider: provider.clone(),
+        last_reload_check: std::sync::atomic::AtomicU64::new(now),
     });
     for index in 0..resolver.encipherment_certs.len() {
         spawn_ocsp_stapling(&resolver, index);

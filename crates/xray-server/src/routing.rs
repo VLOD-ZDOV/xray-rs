@@ -1452,7 +1452,7 @@ impl RouteCache {
     }
 
     pub fn get(
-        &mut self,
+        &self,
         hash: u64,
         query: &Query<'_>,
         ip: Option<IpAddr>,
@@ -1463,11 +1463,9 @@ impl RouteCache {
                 return Some(res.clone());
             }
         }
-        if let Some((k, res)) = self.previous.remove(&hash) {
+        if let Some((k, res)) = self.previous.get(&hash) {
             if k.matches(query, ip, source_port) {
-                let r = res.clone();
-                self.current.insert(hash, (k, res));
-                return Some(r);
+                return Some(res.clone());
             }
         }
         None
@@ -2447,9 +2445,9 @@ impl Router {
         };
 
         if let Some(h) = cache_hash {
-            let mut cache = self
+            let cache = self
                 .route_cache
-                .write()
+                .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(res) = cache.get(h, query, ip, source_port) {
                 return res;
