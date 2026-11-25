@@ -36,6 +36,76 @@ pub struct MasqueOutbound {
     client: Mutex<Option<Client>>,
 }
 
+fn is_netip_addr(text: &str) -> bool {
+    if text.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    // Go's netip.ParseAddr accepts scoped IPv6 (`fe80::1%en0`).
+    text.split_once('%')
+        .is_some_and(|(addr, zone)| !zone.is_empty() && addr.parse::<std::net::Ipv6Addr>().is_ok())
+}
+
+/// Xray parses `https://{host}` and requires the URL's host to be exactly the
+/// configured string; a bracketed host must be IPv6 and a port must be numeric.
+/// Non-ASCII names are accepted by Go's `url.Parse`.
+fn validate_host(host: &str) -> Result<(), String> {
+    if host.contains('@') {
+        return Err(format!("invalid \"host\": {host}"));
+    }
+    if !host.is_ascii() {
+        return Ok(());
+    }
+    let parsed = format!("https://{host}").parse::<http::Uri>();
+    match parsed {
+        Ok(uri)
+            if uri
+                .authority()
+                .is_some_and(|authority| authority.as_str() == host) => {}
+        _ => return Err(format!("invalid \"host\": {host}")),
+    }
+    if let Some(rest) = host.strip_prefix('[') {
+        let Some((inner, rest)) = rest.split_once(']') else {
+            return Err(format!("invalid \"host\": {host}"));
+        };
+        if inner.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(format!("invalid \"host\": {host}"));
+        }
+        return match rest.strip_prefix(':') {
+            None if rest.is_empty() => Ok(()),
+            Some(port) if valid_port(port) => Ok(()),
+            _ => Err(format!("invalid \"host\": {host}")),
+        };
+    }
+    match host.matches(':').count() {
+        0 => Ok(()),
+        1 => {
+            let port = host.rsplit_once(':').map(|(_, port)| port).unwrap_or("");
+            if valid_port(port) {
+                Ok(())
+            } else {
+                Err(format!("invalid \"host\": {host}"))
+            }
+        }
+        _ => Err(format!("invalid \"host\": {host}")),
+    }
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|byte| byte.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+fn is_int32_range(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_i64()
+            .is_some_and(|value| i32::try_from(value).is_ok()),
+        serde_json::Value::String(text) => crate::routing::parse_range_string(text).is_some(),
+        _ => false,
+    }
+}
+
 impl MasqueOutbound {
     pub fn parse(tag: &str, outbound: &Value) -> Result<Self, String> {
         let err = |m: &str| m.to_string();
@@ -46,10 +116,6 @@ impl MasqueOutbound {
             .and_then(Value::as_str)
             .ok_or_else(|| err("MASQUE: \"address\" is not set"))?
             .to_owned();
-        if address.is_empty() {
-            return Err(err("MASQUE: \"address\" is not set"));
-        }
-
         let port = match settings.get("port").and_then(Value::as_u64) {
             Some(p) if p > 0 && p <= u64::from(u16::MAX) => p as u16,
             Some(p) if p > u64::from(u16::MAX) => {
@@ -58,28 +124,39 @@ impl MasqueOutbound {
             _ => return Err(err("MASQUE: \"port\" is not set")),
         };
 
-        if let Some(dns) = settings.get("remoteDNS").and_then(Value::as_array) {
-            for d in dns {
-                if let Some(s) = d.as_str() {
-                    if s.parse::<IpAddr>().is_err() {
-                        return Err(format!("MASQUE: invalid \"remoteDNS\" {s}"));
-                    }
-                }
+        let remote_dns = match settings.get("remoteDNS") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .ok_or_else(|| "MASQUE: \"remoteDNS\" must hold strings".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err("MASQUE: \"remoteDNS\" must be an array".into()),
+        };
+        for server in &remote_dns {
+            if !is_netip_addr(server) {
+                return Err(format!("MASQUE: invalid \"remoteDNS\" {server}"));
             }
+        }
+        if !remote_dns.is_empty() {
+            // The server outbound resolves targets with the system resolver.
+            crate::log::warn!("MASQUE: \"remoteDNS\" is not used by this outbound and is ignored");
         }
 
         let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
         let network = stream
-            .get("network")
-            .or_else(|| stream.get("method"))
+            .get("method")
+            .or_else(|| stream.get("network"))
             .or_else(|| stream.get("transport"))
             .and_then(Value::as_str)
             .unwrap_or("");
-        if network != "masque" {
+        if !network.eq_ignore_ascii_case("masque") {
             return Err("the masque transport can only be used by the masque outbound".into());
         }
         let security = stream.get("security").and_then(Value::as_str).unwrap_or("");
-        if security != "tls" {
+        if !security.eq_ignore_ascii_case("tls") {
             return Err("MASQUE requires \"security\": \"tls\"".into());
         }
 
@@ -94,43 +171,86 @@ impl MasqueOutbound {
         };
         let alpn = tls_config.alpn.clone();
 
-        let masque_settings = stream.get("masqueSettings").unwrap_or(&Value::Null);
+        let masque_settings = match stream.get("masqueSettings") {
+            None | Some(Value::Null) => &Value::Null,
+            Some(settings) if settings.is_object() => settings,
+            Some(_) => return Err("masqueSettings must be an object".into()),
+        };
         if masque_settings.get("warp").is_some_and(|w| !w.is_null()) {
             return Err(err("MASQUE: \"warp\" in masqueSettings is not supported"));
         }
-        if masque_settings.get("xmux").is_some_and(|w| !w.is_null()) {
+        if let Some(xmux) = masque_settings.get("xmux").filter(|value| !value.is_null()) {
+            let Some(xmux) = xmux.as_object() else {
+                return Err("masqueSettings.xmux must be an object".into());
+            };
+            for key in [
+                "maxConnections",
+                "maxConcurrency",
+                "cMaxReuseTimes",
+                "hMaxRequestTimes",
+                "hMaxReusableSecs",
+            ] {
+                if let Some(value) = xmux.get(key).filter(|value| !value.is_null()) {
+                    if !is_int32_range(value) {
+                        return Err(format!("invalid integer range in xmux.{key}"));
+                    }
+                }
+            }
+            if xmux.get("maxConnections").is_some_and(|v| !v.is_null())
+                && xmux.get("maxConcurrency").is_some_and(|v| !v.is_null())
+            {
+                return Err(
+                    "xmux: maxConnections cannot be specified together with maxConcurrency".into(),
+                );
+            }
+            if let Some(keepalive) = xmux.get("keepalive").filter(|value| !value.is_null()) {
+                if !keepalive.is_boolean() {
+                    return Err("xmux.keepalive must be a boolean".into());
+                }
+            }
             crate::log::warn!("MASQUE: masqueSettings \"xmux\" is not supported and is ignored");
         }
-        let path = crate::masque_capsule::normalize_path(
-            masque_settings
-                .get("path")
-                .and_then(Value::as_str)
-                .unwrap_or(""),
-        )?;
-        let host_override = masque_settings
-            .get("host")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
-        if !host_override.is_empty()
-            && http::uri::Authority::try_from(host_override.as_str()).is_err()
-        {
-            return Err(format!("invalid \"host\": {host_override}"));
+        let path = match masque_settings.get("path") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(path)) => path.clone(),
+            Some(_) => return Err("masqueSettings.path must be a string".into()),
+        };
+        let path = crate::masque_capsule::normalize_path(&path)?;
+        let host_override = match masque_settings.get("host") {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(host)) => host.clone(),
+            Some(_) => return Err("masqueSettings.host must be a string".into()),
+        };
+        if !host_override.is_empty() {
+            validate_host(&host_override)?;
         }
 
-        let user = masque_settings
-            .get("user")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let pass = masque_settings
-            .get("pass")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let user = match masque_settings.get("user") {
+            None | Some(Value::Null) => "",
+            Some(Value::String(user)) => user.as_str(),
+            Some(_) => return Err("masqueSettings.user must be a string".into()),
+        };
+        let pass = match masque_settings.get("pass") {
+            None | Some(Value::Null) => "",
+            Some(Value::String(pass)) => pass.as_str(),
+            Some(_) => return Err("masqueSettings.pass must be a string".into()),
+        };
         let has_creds = !user.is_empty() || !pass.is_empty();
         let mut headers = HashMap::new();
-        if let Some(hdr_obj) = masque_settings.get("headers").and_then(Value::as_object) {
+        let headers_value = match masque_settings.get("headers") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(headers)) => Some(headers),
+            Some(_) => return Err("masqueSettings.headers must be an object".into()),
+        };
+        if let Some(hdr_obj) = headers_value {
             for (k, v) in hdr_obj {
+                if http::header::HeaderName::try_from(k.as_str()).is_err() {
+                    return Err(format!("invalid header in \"headers\": {k:?}"));
+                }
                 if let Some(s) = v.as_str() {
+                    if http::header::HeaderValue::try_from(s).is_err() {
+                        return Err(format!("invalid header in \"headers\": {k:?}"));
+                    }
                     match k.to_ascii_lowercase().as_str() {
                         "host" | "capsule-protocol" => {
                             return Err(format!("\"headers\" can't contain \"{k}\""));
@@ -143,6 +263,8 @@ impl MasqueOutbound {
                         _ => {}
                     }
                     headers.insert(k.clone(), s.to_owned());
+                } else if !v.is_null() {
+                    return Err(format!("masqueSettings.headers[{k:?}] must be a string"));
                 }
             }
         }

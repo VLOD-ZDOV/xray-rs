@@ -135,29 +135,55 @@ pub struct XdriveConfig {
     pub params: XdriveParams,
 }
 
+fn local_u32(settings: &Value, key: &str) -> Result<Option<u32>, String> {
+    match settings.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| format!("xdriveSettings.{key} must be a 32-bit unsigned number")),
+        Some(_) => Err(format!("xdriveSettings.{key} must be a number")),
+    }
+}
+
 pub fn parse_xdrive_settings(settings: &Value) -> Result<XdriveConfig, String> {
+    if !settings.is_object() {
+        return Err("xdriveSettings must be an object".into());
+    }
     let service = settings
         .get("service")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
 
-    let remote_folder = settings
-        .get("remoteFolder")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let remote_folder = match settings.get("remoteFolder") {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(folder)) => folder.clone(),
+        Some(_) => return Err("xdriveSettings.remoteFolder must be a string".into()),
+    };
 
-    let secrets: Vec<String> = settings
-        .get("secrets")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
+    let secrets: Vec<String> = match settings.get("secrets") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(String::from)
+                    .ok_or_else(|| "xdriveSettings.secrets must hold strings".to_string())
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("xdriveSettings.secrets must be an array".into()),
+    };
+
+    for key in ["s3", "template"] {
+        if let Some(value) = settings.get(key).filter(|value| !value.is_null()) {
+            if !value.is_object() {
+                return Err(format!("xdriveSettings.{key} must be an object"));
+            }
+        }
+    }
 
     let service = match service.as_str() {
         "local" => "local".to_string(),
@@ -212,63 +238,47 @@ pub fn parse_xdrive_settings(settings: &Value) -> Result<XdriveConfig, String> {
         ));
     }
 
-    let segment_bytes = settings
-        .get("segmentBytes")
-        .and_then(Value::as_u64)
-        .map(|v| (v as usize).min(MAX_SEGMENT_BYTES))
-        .filter(|v| *v > 0)
+    let segment_bytes = local_u32(settings, "segmentBytes")?
+        .map(|value| (value as usize).min(MAX_SEGMENT_BYTES))
+        .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_SEGMENT_BYTES);
 
-    let flush_interval = settings
-        .get("flushIntervalMs")
-        .and_then(Value::as_u64)
-        .filter(|v| *v > 0)
-        .map(Duration::from_millis)
+    let flush_interval = local_u32(settings, "flushIntervalMs")?
+        .filter(|value| *value > 0)
+        .map(|value| Duration::from_millis(u64::from(value)))
         .unwrap_or(DEFAULT_FLUSH_INTERVAL);
 
-    let min_poll_interval = settings
-        .get("pollIntervalMs")
-        .and_then(Value::as_u64)
-        .filter(|v| *v > 0)
-        .map(Duration::from_millis)
+    let min_poll_interval = local_u32(settings, "pollIntervalMs")?
+        .filter(|value| *value > 0)
+        .map(|value| Duration::from_millis(u64::from(value)))
         .unwrap_or(DEFAULT_MIN_POLL_INTERVAL);
 
-    let mut max_poll_interval = settings
-        .get("maxPollIntervalMs")
-        .and_then(Value::as_u64)
-        .filter(|v| *v > 0)
-        .map(Duration::from_millis)
+    let mut max_poll_interval = local_u32(settings, "maxPollIntervalMs")?
+        .filter(|value| *value > 0)
+        .map(|value| Duration::from_millis(u64::from(value)))
         .unwrap_or(DEFAULT_MAX_POLL_INTERVAL);
     if max_poll_interval < min_poll_interval {
         max_poll_interval = min_poll_interval;
     }
 
-    let eager_window = settings
-        .get("eagerWindowMs")
-        .and_then(Value::as_u64)
-        .filter(|v| *v > 0)
-        .map(Duration::from_millis)
+    let eager_window = local_u32(settings, "eagerWindowMs")?
+        .filter(|value| *value > 0)
+        .map(|value| Duration::from_millis(u64::from(value)))
         .unwrap_or(DEFAULT_EAGER_WINDOW);
 
-    let hole_timeout = settings
-        .get("holeTimeoutMs")
-        .and_then(Value::as_u64)
-        .filter(|v| *v > 0)
-        .map(Duration::from_millis)
+    let hole_timeout = local_u32(settings, "holeTimeoutMs")?
+        .filter(|value| *value > 0)
+        .map(|value| Duration::from_millis(u64::from(value)))
         .unwrap_or(DEFAULT_HOLE_TIMEOUT);
 
-    let session_ttl = settings
-        .get("sessionTtlSeconds")
-        .and_then(Value::as_u64)
-        .filter(|v| *v > 0)
-        .map(Duration::from_secs)
+    let session_ttl = local_u32(settings, "sessionTtlSeconds")?
+        .filter(|value| *value > 0)
+        .map(|value| Duration::from_secs(u64::from(value)))
         .unwrap_or(DEFAULT_SESSION_TTL);
 
-    let concurrency = settings
-        .get("concurrency")
-        .and_then(Value::as_u64)
-        .map(|v| (v as usize).min(MAX_CONCURRENCY))
-        .filter(|v| *v > 0)
+    let concurrency = local_u32(settings, "concurrency")?
+        .map(|value| (value as usize).min(MAX_CONCURRENCY))
+        .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_CONCURRENCY);
 
     Ok(XdriveConfig {

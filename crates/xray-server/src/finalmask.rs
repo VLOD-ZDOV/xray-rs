@@ -360,6 +360,103 @@ pub fn warn_inbound_finalmask(stream: &Value, protocol: &str, tag: &str) {
     }
 }
 
+/// The `filter` mask itself is client-only here, but Xray's decoder still
+/// type-checks its settings before the mask is skipped.
+fn geodata_file_exists(name: &str) -> bool {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name == ".." {
+        return false;
+    }
+    let mut dirs = Vec::new();
+    if let Ok(dir) = std::env::current_dir() {
+        dirs.push(dir);
+    }
+    if let Ok(path) = std::env::current_exe() {
+        if let Some(dir) = path.parent() {
+            dirs.push(dir.to_path_buf());
+        }
+    }
+    if let Some(dir) = crate::config::get_env("XRAY_LOCATION_ASSET") {
+        dirs.push(dir.into());
+    }
+    dirs.iter().any(|dir| dir.join(name).is_file())
+}
+
+/// The subset of `geodata.ParseIPRules` that decides whether a rule is valid:
+/// inverse prefixes, `geoip:`/`ext:` specs whose file must exist, and CIDRs.
+fn valid_filter_ip_rule(text: &str) -> bool {
+    let mut rule = text;
+    while let Some(stripped) = rule.strip_prefix('!') {
+        rule = stripped;
+    }
+    if let Some(spec) = rule.strip_prefix("geoip:") {
+        let (code, _) = spec.split_once('@').unwrap_or((spec, ""));
+        let code = code.strip_prefix('!').unwrap_or(code);
+        return !code.is_empty() && geodata_file_exists("geoip.dat");
+    }
+    for prefix in ["ext:", "ext-ip:"] {
+        if let Some(spec) = rule.strip_prefix(prefix) {
+            let Some((file, code)) = spec.split_once(':') else {
+                return false;
+            };
+            let code = code.split_once('@').map_or(code, |(code, _)| code);
+            let code = code.strip_prefix('!').unwrap_or(code);
+            return !file.is_empty() && !code.is_empty() && geodata_file_exists(file);
+        }
+    }
+    let (address, prefix) = rule.split_once('/').unwrap_or((rule, ""));
+    let address = address.trim_matches(|c: char| !c.is_alphanumeric() && c != ':' && c != '.');
+    let address = address
+        .strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(address);
+    let Ok(address) = address.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let max = match address {
+        std::net::IpAddr::V4(_) => 32u32,
+        std::net::IpAddr::V6(address) if address.to_ipv4_mapped().is_some() => 32,
+        std::net::IpAddr::V6(_) => 128,
+    };
+    if prefix.is_empty() {
+        return true;
+    }
+    prefix.bytes().all(|byte| byte.is_ascii_digit())
+        && prefix.parse::<u32>().is_ok_and(|prefix| prefix <= max)
+}
+
+fn validate_filter_mask(mask: &Value, at: &str) -> Result<(), String> {
+    let settings = mask.get("settings").filter(|value| !value.is_null());
+    let Some(settings) = settings else {
+        return Ok(());
+    };
+    let Some(object) = settings.as_object() else {
+        return Err(format!("{at}: filter settings must be an object or null"));
+    };
+    for key in ["blockedSourceIPs", "allowedSourceIPs"] {
+        let value = object.iter().find(|(name, _)| {
+            name.to_lowercase().trim_start_matches('İ')
+                == key.to_lowercase().trim_start_matches('İ')
+        });
+        match value.map(|(_, value)| value) {
+            None | Some(Value::Null) => {}
+            Some(Value::Array(items)) => {
+                for item in items {
+                    let rule = match item {
+                        Value::Null => "",
+                        Value::String(rule) => rule.as_str(),
+                        _ => return Err(format!("{at}: filter.{key} must hold strings")),
+                    };
+                    if !valid_filter_ip_rule(rule) {
+                        return Err(format!("{at}: filter.{key}: illegal ip rule {rule:?}"));
+                    }
+                }
+            }
+            Some(_) => return Err(format!("{at}: filter.{key} must be an array or null")),
+        }
+    }
+    Ok(())
+}
+
 pub fn validate_and_log_finalmask(outbound: &Value, tag: &str) -> Result<(), String> {
     let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
     validate_finalmask_quic_params(stream, tag)?;
@@ -369,6 +466,9 @@ pub fn validate_and_log_finalmask(outbound: &Value, tag: &str) -> Result<(), Str
     if let Some(tcp) = finalmask.get("tcp").and_then(Value::as_array) {
         for mask in tcp {
             let mask_type = mask.get("type").and_then(Value::as_str).unwrap_or("");
+            if mask_type.eq_ignore_ascii_case("filter") {
+                validate_filter_mask(mask, &format!("outbound {tag:?}"))?;
+            }
             if !["fragment", "header-custom", "sudoku"]
                 .iter()
                 .any(|kind| mask_type.eq_ignore_ascii_case(kind))
@@ -382,6 +482,9 @@ pub fn validate_and_log_finalmask(outbound: &Value, tag: &str) -> Result<(), Str
     if let Some(udp) = finalmask.get("udp").and_then(Value::as_array) {
         for mask in udp {
             let mask_type = mask.get("type").and_then(Value::as_str).unwrap_or("");
+            if mask_type.eq_ignore_ascii_case("filter") {
+                validate_filter_mask(mask, &format!("outbound {tag:?}"))?;
+            }
             if !mask_type.eq_ignore_ascii_case("noise") && !mask_type.eq_ignore_ascii_case("udphop")
             {
                 crate::log::warn!(

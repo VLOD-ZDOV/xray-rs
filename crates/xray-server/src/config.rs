@@ -100,6 +100,8 @@ pub struct SockoptSettings {
     pub happy_eyeballs: Option<HappyEyeballsSettings>,
     pub tcp_window_clamp: Option<u32>,
     pub custom_sockopt: Vec<CustomSockopt>,
+    /// `sockopt.domainStrategy`: how the dialer resolves a domain target.
+    pub domain_strategy: Option<crate::routing::FreedomStrategy>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -649,18 +651,40 @@ pub fn parse(raw: &str) -> Result<Config, String> {
         }
     }
     check_version(&root)?;
+    for key in ["inbounds", "outbounds"] {
+        match root.get(key) {
+            None | Some(Value::Null) | Some(Value::Array(_)) => {}
+            Some(_) => return Err(format!("{key} must be an array")),
+        }
+    }
+    if let Some(routing) = root.get("routing").filter(|value| !value.is_null()) {
+        if !routing.is_object() {
+            return Err("routing must be an object".into());
+        }
+        if let Some(rules) = routing.get("rules").filter(|value| !value.is_null()) {
+            if !rules.is_array() {
+                return Err("routing.rules must be an array".into());
+            }
+        }
+    }
     if root
         .get("api")
+        .filter(|api| !api.is_null())
         .is_some_and(|api| str_field(api, "tag").is_empty())
     {
         return Err("API tag can't be empty.".into());
     }
     let api_tag = root
         .get("api")
+        .filter(|api| !api.is_null())
         .map(|api| str_field(api, "tag"))
         .filter(|t| !t.is_empty());
     let mut seen_tags = std::collections::HashSet::new();
-    let mut api = match root.get("api").map(|a| str_field(a, "listen")) {
+    let mut api = match root
+        .get("api")
+        .filter(|api| !api.is_null())
+        .map(|a| str_field(a, "listen"))
+    {
         Some(listen) if !listen.is_empty() => Some(
             listen
                 .parse()
@@ -742,7 +766,7 @@ pub fn parse(raw: &str) -> Result<Config, String> {
     };
     // The upstream parser is client-side and rejects server-only sections, so
     // it only sees `dns`.
-    let dns = match root.get("dns") {
+    let dns = match root.get("dns").filter(|section| !section.is_null()) {
         Some(section) => {
             match section.get("script") {
                 None | Some(Value::Null) => {}
@@ -989,13 +1013,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 }
                 addr => addr.to_owned(),
             };
-            let sniffing = parse_sniffing(item.get("sniffing").unwrap_or(&Value::Null), &tag);
+            let sniffing = parse_sniffing(item.get("sniffing").unwrap_or(&Value::Null), &tag)?;
             let stream = item.get("streamSettings").unwrap_or(&Value::Null);
             let sockopt_settings = parse_sockopt(
-                stream
-                    .get("sockopt")
-                    .or_else(|| item.get("sockopt"))
-                    .unwrap_or(&Value::Null),
+                stream.get("sockopt").unwrap_or(&Value::Null),
                 &format!("inbound {tag:?}"),
             )?;
             return Ok(Some(Inbound {
@@ -1057,12 +1078,9 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                 return Err("MASQUE requires \"security\": \"tls\"".into());
             }
             let tls_settings = parse_tls(stream.get("tlsSettings").unwrap_or(&Value::Null))?;
-            let sniffing = parse_sniffing(item.get("sniffing").unwrap_or(&Value::Null), &tag);
+            let sniffing = parse_sniffing(item.get("sniffing").unwrap_or(&Value::Null), &tag)?;
             let sockopt_settings = parse_sockopt(
-                stream
-                    .get("sockopt")
-                    .or_else(|| item.get("sockopt"))
-                    .unwrap_or(&Value::Null),
+                stream.get("sockopt").unwrap_or(&Value::Null),
                 &format!("inbound {tag:?}"),
             )?;
             let quic_params = parse_quic_params_from_stream(stream, &tag)?;
@@ -1102,9 +1120,18 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         }
         other => return Err(format!("unknown config id: {other}")),
     };
-    let stream = item.get("streamSettings").unwrap_or(&Value::Null);
+    let stream = match item.get("streamSettings") {
+        None | Some(Value::Null) => &Value::Null,
+        Some(stream) if stream.is_object() => stream,
+        Some(_) => return Err(format!("inbound {tag:?}: streamSettings must be an object")),
+    };
+    if let Some(settings) = item.get("settings").filter(|value| !value.is_null()) {
+        if !settings.is_object() {
+            return Err(format!("inbound {tag:?}: settings must be an object"));
+        }
+    }
     let network = stream_network(stream);
-    let security = str_field(stream, "security");
+    let security = str_field(stream, "security").to_ascii_lowercase();
 
     if network == "masque" {
         return Err("the masque transport can only be used by the masque inbound".into());
@@ -1158,14 +1185,14 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     }
 
     let is_hysteria = protocol == InboundProtocol::Hysteria || network == "hysteria";
-    let is_tcp = matches!(network, "" | "tcp" | "raw");
-    let is_ws = matches!(network, "ws" | "websocket");
+    let is_tcp = matches!(network.as_str(), "" | "tcp" | "raw");
+    let is_ws = matches!(network.as_str(), "ws" | "websocket");
     let is_httpupgrade = network == "httpupgrade";
-    let is_grpc = matches!(network, "grpc" | "gun");
-    let is_xhttp = matches!(network, "xhttp" | "splithttp");
-    let is_kcp = matches!(network, "kcp" | "mkcp");
+    let is_grpc = matches!(network.as_str(), "grpc" | "gun");
+    let is_xhttp = matches!(network.as_str(), "xhttp" | "splithttp");
+    let is_kcp = matches!(network.as_str(), "kcp" | "mkcp");
     let is_xdrive = network == "xdrive";
-    let supported_security = matches!(security, "" | "none" | "tls" | "reality");
+    let supported_security = matches!(security.as_str(), "" | "none" | "tls" | "reality");
 
     let kcp_settings = if is_kcp {
         Some(Arc::new(parse_kcp(stream)?))
@@ -1202,7 +1229,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         && !is_xdrive)
         || !supported_security
     {
-        if matches!(network, "h2" | "h3" | "http" | "quic") {
+        if matches!(network.as_str(), "h2" | "h3" | "http" | "quic") {
             return Err(
                 "The feature HTTP transport (without header padding, etc.) has been removed and migrated to XHTTP stream-one H2 & H3. Please update your config(s) according to release note and documentation.".into(),
             );
@@ -1353,7 +1380,14 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         } else {
             user_id(key)
         };
-        let level = client.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
+        let level = parse_user_level(
+            client.get("level"),
+            if protocol == InboundProtocol::Vless {
+                u64::from(u32::MAX)
+            } else {
+                255
+            },
+        )?;
         users.push(User {
             id: uuid,
             hash: crate::trojan::trojan_password_hash(key),
@@ -1417,7 +1451,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         if is_ss2022 {
             if clients.is_empty() {
                 let m = ss2022_method(top_method, top_password)?;
-                let level = settings.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let level = parse_user_level(settings.get("level"), 255)?;
                 shadowsocks_users.push(ShadowsocksUser {
                     method: ShadowsocksMethod::Ss2022(Arc::new(m)),
                     email: str_field(settings, "email").to_owned(),
@@ -1436,7 +1470,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                         format!("{top_password}:{password}")
                     };
                     let m = ss2022_method(method, &full_password)?;
-                    let level = entry.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
+                    let level = parse_user_level(entry.get("level"), 255)?;
                     shadowsocks_users.push(ShadowsocksUser {
                         method: ShadowsocksMethod::Ss2022(Arc::new(m)),
                         email: str_field(entry, "email").to_owned(),
@@ -1462,7 +1496,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
                         return Err(format!("unknown cipher method: {method}"));
                     }
                 };
-                let level = entry.get("level").and_then(Value::as_u64).unwrap_or(0) as u32;
+                let level = parse_user_level(entry.get("level"), 255)?;
                 shadowsocks_users.push(ShadowsocksUser {
                     method: ShadowsocksMethod::Aead2017(Arc::new(m)),
                     email: str_field(entry, "email").to_owned(),
@@ -1472,7 +1506,29 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         }
     }
 
-    let tls_section = stream.get("tlsSettings").unwrap_or(&Value::Null);
+    let tls_section = match stream.get("tlsSettings") {
+        None | Some(Value::Null) => &Value::Null,
+        Some(section) if section.is_object() => section,
+        Some(_) => return Err(format!("inbound {tag:?}: tlsSettings must be an object")),
+    };
+    if let Some(certificates) = tls_section
+        .get("certificates")
+        .filter(|value| !value.is_null())
+    {
+        if !certificates.is_array() {
+            return Err(format!(
+                "inbound {tag:?}: tlsSettings.certificates must be an array"
+            ));
+        }
+        if certificates
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| !item.is_object()))
+        {
+            return Err(format!(
+                "inbound {tag:?}: tlsSettings.certificates entries must be objects"
+            ));
+        }
+    }
     if security == "tls" && array(tls_section, "certificates").is_empty() {
         // Xray starts such an inbound and fails every handshake; the others
         // keep running there too, so only this one is left out.
@@ -1526,7 +1582,7 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         )?))
     };
 
-    let sniffing = parse_sniffing(item.get("sniffing").unwrap_or(&Value::Null), &tag);
+    let sniffing = parse_sniffing(item.get("sniffing").unwrap_or(&Value::Null), &tag)?;
 
     let mut fallbacks = Vec::new();
     let fallback_owner = if protocol == InboundProtocol::Trojan {
@@ -1545,7 +1601,11 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
     }
 
     let dokodemo = if protocol == InboundProtocol::Dokodemo {
-        let addr_str = str_field(settings, "address");
+        // Xray accepts both spellings; `address`/`port` win when set.
+        let addr_str = match str_field(settings, "address") {
+            "" => str_field(settings, "rewriteAddress"),
+            address => address,
+        };
         let address = if !addr_str.is_empty() {
             Some(match addr_str.parse::<std::net::IpAddr>() {
                 Ok(ip) => crate::vless::Host::Ip(ip),
@@ -1554,11 +1614,26 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         } else {
             None
         };
-        let port = parse_port(settings.get("port"));
-        let follow_redirect = settings
-            .get("followRedirect")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let port_field = |key: &str| -> Result<Option<u16>, String> {
+            match settings.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(Value::Number(number)) => number
+                    .as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .map(Some)
+                    .ok_or_else(|| format!("dokodemo {key} must be 0-65535")),
+                Some(_) => Err(format!("dokodemo {key} must be a number")),
+            }
+        };
+        let port = match port_field("port")? {
+            Some(port) if port != 0 => Some(port),
+            _ => port_field("rewritePort")?.filter(|port| *port != 0),
+        };
+        let follow_redirect = match settings.get("followRedirect") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(enabled)) => *enabled,
+            Some(_) => return Err("dokodemo followRedirect must be a boolean".into()),
+        };
         Some(DokodemoSettings {
             address,
             port,
@@ -1574,11 +1649,10 @@ fn parse_inbound(item: &Value, tag: String) -> Result<Option<Inbound>, String> {
         None
     };
 
-    let sockopt = stream
-        .get("sockopt")
-        .or_else(|| item.get("sockopt"))
-        .unwrap_or(&Value::Null);
-    let accept_proxy_protocol = parse_accept_proxy_protocol(sockopt.get("acceptProxyProtocol"));
+    let sockopt = stream.get("sockopt").unwrap_or(&Value::Null);
+    let accept_proxy_protocol =
+        inbound_accept_proxy_protocol(stream, sockopt, is_tcp, is_ws, is_httpupgrade)
+            .map_err(|e| format!("inbound {tag:?}: {e}"))?;
     let tcp_masks = crate::tcp_mask::parse(stream).map_err(|e| format!("inbound {tag:?}: {e}"))?;
     let mut sockopt_settings = parse_sockopt(sockopt, &format!("inbound {tag:?}"))?;
 
@@ -1948,22 +2022,127 @@ fn parse_http_obfs(header: &Value) -> crate::http_obfs::HttpObfsSettings {
     }
 }
 
-fn parse_accept_proxy_protocol(val: Option<&Value>) -> crate::proxy_proto::ProxyProtocolAccept {
-    match val {
-        Some(Value::Bool(true)) => crate::proxy_proto::ProxyProtocolAccept::Any,
-        Some(Value::Number(n)) => match n.as_u64() {
-            Some(1) => crate::proxy_proto::ProxyProtocolAccept::V1,
-            Some(2) => crate::proxy_proto::ProxyProtocolAccept::V2,
-            _ => crate::proxy_proto::ProxyProtocolAccept::None,
-        },
-        _ => crate::proxy_proto::ProxyProtocolAccept::None,
+fn parse_accept_proxy_protocol(
+    value: Option<&Value>,
+) -> Result<crate::proxy_proto::ProxyProtocolAccept, String> {
+    use crate::proxy_proto::ProxyProtocolAccept;
+    match value {
+        None | Some(Value::Null) | Some(Value::Bool(false)) => Ok(ProxyProtocolAccept::None),
+        Some(Value::Bool(true)) => Ok(ProxyProtocolAccept::Any),
+        Some(_) => Err("acceptProxyProtocol must be a boolean".into()),
     }
+}
+
+/// Xray ORs the transport's flag with `sockopt.acceptProxyProtocol`. Go's
+/// decoder rejects a non-boolean wherever the field appears, even in a
+/// transport section the inbound does not use.
+fn inbound_accept_proxy_protocol(
+    stream: &Value,
+    sockopt: &Value,
+    is_tcp: bool,
+    is_ws: bool,
+    is_httpupgrade: bool,
+) -> Result<crate::proxy_proto::ProxyProtocolAccept, String> {
+    use crate::proxy_proto::ProxyProtocolAccept;
+    for section in [
+        "rawSettings",
+        "tcpSettings",
+        "wsSettings",
+        "httpupgradeSettings",
+    ] {
+        if let Some(value) = stream
+            .get(section)
+            .and_then(|section| section.get("acceptProxyProtocol"))
+        {
+            parse_accept_proxy_protocol(Some(value))?;
+        }
+    }
+    let mut enabled = parse_accept_proxy_protocol(sockopt.get("acceptProxyProtocol"))?
+        == ProxyProtocolAccept::Any;
+    let section = if is_tcp {
+        stream
+            .get("rawSettings")
+            .or_else(|| stream.get("tcpSettings"))
+    } else if is_ws {
+        stream.get("wsSettings")
+    } else if is_httpupgrade {
+        stream.get("httpupgradeSettings")
+    } else {
+        None
+    };
+    if section
+        .and_then(|section| section.get("acceptProxyProtocol"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        enabled = true;
+    }
+    Ok(if enabled {
+        ProxyProtocolAccept::Any
+    } else {
+        ProxyProtocolAccept::None
+    })
 }
 
 pub fn parse_sockopt(sockopt: &Value, _owner: &str) -> Result<Option<SockoptSettings>, String> {
     let Some(map) = sockopt.as_object() else {
         return Ok(None);
     };
+    for key in [
+        "mark",
+        "tcpKeepAliveInterval",
+        "tcpKeepAliveIdle",
+        "tcpUserTimeout",
+        "tcpMaxSeg",
+        "tcpWindowClamp",
+    ] {
+        if let Some(value) = map.get(key).filter(|value| !value.is_null()) {
+            if !value.is_number() {
+                return Err(format!("sockopt.{key} must be a number"));
+            }
+        }
+    }
+    for key in ["v6only", "tcpMptcp", "penetrate"] {
+        if let Some(value) = map.get(key).filter(|value| !value.is_null()) {
+            if !value.is_boolean() {
+                return Err(format!("sockopt.{key} must be a boolean"));
+            }
+        }
+    }
+    for key in [
+        "tproxy",
+        "tcpCongestion",
+        "interface",
+        "dialerProxy",
+        "addressPortStrategy",
+    ] {
+        if let Some(value) = map.get(key).filter(|value| !value.is_null()) {
+            if !value.is_string() {
+                return Err(format!("sockopt.{key} must be a string"));
+            }
+        }
+    }
+    if let Some(value) = map
+        .get("trustedXForwardedFor")
+        .filter(|value| !value.is_null())
+    {
+        let Some(items) = value.as_array() else {
+            return Err("sockopt.trustedXForwardedFor must be an array".into());
+        };
+        if items.iter().any(|item| !item.is_string()) {
+            return Err("sockopt.trustedXForwardedFor must hold strings".into());
+        }
+    }
+    if let Some(value) = map.get("happyEyeballs").filter(|value| !value.is_null()) {
+        if !value.is_object() {
+            return Err("sockopt.happyEyeballs must be an object".into());
+        }
+    }
+    if let Some(value) = map.get("customSockopt").filter(|value| !value.is_null()) {
+        if !value.is_array() {
+            return Err("sockopt.customSockopt must be an array".into());
+        }
+    }
     let parse_i32_val = |v: Option<&Value>| {
         v.and_then(|val| match val {
             Value::Number(n) => n.as_i64().map(|x| x as i32),
@@ -2093,6 +2272,17 @@ pub fn parse_sockopt(sockopt: &Value, _owner: &str) -> Result<Option<SockoptSett
         "redirect" => TproxyMode::Redirect,
         _ => TproxyMode::Off,
     };
+    let domain_strategy = match sockopt
+        .get("domainStrategy")
+        .filter(|value| !value.is_null())
+    {
+        None => None,
+        Some(Value::String(name)) => Some(
+            crate::routing::FreedomStrategy::parse(name)
+                .ok_or_else(|| format!("unsupported domain strategy: {name}"))?,
+        ),
+        Some(_) => return Err("sockopt.domainStrategy must be a string".into()),
+    };
     let positive = |key: &str| int(key).filter(|v| *v > 0).map(|v| v as u32);
     let settings = SockoptSettings {
         mark: int("mark").unwrap_or(0) as u32,
@@ -2119,6 +2309,7 @@ pub fn parse_sockopt(sockopt: &Value, _owner: &str) -> Result<Option<SockoptSett
         happy_eyeballs,
         tcp_window_clamp: positive("tcpWindowClamp"),
         custom_sockopt,
+        domain_strategy,
     };
     let unset = SockoptSettings {
         mark: 0,
@@ -2138,6 +2329,7 @@ pub fn parse_sockopt(sockopt: &Value, _owner: &str) -> Result<Option<SockoptSett
         happy_eyeballs: None,
         tcp_window_clamp: None,
         custom_sockopt: Vec::new(),
+        domain_strategy: None,
     };
     Ok((settings != unset).then_some(settings))
 }
@@ -2314,9 +2506,9 @@ fn parse_fakedns_pool(item: &Value) -> Result<Option<crate::fakedns::FakeDnsPool
             .as_i64()
             .ok_or_else(|| "invalid fakeDNS setting".to_owned())?,
     };
-    // Xray ignores a pool with an empty ipPool or a zero LRU size at runtime.
+    // Xray refuses to start with an empty pool or a zero LRU size.
     if ip_pool.is_empty() || pool_size == 0 {
-        return Ok(None);
+        return Err("invalid fakeDNS setting".into());
     }
     let pool_size = usize::try_from(pool_size).map_err(|_| "invalid fakeDNS setting".to_owned())?;
     Ok(Some(crate::fakedns::FakeDnsPoolConfig {
@@ -2568,13 +2760,16 @@ fn map_remaining_localhost(servers: &mut [Value]) {
     }
 }
 
-fn stream_network(stream: &Value) -> &str {
+/// Xray's effective transport: `method` overrides `network`, and names are
+/// matched without case (`StreamConfig.Build` lowercases them).
+fn stream_network(stream: &Value) -> String {
     stream
-        .get("network")
-        .or_else(|| stream.get("method"))
+        .get("method")
+        .or_else(|| stream.get("network"))
         .or_else(|| stream.get("transport"))
         .and_then(Value::as_str)
         .unwrap_or_default()
+        .to_ascii_lowercase()
 }
 
 /// Xray's shadowsocks_2022 server takes only keys of the cipher's exact
@@ -2680,37 +2875,154 @@ fn parse_fakedns(
     Ok(Some(multi))
 }
 
-fn parse_sniffing(item: &Value, tag: &str) -> crate::vless::Sniffing {
+fn parse_sniffing(item: &Value, tag: &str) -> Result<crate::vless::Sniffing, String> {
     let mut sniffing = crate::vless::Sniffing::default();
-    let flag = |key| item.get(key).and_then(Value::as_bool).unwrap_or(false);
-    if !flag("enabled") {
-        return sniffing;
+    if item.is_null() {
+        return Ok(sniffing);
     }
-    sniffing.metadata_only = flag("metadataOnly");
-    sniffing.route_only = flag("routeOnly");
-    let mut ignored = Vec::new();
-    for name in array(item, "destOverride").iter().filter_map(Value::as_str) {
-        match name {
+    let Some(object) = item.as_object() else {
+        return Err(format!("inbound {tag:?}: sniffing must be an object"));
+    };
+    let flag = |key: &str| match object.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(enabled)) => Ok(*enabled),
+        Some(_) => Err(format!("inbound {tag:?}: sniffing.{key} must be a boolean")),
+    };
+    if !flag("enabled")? {
+        return Ok(sniffing);
+    }
+    sniffing.metadata_only = flag("metadataOnly")?;
+    sniffing.route_only = flag("routeOnly")?;
+    let names = match object.get("destOverride") {
+        None | Some(Value::Null) => &[][..],
+        Some(Value::Array(names)) => names.as_slice(),
+        Some(_) => {
+            return Err(format!(
+                "inbound {tag:?}: sniffing.destOverride must be an array"
+            ))
+        }
+    };
+    for name in names {
+        let Some(name) = name.as_str() else {
+            return Err(format!(
+                "inbound {tag:?}: sniffing.destOverride must hold strings"
+            ));
+        };
+        match name.to_ascii_lowercase().as_str() {
             "http" => sniffing.http = true,
-            "tls" => sniffing.tls = true,
-            "quic" => sniffing.quic = true,
+            "tls" | "https" | "ssl" => sniffing.tls = true,
+            "quic" => {
+                crate::log::warn!(
+                    "inbound {tag:?}: sniffing quic is accepted but not implemented yet, ignored"
+                );
+                sniffing.quic = true;
+            }
             "fakedns" => sniffing.fakedns = true,
-            "fakedns+others" => sniffing.fakedns_other = true,
-            other => ignored.push(other),
+            "fakedns+others" => {
+                sniffing.fakedns = true;
+                sniffing.fakedns_other = true;
+            }
+            other => return Err(format!("inbound {tag:?}: unknown protocol: {other}")),
         }
     }
-    let mut excluded = Vec::new();
-    for ex in array(item, "domainsExcluded")
-        .iter()
-        .filter_map(Value::as_str)
+    if let Some(entries) = object
+        .get("domainsExcluded")
+        .filter(|value| !value.is_null())
     {
-        excluded.push(ex.to_owned());
+        let Some(entries) = entries.as_array() else {
+            return Err(format!(
+                "inbound {tag:?}: sniffing.domainsExcluded must be an array"
+            ));
+        };
+        let mut excluded = Vec::new();
+        for entry in entries {
+            let Some(rule) = entry.as_str() else {
+                return Err(format!(
+                    "inbound {tag:?}: sniffing.domainsExcluded must hold strings"
+                ));
+            };
+            if rule.starts_with("geosite:")
+                || rule.starts_with("ext:")
+                || rule.starts_with("ext-domain:")
+                || rule.starts_with("ext-site:")
+            {
+                crate::log::warn!(
+                    "inbound {tag:?}: sniffing.domainsExcluded geodata rule {rule:?} is not supported yet, ignored"
+                );
+                continue;
+            }
+            if let Some(pattern) = rule.strip_prefix("regexp:") {
+                regex::Regex::new(pattern).map_err(|e| {
+                    format!("inbound {tag:?}: invalid sniffing.domainsExcluded regexp: {e}")
+                })?;
+            }
+            if let Some(substr) = rule.strip_prefix("dotless:") {
+                if substr.contains('.') {
+                    return Err(format!(
+                        "inbound {tag:?}: substr in dotless rule should not contain a dot"
+                    ));
+                }
+            }
+            excluded.push(rule.to_owned());
+        }
+        sniffing.domains_excluded = std::sync::Arc::new(excluded);
     }
-    sniffing.domains_excluded = std::sync::Arc::new(excluded);
-    if !ignored.is_empty() {
-        crate::log::warn!("inbound {tag:?}: sniffing {} ignored", ignored.join(", "));
+    if let Some(entries) = object.get("ipsExcluded").filter(|value| !value.is_null()) {
+        let Some(entries) = entries.as_array() else {
+            return Err(format!(
+                "inbound {tag:?}: sniffing.ipsExcluded must be an array"
+            ));
+        };
+        let mut excluded = Vec::new();
+        for entry in entries {
+            let Some(rule) = entry.as_str() else {
+                return Err(format!(
+                    "inbound {tag:?}: sniffing.ipsExcluded must hold strings"
+                ));
+            };
+            let rule = rule.strip_prefix('!').unwrap_or(rule);
+            if rule.starts_with("geoip:") || rule.starts_with("ext:") || rule.starts_with("ext-ip:")
+            {
+                crate::log::warn!(
+                    "inbound {tag:?}: sniffing.ipsExcluded geodata rule {rule:?} is not supported yet, ignored"
+                );
+                continue;
+            }
+            let (address, prefix) = rule.split_once('/').unwrap_or((rule, ""));
+            let address = address
+                .trim_matches(|c: char| !c.is_alphanumeric() && c != ':' && c != '.')
+                .trim_start_matches('[')
+                .trim_end_matches(']');
+            let ip: std::net::IpAddr = address.parse().map_err(|_| {
+                format!("inbound {tag:?}: illegal ip rule in sniffing.ipsExcluded: {rule}")
+            })?;
+            let ip = match ip {
+                std::net::IpAddr::V6(v6) => v6
+                    .to_ipv4_mapped()
+                    .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+                ip => ip,
+            };
+            let max = match ip {
+                std::net::IpAddr::V4(_) => 32u32,
+                std::net::IpAddr::V6(ip) if ip.to_ipv4_mapped().is_some() => 32,
+                std::net::IpAddr::V6(_) => 128,
+            };
+            let prefix = if prefix.is_empty() {
+                max
+            } else {
+                prefix
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|prefix| *prefix <= max)
+                    .ok_or_else(|| {
+                        format!("inbound {tag:?}: invalid CIDR prefix in sniffing.ipsExcluded")
+                    })?
+            };
+            excluded.push((ip, prefix as u8));
+        }
+        sniffing.ips_excluded = std::sync::Arc::new(excluded);
     }
-    sniffing
+    Ok(sniffing)
 }
 
 fn parse_fallback(item: &Value) -> Result<Fallback, String> {
@@ -2720,9 +3032,18 @@ fn parse_fallback(item: &Value) -> Result<Fallback, String> {
     }
     let dest = parse_dest(item.get("dest"))
         .map_err(|_| r#"please fill in a valid value for every "dest""#.to_string())?;
-    let xver = match item.get("xver").and_then(Value::as_u64).unwrap_or(0) {
-        x @ 0..=2 => x as u8,
-        _ => return Err(r#"invalid PROXY protocol version, "xver" only accepts 0, 1, 2"#.into()),
+    let xver = match item.get("xver") {
+        None | Some(Value::Null) => 0,
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .filter(|version| *version <= 2)
+            .map(|version| version as u8)
+            .ok_or_else(|| {
+                r#"invalid PROXY protocol version, "xver" only accepts 0, 1, 2"#.to_string()
+            })?,
+        Some(_) => {
+            return Err(r#"invalid PROXY protocol version, "xver" only accepts 0, 1, 2"#.into())
+        }
     };
     Ok(Fallback {
         name: str_field(item, "name").to_owned(),
@@ -2731,6 +3052,19 @@ fn parse_fallback(item: &Value) -> Result<Fallback, String> {
         dest,
         xver,
     })
+}
+
+/// User levels are `uint32` for VLESS and `byte` for VMess/Trojan/Shadowsocks.
+fn parse_user_level(value: Option<&Value>, max: u64) -> Result<u32, String> {
+    match value {
+        None | Some(Value::Null) => Ok(0),
+        Some(Value::Number(number)) => number
+            .as_u64()
+            .filter(|level| *level <= max)
+            .map(|level| level as u32)
+            .ok_or_else(|| "user level is out of range".to_string()),
+        Some(_) => Err("user level must be a number".to_string()),
+    }
 }
 
 pub(crate) fn parse_dest(dest: Option<&Value>) -> Result<FallbackDest, String> {
@@ -2843,7 +3177,12 @@ fn parse_version_opt(v: &Value) -> Option<Result<[u8; 3], String>> {
 }
 
 fn parse_reality(reality: &Value, _tag: &str) -> Result<Option<RealityInboundSettings>, String> {
-    let dest = parse_dest(reality.get("dest"))?;
+    // Go's REALITYConfig lets `target` override `dest`; 3x-ui v3 writes `target`.
+    let dest_value = reality
+        .get("target")
+        .filter(|value| !value.is_null())
+        .or_else(|| reality.get("dest"));
+    let dest = parse_dest(dest_value)?;
 
     let mut server_names = Vec::new();
     for name in array(reality, "serverNames") {
@@ -3420,8 +3759,22 @@ fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
         .map_or(&[], Vec::as_slice)
 }
 
+/// Reads a string field the way Go's JSON decoder matches struct fields:
+/// exact spelling first, then without case. Case-insensitive matching matters
+/// after `normalize_keys`: freedom's `logLevel` and the log section's
+/// `loglevel` both canonicalize to `loglevel`.
 pub(crate) fn str_field<'a>(value: &'a Value, key: &str) -> &'a str {
-    value.get(key).and_then(Value::as_str).unwrap_or_default()
+    let Some(map) = value.as_object() else {
+        return "";
+    };
+    map.get(key)
+        .or_else(|| {
+            map.iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case(key))
+                .map(|(_, value)| value)
+        })
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -3973,6 +4326,7 @@ mod tests {
             route_only: true,
             metadata_only: false,
             domains_excluded: std::sync::Arc::new(Vec::new()),
+            ips_excluded: std::sync::Arc::new(Vec::new()),
         };
         assert_eq!(inbound.sniffing, sniffing);
         if let InboundTransport::HttpUpgrade(hu) = &inbound.transport {
@@ -4108,33 +4462,41 @@ mod tests {
     fn parses_accept_proxy_protocol() {
         let raw = r#"{
           "inbounds": [
-            {"tag": "in-v1", "port": 10001, "protocol": "vless",
-             "streamSettings": {"sockopt": {"acceptProxyProtocol": 1}}},
-            {"tag": "in-v2", "port": 10002, "protocol": "vless",
-             "streamSettings": {"sockopt": {"acceptProxyProtocol": 2}}},
-            {"tag": "in-bool", "port": 10003, "protocol": "vless",
-             "streamSettings": {"sockopt": {"acceptProxyProtocol": true}}},
-            {"tag": "in-none", "port": 10004, "protocol": "vless"}
+            {"tag": "in-sockopt", "port": 10001, "protocol": "vless",
+             "streamSettings": {"network": "tcp", "sockopt": {"acceptProxyProtocol": true}}},
+            {"tag": "in-tcp", "port": 10002, "protocol": "vless",
+             "streamSettings": {"network": "tcp", "tcpSettings": {"acceptProxyProtocol": true}}},
+            {"tag": "in-raw", "port": 10003, "protocol": "vless",
+             "streamSettings": {"network": "raw", "rawSettings": {"acceptProxyProtocol": true}}},
+            {"tag": "in-ws", "port": 10004, "protocol": "vless",
+             "streamSettings": {"network": "ws", "wsSettings": {"acceptProxyProtocol": true}}},
+            {"tag": "in-unused", "port": 10005, "protocol": "vless",
+             "streamSettings": {"network": "tcp", "wsSettings": {"acceptProxyProtocol": true}}},
+            {"tag": "in-none", "port": 10006, "protocol": "vless"}
           ]
         }"#;
         let inbounds = parse(raw).unwrap().inbounds;
-        assert_eq!(inbounds.len(), 4);
-        assert_eq!(
-            inbounds[0].accept_proxy_protocol,
-            crate::proxy_proto::ProxyProtocolAccept::V1
-        );
-        assert_eq!(
-            inbounds[1].accept_proxy_protocol,
-            crate::proxy_proto::ProxyProtocolAccept::V2
-        );
-        assert_eq!(
-            inbounds[2].accept_proxy_protocol,
-            crate::proxy_proto::ProxyProtocolAccept::Any
-        );
-        assert_eq!(
-            inbounds[3].accept_proxy_protocol,
-            crate::proxy_proto::ProxyProtocolAccept::None
-        );
+        let any = crate::proxy_proto::ProxyProtocolAccept::Any;
+        let none = crate::proxy_proto::ProxyProtocolAccept::None;
+        assert_eq!(inbounds.len(), 6);
+        assert_eq!(inbounds[0].accept_proxy_protocol, any);
+        assert_eq!(inbounds[1].accept_proxy_protocol, any);
+        assert_eq!(inbounds[2].accept_proxy_protocol, any);
+        assert_eq!(inbounds[3].accept_proxy_protocol, any);
+        // A flag in a transport the inbound does not use stays unused.
+        assert_eq!(inbounds[4].accept_proxy_protocol, none);
+        assert_eq!(inbounds[5].accept_proxy_protocol, none);
+
+        assert!(parse(
+            r#"{"inbounds": [{"tag": "x", "port": 1, "protocol": "vless",
+                "streamSettings": {"network": "tcp", "sockopt": {"acceptProxyProtocol": 1}}}]}"#
+        )
+        .is_err());
+        assert!(parse(
+            r#"{"inbounds": [{"tag": "x", "port": 1, "protocol": "vless",
+                "streamSettings": {"network": "ws", "wsSettings": {"acceptProxyProtocol": "true"}}}]}"#
+        )
+        .is_err());
     }
 
     #[test]
@@ -4500,6 +4862,14 @@ mod tests {
             parse(serde_json::json!({"acceptProxyProtocol": true})).unwrap(),
             None
         );
+        assert_eq!(
+            parse(serde_json::json!({"domainStrategy": "UseIPv4"}))
+                .unwrap()
+                .unwrap()
+                .domain_strategy,
+            Some(crate::routing::FreedomStrategy::UseIPv4)
+        );
+        assert!(parse(serde_json::json!({"domainStrategy": "Bogus"})).is_err());
         let on = parse(serde_json::json!({"tcpFastOpen": true, "tproxy": "Redirect", "mark": 7}))
             .unwrap()
             .unwrap();

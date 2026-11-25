@@ -72,6 +72,11 @@ impl PolicyManager {
                         {
                             // Each connection allocates this per direction; an absurd
                             // value would abort the process on allocation failure.
+                            if bytes > MAX_BUFFER_SIZE {
+                                crate::log::warn!(
+                                    "policy level {lvl}: bufferSize {kib} KiB exceeds 16 MiB, clamped"
+                                );
+                            }
                             settings.buffer_size = bytes.min(MAX_BUFFER_SIZE);
                         }
                     }
