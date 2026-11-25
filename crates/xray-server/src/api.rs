@@ -399,14 +399,36 @@ pub struct ListRuleResponse {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RouterConfigProto {
+    #[prost(int32, tag = "1")]
+    pub domain_strategy: i32,
     #[prost(message, repeated, tag = "2")]
     pub rule: Vec<RoutingRuleProto>,
+    #[prost(message, repeated, tag = "3")]
+    pub balancing_rule: Vec<BalancingRuleProto>,
+    #[prost(string, tag = "4")]
+    pub script: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct BalancingRuleProto {
+    #[prost(string, tag = "1")]
+    pub tag: String,
+    #[prost(string, repeated, tag = "2")]
+    pub outbound_selector: Vec<String>,
+    #[prost(string, tag = "3")]
+    pub strategy: String,
+    #[prost(message, optional, tag = "4")]
+    pub strategy_settings: Option<TypedMessage>,
+    #[prost(string, tag = "5")]
+    pub fallback_tag: String,
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RoutingRuleProto {
     #[prost(string, tag = "1")]
     pub tag: String,
+    #[prost(string, tag = "12")]
+    pub balancing_tag: String,
     #[prost(string, tag = "19")]
     pub rule_tag: String,
     #[prost(message, repeated, tag = "2")]
@@ -527,6 +549,22 @@ pub struct StreamConfigProto {
     pub protocol_name: String,
     #[prost(string, tag = "3")]
     pub security_type: String,
+    #[prost(message, repeated, tag = "2")]
+    pub transport_settings: Vec<TypedMessage>,
+    #[prost(message, repeated, tag = "4")]
+    pub security_settings: Vec<TypedMessage>,
+    #[prost(bytes = "bytes", optional, tag = "6")]
+    pub socket_settings: Option<Bytes>,
+    #[prost(message, optional, tag = "8")]
+    pub address: Option<IpOrDomainProto>,
+    #[prost(uint32, tag = "9")]
+    pub port: u32,
+    #[prost(message, repeated, tag = "10")]
+    pub udp_masks: Vec<TypedMessage>,
+    #[prost(message, repeated, tag = "11")]
+    pub tcp_masks: Vec<TypedMessage>,
+    #[prost(bytes = "bytes", optional, tag = "12")]
+    pub quic_params: Option<Bytes>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -535,10 +573,14 @@ pub struct SniffingConfigProto {
     pub enabled: bool,
     #[prost(string, repeated, tag = "2")]
     pub destination_override: Vec<String>,
+    #[prost(bytes = "bytes", repeated, tag = "3")]
+    pub domains_excluded: Vec<Bytes>,
     #[prost(bool, tag = "4")]
     pub metadata_only: bool,
     #[prost(bool, tag = "5")]
     pub route_only: bool,
+    #[prost(bytes = "bytes", repeated, tag = "6")]
+    pub ips_excluded: Vec<Bytes>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -571,14 +613,22 @@ pub struct VlessInboundConfigProto {
 pub struct TrojanServerConfigProto {
     #[prost(message, repeated, tag = "1")]
     pub users: Vec<ProtocolUser>,
-    #[prost(message, repeated, tag = "3")]
+    #[prost(message, repeated, tag = "2")]
     pub fallbacks: Vec<FallbackProto>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct VmessDefaultConfigProto {
+    #[prost(uint32, tag = "2")]
+    pub level: u32,
 }
 
 #[derive(Clone, PartialEq, Message)]
 pub struct VmessInboundConfigProto {
     #[prost(message, repeated, tag = "1")]
     pub user: Vec<ProtocolUser>,
+    #[prost(message, optional, tag = "2")]
+    pub default: Option<VmessDefaultConfigProto>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -1049,7 +1099,10 @@ fn serialize_proxy_settings(inbound: &Inbound) -> (String, Vec<u8>) {
                     }
                 })
                 .collect();
-            let cfg = VmessInboundConfigProto { user };
+            let cfg = VmessInboundConfigProto {
+                user,
+                default: None,
+            };
             let _ = cfg.encode(&mut buf);
         }
         InboundProtocol::Shadowsocks => {
@@ -1163,6 +1216,7 @@ pub fn inbound_handler_config(inbound: &Inbound) -> InboundHandlerConfig {
     let stream_settings = Some(StreamConfigProto {
         protocol_name: protocol_name.into(),
         security_type: security_type.into(),
+        ..Default::default()
     });
 
     let sniffing_settings = if inbound.sniffing.http
@@ -1189,6 +1243,7 @@ pub fn inbound_handler_config(inbound: &Inbound) -> InboundHandlerConfig {
             destination_override: dests,
             metadata_only: inbound.sniffing.metadata_only,
             route_only: inbound.sniffing.route_only,
+            ..Default::default()
         })
     } else {
         None
@@ -1298,6 +1353,14 @@ impl InboundManager {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(tag).map(|e| e.ctx.clone())
+    }
+
+    pub fn protocol(&self, tag: &str) -> Option<crate::config::InboundProtocol> {
+        let map = self
+            .inbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(tag).map(|entry| entry.inbound.protocol)
     }
 
     pub fn contains(&self, tag: &str) -> bool {
@@ -1731,11 +1794,35 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                 let config = req.config.unwrap_or_default();
                 if config.r#type.contains("xray.app.router.Config") {
                     if let Ok(cfg) = RouterConfigProto::decode(config.value) {
+                        if !cfg.balancing_rule.is_empty() {
+                            // `Router.balancers` is immutable after build; a
+                            // clear error makes 3x-ui restart with the config.
+                            return status(
+                                UNKNOWN,
+                                "routing balancers cannot be changed at runtime; restart the core",
+                            );
+                        }
+                        let strategy = match cfg.domain_strategy {
+                            2 => xray_config::RoutingDomainStrategy::IpIfNonMatch,
+                            3 => xray_config::RoutingDomainStrategy::IpOnDemand,
+                            _ => xray_config::RoutingDomainStrategy::AsIs,
+                        };
+                        if strategy != router.strategy {
+                            return status(
+                                UNKNOWN,
+                                "routing domainStrategy change requires a restart",
+                            );
+                        }
                         let mut parsed_rules = Vec::new();
                         for r in cfg.rule {
                             let mut rule_obj = serde_json::Map::new();
                             rule_obj.insert("type".into(), serde_json::json!("field"));
-                            if !r.tag.is_empty() {
+                            if !r.balancing_tag.is_empty() {
+                                rule_obj.insert(
+                                    "balancerTag".into(),
+                                    serde_json::json!(r.balancing_tag),
+                                );
+                            } else if !r.tag.is_empty() {
                                 rule_obj.insert("outboundTag".into(), serde_json::json!(r.tag));
                             }
                             if !r.rule_tag.is_empty() {
@@ -1838,12 +1925,12 @@ async fn handle_router(method: &str, message: Bytes, router: &Arc<Router>) -> Re
                                 Err(e) => return status(UNKNOWN, &e),
                             }
                         }
-                        // Prepending one by one would reverse the given order.
-                        if !req.should_append {
-                            parsed_rules.reverse();
-                        }
-                        for rule in parsed_rules {
-                            router.add_rule(rule, req.should_append);
+                        if req.should_append {
+                            for rule in parsed_rules {
+                                router.add_rule(rule, true);
+                            }
+                        } else {
+                            router.set_rules(parsed_rules);
                         }
                     }
                 }
@@ -2182,6 +2269,89 @@ fn handle_stats_inner(stats: &crate::stats::Stats, method: &str, message: Bytes)
     }
 }
 
+/// The runtime protobuf carries one port (3x-ui always sends a single value).
+fn receiver_port(rec: &ReceiverConfig) -> Result<u16, String> {
+    let ranges = rec
+        .port_list
+        .as_ref()
+        .map(|list| list.range.as_slice())
+        .unwrap_or_default();
+    if ranges.len() != 1 || ranges[0].from != ranges[0].to {
+        return Err("AddInbound needs exactly one port".into());
+    }
+    u16::try_from(ranges[0].from).map_err(|_| {
+        format!(
+            "AddInbound port {} is out of range (0-65535)",
+            ranges[0].from
+        )
+    })
+}
+
+fn receiver_listen(rec: &ReceiverConfig) -> Result<String, String> {
+    let Some(listen) = &rec.listen else {
+        return Ok(String::new());
+    };
+    if let Some(domain) = &listen.domain {
+        return Ok(domain.clone());
+    }
+    let Some(ip) = &listen.ip else {
+        return Ok(String::new());
+    };
+    match ip.len() {
+        4 => Ok(format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])),
+        16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(ip);
+            Ok(std::net::Ipv6Addr::from(octets).to_string())
+        }
+        len => Err(format!(
+            "AddInbound listen address has {len} bytes, expected 4 or 16"
+        )),
+    }
+}
+
+/// Rejects proxy settings whose fields this server would silently drop when
+/// starting the inbound from the runtime protobuf.
+fn check_inbound_proxy_settings(proxy_name: &str, value: &Bytes) -> Result<(), String> {
+    match proxy_name {
+        "vless" => {
+            let config = VlessInboundConfigProto::decode(value.clone())
+                .map_err(|e| format!("bad VLESS inbound settings: {e}"))?;
+            if !config.decryption.is_empty() && !config.decryption.eq_ignore_ascii_case("none") {
+                return Err(format!(
+                    "AddInbound does not support VLESS decryption {:?} yet",
+                    config.decryption
+                ));
+            }
+            if !config.fallbacks.is_empty() {
+                return Err("AddInbound does not support fallbacks yet".into());
+            }
+        }
+        "trojan" => {
+            let config = TrojanServerConfigProto::decode(value.clone())
+                .map_err(|e| format!("bad Trojan inbound settings: {e}"))?;
+            if !config.fallbacks.is_empty() {
+                return Err("AddInbound does not support fallbacks yet".into());
+            }
+        }
+        "vmess" => {
+            let config = VmessInboundConfigProto::decode(value.clone())
+                .map_err(|e| format!("bad VMess inbound settings: {e}"))?;
+            if config.default.is_some_and(|default| default.level != 0) {
+                return Err(
+                    "AddInbound does not support a non-zero VMess default level yet".into(),
+                );
+            }
+        }
+        other => {
+            return Err(format!(
+                "AddInbound does not support proxy type {other:?} yet"
+            ))
+        }
+    }
+    Ok(())
+}
+
 async fn handle_handler(
     method: &str,
     message: Bytes,
@@ -2224,6 +2394,14 @@ async fn handle_handler(
             let Some(ctx) = inbound_manager.get_ctx(&r.tag) else {
                 return missing_handler(&r.tag);
             };
+            if inbound_manager.protocol(&r.tag) == Some(crate::config::InboundProtocol::Wireguard) {
+                // 3x-ui then falls back to a full core restart, which applies
+                // the peer removal from the JSON config.
+                return status(
+                    UNKNOWN,
+                    "wireguard user management is not supported at runtime; restart the core",
+                );
+            }
             let users: Vec<_> = ctx
                 .users()
                 .into_iter()
@@ -2304,15 +2482,41 @@ async fn handle_handler(
             if inbound_manager.contains(&tag) {
                 return status(UNKNOWN, &format!("handler already exists: {tag}"));
             }
-            // The API only rebuilds plain TCP inbounds of known protocols; TLS, REALITY and
-            // transport settings would be lost. An error makes 3x-ui restart the core with the
-            // full config instead.
-            let stream = inbound_cfg
-                .receiver_settings
+            let proxy_type = inbound_cfg
+                .proxy_settings
                 .as_ref()
-                .and_then(|r| ReceiverConfig::decode(r.value.clone()).ok())
-                .and_then(|r| r.stream_settings);
-            if let Some(stream) = &stream {
+                .map(|p| p.r#type.as_str())
+                .unwrap_or_default();
+            // AddInbound receives the runtime protobuf, not the JSON config.
+            // TLS, REALITY, fallbacks and transport options live in nested
+            // typed messages; rebuilding only part of them would start a
+            // listener that differs from the panel. Rejecting makes 3x-ui
+            // restart the core with the full JSON config instead.
+            let known = ["vless", "vmess", "trojan"];
+            let Some(proxy_name) = known.iter().find(|k| proxy_type.contains(*k)) else {
+                return status(
+                    UNKNOWN,
+                    &format!("AddInbound does not support proxy type {proxy_type:?} yet"),
+                );
+            };
+            let Some(receiver) = inbound_cfg.receiver_settings else {
+                return status(INVALID_ARGUMENT, "missing receiver settings");
+            };
+            let rec = match ReceiverConfig::decode(receiver.value) {
+                Ok(rec) => rec,
+                Err(e) => return status(INVALID_ARGUMENT, &format!("bad receiver settings: {e}")),
+            };
+            if rec.receive_original_destination {
+                return status(
+                    UNKNOWN,
+                    "AddInbound does not support receiveOriginalDestination yet",
+                );
+            }
+            if let Some(stream) = &rec.stream_settings {
+                // The API only rebuilds plain TCP inbounds. Everything else
+                // lives in nested typed messages this server does not decode;
+                // dropping it silently would start a listener that differs
+                // from the panel. An error makes 3x-ui restart the core.
                 if !stream.security_type.is_empty()
                     || !matches!(stream.protocol_name.as_str(), "" | "tcp" | "raw")
                 {
@@ -2324,248 +2528,189 @@ async fn handle_handler(
                         ),
                     );
                 }
+                if stream
+                    .transport_settings
+                    .iter()
+                    .any(|settings| !settings.value.is_empty())
+                {
+                    return status(
+                        UNKNOWN,
+                        "AddInbound does not support transport settings yet",
+                    );
+                }
+                if !stream.security_settings.is_empty() {
+                    return status(UNKNOWN, "AddInbound does not support security settings yet");
+                }
+                if stream
+                    .socket_settings
+                    .as_ref()
+                    .is_some_and(|settings| !settings.is_empty())
+                {
+                    return status(UNKNOWN, "AddInbound does not support sockopt yet");
+                }
+                if stream.address.is_some() || stream.port != 0 {
+                    return status(
+                        UNKNOWN,
+                        "AddInbound does not support stream address or port",
+                    );
+                }
+                if stream
+                    .udp_masks
+                    .iter()
+                    .chain(stream.tcp_masks.iter())
+                    .any(|mask| !mask.value.is_empty())
+                {
+                    return status(UNKNOWN, "AddInbound does not support finalmask yet");
+                }
+                if stream
+                    .quic_params
+                    .as_ref()
+                    .is_some_and(|params| !params.is_empty())
+                {
+                    return status(UNKNOWN, "AddInbound does not support quicParams yet");
+                }
             }
-            let proxy_type = inbound_cfg
-                .proxy_settings
-                .as_ref()
-                .map(|p| p.r#type.as_str())
-                .unwrap_or_default();
-            let known = [
-                "trojan",
-                "vmess",
-                "shadowsocks",
-                "dokodemo",
-                "socks",
-                "http",
-                "hysteria",
-                "vless",
-            ];
-            let Some(proxy_name) = known.iter().find(|k| proxy_type.contains(*k)) else {
-                return status(
-                    UNKNOWN,
-                    &format!("AddInbound does not support proxy type {proxy_type:?} yet"),
-                );
+            let port = match receiver_port(&rec) {
+                Ok(port) => port,
+                Err(e) => return status(UNKNOWN, &e),
             };
-            let (port, listen, sniffing, transport) =
-                if let Some(rec) = inbound_cfg.receiver_settings {
-                    let rec = ReceiverConfig::decode(rec.value).unwrap_or(ReceiverConfig {
-                        port_list: None,
-                        listen: None,
-                        stream_settings: None,
-                        receive_original_destination: false,
-                        sniffing_settings: None,
-                    });
-                    let port = rec
-                        .port_list
-                        .and_then(|p| p.range.first().map(|r| r.from as u16))
-                        .unwrap_or(0);
-                    let listen = if let Some(l) = rec.listen {
-                        if let Some(d) = l.domain {
-                            d
-                        } else if let Some(ip) = l.ip {
-                            if ip.len() == 4 {
-                                format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
-                            } else {
-                                "127.0.0.1".into()
-                            }
-                        } else {
-                            "127.0.0.1".into()
-                        }
-                    } else {
-                        "127.0.0.1".into()
-                    };
-                    let sniffing = if let Some(s) = rec.sniffing_settings {
-                        let http = s
-                            .destination_override
-                            .iter()
-                            .any(|d| d.eq_ignore_ascii_case("http"));
-                        let tls = s
-                            .destination_override
-                            .iter()
-                            .any(|d| d.eq_ignore_ascii_case("tls"));
-                        let fakedns = s
-                            .destination_override
-                            .iter()
-                            .any(|d| d.eq_ignore_ascii_case("fakedns"));
-                        let fakedns_other = s
-                            .destination_override
-                            .iter()
-                            .any(|d| d.eq_ignore_ascii_case("fakedns+others"));
-                        crate::vless::Sniffing {
-                            http: s.enabled && (http || s.destination_override.is_empty()),
-                            tls: s.enabled && (tls || s.destination_override.is_empty()),
-                            route_only: s.route_only,
-                            quic: false,
-                            fakedns: s.enabled && fakedns,
-                            fakedns_other: s.enabled && fakedns_other,
-                            domains_excluded: std::sync::Arc::new(Vec::new()),
-                            metadata_only: false,
-                        }
-                    } else {
-                        crate::vless::Sniffing::default()
-                    };
-                    let transport = match rec
-                        .stream_settings
-                        .as_ref()
-                        .map(|s| s.protocol_name.as_str())
-                    {
-                        Some("ws") => {
-                            crate::config::InboundTransport::Websocket(crate::ws::WsSettings {
-                                path: "/".into(),
-                                host: None,
-                                heartbeat_period: None,
-                            })
-                        }
-                        Some("grpc") => {
-                            crate::config::InboundTransport::Grpc(crate::grpc::GrpcSettings {
-                                service_name: String::new(),
-                                multi_mode: false,
-                                authority: None,
-                            })
-                        }
-                        Some("httpupgrade") => crate::config::InboundTransport::HttpUpgrade(
-                            crate::httpupgrade::HttpUpgradeSettings {
-                                path: "/".into(),
-                                host: None,
-                            },
-                        ),
-                        _ => crate::config::InboundTransport::Tcp,
-                    };
-                    (port, listen, sniffing, transport)
-                } else {
-                    (
-                        0,
-                        "127.0.0.1".into(),
-                        crate::vless::Sniffing::default(),
-                        crate::config::InboundTransport::Tcp,
-                    )
-                };
-            let proxy_type = inbound_cfg
-                .proxy_settings
-                .as_ref()
-                .map(|p| p.r#type.as_str())
-                .unwrap_or_default();
-            let protocol = if proxy_type.contains("trojan") {
-                crate::config::InboundProtocol::Trojan
-            } else if proxy_type.contains("vmess") {
-                crate::config::InboundProtocol::Vmess
-            } else if proxy_type.contains("shadowsocks") {
-                crate::config::InboundProtocol::Shadowsocks
-            } else if proxy_type.contains("dokodemo") {
-                crate::config::InboundProtocol::Dokodemo
-            } else if proxy_type.contains("socks") {
-                crate::config::InboundProtocol::Socks
-            } else if proxy_type.contains("http") {
-                crate::config::InboundProtocol::Http
-            } else if proxy_type.contains("hysteria") {
-                crate::config::InboundProtocol::Hysteria
+            let listen = match receiver_listen(&rec) {
+                Ok(listen) => listen,
+                Err(e) => return status(UNKNOWN, &e),
+            };
+            let sniffing = if let Some(s) = rec.sniffing_settings {
+                if !s.domains_excluded.is_empty() || !s.ips_excluded.is_empty() {
+                    return status(
+                        UNKNOWN,
+                        "AddInbound does not support sniffing exclusion lists yet",
+                    );
+                }
+                let http = s
+                    .destination_override
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case("http"));
+                let tls = s
+                    .destination_override
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case("tls"));
+                let quic = s
+                    .destination_override
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case("quic"));
+                let fakedns = s
+                    .destination_override
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case("fakedns"));
+                let fakedns_other = s
+                    .destination_override
+                    .iter()
+                    .any(|d| d.eq_ignore_ascii_case("fakedns+others"));
+                let empty = s.destination_override.is_empty();
+                crate::vless::Sniffing {
+                    http: s.enabled && (http || empty),
+                    tls: s.enabled && (tls || empty),
+                    route_only: s.route_only,
+                    quic: s.enabled && quic,
+                    fakedns: s.enabled && fakedns,
+                    fakedns_other: s.enabled && fakedns_other,
+                    domains_excluded: std::sync::Arc::new(Vec::new()),
+                    ips_excluded: std::sync::Arc::new(Vec::new()),
+                    metadata_only: s.metadata_only,
+                }
             } else {
-                crate::config::InboundProtocol::Vless
+                crate::vless::Sniffing::default()
+            };
+            if let Some(proxy_settings) = &inbound_cfg.proxy_settings {
+                if let Err(e) = check_inbound_proxy_settings(proxy_name, &proxy_settings.value) {
+                    return status(UNKNOWN, &e);
+                }
+            }
+            let transport = crate::config::InboundTransport::Tcp;
+            let protocol = match *proxy_name {
+                "trojan" => crate::config::InboundProtocol::Trojan,
+                "vmess" => crate::config::InboundProtocol::Vmess,
+                _ => crate::config::InboundProtocol::Vless,
             };
             let mut parsed_users = Vec::new();
-            let mut parsed_ss_users = Vec::new();
-            let mut parsed_hysteria_users = Vec::new();
-            let mut ss_method = None;
-            let mut ss_pass = None;
             if let Some(ref ps) = inbound_cfg.proxy_settings {
-                if let Ok(u_cfg) = ProxyUsersConfig::decode(ps.value.clone()) {
-                    for u in u_cfg.users {
-                        let email = u.email.clone();
-                        let account = u.account.unwrap_or_default();
-                        match account.r#type.as_str() {
-                            VMESS_ACCOUNT => {
-                                let Ok(acc) = VmessAccount::decode(account.value) else {
-                                    return status(INVALID_ARGUMENT, "bad VMess account");
-                                };
-                                parsed_users.push(InboundUser {
-                                    id: user_id(&acc.id),
-                                    hash: crate::trojan::trojan_password_hash(&acc.id),
-                                    email,
-                                    level: u.level,
-                                    flow: String::new(),
-                                    reverse: None,
-                                    testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
-                                });
+                let u_cfg = match ProxyUsersConfig::decode(ps.value.clone()) {
+                    Ok(config) => config,
+                    Err(e) => {
+                        return status(INVALID_ARGUMENT, &format!("bad inbound users: {e}"));
+                    }
+                };
+                for u in u_cfg.users {
+                    let email = u.email.clone();
+                    let account = u.account.unwrap_or_default();
+                    match (protocol, account.r#type.as_str()) {
+                        (crate::config::InboundProtocol::Vmess, VMESS_ACCOUNT) => {
+                            let Ok(acc) = VmessAccount::decode(account.value) else {
+                                return status(INVALID_ARGUMENT, "bad VMess account");
+                            };
+                            parsed_users.push(InboundUser {
+                                id: user_id(&acc.id),
+                                hash: crate::trojan::trojan_password_hash(&acc.id),
+                                email,
+                                level: u.level,
+                                flow: String::new(),
+                                reverse: None,
+                                testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                            });
+                        }
+                        (crate::config::InboundProtocol::Vless, VLESS_ACCOUNT) => {
+                            let Ok(acc) = VlessAccount::decode(account.value) else {
+                                return status(INVALID_ARGUMENT, "bad VLESS account");
+                            };
+                            if !acc.encryption.is_empty()
+                                && !acc.encryption.eq_ignore_ascii_case("none")
+                            {
+                                return status(
+                                    UNKNOWN,
+                                    "AddInbound does not support VLESS encryption yet",
+                                );
                             }
-                            VLESS_ACCOUNT => {
-                                let Ok(acc) = VlessAccount::decode(account.value) else {
-                                    return status(INVALID_ARGUMENT, "bad VLESS account");
-                                };
-                                {
-                                    let testseed = if acc.testseed.len() >= 4 {
-                                        [
-                                            acc.testseed[0],
-                                            acc.testseed[1],
-                                            acc.testseed[2],
-                                            acc.testseed[3],
-                                        ]
-                                    } else {
-                                        xray_proxy::vless::DEFAULT_VISION_SEED
-                                    };
-                                    parsed_users.push(InboundUser {
-                                        id: user_id(&acc.id),
-                                        hash: crate::trojan::trojan_password_hash(&acc.id),
-                                        email,
-                                        level: u.level,
-                                        flow: acc.flow,
-                                        reverse: None,
-                                        testseed,
-                                    });
-                                }
-                            }
-                            TROJAN_ACCOUNT => {
-                                let Ok(acc) = TrojanAccount::decode(account.value) else {
-                                    return status(INVALID_ARGUMENT, "bad Trojan account");
-                                };
-                                parsed_users.push(InboundUser {
-                                    id: user_id(&acc.password),
-                                    hash: crate::trojan::trojan_password_hash(&acc.password),
-                                    email,
-                                    level: u.level,
-                                    flow: String::new(),
-                                    reverse: None,
-                                    testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
-                                });
-                            }
-                            SHADOWSOCKS_ACCOUNT => {
-                                if let Ok(acc) = ShadowsocksAccount::decode(account.value) {
-                                    let m_name = match CipherType::try_from(acc.cipher_type) {
-                                        Ok(CipherType::Aes128Gcm) => "aes-128-gcm",
-                                        Ok(CipherType::Aes256Gcm) => "aes-256-gcm",
-                                        Ok(CipherType::Chacha20Poly1305) => {
-                                            "chacha20-ietf-poly1305"
-                                        }
-                                        Ok(CipherType::Xchacha20Poly1305) => {
-                                            "xchacha20-ietf-poly1305"
-                                        }
-                                        _ => "aes-256-gcm",
-                                    };
-                                    if let Ok(m) = xray_proxy::shadowsocks::aead2017::Method::new(
-                                        m_name,
-                                        &acc.password,
-                                    ) {
-                                        parsed_ss_users.push(crate::config::ShadowsocksUser {
-                                            email,
-                                            method: crate::config::ShadowsocksMethod::Aead2017(
-                                                Arc::new(m),
-                                            ),
-                                            level: u.level,
-                                        });
-                                        ss_method = Some(m_name.to_owned());
-                                        ss_pass = Some(acc.password);
-                                    }
-                                }
-                            }
-                            HYSTERIA_ACCOUNT | HYSTERIA_ACCOUNT_ALT => {
-                                if let Ok(acc) = HysteriaAccount::decode(account.value) {
-                                    parsed_hysteria_users.push(crate::vless::HysteriaUser {
-                                        auth: acc.auth,
-                                        email,
-                                        level: u.level,
-                                    });
-                                }
-                            }
-                            _ => {}
+                            let testseed = if acc.testseed.len() >= 4 {
+                                [
+                                    acc.testseed[0],
+                                    acc.testseed[1],
+                                    acc.testseed[2],
+                                    acc.testseed[3],
+                                ]
+                            } else {
+                                xray_proxy::vless::DEFAULT_VISION_SEED
+                            };
+                            parsed_users.push(InboundUser {
+                                id: user_id(&acc.id),
+                                hash: crate::trojan::trojan_password_hash(&acc.id),
+                                email,
+                                level: u.level,
+                                flow: acc.flow,
+                                reverse: None,
+                                testseed,
+                            });
+                        }
+                        (crate::config::InboundProtocol::Trojan, TROJAN_ACCOUNT) => {
+                            let Ok(acc) = TrojanAccount::decode(account.value) else {
+                                return status(INVALID_ARGUMENT, "bad Trojan account");
+                            };
+                            parsed_users.push(InboundUser {
+                                id: user_id(&acc.password),
+                                hash: crate::trojan::trojan_password_hash(&acc.password),
+                                email,
+                                level: u.level,
+                                flow: String::new(),
+                                reverse: None,
+                                testseed: xray_proxy::vless::DEFAULT_VISION_SEED,
+                            });
+                        }
+                        (_, other) => {
+                            return status(
+                                UNKNOWN,
+                                &format!(
+                                    "AddInbound does not support account type {other:?} for {:?}",
+                                    protocol
+                                ),
+                            );
                         }
                     }
                 }
@@ -2576,9 +2721,9 @@ async fn handle_handler(
                 port,
                 protocol,
                 users: parsed_users,
-                shadowsocks_users: parsed_ss_users,
-                shadowsocks_top_method: ss_method,
-                shadowsocks_top_password: ss_pass,
+                shadowsocks_users: Vec::new(),
+                shadowsocks_top_method: None,
+                shadowsocks_top_password: None,
                 fallbacks: Vec::new(),
                 socks_auth: xray_proxy::inbound::SocksInboundAuth::NoAuth,
                 user_level: 0,
@@ -2591,7 +2736,7 @@ async fn handle_handler(
                 transport,
                 accept_proxy_protocol: crate::proxy_proto::ProxyProtocolAccept::None,
                 tcp_masks: None,
-                hysteria_users: parsed_hysteria_users,
+                hysteria_users: Vec::new(),
                 hysteria_salamander: None,
                 hysteria_gecko: None,
                 hysteria_udp_idle_timeout: None,
@@ -2916,6 +3061,98 @@ fn grpc_response(body: Body, error: Option<(u8, &str)>) -> Response<Body> {
 mod tests {
     use super::*;
 
+    fn receiver_with_port(from: u32, to: u32) -> ReceiverConfig {
+        ReceiverConfig {
+            port_list: Some(PortListProto {
+                range: vec![PortRangeProto { from, to }],
+            }),
+            listen: None,
+            stream_settings: None,
+            receive_original_destination: false,
+            sniffing_settings: None,
+        }
+    }
+
+    #[test]
+    fn add_inbound_receiver_ports_and_listen() {
+        assert_eq!(receiver_port(&receiver_with_port(0, 0)), Ok(0));
+        assert_eq!(receiver_port(&receiver_with_port(8443, 8443)), Ok(8443));
+        assert!(receiver_port(&receiver_with_port(1, 2)).is_err());
+        assert!(receiver_port(&receiver_with_port(70000, 70000)).is_err());
+
+        let mut receiver = receiver_with_port(443, 443);
+        receiver.listen = Some(IpOrDomainProto {
+            ip: Some(Bytes::from_static(&[
+                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+            ])),
+            domain: None,
+        });
+        assert_eq!(receiver_listen(&receiver).as_deref(), Ok("2001:db8::1"));
+
+        receiver.listen = Some(IpOrDomainProto {
+            ip: Some(Bytes::from_static(&[127, 0, 0, 1])),
+            domain: None,
+        });
+        assert_eq!(receiver_listen(&receiver).as_deref(), Ok("127.0.0.1"));
+
+        receiver.listen = Some(IpOrDomainProto {
+            ip: Some(Bytes::from_static(&[1, 2, 3])),
+            domain: None,
+        });
+        assert!(receiver_listen(&receiver).is_err());
+
+        receiver.listen = None;
+        assert_eq!(receiver_listen(&receiver).as_deref(), Ok(""));
+    }
+
+    #[test]
+    fn add_inbound_rejects_proxy_settings_it_would_drop() {
+        let empty = Bytes::new();
+        assert!(check_inbound_proxy_settings("vless", &empty).is_ok());
+        assert!(check_inbound_proxy_settings("vmess", &empty).is_ok());
+        assert!(check_inbound_proxy_settings("trojan", &empty).is_ok());
+
+        let vless_fallback = VlessInboundConfigProto {
+            users: Vec::new(),
+            fallbacks: vec![FallbackProto {
+                name: String::new(),
+                alpn: String::new(),
+                path: "/".into(),
+                r#type: String::new(),
+                dest: 8080u16.to_string(),
+                xver: 0,
+            }],
+            decryption: "none".into(),
+        }
+        .encode_to_vec();
+        assert!(check_inbound_proxy_settings("vless", &vless_fallback.into()).is_err());
+
+        let vmess_default = VmessInboundConfigProto {
+            user: Vec::new(),
+            default: Some(VmessDefaultConfigProto { level: 1 }),
+        }
+        .encode_to_vec();
+        assert!(check_inbound_proxy_settings("vmess", &vmess_default.into()).is_err());
+
+        let trojan_fallback = TrojanServerConfigProto {
+            users: Vec::new(),
+            fallbacks: vec![FallbackProto {
+                name: String::new(),
+                alpn: String::new(),
+                path: String::new(),
+                r#type: String::new(),
+                dest: 8080u16.to_string(),
+                xver: 0,
+            }],
+        }
+        .encode_to_vec();
+        // Xray's `xray.proxy.trojan.ServerConfig.fallbacks` is field 2.
+        assert_eq!(trojan_fallback[0], 0x12);
+        assert!(check_inbound_proxy_settings("trojan", &trojan_fallback.into()).is_err());
+
+        assert!(check_inbound_proxy_settings("socks", &empty).is_err());
+    }
+
     #[test]
     fn routing_stats_events_apply_field_selectors() {
         let event = crate::routing::RoutingEvent {
@@ -3166,6 +3403,7 @@ mod tests {
         };
         let cfg_proto = RouterConfigProto {
             rule: vec![rule_proto],
+            ..Default::default()
         };
         let add_req = AddRuleRequest {
             config: Some(TypedMessage {
@@ -3499,6 +3737,7 @@ mod tests {
                 route_only: true,
                 metadata_only: false,
                 domains_excluded: Arc::new(Vec::new()),
+                ips_excluded: Arc::new(Vec::new()),
             },
             fallbacks: vec![crate::config::Fallback {
                 name: "fb1".into(),
