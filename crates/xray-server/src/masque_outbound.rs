@@ -72,7 +72,8 @@ fn validate_host(host: &str) -> Result<(), String> {
         }
         return match rest.strip_prefix(':') {
             None if rest.is_empty() => Ok(()),
-            Some(port) if valid_port(port) => Ok(()),
+            // Go's url.Parse accepts any port text here.
+            Some(_) => Ok(()),
             _ => Err(format!("invalid \"host\": {host}")),
         };
     }

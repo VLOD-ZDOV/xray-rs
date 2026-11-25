@@ -2980,7 +2980,12 @@ fn parse_sniffing(item: &Value, tag: &str) -> Result<crate::vless::Sniffing, Str
                     "inbound {tag:?}: sniffing.ipsExcluded must hold strings"
                 ));
             };
-            let rule = rule.strip_prefix('!').unwrap_or(rule);
+            let mut rule = rule;
+            let mut inverted = false;
+            while let Some(stripped) = rule.strip_prefix('!') {
+                rule = stripped;
+                inverted = !inverted;
+            }
             if rule.starts_with("geoip:") || rule.starts_with("ext:") || rule.starts_with("ext-ip:")
             {
                 crate::log::warn!(
@@ -3018,7 +3023,7 @@ fn parse_sniffing(item: &Value, tag: &str) -> Result<crate::vless::Sniffing, Str
                         format!("inbound {tag:?}: invalid CIDR prefix in sniffing.ipsExcluded")
                     })?
             };
-            excluded.push((ip, prefix as u8));
+            excluded.push((ip, prefix as u8, inverted));
         }
         sniffing.ips_excluded = std::sync::Arc::new(excluded);
     }

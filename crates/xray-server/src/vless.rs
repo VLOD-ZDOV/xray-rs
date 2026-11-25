@@ -217,7 +217,7 @@ pub struct Sniffing {
     pub route_only: bool,
     pub metadata_only: bool,
     pub domains_excluded: std::sync::Arc<Vec<String>>,
-    pub ips_excluded: std::sync::Arc<Vec<(std::net::IpAddr, u8)>>,
+    pub ips_excluded: std::sync::Arc<Vec<(std::net::IpAddr, u8, bool)>>,
 }
 
 /// Xray parses `domainsExcluded` with `geodata.Domain_Substr` as the default:
@@ -279,9 +279,8 @@ impl Sniffing {
                 .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
             ip => ip,
         };
-        self.ips_excluded
-            .iter()
-            .any(|(network, prefix)| match (ip, network) {
+        self.ips_excluded.iter().any(|(network, prefix, inverted)| {
+            let matched = match (ip, network) {
                 (std::net::IpAddr::V4(address), std::net::IpAddr::V4(network)) => {
                     let bits = u32::from(*network);
                     let mask = if *prefix == 0 {
@@ -301,7 +300,9 @@ impl Sniffing {
                     u128::from(address) & mask == bits & mask
                 }
                 _ => false,
-            })
+            };
+            matched != *inverted
+        })
     }
 
     pub fn sniff(&self, payload: &[u8], host: &Host) -> Option<SniffOutput> {
@@ -1846,8 +1847,8 @@ mod tests {
                 "plain-substring".to_owned(),
             ]),
             ips_excluded: std::sync::Arc::new(vec![
-                ("10.0.0.0".parse().unwrap(), 8),
-                ("2001:db8::".parse().unwrap(), 32),
+                ("10.0.0.0".parse().unwrap(), 8, false),
+                ("2001:db8::".parse().unwrap(), 32, false),
             ]),
             ..Default::default()
         };
@@ -1865,6 +1866,13 @@ mod tests {
         assert!(!sniffing.is_ip_excluded("11.0.0.1".parse().unwrap()));
         assert!(sniffing.is_ip_excluded("2001:db8::1".parse().unwrap()));
         assert!(!sniffing.is_ip_excluded("2001:db9::1".parse().unwrap()));
+        // "!" inverts the rule, as geodata's reverse match.
+        let inverted = Sniffing {
+            ips_excluded: std::sync::Arc::new(vec![("192.0.2.0".parse().unwrap(), 24, true)]),
+            ..Default::default()
+        };
+        assert!(inverted.is_ip_excluded("198.51.100.1".parse().unwrap()));
+        assert!(!inverted.is_ip_excluded("192.0.2.5".parse().unwrap()));
     }
 
     #[tokio::test]

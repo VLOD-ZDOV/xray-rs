@@ -16,11 +16,20 @@ use crate::vless::{resolve, Host};
 const LOCAL_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// DNS over TCP: a two-byte length prefix in each direction (RFC 1035 §4.2.2).
-async fn dns_tcp_query(upstream: SocketAddr, query: &[u8]) -> io::Result<Vec<u8>> {
+async fn dns_tcp_query(
+    upstream: SocketAddr,
+    query: &[u8],
+    sockopt: Option<&crate::config::SockoptSettings>,
+) -> io::Result<Vec<u8>> {
     let len = u16::try_from(query.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "DNS query too large"))?;
     let exchange = async {
-        let mut stream = tokio::net::TcpStream::connect(upstream).await?;
+        let socket = if upstream.is_ipv4() {
+            tokio::net::TcpSocket::new_v4()?
+        } else {
+            tokio::net::TcpSocket::new_v6()?
+        };
+        let mut stream = crate::sockopt::connect(socket, upstream, sockopt).await?;
         stream.write_all(&len.to_be_bytes()).await?;
         stream.write_all(query).await?;
         let len = stream.read_u16().await?;
@@ -133,7 +142,7 @@ impl DnsOutbound {
                 ([0u16; 8], 0).into()
             };
             if self.network == Network::Tcp {
-                return dns_tcp_query(upstream_addr, query).await;
+                return dns_tcp_query(upstream_addr, query, self.sockopt.as_deref()).await;
             }
             let socket = crate::sockopt::bind_udp(bind_addr, self.sockopt.as_deref())?;
             socket.connect(upstream_addr).await?;

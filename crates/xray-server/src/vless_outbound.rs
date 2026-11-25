@@ -380,8 +380,8 @@ impl VlessOutbound {
 
         let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
         let network = stream
-            .get("network")
-            .or_else(|| stream.get("method"))
+            .get("method")
+            .or_else(|| stream.get("network"))
             .or_else(|| stream.get("transport"))
             .and_then(Value::as_str)
             .unwrap_or_default();
