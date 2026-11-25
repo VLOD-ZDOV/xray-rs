@@ -19,7 +19,7 @@ use xray_config::Network;
 use crate::outbound::{self, ConeUdp};
 use crate::routing::{Action, Decision, Router};
 use crate::stats::{self, Traffic};
-use crate::vless::{host_label, Host, RouteRequest, Sniffing, CONN_IDLE};
+use crate::vless::{host_label, Host, RouteRequest, Sniffing};
 
 pub(crate) const STATUS_NEW: u8 = 1;
 pub(crate) const STATUS_KEEP: u8 = 2;
@@ -252,6 +252,10 @@ where
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
                 Err(e) => return Err(e),
             };
+            // Finished workers keep their entry until the client sends END;
+            // prune them so idle clients cannot exhaust the session table.
+            sessions
+                .retain(|_, session| session.task.as_ref().is_none_or(|task| !task.is_finished()));
             match frame.status {
                 STATUS_NEW => {
                     let Some((network, mut host, port)) = frame.target else {
@@ -277,6 +281,7 @@ where
                         port,
                         sniffing: &info.sniffing,
                         vless_route: info.vless_route,
+                        from_prefix: "tcp",
                     };
                     let Some(decision) = route
                         .allow(&info.router, frame.data.as_deref().unwrap_or_default())
@@ -307,6 +312,7 @@ where
                     let traffic =
                         stats::get().traffic(&info.tag, &info.email, info.level, &decision.tag);
                     let dial = Dial {
+                        level: info.level,
                         router: info.router.clone(),
                         decision,
                         traffic,
@@ -478,6 +484,7 @@ async fn forward(session: &Session, packet: Packet) {
 
 /// Where a sub-session's traffic goes after routing.
 struct Dial {
+    level: u32,
     router: Arc<Router>,
     decision: Decision,
     traffic: Traffic,
@@ -491,6 +498,7 @@ async fn tcp_session(
     dial: Dial,
 ) {
     let result: io::Result<()> = async {
+        let conn_idle = crate::policy::for_level(dial.level).conn_idle;
         let stream = outbound::connect(&dial.router, &dial.decision, &target.0, target.1).await?;
         let (mut r, mut w) = tokio::io::split(stream);
         let up = async {
@@ -503,7 +511,7 @@ async fn tcp_session(
         let down = async {
             let mut buf = vec![0u8; STREAM_CHUNK];
             loop {
-                let n = timeout(CONN_IDLE, r.read(&mut buf))
+                let n = timeout(conn_idle, r.read(&mut buf))
                     .await
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
                 if n == 0 {
@@ -545,6 +553,7 @@ async fn xudp_worker(
     dial: Dial,
 ) {
     let result: io::Result<()> = async {
+        let conn_idle = crate::policy::for_level(dial.level).conn_idle;
         let cone = ConeUdp::open(dial.router.clone(), &dial.decision).await?;
         let mut resolved: HashMap<(String, u16), SocketAddr> = HashMap::new();
         let last_active = std::sync::atomic::AtomicU64::new(unix_secs());
@@ -605,7 +614,7 @@ async fn xudp_worker(
                         }
                         let idle = now
                             .saturating_sub(last_active.load(std::sync::atomic::Ordering::Relaxed));
-                        if idle >= CONN_IDLE.as_secs() {
+                        if idle >= conn_idle.as_secs() {
                             return Ok(());
                         }
                         continue;
@@ -653,6 +662,7 @@ async fn udp_session(
     dial: Dial,
 ) {
     let result: io::Result<()> = async {
+        let conn_idle = crate::policy::for_level(dial.level).conn_idle;
         let cone = ConeUdp::open(dial.router.clone(), &dial.decision).await?;
         let mut resolved: HashMap<(String, u16), SocketAddr> = HashMap::new();
         let up = async {
@@ -685,7 +695,7 @@ async fn udp_session(
         let down = async {
             let mut buf = vec![0u8; 65535];
             loop {
-                let (n, from) = timeout(CONN_IDLE, cone.recv_from(&mut buf))
+                let (n, from) = timeout(conn_idle, cone.recv_from(&mut buf))
                     .await
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "idle"))??;
                 dial.traffic.down(n);
@@ -727,33 +737,39 @@ pub struct MuxSettings {
 }
 
 impl MuxSettings {
-    pub fn parse(v: Option<&serde_json::Value>) -> Option<Self> {
-        let v = v?;
-        let enabled = v
-            .get("enabled")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        if !enabled {
-            return None;
+    /// Reads `mux` as Xray's Go decoder does: `concurrency` and
+    /// `xudpConcurrency` are `int16` fields, so strings and out-of-range
+    /// numbers reject the config instead of silently wrapping.
+    pub fn parse(v: Option<&serde_json::Value>) -> Result<Option<Self>, String> {
+        let Some(v) = v else {
+            return Ok(None);
+        };
+        if v.is_null() {
+            return Ok(None);
         }
-        let concurrency = v
-            .get("concurrency")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(8) as i16;
-        let xudp_concurrency = v
-            .get("xudpConcurrency")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(16) as i16;
-        let udp443_str = v
-            .get("xudpProxyUDP443")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("reject");
+        let object = v.as_object().ok_or("mux must be an object")?;
+        let enabled = match object.get("enabled") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(enabled)) => *enabled,
+            Some(_) => return Err("mux.enabled must be a boolean".into()),
+        };
+        if !enabled {
+            return Ok(None);
+        }
+        let concurrency = mux_int16(object.get("concurrency"), "concurrency")?.unwrap_or(8);
+        let xudp_concurrency =
+            mux_int16(object.get("xudpConcurrency"), "xudpConcurrency")?.unwrap_or(16);
+        let udp443_str = match object.get("xudpProxyUDP443") {
+            None | Some(serde_json::Value::Null) => "reject",
+            Some(serde_json::Value::String(value)) => value,
+            Some(_) => return Err("mux.xudpProxyUDP443 must be a string".into()),
+        };
         let udp443 = match udp443_str.to_ascii_lowercase().as_str() {
             "allow" => MuxUdp443::Allow,
             "skip" => MuxUdp443::Skip,
             _ => MuxUdp443::Reject,
         };
-        Some(Self {
+        Ok(Some(Self {
             enabled,
             concurrency: if concurrency == 0 { 8 } else { concurrency },
             xudp_concurrency: if xudp_concurrency == 0 {
@@ -762,7 +778,19 @@ impl MuxSettings {
                 xudp_concurrency
             },
             udp443,
-        })
+        }))
+    }
+}
+
+fn mux_int16(value: Option<&serde_json::Value>, key: &str) -> Result<Option<i16>, String> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Number(number)) => number
+            .as_i64()
+            .and_then(|value| i16::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| format!("mux.{key} is out of range for int16")),
+        Some(_) => Err(format!("mux.{key} must be a number")),
     }
 }
 
@@ -1292,6 +1320,29 @@ impl ReversePortal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mux_settings_reject_xray_type_errors() {
+        let parse = |value: serde_json::Value| MuxSettings::parse(Some(&value));
+        assert!(parse(serde_json::json!({"enabled": true}))
+            .unwrap()
+            .is_some());
+        assert!(parse(serde_json::json!({"enabled": false}))
+            .unwrap()
+            .is_none());
+        assert!(parse(serde_json::json!({"enabled": "true"})).is_err());
+        assert!(parse(serde_json::json!({"enabled": true, "concurrency": "8"})).is_err());
+        assert!(parse(serde_json::json!({"enabled": true, "concurrency": 32768})).is_err());
+        assert!(parse(serde_json::json!({"enabled": true, "xudpConcurrency": -32769})).is_err());
+        assert!(parse(serde_json::json!({"enabled": true, "xudpProxyUDP443": 1})).is_err());
+        assert_eq!(
+            parse(serde_json::json!({"enabled": true, "concurrency": 0}))
+                .unwrap()
+                .unwrap()
+                .concurrency,
+            8
+        );
+    }
 
     #[tokio::test]
     async fn parses_xudp_new_frame_with_global_id() {

@@ -31,7 +31,6 @@ pub struct Addons {
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 // Xray policy level 0 defaults.
-pub(crate) const CONN_IDLE: Duration = Duration::from_secs(300);
 // How long to wait for the first payload when a rule needs to sniff it.
 // Xray's dispatcher uses a 200 ms cache deadline and a 32 KiB buffer.
 const SNIFF_TIMEOUT: Duration = Duration::from_millis(200);
@@ -218,6 +217,40 @@ pub struct Sniffing {
     pub route_only: bool,
     pub metadata_only: bool,
     pub domains_excluded: std::sync::Arc<Vec<String>>,
+    pub ips_excluded: std::sync::Arc<Vec<(std::net::IpAddr, u8)>>,
+}
+
+/// Xray parses `domainsExcluded` with `geodata.Domain_Substr` as the default:
+/// plain text is a substring rule; the usual prefixes select the other modes.
+fn domain_rule_matches(rule: &str, domain: &str) -> bool {
+    let domain_lower = domain.to_ascii_lowercase();
+    if let Some(value) = rule.strip_prefix("full:") {
+        return domain.eq_ignore_ascii_case(value);
+    }
+    if let Some(value) = rule.strip_prefix("domain:") {
+        let value = value.to_ascii_lowercase();
+        return domain_lower == value
+            || (domain_lower.len() > value.len()
+                && domain_lower.ends_with(&value)
+                && domain_lower.as_bytes()[domain_lower.len() - value.len() - 1] == b'.');
+    }
+    if let Some(value) = rule.strip_prefix("keyword:") {
+        return domain_lower.contains(&value.to_ascii_lowercase());
+    }
+    if let Some(pattern) = rule.strip_prefix("regexp:") {
+        return regex::Regex::new(pattern).is_ok_and(|regex| regex.is_match(domain));
+    }
+    if let Some(substr) = rule.strip_prefix("dotless:") {
+        let pattern = if substr.is_empty() {
+            "^[^.]*$".to_owned()
+        } else if !substr.contains('.') {
+            format!("^[^.]*{}[^.]*$", regex::escape(substr))
+        } else {
+            return false;
+        };
+        return regex::Regex::new(&pattern).is_ok_and(|regex| regex.is_match(domain));
+    }
+    domain_lower.contains(&rule.to_ascii_lowercase())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,16 +267,48 @@ impl Sniffing {
     }
 
     pub fn is_excluded(&self, domain: &str) -> bool {
-        self.domains_excluded.iter().any(|ex| {
-            domain.eq_ignore_ascii_case(ex)
-                || (domain.len() > ex.len()
-                    && domain.ends_with(ex)
-                    && domain.as_bytes()[domain.len() - ex.len() - 1] == b'.')
-        })
+        self.domains_excluded
+            .iter()
+            .any(|rule| domain_rule_matches(rule, domain))
+    }
+
+    pub fn is_ip_excluded(&self, ip: std::net::IpAddr) -> bool {
+        let ip = match ip {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+            ip => ip,
+        };
+        self.ips_excluded
+            .iter()
+            .any(|(network, prefix)| match (ip, network) {
+                (std::net::IpAddr::V4(address), std::net::IpAddr::V4(network)) => {
+                    let bits = u32::from(*network);
+                    let mask = if *prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - u32::from(*prefix))
+                    };
+                    u32::from(address) & mask == bits & mask
+                }
+                (std::net::IpAddr::V6(address), std::net::IpAddr::V6(network)) => {
+                    let bits = u128::from(*network);
+                    let mask = if *prefix == 0 {
+                        0
+                    } else {
+                        u128::MAX << (128 - u32::from(*prefix))
+                    };
+                    u128::from(address) & mask == bits & mask
+                }
+                _ => false,
+            })
     }
 
     pub fn sniff(&self, payload: &[u8], host: &Host) -> Option<SniffOutput> {
         if let Host::Ip(ip) = host {
+            if self.is_ip_excluded(*ip) {
+                return None;
+            }
             if self.fakedns || self.fakedns_other {
                 if let Some(domain) = crate::fakedns::get_domain_from_fake_ip(ip) {
                     if !self.is_excluded(&domain) {
@@ -744,6 +809,7 @@ where
         port: request.port,
         sniffing: &ctx.sniffing,
         vless_route: Some(u32::from(request.vless_route)),
+        from_prefix: "",
     };
     let Some(decision) = route.allow(&ctx.router, payload).await else {
         // Xray writes the response header before the link turns out closed.
@@ -867,6 +933,9 @@ pub(crate) struct RouteRequest<'a> {
     pub port: u16,
     pub sniffing: &'a Sniffing,
     pub vless_route: Option<u32>,
+    /// `"tcp"`/`"udp"` where Xray's access message carries a
+    /// `net.Destination`; empty where it carries a raw `net.Addr`.
+    pub from_prefix: &'static str,
 }
 
 impl RouteRequest<'_> {
@@ -912,7 +981,7 @@ impl RouteRequest<'_> {
             attributes: None,
             local_ip: None,
             vless_route: self.vless_route,
-            process_info: Some(&proc_cell),
+            process_info: router.needs_process.then_some(&proc_cell),
         };
         let decision = router.route(&query).await;
         let network = if self.network == Network::Tcp {
@@ -930,10 +999,12 @@ impl RouteRequest<'_> {
         let accepted = true;
         log::access(
             self.peer,
+            self.from_prefix,
             accepted,
             to,
             self.ctx_tag,
             &decision.tag,
+            decision.detour.separator(),
             self.email,
         );
         match &decision.action {
@@ -1029,7 +1100,7 @@ impl Activity {
     }
 }
 
-/// Runs both directions until `CONN_IDLE` passes without traffic. Once one side
+/// Runs both directions until `connIdle` passes without traffic. Once one side
 /// finishes, the other keeps going only while it stays active (Xray's
 /// uplinkOnly/downlinkOnly semantics).
 pub(crate) async fn relay(
@@ -1717,6 +1788,7 @@ mod tests {
             port: 80,
             sniffing,
             vless_route: None,
+            from_prefix: "",
         };
         // routeOnly still dials 10.0.0.1; without it the sniffed domain is dialed instead.
         assert!(route(&sniff_route_only)
@@ -1761,6 +1833,38 @@ mod tests {
             ..sniffing
         };
         assert_eq!(metadata_sniffing.domain(http_allowed), None);
+    }
+
+    #[test]
+    fn sniffing_domain_and_ip_rules_follow_xray() {
+        let sniffing = Sniffing {
+            domains_excluded: std::sync::Arc::new(vec![
+                "domain:example.com".to_owned(),
+                "full:only.example".to_owned(),
+                "keyword:tracker".to_owned(),
+                "regexp:^ads[0-9]+\\.example$".to_owned(),
+                "plain-substring".to_owned(),
+            ]),
+            ips_excluded: std::sync::Arc::new(vec![
+                ("10.0.0.0".parse().unwrap(), 8),
+                ("2001:db8::".parse().unwrap(), 32),
+            ]),
+            ..Default::default()
+        };
+        assert!(sniffing.is_excluded("sub.example.com"));
+        assert!(sniffing.is_excluded("EXAMPLE.COM"));
+        assert!(!sniffing.is_excluded("example.com.evil"));
+        assert!(sniffing.is_excluded("only.example"));
+        assert!(!sniffing.is_excluded("sub.only.example"));
+        assert!(sniffing.is_excluded("my-tracker.example"));
+        assert!(sniffing.is_excluded("ads12.example"));
+        assert!(sniffing.is_excluded("has-plain-substring-inside.example"));
+        assert!(!sniffing.is_excluded("unrelated.example"));
+
+        assert!(sniffing.is_ip_excluded("10.1.2.3".parse().unwrap()));
+        assert!(!sniffing.is_ip_excluded("11.0.0.1".parse().unwrap()));
+        assert!(sniffing.is_ip_excluded("2001:db8::1".parse().unwrap()));
+        assert!(!sniffing.is_ip_excluded("2001:db9::1".parse().unwrap()));
     }
 
     #[tokio::test]

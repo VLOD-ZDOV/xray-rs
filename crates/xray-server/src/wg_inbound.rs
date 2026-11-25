@@ -251,10 +251,12 @@ async fn handle_tcp(
     let accepted = true;
     log::access(
         tcp.src,
+        "tcp",
         accepted,
         format!("tcp:{}:{}", tcp.dst.ip(), tcp.dst.port()),
         &ctx.tag,
         &decision.tag,
+        decision.detour.separator(),
         user,
     );
     if !accepted {
@@ -321,10 +323,12 @@ async fn handle_udp(
     let accepted = true;
     log::access(
         udp.src,
+        "udp",
         accepted,
         format!("udp:{}:{}", udp.dst.ip(), udp.dst.port()),
         &ctx.tag,
         &decision.tag,
+        decision.detour.separator(),
         user,
     );
     if !accepted {

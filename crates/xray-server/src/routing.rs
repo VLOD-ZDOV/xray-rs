@@ -1085,6 +1085,53 @@ pub const DEFAULT_FINAL_BLOCK: FinalBlock = FinalBlock {
     log: FinalLog::Warning,
 };
 
+/// Parses Go's `Int32Range`: a plain int32, or a range like `"1-2"`,
+/// `"-114-514"`, `"-1919--810"`, or `""` (zero). Values are ordered, and
+/// negative delays are accepted as Xray accepts them.
+fn parse_int32_range(value: &Value, at: &str) -> Result<(i64, i64), String> {
+    let invalid = || format!("{at}: invalid delay {value}");
+    let (from, to) = match value {
+        Value::Number(number) => {
+            let value = number
+                .as_i64()
+                .filter(|value| i32::try_from(*value).is_ok())
+                .ok_or_else(invalid)?;
+            (value, value)
+        }
+        Value::String(text) => {
+            let (from, to) = parse_range_string(text).ok_or_else(invalid)?;
+            // Go parses the text as an int and then truncates to int32.
+            (i64::from(from as i32), i64::from(to as i32))
+        }
+        _ => return Err(invalid()),
+    };
+    Ok(if from > to { (to, from) } else { (from, to) })
+}
+
+pub(crate) fn parse_range_string(text: &str) -> Option<(i64, i64)> {
+    if let Ok(value) = text.parse::<i64>() {
+        return Some((value, value));
+    }
+    if text.is_empty() {
+        return Some((0, 0));
+    }
+    // "-114-514" splits into "-114" and "514"; "-1919--810" into
+    // "-1919" and "-810" (Xray's splitFromSecondDash).
+    let pair = if text.starts_with('-') {
+        let mut parts = text.splitn(3, '-');
+        let sign = parts.next()?;
+        let low = parts.next()?;
+        let high = parts.next()?;
+        [format!("{sign}-{low}"), high.to_string()]
+    } else {
+        let (low, high) = text.split_once('-')?;
+        [low.to_string(), high.to_string()]
+    };
+    let from = pair[0].parse::<i64>().ok()?;
+    let to = pair[1].parse::<i64>().ok()?;
+    Some((from, to))
+}
+
 /// A `finalRules` entry's `delay` (or the deprecated `blockDelay`) and
 /// `logLevel`, which Xray allows on block rules only.
 fn parse_final_block(raw: &Value, block: bool, at: &str) -> Result<FinalBlock, String> {
@@ -1093,7 +1140,17 @@ fn parse_final_block(raw: &Value, block: bool, at: &str) -> Result<FinalBlock, S
         crate::log::warn!("{at}: finalRules.blockDelay is deprecated, use finalRules.delay");
         delay = Some(old);
     }
-    let level = str_field(raw, "logLevel");
+    // Go decodes `logLevel` as a string, so any other JSON type is an error.
+    let level = match raw.as_object().and_then(|object| {
+        object
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("logLevel"))
+            .map(|(_, value)| value)
+    }) {
+        None | Some(Value::Null) => "",
+        Some(Value::String(level)) => level.as_str(),
+        Some(_) => return Err(format!("{at}: finalRules.logLevel must be a string")),
+    };
     if !block {
         if delay.is_some() || !level.is_empty() {
             return Err("delay and logLevel are only supported for block finalRules".into());
@@ -1102,27 +1159,16 @@ fn parse_final_block(raw: &Value, block: bool, at: &str) -> Result<FinalBlock, S
     }
     let delay = match delay {
         None => (30, 90),
-        Some(Value::Number(n)) => {
-            let n = n.as_u64().ok_or(format!("{at}: invalid delay {n}"))?;
-            (n, n)
+        Some(value) => {
+            let (from, to) = parse_int32_range(value, at)?;
+            // Negative delays wrap in Go; keep the hold finite instead of
+            // building a `Duration` that overflows.
+            (from.max(0) as u64, to.max(0) as u64)
         }
-        Some(Value::String(text)) => {
-            let parse = |t: &str| {
-                t.trim()
-                    .parse::<u64>()
-                    .map_err(|_| format!("{at}: invalid delay {text:?}"))
-            };
-            match text.split_once('-') {
-                Some((from, to)) => (parse(from)?, parse(to)?),
-                None => {
-                    let n = parse(text)?;
-                    (n, n)
-                }
-            }
-        }
-        Some(other) => return Err(format!("{at}: invalid delay {other}")),
     };
-    let log = match level.to_ascii_lowercase().as_str() {
+    // Go's strings.ToLower maps the Turkish dotted capital I to plain "i".
+    let level_lower = level.replace('\u{0130}', "i").to_ascii_lowercase();
+    let log = match level_lower.as_str() {
         "" | "info" => FinalLog::Info,
         "none" => FinalLog::None,
         "debug" => FinalLog::Debug,
@@ -1191,6 +1237,26 @@ impl Action {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detour {
+    /// No rule matched: Xray logs `in >> out`.
+    Default,
+    /// A routing rule chose the outbound: `in -> out`.
+    Rule,
+    /// A platform-forced outbound tag (reverse portal): `in ==> out`.
+    Forced,
+}
+
+impl Detour {
+    pub fn separator(self) -> &'static str {
+        match self {
+            Self::Default => ">>",
+            Self::Rule => "->",
+            Self::Forced => "==>",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     pub tag: String,
@@ -1198,6 +1264,7 @@ pub struct Decision {
     /// Freedom may dial private addresses with no matching `finalRules`
     /// entry: Xray blocks them only for public proxy inbounds.
     pub open_private: bool,
+    pub detour: Detour,
 }
 
 pub struct Query<'a> {
@@ -1530,6 +1597,8 @@ pub struct Router {
     pub inbound_protocols: std::sync::RwLock<HashMap<String, String>>,
     pub route_cache: std::sync::RwLock<RouteCache>,
     pub has_source_port: std::sync::atomic::AtomicBool,
+    /// Any rule matches on the process, so the route cache must stay off.
+    pub needs_process: bool,
     routing_stats: tokio::sync::broadcast::Sender<RoutingEvent>,
 }
 
@@ -1582,12 +1651,47 @@ impl Router {
             let tag = str_field(outbound, "tag").to_owned();
             let protocol = str_field(outbound, "protocol");
             let stream = outbound.get("streamSettings").unwrap_or(&Value::Null);
+            // Xray's `method` overrides `network` when both are present.
             let network = stream
-                .get("network")
-                .or_else(|| stream.get("method"))
+                .get("method")
+                .or_else(|| stream.get("network"))
                 .or_else(|| stream.get("transport"))
                 .and_then(Value::as_str)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+
+            if let Some(address) = stream.get("address").filter(|value| !value.is_null()) {
+                if !address.is_string() {
+                    return Err(format!(
+                        "outbound {tag:?}: streamSettings.address must be a string"
+                    ));
+                }
+            }
+            if let Some(port) = stream.get("port").filter(|value| !value.is_null()) {
+                let valid = port
+                    .as_u64()
+                    .and_then(|port| u16::try_from(port).ok())
+                    .is_some();
+                if !valid {
+                    return Err(format!(
+                        "outbound {tag:?}: streamSettings.port must be 0-65535"
+                    ));
+                }
+            }
+            if let Some(xdrive) = stream
+                .get("xdriveSettings")
+                .filter(|value| !value.is_null())
+            {
+                if !xdrive.is_object() {
+                    return Err(format!(
+                        "outbound {tag:?}: xdriveSettings must be an object"
+                    ));
+                }
+                // Xray validates the whole xdrive config even when this
+                // outbound does not use the transport.
+                crate::xdrive::parse_xdrive_settings(xdrive)
+                    .map_err(|e| format!("outbound {tag:?}: {e}"))?;
+            }
 
             if network == "masque" && protocol != "masque" {
                 return Err("the masque transport can only be used by the masque outbound".into());
@@ -1597,16 +1701,11 @@ impl Router {
                 if protocol != "vless" {
                     return Err("the xdrive transport can only be used by VLESS".into());
                 }
+                if str_field(stream, "security").eq_ignore_ascii_case("reality") {
+                    return Err("REALITY only supports RAW, XHTTP and gRPC for now.".into());
+                }
                 let settings = outbound.get("settings").unwrap_or(&Value::Null);
-                if let Some(vnext) = settings
-                    .get("vnext")
-                    .and_then(Value::as_array)
-                    .and_then(|v| v.first())
-                {
-                    if let Some(users) = vnext
-                        .get("users")
-                        .and_then(Value::as_array)
-                        .and_then(|u| u.first())
+                if let Some(users) = first_vless_user(settings) {
                     {
                         if !str_field(users, "flow").is_empty() {
                             return Err(
@@ -1644,7 +1743,7 @@ impl Router {
                 }
             }
 
-            if matches!(network, "kcp" | "mkcp") {
+            if matches!(network.as_str(), "kcp" | "mkcp") {
                 let _ = crate::config::parse_kcp(stream)?;
             }
 
@@ -1656,7 +1755,7 @@ impl Router {
                         "" => str_field(settings, "domainStrategy"),
                         name => name,
                     };
-                    let domain_strategy = FreedomStrategy::parse(name).ok_or_else(|| {
+                    let mut domain_strategy = FreedomStrategy::parse(name).ok_or_else(|| {
                         format!("outbound {tag:?}: unsupported domain strategy: {name}")
                     })?;
                     let redirect = if let Some(r) = settings.get("redirect").and_then(Value::as_str)
@@ -1684,6 +1783,13 @@ impl Router {
                         &format!("outbound {tag:?}"),
                     )?
                     .map(Arc::new);
+                    // Xray's dialer applies `sockopt.domainStrategy` when the
+                    // outbound itself does not override it.
+                    if matches!(domain_strategy, FreedomStrategy::AsIs) {
+                        if let Some(strategy) = sockopt.as_ref().and_then(|s| s.domain_strategy) {
+                            domain_strategy = strategy;
+                        }
+                    }
                     if let Some(ref so) = sockopt {
                         if so.address_port_strategy != crate::config::AddressPortStrategy::None {
                             return Err(
@@ -1815,7 +1921,11 @@ impl Router {
                     let inbound_tag = str_field(settings, "inboundTag").to_owned();
                     Action::Loopback(inbound_tag)
                 }
-                other => return Err(format!("unknown config id: {other}")),
+                other => {
+                    return Err(format!(
+                    "failed to build outbound config with tag {tag:?} > unknown config id: {other}"
+                ))
+                }
             };
             default_tag.get_or_insert_with(|| tag.clone());
             crate::finalmask::validate_and_log_finalmask(outbound, &tag)?;
@@ -1917,9 +2027,11 @@ impl Router {
         let has_source_port = rules
             .iter()
             .any(|r| r.source.as_ref().is_some_and(|s| s.port_ranges.is_some()));
+        let needs_process = rules.iter().any(|rule| rule.process.is_some());
 
         Ok(Self {
             has_source_port: std::sync::atomic::AtomicBool::new(has_source_port),
+            needs_process,
             rules: std::sync::RwLock::new(rules),
             strategy,
             outbounds: std::sync::RwLock::new(outbounds),
@@ -1995,7 +2107,7 @@ impl Router {
             .outbounds
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.decision(&outbounds, tag)
+        self.decision(&outbounds, tag, Detour::Default)
     }
 
     pub fn explain(&self, query: &Query<'_>) -> String {
@@ -2063,6 +2175,27 @@ impl Router {
         let has_source = rules
             .iter()
             .any(|r| r.source.as_ref().is_some_and(|s| s.port_ranges.is_some()));
+        self.has_source_port
+            .store(has_source, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `AddRule(shouldAppend=false)` replaces the whole rule set, as Xray's
+    /// `ReloadRules` does (3x-ui sends the full list on every save).
+    pub fn set_rules(&self, rules: Vec<Rule>) {
+        let mut current = self
+            .rules
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.route_cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        *current = rules;
+        let has_source = current.iter().any(|rule| {
+            rule.source
+                .as_ref()
+                .is_some_and(|source| source.port_ranges.is_some())
+        });
         self.has_source_port
             .store(has_source, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2326,16 +2459,19 @@ impl Router {
             open_private: false,
             tag: "loopback".into(),
             action: Action::Block(BlockAction::Drop),
+            detour: Detour::Default,
         }
     }
 
     async fn resolve(&self, query: &Query<'_>) -> Option<IpAddr> {
         let domain = query.domain?;
-        tokio::net::lookup_host((domain, query.port))
+        // Use the configured `dns` section (hosts and upstreams), as Xray's
+        // dispatcher does, instead of the system resolver.
+        crate::dns::resolve_all(domain, query.port)
             .await
             .ok()?
-            .next()
-            .map(|a| a.ip())
+            .first()
+            .map(|address| address.ip())
     }
 
     async fn route_once(&self, query: &Query<'_>, resolved: Option<IpAddr>) -> Decision {
@@ -2418,7 +2554,7 @@ impl Router {
                 "routing: {dest} did not match any rule, fallback to default outbound [{default_tag}]"
             );
         }
-        self.decision(&outbounds, &default_tag)
+        self.decision(&outbounds, &default_tag, Detour::Default)
     }
 
     fn first_match<'a>(
@@ -2498,7 +2634,7 @@ impl Router {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match target {
-            RuleTarget::Outbound(tag) => self.decision(&outbounds, tag),
+            RuleTarget::Outbound(tag) => self.decision(&outbounds, tag, Detour::Rule),
             RuleTarget::Balancer(balancer_tag) => {
                 if let Some(balancer) = self.balancers.get(balancer_tag) {
                     let obs = self
@@ -2511,6 +2647,7 @@ impl Router {
                             open_private: false,
                             tag: tag.to_owned(),
                             action: action.clone(),
+                            detour: Detour::Rule,
                         };
                     }
                 }
@@ -2518,12 +2655,13 @@ impl Router {
                     open_private: false,
                     tag: format!("balancer:{balancer_tag}"),
                     action: Action::Block(BlockAction::Drop),
+                    detour: Detour::Rule,
                 }
             }
         }
     }
 
-    fn decision(&self, outbounds: &HashMap<String, Action>, tag: &str) -> Decision {
+    fn decision(&self, outbounds: &HashMap<String, Action>, tag: &str, detour: Detour) -> Decision {
         let action = if outbounds.is_empty() {
             Action::Direct(FreedomStrategy::AsIs.into())
         } else {
@@ -2536,8 +2674,22 @@ impl Router {
             open_private: false,
             tag: tag.to_owned(),
             action,
+            detour,
         }
     }
+}
+
+/// The user object of a VLESS outbound: `settings.vnext[0].users[0]`, or the
+/// flattened `settings` itself (where `address`, `port` and `id` live).
+fn first_vless_user(settings: &Value) -> Option<&Value> {
+    settings
+        .get("vnext")
+        .and_then(Value::as_array)
+        .and_then(|vnext| vnext.first())
+        .and_then(|vnext| vnext.get("users"))
+        .and_then(Value::as_array)
+        .and_then(|users| users.first())
+        .or_else(|| settings.get("id").is_some().then_some(settings))
 }
 
 /// Xray's validateOutboundTransportSecurity: VLESS without encryption and
@@ -3190,12 +3342,41 @@ mod tests {
             Decision {
                 open_private: false,
                 tag: "direct".into(),
-                action: Action::Direct(FreedomStrategy::AsIs.into())
+                action: Action::Direct(FreedomStrategy::AsIs.into()),
+                detour: Detour::Default,
             }
         );
         let mut bt = query(None, Some("1.1.1.1"), 6881);
         bt.protocol = Some("bittorrent");
         assert_eq!(r.route(&bt).await.tag, "blocked");
+    }
+
+    #[test]
+    fn add_rule_without_append_replaces_the_rule_set() {
+        let router = Router::build(
+            &serde_json::json!({
+                "outbounds": [
+                    {"tag": "direct", "protocol": "freedom"},
+                    {"tag": "blocked", "protocol": "blackhole"}
+                ]
+            }),
+            &[],
+        )
+        .unwrap();
+        let rule = |tag: &str| {
+            router
+                .parse_rule(&serde_json::json!({
+                    "type": "field", "domain": ["a.example"], "outboundTag": tag
+                }))
+                .unwrap()
+        };
+        router.add_rule(rule("direct"), true);
+        assert_eq!(router.list_rules().len(), 1);
+        // `shouldAppend=false` is Xray's ReloadRules: the full new list wins.
+        router.set_rules(vec![rule("blocked")]);
+        let rules = router.list_rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].0, "blocked");
     }
 
     #[tokio::test]
@@ -3214,7 +3395,8 @@ mod tests {
             Decision {
                 open_private: false,
                 tag: "warp".into(),
-                action: Action::Block(BlockAction::Drop)
+                action: Action::Block(BlockAction::Drop),
+                detour: Detour::Rule,
             }
         );
         assert_eq!(
@@ -3422,7 +3604,8 @@ mod tests {
             Decision {
                 open_private: false,
                 tag: "forbidden".into(),
-                action: Action::Block(BlockAction::Http403)
+                action: Action::Block(BlockAction::Http403),
+                detour: Detour::Rule,
             }
         );
 
@@ -3432,7 +3615,8 @@ mod tests {
             Decision {
                 open_private: false,
                 tag: "forbidden".into(),
-                action: Action::Block(BlockAction::Http403)
+                action: Action::Block(BlockAction::Http403),
+                detour: Detour::Rule,
             }
         );
 
@@ -3442,7 +3626,8 @@ mod tests {
             Decision {
                 open_private: false,
                 tag: "blocked".into(),
-                action: Action::Block(BlockAction::Drop)
+                action: Action::Block(BlockAction::Drop),
+                detour: Detour::Rule,
             }
         );
 
@@ -3452,7 +3637,8 @@ mod tests {
             Decision {
                 open_private: false,
                 tag: "direct".into(),
-                action: Action::Direct(FreedomStrategy::AsIs.into())
+                action: Action::Direct(FreedomStrategy::AsIs.into()),
+                detour: Detour::Default,
             }
         );
     }
@@ -3471,7 +3657,8 @@ mod tests {
             Decision {
                 open_private: false,
                 tag: "v4only".into(),
-                action: Action::Direct(FreedomStrategy::UseIPv4.into())
+                action: Action::Direct(FreedomStrategy::UseIPv4.into()),
+                detour: Detour::Default,
             }
         );
         assert!(Router::build(

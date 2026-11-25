@@ -51,6 +51,17 @@ pub fn trojan_password_hash(password: &str) -> [u8; 56] {
     token
 }
 
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (left, right) in a.iter().zip(b) {
+        diff |= left ^ right;
+    }
+    diff == 0
+}
+
 /// Parses a Trojan request header from the incoming byte buffer.
 pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), ParseError> {
     if buf.len() < 58 {
@@ -60,7 +71,7 @@ pub fn parse_request(buf: &[u8], users: &[User]) -> Result<(Request, usize), Par
     // Xray reads the two delimiter bytes without checking their contents.
     let user_index = users
         .iter()
-        .position(|u| u.hash.as_slice() == token)
+        .position(|u| constant_time_eq(&u.hash, token))
         .ok_or(ParseError::Invalid("unknown user"))?;
 
     let mut pos = 58;
@@ -243,6 +254,7 @@ where
         port: request.port,
         sniffing: &ctx.sniffing,
         vless_route: None,
+        from_prefix: "",
     };
 
     let Some(decision) = route.allow(&ctx.router, payload).await else {

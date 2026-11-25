@@ -688,6 +688,7 @@ async fn handle_tcp_streams(
                 port,
                 sniffing: &ctx.sniffing,
                 vless_route: None,
+                from_prefix: "",
             };
 
             let decision = match route.allow(&ctx.router, early).await {
@@ -842,6 +843,7 @@ async fn handle_udp_datagrams(
                 port,
                 sniffing: &ctx.sniffing,
                 vless_route: None,
+                from_prefix: "",
             };
             let decision = match route.allow(&ctx.router, &payload).await {
                 Some(d) => d,

@@ -90,6 +90,7 @@ where
         port,
         sniffing: &ctx.sniffing,
         vless_route: None,
+        from_prefix: "",
     };
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());
@@ -310,6 +311,7 @@ async fn serve_udp_session(
         port,
         sniffing: &ctx.sniffing,
         vless_route: None,
+        from_prefix: "",
     };
     let Some(decision) = route.allow(&ctx.router, &initial_payload).await else {
         return Ok(());

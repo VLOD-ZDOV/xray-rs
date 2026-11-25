@@ -131,6 +131,7 @@ where
         port,
         sniffing: &ctx.sniffing,
         vless_route: None,
+        from_prefix: "",
     };
 
     // Xray writes the response header even when the request goes nowhere.

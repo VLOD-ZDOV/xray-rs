@@ -1039,10 +1039,12 @@ async fn handle_tcp(tcp: IncomingTcpStream, ctx: Arc<crate::vless::Context>, rou
     let accepted = true;
     log::access(
         tcp.src,
+        "tcp",
         accepted,
         format!("tcp:{}:{}", tcp.dst.ip(), tcp.dst.port()),
         &ctx.tag,
         &decision.tag,
+        decision.detour.separator(),
         "",
     );
     if !accepted {
@@ -1089,10 +1091,12 @@ async fn handle_udp(udp: IncomingUdpSession, ctx: Arc<crate::vless::Context>, ro
     let accepted = true;
     log::access(
         udp.src,
+        "udp",
         accepted,
         format!("udp:{}:{}", udp.dst.ip(), udp.dst.port()),
         &ctx.tag,
         &decision.tag,
+        decision.detour.separator(),
         "",
     );
     if !accepted {

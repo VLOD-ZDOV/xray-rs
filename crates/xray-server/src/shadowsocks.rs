@@ -168,6 +168,7 @@ where
         port,
         sniffing: &ctx.sniffing,
         vless_route: None,
+        from_prefix: "",
     };
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());
@@ -440,6 +441,7 @@ impl ShadowsocksUdpHandler {
             port,
             sniffing: &self.ctx.sniffing,
             vless_route: None,
+            from_prefix: "udp",
         };
         let Some(decision) = route.allow(&self.ctx.router, &init.payload).await else {
             return Ok(());
@@ -626,6 +628,7 @@ impl ShadowsocksUdpHandler {
             port,
             sniffing: &self.ctx.sniffing,
             vless_route: None,
+            from_prefix: "udp",
         };
         let Some(decision) = route.allow(&self.ctx.router, &initial_payload).await else {
             return Ok(());
