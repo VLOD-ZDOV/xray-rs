@@ -17,6 +17,8 @@ const MAX_HEADER_SIZE: usize = 8192;
 const CHUNK_SIZE: usize = 4096;
 // Xray clients send one frame per write (a few KiB at most).
 const MAX_FRAME_SIZE: usize = 1 << 20;
+/// A fragmented WS message is assembled in memory; cap its total size.
+const MAX_MESSAGE_SIZE: usize = 16 << 20;
 const MAX_QUEUED_PONGS: usize = 64 * 1024;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
@@ -98,6 +100,13 @@ impl ServerFrameDecoder {
 
         let b0 = bytes[0];
         let b1 = bytes[1];
+        // RFC 6455 §5.2: no extension negotiated, so RSV1-3 must be zero.
+        if b0 & 0x70 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "reserved websocket bits set",
+            ));
+        }
         let opcode = b0 & 0x0F;
         let fin = b0 & 0x80 != 0;
         let masked = (b1 & 0x80) != 0;
@@ -175,6 +184,12 @@ impl ServerFrameDecoder {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "continuation after FIN",
+                    ));
+                }
+                if self.fragment.len() + payload.len() > MAX_MESSAGE_SIZE {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "websocket message too large",
                     ));
                 }
                 self.fragment.extend_from_slice(&payload);

@@ -621,9 +621,10 @@ const SOCKS4_CONNECT: u8 = 0x01;
 /// leaves zero.
 pub const SOCKS4_GRANTED: [u8; 8] = [0x00, 90, 0, 0, 0, 0, 0, 0];
 pub const SOCKS4_REJECTED: [u8; 8] = [0x00, 91, 0, 0, 0, 0, 0, 0];
-/// A user ID or SOCKS 4a domain longer than this is refused. Xray allows up to
-/// its 8 KiB buffer; a DNS name has at most 253 bytes.
-const MAX_SOCKS4_STRING: usize = 255;
+/// A user ID or SOCKS 4a domain longer than Xray's 8 KiB stack buffer is
+/// refused; the reference drops the connection at that point. Anything shorter
+/// is granted, even when a later dial fails.
+const MAX_SOCKS4_STRING: usize = 8192;
 
 /// Reads a SOCKS 4 or 4a `CONNECT` after its version byte, as Xray-core
 /// accepts it: the user ID is ignored, and an address whose first byte is zero
@@ -668,7 +669,9 @@ where
     loop {
         match reader.read_u8().await.map_err(|_| SocksParseError::Io)? {
             0 => return Ok(value),
-            _ if value.len() == MAX_SOCKS4_STRING => return Err(SocksParseError::InvalidDomain),
+            _ if value.len() >= MAX_SOCKS4_STRING - 1 => {
+                return Err(SocksParseError::InvalidDomain)
+            }
             byte => value.push(byte),
         }
     }

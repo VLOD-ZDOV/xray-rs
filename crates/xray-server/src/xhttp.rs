@@ -40,6 +40,7 @@ pub struct Handler {
 }
 
 struct Session {
+    created: std::time::Instant,
     uploads: mpsc::Sender<Upload>,
     // Taken by the GET request that carries the downlink.
     uplink: Mutex<Option<DuplexStream>>,
@@ -717,11 +718,25 @@ impl Handler {
             return Some(session.clone());
         }
         if sessions.len() >= MAX_SESSIONS {
-            return None;
+            // Reclaim the oldest session that never got a GET instead of
+            // letting one client's POST flood lock out everyone else.
+            let victim = sessions
+                .iter()
+                .filter(|(_, session)| !session.connected.load(Ordering::Relaxed))
+                .min_by_key(|(_, session)| session.created)
+                .map(|(id, session)| (id.clone(), session.clone()));
+            match victim {
+                Some((id, session)) => {
+                    session.close();
+                    sessions.remove(&id);
+                }
+                None => return None,
+            }
         }
         let (writer, reader) = tokio::io::duplex(PIPE_SIZE);
         let (tx, rx) = mpsc::channel(self.settings.max_buffered_posts);
         let session = Arc::new(Session {
+            created: std::time::Instant::now(),
             uploads: tx,
             uplink: Mutex::new(Some(reader)),
             connected: AtomicBool::new(false),

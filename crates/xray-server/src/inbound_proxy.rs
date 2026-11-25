@@ -102,7 +102,17 @@ where
     stream.flush().await?;
     let _online = stats::get().connect("", level, peer.ip());
     let (host, port) = target_to_host_port(&target);
-    relay_tcp(stream, ctx, ("", level), peer, host, port, Vec::new()).await
+    relay_tcp(
+        stream,
+        ctx,
+        ("", level),
+        peer,
+        host,
+        port,
+        Vec::new(),
+        "tcp",
+    )
+    .await
 }
 
 async fn serve_socks5<S>(
@@ -117,13 +127,11 @@ async fn serve_socks5<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let auth_user = timeout(
-        crate::policy::for_level(level).handshake,
-        negotiate_socks5(&mut stream, auth),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks handshake timeout"))?
-    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("socks auth: {e}")))?;
+    let deadline = tokio::time::Instant::now() + crate::policy::for_level(level).handshake;
+    let auth_user = tokio::time::timeout_at(deadline, negotiate_socks5(&mut stream, auth))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks handshake timeout"))?
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("socks auth: {e}")))?;
 
     let email = auth_user
         .as_ref()
@@ -131,12 +139,9 @@ where
         .unwrap_or_default();
     let _online = stats::get().connect(&email, level, peer.ip());
 
-    let req = timeout(
-        crate::policy::for_level(level).handshake,
-        parse_socks5_request_message(&mut stream),
-    )
-    .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks request timeout"))?;
+    let req = tokio::time::timeout_at(deadline, parse_socks5_request_message(&mut stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "socks request timeout"))?;
     let req = match req {
         Ok(req) => req,
         // Xray answers BIND and unknown commands with "command not supported".
@@ -163,7 +168,17 @@ where
                 .map_err(|e| io::Error::other(format!("{e}")))?;
             stream.flush().await?;
             let (host, port) = target_to_host_port(&req.target);
-            relay_tcp(stream, ctx, (&email, level), peer, host, port, Vec::new()).await
+            relay_tcp(
+                stream,
+                ctx,
+                (&email, level),
+                peer,
+                host,
+                port,
+                Vec::new(),
+                "tcp",
+            )
+            .await
         }
         SocksCommand::UdpAssociate => {
             if !udp_enabled {
@@ -224,6 +239,7 @@ async fn relay_udp(
         port,
         sniffing: &ctx.sniffing,
         vless_route: None,
+        from_prefix: "udp",
     };
     let decision = match route.allow(&ctx.router, &first.payload).await {
         Some(d) if !matches!(d.action, Action::Block(_)) => d,
@@ -275,6 +291,7 @@ async fn relay_udp(
 }
 
 /// Waits for the first payload, routes it and relays a proxied TCP connection.
+#[allow(clippy::too_many_arguments)]
 async fn relay_tcp<S>(
     stream: S,
     ctx: &Context,
@@ -283,6 +300,7 @@ async fn relay_tcp<S>(
     mut host: Host,
     port: u16,
     mut early: Vec<u8>,
+    from_prefix: &'static str,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -302,6 +320,7 @@ where
         port,
         sniffing: &ctx.sniffing,
         vless_route: None,
+        from_prefix,
     };
     let Some(decision) = route.allow(&ctx.router, &early).await else {
         return Ok(());
@@ -413,7 +432,17 @@ where
             stream.write_all(HTTP_CONNECT_ESTABLISHED).await?;
             stream.flush().await?;
             let (host, port) = target_to_host_port(&target);
-            return relay_tcp(stream, ctx, (&email, level), peer, host, port, Vec::new()).await;
+            return relay_tcp(
+                stream,
+                ctx,
+                (&email, level),
+                peer,
+                host,
+                port,
+                Vec::new(),
+                "",
+            )
+            .await;
         }
         let request = match PlainHttpRequest::new(&head) {
             Ok(request) => request,
@@ -462,6 +491,7 @@ where
         port,
         sniffing: &crate::vless::Sniffing::default(),
         vless_route: None,
+        from_prefix: "",
     };
     let Some(decision) = route.allow(&ctx.router, &forwarded).await else {
         stream.write_all(HTTP_SERVICE_UNAVAILABLE).await?;
