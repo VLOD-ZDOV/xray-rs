@@ -566,7 +566,8 @@ impl VlessOutbound {
             &format!("outbound {tag:?}"),
         )?
         .map(Arc::new);
-        let mux_settings = crate::mux::MuxSettings::parse(outbound.get("mux"));
+        let mux_settings = crate::mux::MuxSettings::parse(outbound.get("mux"))
+            .map_err(|e| err(&format!("mux: {e}")))?;
         let mux_pool = mux_settings.as_ref().map(|m| {
             Arc::new(crate::mux::MuxClientPool::new(if m.concurrency <= 0 {
                 8
@@ -1029,7 +1030,7 @@ impl VlessUdpLink {
 
 struct XudpSessions {
     by_addr: HashMap<SocketAddr, u16>,
-    by_id: HashMap<u16, SocketAddr>,
+    by_id: HashMap<u16, (SocketAddr, [u8; 8])>,
     next_id: u16,
 }
 
@@ -1037,7 +1038,6 @@ struct XudpConn {
     writer: Mutex<tokio::io::WriteHalf<VlessResponseStream<VisionTransportStream>>>,
     sessions: Arc<Mutex<XudpSessions>>,
     task: JoinHandle<()>,
-    global_id: [u8; 8],
 }
 
 impl XudpConn {
@@ -1069,8 +1069,10 @@ impl XudpConn {
                 }
                 s.next_id = session_id.checked_add(1).unwrap_or(1);
                 s.by_addr.insert(addr, session_id);
-                s.by_id.insert(session_id, addr);
-                let global_id = self.global_id;
+                // Xray keys XUDP takeover by this id; every flow needs its own.
+                let mut global_id = [0u8; 8];
+                rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut global_id);
+                s.by_id.insert(session_id, (addr, global_id));
                 let target = Target::new(
                     TargetAddr::Ip(addr.ip()),
                     addr.port(),
@@ -1149,7 +1151,7 @@ impl VlessConeUdp {
             while let Ok(frame) = crate::mux::read_frame(&mut reader).await {
                 if frame.status == crate::mux::STATUS_END {
                     let mut s = sessions_clone.lock().await;
-                    if let Some(addr) = s.by_id.remove(&frame.id) {
+                    if let Some((addr, _)) = s.by_id.remove(&frame.id) {
                         s.by_addr.remove(&addr);
                     }
                     continue;
@@ -1158,7 +1160,7 @@ impl VlessConeUdp {
                     Some((_, Host::Ip(ip), port)) => Some(SocketAddr::new(ip, port)),
                     _ => {
                         let s = sessions_clone.lock().await;
-                        s.by_id.get(&frame.id).copied()
+                        s.by_id.get(&frame.id).map(|(addr, _)| *addr)
                     }
                 };
                 if let Some(from_addr) = from_opt {
@@ -1170,18 +1172,10 @@ impl VlessConeUdp {
                 }
             }
         });
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(b"xray-xudp-global-id");
-        hasher.update(&self.vless.user_id);
-        let hash = hasher.finalize();
-        let mut global_id = [0u8; 8];
-        global_id.copy_from_slice(&hash[..8]);
         Ok(Arc::new(XudpConn {
             writer: Mutex::new(writer),
             sessions,
             task,
-            global_id,
         }))
     }
 
