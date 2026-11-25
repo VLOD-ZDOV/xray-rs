@@ -22,9 +22,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy -p xray-server --all-targets -- -Dwarnings
+      - run: cargo test --bins -p xray-server
       - run: >-
-          cargo test --lib --bins
-          -p xray-server -p xray-config -p xray-proxy -p xray-transport
+          cargo test --lib
+          -p xray-config -p xray-proxy -p xray-transport
           -p xray-routing -p xray-utls -p xray-vless-encryption -p xray-wireguard
       - run: cargo test -p xray-config --test tooling_tests
       - run: cargo build --release -p xray-server

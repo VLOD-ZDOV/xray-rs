@@ -20,11 +20,16 @@ The server crate and every workspace crate it is built from (`xray-config`,
 | Security | TLS (`minVersion`, `maxVersion`, `cipherSuites`, `rejectUnknownSni`, certificate reload, `usage`, `ocspStapling`), REALITY (dest mirroring and padding, `mldsa65Seed`), or plain behind nginx |
 | Transports | XHTTP over HTTP/1.1, HTTP/2 and HTTP/3 (packet-up, stream-up, stream-one, Xray 26 obfuscation settings, `responseHeaders`, `downloadSettings`), raw TCP (including `header: http`), WebSocket (with early data), HTTPUpgrade, gRPC (gun and multi mode), mKCP, `masque`, `xdrive`; `acceptProxyProtocol`; `sockopt` (`mark`, `interface`, `tcpFastOpen`, keepalive, `tcpCongestion`, `tcpUserTimeout`, `tcpMaxSeg`, `tcpWindowClamp`, `customSockopt`, `v6only`, `tcpMptcp`, `tproxy`, `trustedXForwardedFor`, `happyEyeballs`); `finalmask` (`fragment`, `noise`, `header-custom` and `sudoku` on TCP, `salamander`, `udphop`, `mkcp-legacy`, `quicParams`) |
 | VLESS / Trojan | TCP, UDP, Mux.Cool and XUDP; `fallbacks` by `name`, `alpn` and `path` with PROXY protocol v1/v2 |
-| Sniffing | `destOverride` `http`, `tls`, `quic`, `fakedns`; `routeOnly`, `metadataOnly`, `domainsExcluded` |
+| Sniffing | `destOverride` `http`, `tls`, `fakedns` (`quic` is accepted but not sniffed yet); `routeOnly`, `metadataOnly`, `domainsExcluded`, `ipsExcluded` |
 | Outbound | `freedom` / `direct` (every `domainStrategy`, `fragment`, `noises`, `redirect`), `blackhole` / `block`, `wireguard` (Cloudflare WARP), `socks`, `vless` (raw, WS, gRPC, XHTTP, mKCP, TLS, REALITY), `vmess`, `trojan`, `shadowsocks`, `hysteria`, `masque`, `http`, `dns`, `loopback`; `sockopt` on every outbound, `sendThrough`, `proxySettings`, `mux`; balancers (`random`, `roundRobin`, `leastPing`, `leastLoad`) with `observatory` and `burstObservatory` |
 | Routing | `domain`, `geosite`, `ip`, `geoip`, `port`, `network`, `inboundTag`, `user`, `source`, `sourcePort`, `localPort`, `localIP`, `protocol`, `attrs`, `vlessRoute`, `process`, `webhook`, `balancerTag`; `domainStrategy` AsIs, IPIfNonMatch, IPOnDemand |
 | DNS and policy | built-in `dns` section (servers, `hosts`, `queryStrategy`), `fakedns`; `policy` levels (timeouts, `bufferSize`, per-user stats and online tracking) |
 | 3x-ui | `-c`, `run -test -c`, `-version`; gRPC `StatsService`, `HandlerService` (users for VLESS, VMess, Trojan and Shadowsocks, `AddInbound`, `RemoveInbound`, `AddOutbound`, `RemoveOutbound`), `RoutingService`, `LoggerService`, `ObservatoryService`; the `log` section (`loglevel`, `access`, `error`, `maskAddress`, `dnsLog`); `metrics` (`/debug/vars`); `version` |
+| CLI | `run`, `-test`, `-c`, `-version`, `-h`, `uuid [-i]`, `x25519 [-i] [--std-encoding]`, `test-route` |
+
+Configuration errors print `Failed to start: ...` and exit with code 23 like
+Xray, so systemd does not restart a core that cannot load its config. Errors
+after the config was accepted (a busy port, for example) exit with 255.
 
 Tested against the official Xray-core 26.11.9 as client, outbound peer,
 WireGuard peer and `xray api` client.
@@ -37,6 +42,20 @@ WireGuard peer and `xray api` client.
   `uint16` and listens on a different port, which hides operator typos.
 - `AlterOutbound` with no operation returns a gRPC status; official Xray panics
   on that request.
+- `AddInbound` accepts only plain TCP VLESS, VMess and Trojan inbounds with
+  plain user accounts. TLS, REALITY, fallbacks, VLESS encryption, shadowsocks,
+  SOCKS, HTTP, dokodemo and Hysteria settings are refused with an error instead
+  of being dropped; 3x-ui restarts the core with the full JSON config in that
+  case.
+- `geoip:private` in a routing rule uses the built-in private ranges even when
+  `geoip.dat` is missing. Official Xray refuses to start without the file; with
+  the standard geo data both match the same addresses.
+- An empty `fakedns` pool (`ipPool` empty or `poolSize: 0`) is rejected by
+  `-test`. Official Xray accepts it in `-test` and then fails at startup with
+  `invalid fakeDNS setting`.
+- A single fragmented WebSocket message is capped at 16 MiB and closed with
+  code 1002 beyond that. Xray streams fragments without assembling them, so a
+  message that large would pass there; normal clients send small messages.
 
 ## Resource use
 

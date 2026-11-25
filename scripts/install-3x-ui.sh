@@ -17,6 +17,8 @@ case "$(uname -m)" in
     aarch64 | arm64 | armv8*) CORE_NAME="xray-linux-arm64"; ASSET="xray-linux-arm64" ;;
     armv7* | arm) CORE_NAME="xray-linux-arm32"; ASSET="xray-linux-arm32" ;;
     armv6*) CORE_NAME="xray-linux-arm32"; ASSET="xray-linux-arm32-v6" ;;
+    # No ARMv5 release exists: it lacks 64-bit atomics.
+    armv5* | armv4*) CORE_NAME=""; ASSET="" ;;
     s390x) CORE_NAME="xray-linux-s390x"; ASSET="xray-linux-s390x" ;;
     *) CORE_NAME=""; ASSET="" ;;
 esac
@@ -55,7 +57,7 @@ Examples:
     sudo ./scripts/install-3x-ui.sh /path/to/xray-server
     sudo ./scripts/install-3x-ui.sh --rollback
 EOF
-    exit 0
+    exit "${1:-0}"
 }
 
 log_info() {
@@ -162,6 +164,10 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         --repo)
+            if [ $# -lt 2 ]; then
+                log_error "Option --repo needs a value."
+                usage 1
+            fi
             GITHUB_REPO="$2"
             shift 2
             ;;
@@ -173,7 +179,7 @@ while [ $# -gt 0 ]; do
             ;;
         -*)
             log_error "Unknown option: $1"
-            usage
+            usage 1
             ;;
         *)
             SOURCE_BIN="$1"
