@@ -182,9 +182,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.18.1"
+version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b281d307588d634de920874890732659e2e7672f72b5e10e81badc1a8a83621e"
+checksum = "048006790404103c488e6c5616b3e7e702a71292aadda08e8f7698a9e0d2eb53"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -192,9 +192,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.45.0"
+version = "0.47.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bff6c3b54fad79a2e60b8102caf565819711497c1f5f092f49508e2f5c31b27"
+checksum = "8bfbe32ac36b3c428696ce315464181bc4029d689fd58e3f2a4e58c252242f52"
 dependencies = [
  "cc",
  "cmake",
@@ -274,6 +274,8 @@ dependencies = [
 [[package]]
 name = "blake3"
 version = "1.8.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0aa83c34e62843d924f905e0f5c866eb1dd6545fc4d719e803d9ba6030371fce"
 dependencies = [
  "arrayref",
  "arrayvec",
@@ -338,9 +340,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
-version = "1.12.1"
+version = "1.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+checksum = "776dfebd015e2d8732c684a2c71003674ccb49457b539b9e82151ba38e96dd7c"
 
 [[package]]
 name = "cc"
@@ -953,47 +955,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "gotatun"
-version = "0.9.1"
-dependencies = [
- "aead 0.5.2",
- "base64 0.22.1",
- "bitfield-struct",
- "blake2 0.10.6",
- "bytes",
- "chacha20poly1305 0.10.1",
- "constant_time_eq",
- "duplicate",
- "either",
- "eyre",
- "futures",
- "hex",
- "hmac 0.12.1",
- "ip_network",
- "ip_network_table",
- "ipnetwork",
- "libc",
- "nix",
- "parking_lot",
- "rand 0.9.5",
- "rand_chacha 0.9.0",
- "rand_core 0.6.4",
- "ring",
- "socket2",
- "thiserror 1.0.69",
- "tokio",
- "tokio-util",
- "tracing",
- "typed-builder",
- "windows-sys 0.61.2",
- "x25519-dalek",
- "zerocopy",
- "zeroize",
-]
-
-[[package]]
 name = "h2"
-version = "0.4.20"
+version = "0.4.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b634322c4924093fe6a6e05ecbe5717cd3c6014934455f4ae8e5cf14ba3264a8"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1006,30 +971,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "h3"
-version = "0.0.8"
-dependencies = [
- "bytes",
- "fastrand",
- "futures-util",
- "http",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
-name = "h3-quinn"
-version = "0.0.10"
-dependencies = [
- "bytes",
- "futures",
- "h3",
- "quinn",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -1163,9 +1104,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.12.0"
+version = "1.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
+checksum = "229c6ff5584df4c6becbfe00567128bac768c8cd32ebc8a8366bd81ed072e8f3"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1726,22 +1667,22 @@ dependencies = [
 
 [[package]]
 name = "pin-project"
-version = "1.1.13"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2466b2336ed02bcdca6b294417127b90ec92038d1d5c4fbeac971a922e0e0924"
+checksum = "a6c2123f4708bbd422630a6dae7c03f678b1ce1f1c99e4c4b3beac69c8174cc9"
 dependencies = [
  "pin-project-internal",
 ]
 
 [[package]]
 name = "pin-project-internal"
-version = "1.1.13"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c96395f0a926bc13b1c17622aaddda1ecb55d49c8f1bf9777e4d877800a43f8b"
+checksum = "358938fd6df944c1e44bb328b60fb275f13c804aac47ba26a1165d45a3f87756"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -1885,45 +1826,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "quinn"
-version = "0.11.12"
-dependencies = [
- "bytes",
- "cfg_aliases",
- "futures-io",
- "pin-project-lite",
- "quinn-proto",
- "quinn-udp",
- "rustc-hash",
- "rustls",
- "socket2",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "web-time",
-]
-
-[[package]]
-name = "quinn-proto"
-version = "0.11.19"
-dependencies = [
- "bytes",
- "getrandom 0.4.2",
- "lru-slab",
- "rand 0.10.2",
- "rand_pcg",
- "ring",
- "rustc-hash",
- "rustls",
- "rustls-pki-types",
- "slab",
- "thiserror 2.0.21",
- "tinyvec",
- "tracing",
- "web-time",
 ]
 
 [[package]]
@@ -2137,24 +2039,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls"
-version = "0.23.40"
-dependencies = [
- "aws-lc-rs",
- "brotli",
- "brotli-decompressor",
- "log",
- "once_cell",
- "ring",
- "rustls-pki-types",
- "rustls-webpki",
- "shake",
- "subtle",
- "zeroize",
- "zlib-rs",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2304,6 +2188,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "shaped-rustls"
+version = "0.23.4600"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bca996193e4d5b1769d8518203ab6b77d3d28599b42779a38778595dc2ab33cf"
+dependencies = [
+ "aws-lc-rs",
+ "brotli",
+ "brotli-decompressor",
+ "log",
+ "once_cell",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "shake",
+ "subtle",
+ "zeroize",
+ "zlib-rs",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2354,18 +2258,6 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
-
-[[package]]
-name = "smoltcp"
-version = "0.14.0"
-dependencies = [
- "bitflags 1.3.2",
- "byteorder",
- "cfg-if",
- "defmt",
- "heapless",
- "managed",
-]
 
 [[package]]
 name = "socket2"
@@ -2573,10 +2465,8 @@ dependencies = [
 [[package]]
 name = "tokio-rustls"
 version = "0.26.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls",
+ "shaped-rustls",
  "tokio",
 ]
 
@@ -2744,9 +2634,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.29.0"
+version = "1.29.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a0e2d11620c50695fe12bbbfde96b3477fe606e7284c22d505c12ce51214514"
+checksum = "3c14b15dffa2f4bd712103e857140aa04a4f2ff6e955c77d7eb8e53ee02a3b64"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
@@ -3198,11 +3088,10 @@ dependencies = [
  "bytes",
  "libc",
  "rcgen",
- "rustls",
  "serde",
  "serde_json",
  "sha2",
- "smoltcp",
+ "shaped-rustls",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -3210,6 +3099,7 @@ dependencies = [
  "xray-core-rs",
  "xray-proxy",
  "xray-routing",
+ "xray-smoltcp",
  "xray-transport",
  "xray-tun",
  "xray-utls",
@@ -3258,18 +3148,15 @@ dependencies = [
  "base64 0.23.1",
  "bytes",
  "futures-util",
- "h2",
  "hkdf",
  "http",
  "libc",
  "loom",
- "quinn",
  "rand 0.8.6",
  "rcgen",
- "rustls",
  "serde_json",
  "sha2",
- "smoltcp",
+ "shaped-rustls",
  "socket2",
  "thiserror 2.0.21",
  "tokio",
@@ -3277,9 +3164,12 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "xray-config",
+ "xray-h2",
  "xray-proxy",
+ "xray-quinn",
  "xray-routing",
  "xray-runtime",
+ "xray-smoltcp",
  "xray-transport",
  "xray-tun",
  "xray-vless-encryption",
@@ -3301,6 +3191,86 @@ dependencies = [
  "xray-transport",
  "xray-tun",
  "zeroize",
+]
+
+[[package]]
+name = "xray-gotatun"
+version = "0.9.100"
+dependencies = [
+ "aead 0.5.2",
+ "base64 0.22.1",
+ "bitfield-struct",
+ "blake2 0.10.6",
+ "bytes",
+ "chacha20poly1305 0.10.1",
+ "constant_time_eq",
+ "duplicate",
+ "either",
+ "eyre",
+ "futures",
+ "hex",
+ "hmac 0.12.1",
+ "ip_network",
+ "ip_network_table",
+ "ipnetwork",
+ "libc",
+ "nix",
+ "parking_lot",
+ "rand 0.9.5",
+ "rand_chacha 0.9.0",
+ "rand_core 0.6.4",
+ "ring",
+ "socket2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "typed-builder",
+ "windows-sys 0.61.2",
+ "x25519-dalek",
+ "zerocopy",
+ "zeroize",
+]
+
+[[package]]
+name = "xray-h2"
+version = "0.4.2000"
+dependencies = [
+ "atomic-waker",
+ "bytes",
+ "fnv",
+ "futures-core",
+ "futures-sink",
+ "http",
+ "indexmap",
+ "slab",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "xray-h3"
+version = "0.0.800"
+dependencies = [
+ "bytes",
+ "fastrand",
+ "futures-util",
+ "http",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
+name = "xray-h3-quinn"
+version = "0.0.1000"
+dependencies = [
+ "bytes",
+ "futures",
+ "tokio",
+ "tokio-util",
+ "xray-h3",
+ "xray-quinn",
 ]
 
 [[package]]
@@ -3328,6 +3298,45 @@ dependencies = [
  "uuid",
  "xray-routing",
  "zeroize",
+]
+
+[[package]]
+name = "xray-quinn"
+version = "0.11.1200"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "futures-io",
+ "pin-project-lite",
+ "quinn-udp",
+ "rustc-hash",
+ "shaped-rustls",
+ "socket2",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "web-time",
+ "xray-quinn-proto",
+]
+
+[[package]]
+name = "xray-quinn-proto"
+version = "0.11.1900"
+dependencies = [
+ "bytes",
+ "getrandom 0.4.2",
+ "lru-slab",
+ "rand 0.10.2",
+ "rand_pcg",
+ "ring",
+ "rustc-hash",
+ "rustls-pki-types",
+ "shaped-rustls",
+ "slab",
+ "thiserror 2.0.21",
+ "tinyvec",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]
@@ -3379,9 +3388,6 @@ dependencies = [
  "cc",
  "chacha20poly1305 0.11.0",
  "futures-util",
- "h2",
- "h3",
- "h3-quinn",
  "hkdf",
  "hmac 0.13.0",
  "http",
@@ -3393,15 +3399,13 @@ dependencies = [
  "ml-dsa",
  "nix",
  "prost",
- "quinn",
- "quinn-proto",
  "rand 0.8.6",
  "rcgen",
  "regex",
- "rustls",
  "serde_json",
  "sha1",
  "sha2",
+ "shaped-rustls",
  "socket2",
  "tokio",
  "tokio-rustls",
@@ -3410,12 +3414,29 @@ dependencies = [
  "x25519-dalek",
  "x509-parser",
  "xray-config",
+ "xray-h2",
+ "xray-h3",
+ "xray-h3-quinn",
  "xray-proxy",
+ "xray-quinn",
+ "xray-quinn-proto",
  "xray-routing",
  "xray-transport",
  "xray-vless-encryption",
  "xray-wireguard",
  "zeroize",
+]
+
+[[package]]
+name = "xray-smoltcp"
+version = "0.14.0"
+dependencies = [
+ "bitflags 1.3.2",
+ "byteorder",
+ "cfg-if",
+ "defmt",
+ "heapless",
+ "managed",
 ]
 
 [[package]]
@@ -3431,9 +3452,6 @@ dependencies = [
  "bytes",
  "futures-util",
  "ghash",
- "h2",
- "h3",
- "h3-quinn",
  "hkdf",
  "hmac 0.13.0",
  "http",
@@ -3443,16 +3461,14 @@ dependencies = [
  "nix",
  "num-bigint",
  "polyval",
- "quinn",
- "quinn-proto",
  "rand 0.8.6",
  "rcgen",
  "regex",
- "rustls",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
+ "shaped-rustls",
  "socket2",
  "thiserror 2.0.21",
  "tokio",
@@ -3461,7 +3477,12 @@ dependencies = [
  "webpki-roots",
  "x25519-dalek",
  "x509-parser",
+ "xray-h2",
+ "xray-h3",
+ "xray-h3-quinn",
  "xray-proxy",
+ "xray-quinn",
+ "xray-quinn-proto",
  "xray-routing",
  "xray-utls",
  "zeroize",
@@ -3505,15 +3526,15 @@ version = "0.10.1"
 dependencies = [
  "base64 0.23.1",
  "bytes",
- "gotatun",
  "rand 0.8.6",
  "serde_json",
- "smoltcp",
  "socket2",
  "thiserror 2.0.21",
  "tokio",
  "x25519-dalek",
+ "xray-gotatun",
  "xray-proxy",
+ "xray-smoltcp",
  "xray-transport",
 ]
 
@@ -3658,27 +3679,27 @@ checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
 
 [[package]]
 name = "zstd"
-version = "0.14.3"
+version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db3ae9bf90af6e40197bef767eeefc46ad6397420fe873830bd85e5fbbfb3c70"
+checksum = "ad5020ab8f27bfc0024ad0a07aed6bf022a16208f479686fbed4fdd0c85eb0b3"
 dependencies = [
  "zstd-safe",
 ]
 
 [[package]]
 name = "zstd-safe"
-version = "8.2.0"
+version = "8.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ded520f16b29e1a9b771c722221b2b0a0398c2316d9bb3c42b458a5414d7434b"
+checksum = "5a9ea9cc2576c2fcc104e9cec04f46e3ede564f4fbc206831e4ef7e859a4140d"
 dependencies = [
  "zstd-sys",
 ]
 
 [[package]]
 name = "zstd-sys"
-version = "2.1.2+zstd.1.5.7"
+version = "2.1.3+zstd.1.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "481ada9c543b2323cbb7bbdbb5249177fbf0188ed959ed2c15e4b22421c84ed3"
+checksum = "f729a06d0257428fd9d997ac8db7e1407bd0262ab016b085b36bc52957c0052d"
 dependencies = [
  "cc",
  "pkg-config",

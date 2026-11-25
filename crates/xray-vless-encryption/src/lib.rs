@@ -7,6 +7,7 @@
 //! See `docs/vless-encryption-design.md` for the wire and lifecycle contract.
 
 mod config;
+mod context_key;
 mod crypto;
 mod handshake;
 mod padding;

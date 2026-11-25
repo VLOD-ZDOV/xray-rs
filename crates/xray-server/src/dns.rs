@@ -38,6 +38,7 @@ fn map_transport(t: xray_config::DnsServerTransport) -> NameServerTransport {
         xray_config::DnsServerTransport::HttpsRouted => NameServerTransport::HttpsRouted,
         xray_config::DnsServerTransport::HttpsLocal => NameServerTransport::HttpsLocal,
         xray_config::DnsServerTransport::QuicLocal => NameServerTransport::QuicLocal,
+        xray_config::DnsServerTransport::System => NameServerTransport::System,
     }
 }
 

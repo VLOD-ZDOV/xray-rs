@@ -44,6 +44,7 @@ socket2 = { version = "0.6.5", features = ["all"] }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
+tracing = "0.1"
 webpki-roots.workspace = true
 x25519-dalek.workspace = true
 x509-parser.workspace = true
@@ -62,6 +63,3 @@ tokio = { workspace = true, features = ["test-util"] }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 nix = { workspace = true, features = ["socket", "net", "hostname"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-tracing = "0.1"
