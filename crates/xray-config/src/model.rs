@@ -2348,6 +2348,11 @@ pub struct TcpFragmentSettings {
     pub lengths: Vec<FragmentRange>,
     pub delays_ms: Vec<FragmentRange>,
     pub max_split: FragmentRange,
+    /// Further `fragment` masks listed after this one in `finalmask.tcp`,
+    /// in list order. Xray-core keeps every mask in the list and applies
+    /// them in order on the write path, the first listed outermost; a lone
+    /// mask has none.
+    pub chained: Vec<TcpFragmentSettings>,
     /// The `finalRules` of the dedicated freedom fragment outbound a
     /// `dialerProxy` named, when the parser folded that freedom into this
     /// outbound; `None` for any other fragment mask. A connection from a VLESS

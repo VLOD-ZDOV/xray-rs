@@ -24,14 +24,25 @@ pub fn parse_finalmask_tcp_fragment(
     let Some(arr) = tcp.as_array() else {
         return Err("streamSettings.finalmask.tcp must be an array or null".to_string());
     };
+    // Xray-core keeps every fragment mask in the list and applies them in
+    // order; the first is the head of the chain, the rest follow it.
+    let mut fragments = Vec::new();
     for mask in arr {
         let mask_type = mask.get("type").and_then(Value::as_str).unwrap_or("");
         if mask_type.eq_ignore_ascii_case("fragment") {
             let settings = mask.get("settings").unwrap_or(&Value::Null);
-            return parse_tcp_fragment_settings(settings).map(Some);
+            fragments.push(parse_tcp_fragment_settings(settings)?);
         }
     }
-    Ok(None)
+    match fragments.split_first() {
+        None => Ok(None),
+        Some((head, rest)) => head
+            .as_ref()
+            .clone()
+            .with_chained(rest.iter().map(|arc| arc.as_ref().clone()).collect())
+            .map(|config| Some(Arc::new(config)))
+            .map_err(|e| format!("invalid fragment configuration: {e}")),
+    }
 }
 
 /// Parses TCP fragment settings into `Arc<TcpFragmentConfig>`.
@@ -42,7 +53,10 @@ pub fn parse_tcp_fragment_settings(v: &Value) -> Result<Arc<TcpFragmentConfig>, 
         .ok_or_else(|| "Length can't be empty".to_string())?;
     let mut lengths = parse_ranges_list(length_val)?;
     for r in &mut lengths {
-        let start = (*r.start()).clamp(1, 16384);
+        // As in Xray-core, a 0 length is legal in any entry but the last:
+        // it emits an empty segment and moves to the next entry. It is not
+        // clamped up to 1, which would change the wire pattern.
+        let start = (*r.start()).min(16384);
         let end = (*r.end()).clamp(start, 16384);
         *r = start..=end;
     }
@@ -69,7 +83,29 @@ pub fn parse_tcp_fragment_settings(v: &Value) -> Result<Arc<TcpFragmentConfig>, 
         0..=0
     };
 
+    // `packets`, as Xray-core reads it: `tlshello`, empty or absent for
+    // every write, or a write number / `from-to` range counting from one.
+    let packets = match v.get("packets").and_then(Value::as_str) {
+        None => xray_transport::FragmentPackets::AllWrites,
+        Some(raw) => {
+            let raw = raw.trim().to_ascii_lowercase();
+            if raw.is_empty() {
+                xray_transport::FragmentPackets::AllWrites
+            } else if raw == "tlshello" {
+                xray_transport::FragmentPackets::TlsHello
+            } else {
+                let (from, to) = parse_range_val(&Value::String(raw.clone()))
+                    .map_err(|e| format!("invalid fragment packets {raw:?}: {e}"))?;
+                if from == 0 {
+                    return Err("PacketsFrom can't be 0".to_string());
+                }
+                xray_transport::FragmentPackets::Writes(u64::from(from)..=u64::from(to))
+            }
+        }
+    };
+
     TcpFragmentConfig::new(lengths, delays, max_split)
+        .and_then(|config| config.with_packets(packets))
         .map(Arc::new)
         .map_err(|e| format!("invalid fragment configuration: {e}"))
 }
@@ -604,6 +640,47 @@ mod tests {
         let v = json!({"lengths": "20000-30000", "delays": 2000});
         assert!(parse_tcp_fragment_settings(&v).is_ok());
         assert!(decode_hex("a\u{e9}a").is_err());
+    }
+
+    #[test]
+    fn two_fragment_masks_chain_and_keep_their_packets() {
+        let stream = json!({
+            "finalmask": {
+                "tcp": [
+                    {
+                        "type": "fragment",
+                        "settings": {
+                            "packets": "tlshello",
+                            "lengths": ["0", "104", "1"],
+                            "delays": ["0"],
+                            "maxSplit": "0"
+                        }
+                    },
+                    {
+                        "type": "fragment",
+                        "settings": {
+                            "packets": "1-1",
+                            "lengths": ["114", "1"],
+                            "delays": ["1"],
+                            "maxSplit": "11"
+                        }
+                    }
+                ]
+            }
+        });
+        let frag = parse_finalmask_tcp_fragment(&stream).unwrap().unwrap();
+        let expected = TcpFragmentConfig::new(vec![0..=0, 104..=104, 1..=1], vec![0..=0], 0..=0)
+            .unwrap()
+            .with_chained(vec![TcpFragmentConfig::new(
+                vec![114..=114, 1..=1],
+                vec![1..=1],
+                11..=11,
+            )
+            .unwrap()
+            .with_packets(xray_transport::FragmentPackets::Writes(1..=1))
+            .unwrap()])
+            .unwrap();
+        assert_eq!(frag, Arc::new(expected));
     }
 
     #[test]

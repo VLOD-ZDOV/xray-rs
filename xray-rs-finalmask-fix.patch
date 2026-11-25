@@ -1,0 +1,659 @@
+diff --git a/crates/xray-config/src/model.rs b/crates/xray-config/src/model.rs
+index dcf6bde..deaea98 100644
+--- a/crates/xray-config/src/model.rs
++++ b/crates/xray-config/src/model.rs
+@@ -2348,6 +2348,11 @@ pub struct TcpFragmentSettings {
+     pub lengths: Vec<FragmentRange>,
+     pub delays_ms: Vec<FragmentRange>,
+     pub max_split: FragmentRange,
++    /// Further `fragment` masks listed after this one in `finalmask.tcp`,
++    /// in list order. Xray-core keeps every mask in the list and applies
++    /// them in order on the write path, the first listed outermost; a lone
++    /// mask has none.
++    pub chained: Vec<TcpFragmentSettings>,
+     /// The `finalRules` of the dedicated freedom fragment outbound a
+     /// `dialerProxy` named, when the parser folded that freedom into this
+     /// outbound; `None` for any other fragment mask. A connection from a VLESS
+diff --git a/crates/xray-config/src/parser/fragment.rs b/crates/xray-config/src/parser/fragment.rs
+index 938dfc5..9ed1de6 100644
+--- a/crates/xray-config/src/parser/fragment.rs
++++ b/crates/xray-config/src/parser/fragment.rs
+@@ -71,12 +71,22 @@ impl Parser<'_> {
+             self.fragment_ranges(raw.get("delays"), &format!("{path}.delays"), delay)?
+         };
+         let max_split = self.fragment_range(raw.get("maxSplit"), &format!("{path}.maxSplit"))?;
+-        if lengths.iter().any(|r| r.from == 0 || r.to > 16_384) {
++        if lengths.iter().any(|r| r.to > 16_384) {
+             self.error(
+                 format!("{path}.length"),
+                 "fragment lengths must be in 1..=16384 bytes",
+             );
+         }
++        // Xray-core's only lengths check (`FragmentMask.Build`): the last
++        // entry's min cannot be 0, because the segment loop clamps to the
++        // last entry and would never advance. A 0 earlier in the list is
++        // legal there: it emits an empty segment and moves to the next entry.
++        if lengths.last().is_some_and(|r| r.from == 0) {
++            self.error(
++                format!("{path}.length"),
++                "last lengths entry min can't be 0",
++            );
++        }
+         if delays_ms.iter().any(|r| r.to > 1000) {
+             self.error(
+                 format!("{path}.{delay_key}"),
+@@ -94,6 +104,7 @@ impl Parser<'_> {
+             lengths,
+             delays_ms,
+             max_split,
++            chained: Vec::new(),
+             folded_final_rules: None,
+         })
+     }
+diff --git a/crates/xray-config/src/parser/header_custom.rs b/crates/xray-config/src/parser/header_custom.rs
+index 2ea0368..a19dc91 100644
+--- a/crates/xray-config/src/parser/header_custom.rs
++++ b/crates/xray-config/src/parser/header_custom.rs
+@@ -21,10 +21,10 @@ pub(super) struct TcpMasks {
+ }
+ 
+ impl Parser<'_> {
+-    /// `finalmask.tcp`: at most one `fragment`, one `header-custom` and one
+-    /// `sudoku` or `xmc` mask. The fragment and `header-custom` may stand
+-    /// together only with the fragment first: Xray-core fragments just the
+-    /// first write through it, which after `header-custom` is the handshake
++    /// `finalmask.tcp`: any number of `fragment` masks, one `header-custom`
++    /// and one `sudoku` or `xmc` mask. The fragments and `header-custom` may
++    /// stand together only with the fragments first: Xray-core fragments just
++    /// the first write through it, which after `header-custom` is the handshake
+     /// rather than the TLS ClientHello. Any number of filters may stand
+     /// anywhere: Xray-core's client wraps nothing in them, and no TCP mask
+     /// has to be outermost there.
+@@ -42,7 +42,7 @@ impl Parser<'_> {
+             self.error(path, "finalmask.tcp must be an array or null");
+             return found;
+         };
+-        let mut fragment = None;
++        let mut fragments: Vec<TcpFragmentSettings> = Vec::new();
+         let mut header = None;
+         let mut sudoku = None;
+         let mut xmc = None;
+@@ -70,10 +70,15 @@ impl Parser<'_> {
+             match kind.as_deref() {
+                 Some("sudoku") => sudoku = Some(self.parse_sudoku(settings, &settings_path)),
+                 Some("xmc") => xmc = Some(self.parse_xmc(settings, &settings_path)),
+-                Some("fragment") if fragment.is_none() && header.is_none() => {
+-                    fragment = Some(self.parse_tcp_fragment(settings, &settings_path, false));
++                // Xray-core keeps every fragment mask in the list and
++                // applies them in order, so a second one is not an error.
++                Some("fragment") if header.is_none() => {
++                    if let Some(fragment) = self.parse_tcp_fragment(settings, &settings_path, false)
++                    {
++                        fragments.push(fragment);
++                    }
+                 }
+-                Some("fragment") if fragment.is_none() => self.error(
++                Some("fragment") => self.error(
+                     &mask_path,
+                     "a fragment mask after header-custom would cut the header-custom handshake, which is not supported here; put it first",
+                 ),
+@@ -82,11 +87,15 @@ impl Parser<'_> {
+                 }
+                 _ => self.error(
+                     &mask_path,
+-                    "only one fragment, one header-custom and one sudoku or xmc TCP mask are supported",
++                    "only one header-custom and one sudoku or xmc TCP mask are supported",
+                 ),
+             }
+         }
+-        found.fragment = fragment.flatten();
++        if !fragments.is_empty() {
++            let mut first = fragments.remove(0);
++            first.chained = fragments;
++            found.fragment = Some(first);
++        }
+         found.header = header.flatten();
+         found.sudoku = sudoku.flatten();
+         found.xmc = xmc.flatten();
+diff --git a/crates/xray-config/tests/fragment_tests.rs b/crates/xray-config/tests/fragment_tests.rs
+index 70f6142..ed6cf04 100644
+--- a/crates/xray-config/tests/fragment_tests.rs
++++ b/crates/xray-config/tests/fragment_tests.rs
+@@ -202,7 +202,7 @@ fn unsupported_masks_and_unbounded_values_fail_closed() {
+         ("length", json!(0)),
+         ("length", json!(-1)),
+         ("length", json!(16385)),
+-        ("lengths", json!([0, 1])),
++        ("lengths", json!([1, 0])),
+         ("lengths", json!(vec![1; 17])),
+         ("delay", json!(1001)),
+         ("maxSplit", json!(4097)),
+@@ -214,11 +214,7 @@ fn unsupported_masks_and_unbounded_values_fail_closed() {
+         let raw = profile(value_settings).to_string();
+         assert!(parse_xray_json(&raw).is_err(), "{raw}");
+     }
+-    for mask in [
+-        json!({}),
+-        json!([{"type":"noise"}]),
+-        json!([{"type":"fragment","settings":settings()},{"type":"fragment","settings":settings()}]),
+-    ] {
++    for mask in [json!({}), json!([{"type":"noise"}])] {
+         let mut config = profile(settings());
+         config["outbounds"][0]["streamSettings"]["finalmask"]["tcp"] = mask;
+         assert!(parse_xray_json(&config.to_string()).is_err());
+@@ -325,3 +321,58 @@ fn raw_pieces_need_a_tcp_carrier_but_no_tls() {
+     freedom["packets"] = json!("1-2");
+     assert!(parse_xray_json(&profile(freedom).to_string()).is_ok());
+ }
++
++/// Xray-core's `FragmentMask.Build` rejects only a last `lengths` entry
++/// whose min is 0; a 0 earlier in the list emits an empty segment and the
++/// loop moves to the next entry.
++#[test]
++fn a_zero_length_is_legal_before_the_last_entry() {
++    let mut fragment = settings();
++    fragment["lengths"] = json!(["0", "104", "1"]);
++    let parsed = parse_xray_json(&profile(fragment).to_string()).unwrap();
++    let fragment = parsed.config.outbounds[0]
++        .stream
++        .tcp_fragment
++        .as_ref()
++        .unwrap();
++    assert_eq!(
++        fragment.lengths,
++        [
++            FragmentRange { from: 0, to: 0 },
++            FragmentRange { from: 104, to: 104 },
++            FragmentRange { from: 1, to: 1 }
++        ]
++    );
++}
++
++/// Xray-core keeps every mask in `finalmask.tcp`: two `fragment` masks are
++/// applied in list order, the first listed outermost on the write path.
++#[test]
++fn two_fragment_masks_chain_in_list_order() {
++    let first =
++        json!({"packets":"tlshello","lengths":["0","104","1"],"delays":["0"],"maxSplit":"0"});
++    let second = json!({"packets":"1-1","lengths":["114","1"],"delays":["1"],"maxSplit":"11"});
++    let config = json!({"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"192.0.2.1","port":443,"users":[{"id":"00010203-0405-0607-0809-0a0b0c0d0e0f","encryption":"none"}]}]},
++        "streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"example.com"},
++        "xhttpSettings":{"host":"example.com","path":"/api/1","mode":"auto"},
++        "finalmask":{"tcp":[{"type":"fragment","settings":first},{"type":"fragment","settings":second}]}}}]});
++    let parsed = parse_xray_json(&config.to_string()).unwrap();
++    let fragment = parsed.config.outbounds[0]
++        .stream
++        .tcp_fragment
++        .as_ref()
++        .unwrap();
++    assert_eq!(fragment.packets, FragmentPackets::TlsHello);
++    assert_eq!(fragment.chained.len(), 1);
++    assert_eq!(
++        fragment.chained[0].packets,
++        FragmentPackets::Writes { from: 1, to: 1 }
++    );
++    assert_eq!(
++        fragment.chained[0].lengths,
++        [
++            FragmentRange { from: 114, to: 114 },
++            FragmentRange { from: 1, to: 1 }
++        ]
++    );
++}
+diff --git a/crates/xray-config/tests/header_custom_tests.rs b/crates/xray-config/tests/header_custom_tests.rs
+index b62aafb..d425ead 100644
+--- a/crates/xray-config/tests/header_custom_tests.rs
++++ b/crates/xray-config/tests/header_custom_tests.rs
+@@ -290,7 +290,7 @@ fn the_mask_list_takes_a_fragment_first_then_header_custom() {
+         ),
+         (
+             json!([header.clone(), header.clone()]),
+-            "only one fragment, one header-custom and one sudoku",
++            "only one header-custom and one sudoku",
+         ),
+         (
+             json!([{"type": "sudoku"}, header.clone()]),
+diff --git a/crates/xray-core-rs/src/outbound/carrier.rs b/crates/xray-core-rs/src/outbound/carrier.rs
+index 4118245..7ddb487 100644
+--- a/crates/xray-core-rs/src/outbound/carrier.rs
++++ b/crates/xray-core-rs/src/outbound/carrier.rs
+@@ -953,26 +953,38 @@ pub(super) fn fragment_config(
+         .tcp_fragment
+         .as_ref()
+         .map(|settings| {
+-            let packets = match settings.packets {
+-                xray_config::FragmentPackets::TlsHello => xray_transport::FragmentPackets::TlsHello,
+-                xray_config::FragmentPackets::AllWrites => {
+-                    xray_transport::FragmentPackets::AllWrites
+-                }
+-                xray_config::FragmentPackets::Writes { from, to } => {
+-                    xray_transport::FragmentPackets::Writes(u64::from(from)..=u64::from(to))
+-                }
+-            };
+-            xray_transport::TcpFragmentConfig::new(
+-                settings.lengths.iter().map(|r| r.from..=r.to).collect(),
+-                settings.delays_ms.iter().map(|r| r.from..=r.to).collect(),
+-                settings.max_split.from..=settings.max_split.to,
+-            )
+-            .and_then(|config| config.with_packets(packets))
+-            .map(Arc::new)
+-            .map_err(|_| CoreError::UnsupportedOutboundNetwork)
++            build_fragment_config(settings)
++                .map(Arc::new)
++                .map_err(|_| CoreError::UnsupportedOutboundNetwork)
+         })
+         .transpose()
+ }
+ 
++/// One fragment mask, with the masks listed after it in `finalmask.tcp`
++/// attached as its chain, in list order.
++fn build_fragment_config(
++    settings: &xray_config::TcpFragmentSettings,
++) -> io::Result<xray_transport::TcpFragmentConfig> {
++    let packets = match settings.packets {
++        xray_config::FragmentPackets::TlsHello => xray_transport::FragmentPackets::TlsHello,
++        xray_config::FragmentPackets::AllWrites => xray_transport::FragmentPackets::AllWrites,
++        xray_config::FragmentPackets::Writes { from, to } => {
++            xray_transport::FragmentPackets::Writes(u64::from(from)..=u64::from(to))
++        }
++    };
++    let chained = settings
++        .chained
++        .iter()
++        .map(build_fragment_config)
++        .collect::<io::Result<Vec<_>>>()?;
++    xray_transport::TcpFragmentConfig::new(
++        settings.lengths.iter().map(|r| r.from..=r.to).collect(),
++        settings.delays_ms.iter().map(|r| r.from..=r.to).collect(),
++        settings.max_split.from..=settings.max_split.to,
++    )
++    .and_then(|config| config.with_packets(packets))
++    .and_then(|config| config.with_chained(chained))
++}
++
+ #[cfg(test)]
+ mod tests;
+diff --git a/crates/xray-server/src/finalmask.rs b/crates/xray-server/src/finalmask.rs
+index 472ecf7..af434a5 100644
+--- a/crates/xray-server/src/finalmask.rs
++++ b/crates/xray-server/src/finalmask.rs
+@@ -24,14 +24,25 @@ pub fn parse_finalmask_tcp_fragment(
+     let Some(arr) = tcp.as_array() else {
+         return Err("streamSettings.finalmask.tcp must be an array or null".to_string());
+     };
++    // Xray-core keeps every fragment mask in the list and applies them in
++    // order; the first is the head of the chain, the rest follow it.
++    let mut fragments = Vec::new();
+     for mask in arr {
+         let mask_type = mask.get("type").and_then(Value::as_str).unwrap_or("");
+         if mask_type.eq_ignore_ascii_case("fragment") {
+             let settings = mask.get("settings").unwrap_or(&Value::Null);
+-            return parse_tcp_fragment_settings(settings).map(Some);
++            fragments.push(parse_tcp_fragment_settings(settings)?);
+         }
+     }
+-    Ok(None)
++    match fragments.split_first() {
++        None => Ok(None),
++        Some((head, rest)) => head
++            .as_ref()
++            .clone()
++            .with_chained(rest.iter().map(|arc| arc.as_ref().clone()).collect())
++            .map(|config| Some(Arc::new(config)))
++            .map_err(|e| format!("invalid fragment configuration: {e}")),
++    }
+ }
+ 
+ /// Parses TCP fragment settings into `Arc<TcpFragmentConfig>`.
+@@ -42,7 +53,10 @@ pub fn parse_tcp_fragment_settings(v: &Value) -> Result<Arc<TcpFragmentConfig>,
+         .ok_or_else(|| "Length can't be empty".to_string())?;
+     let mut lengths = parse_ranges_list(length_val)?;
+     for r in &mut lengths {
+-        let start = (*r.start()).clamp(1, 16384);
++        // As in Xray-core, a 0 length is legal in any entry but the last:
++        // it emits an empty segment and moves to the next entry. It is not
++        // clamped up to 1, which would change the wire pattern.
++        let start = (*r.start()).min(16384);
+         let end = (*r.end()).clamp(start, 16384);
+         *r = start..=end;
+     }
+@@ -69,7 +83,29 @@ pub fn parse_tcp_fragment_settings(v: &Value) -> Result<Arc<TcpFragmentConfig>,
+         0..=0
+     };
+ 
++    // `packets`, as Xray-core reads it: `tlshello`, empty or absent for
++    // every write, or a write number / `from-to` range counting from one.
++    let packets = match v.get("packets").and_then(Value::as_str) {
++        None => xray_transport::FragmentPackets::AllWrites,
++        Some(raw) => {
++            let raw = raw.trim().to_ascii_lowercase();
++            if raw.is_empty() {
++                xray_transport::FragmentPackets::AllWrites
++            } else if raw == "tlshello" {
++                xray_transport::FragmentPackets::TlsHello
++            } else {
++                let (from, to) = parse_range_val(&Value::String(raw.clone()))
++                    .map_err(|e| format!("invalid fragment packets {raw:?}: {e}"))?;
++                if from == 0 {
++                    return Err("PacketsFrom can't be 0".to_string());
++                }
++                xray_transport::FragmentPackets::Writes(u64::from(from)..=u64::from(to))
++            }
++        }
++    };
++
+     TcpFragmentConfig::new(lengths, delays, max_split)
++        .and_then(|config| config.with_packets(packets))
+         .map(Arc::new)
+         .map_err(|e| format!("invalid fragment configuration: {e}"))
+ }
+@@ -606,6 +642,47 @@ mod tests {
+         assert!(decode_hex("a\u{e9}a").is_err());
+     }
+ 
++    #[test]
++    fn two_fragment_masks_chain_and_keep_their_packets() {
++        let stream = json!({
++            "finalmask": {
++                "tcp": [
++                    {
++                        "type": "fragment",
++                        "settings": {
++                            "packets": "tlshello",
++                            "lengths": ["0", "104", "1"],
++                            "delays": ["0"],
++                            "maxSplit": "0"
++                        }
++                    },
++                    {
++                        "type": "fragment",
++                        "settings": {
++                            "packets": "1-1",
++                            "lengths": ["114", "1"],
++                            "delays": ["1"],
++                            "maxSplit": "11"
++                        }
++                    }
++                ]
++            }
++        });
++        let frag = parse_finalmask_tcp_fragment(&stream).unwrap().unwrap();
++        let expected = TcpFragmentConfig::new(vec![0..=0, 104..=104, 1..=1], vec![0..=0], 0..=0)
++            .unwrap()
++            .with_chained(vec![TcpFragmentConfig::new(
++                vec![114..=114, 1..=1],
++                vec![1..=1],
++                11..=11,
++            )
++            .unwrap()
++            .with_packets(xray_transport::FragmentPackets::Writes(1..=1))
++            .unwrap()])
++            .unwrap();
++        assert_eq!(frag, Arc::new(expected));
++    }
++
+     #[test]
+     fn test_finalmask_tcp_fragment_parsing() {
+         let stream = json!({
+diff --git a/crates/xray-server/src/xhttp_outbound.rs b/crates/xray-server/src/xhttp_outbound.rs
+index eb78e58..d097d04 100644
+--- a/crates/xray-server/src/xhttp_outbound.rs
++++ b/crates/xray-server/src/xhttp_outbound.rs
+@@ -64,6 +64,24 @@ pub fn transport(
+         "network": "xhttp",
+         "xhttpSettings": xhttp_settings,
+     });
++    // The parser validates the finalmask against the carrier, so the synth
++    // stream must carry the outbound's real security: without it a
++    // `tlshello` fragment over TLS is refused as if the carrier were plain
++    // TCP, which Xray-core accepts. Only the fields that validation reads
++    // go across: the security type, the TLS ALPN (an `h3` ALPN makes the
++    // carrier QUIC, which no TCP mask can cut) and the REALITY settings.
++    // The rest of `tlsSettings` stays out: the synth parse would reject
++    // combinations the server's own TLS stack applies, such as
++    // `cipherSuites` with fingerprint `unsafe`.
++    if let Some(security) = stream.get("security") {
++        synth_stream["security"] = security.clone();
++    }
++    if let Some(alpn) = stream.pointer("/tlsSettings/alpn") {
++        synth_stream["tlsSettings"] = json!({ "alpn": alpn });
++    }
++    if let Some(reality) = stream.get("realitySettings") {
++        synth_stream["realitySettings"] = reality.clone();
++    }
+     if let Some(fm) = stream.get("finalmask") {
+         synth_stream["finalmask"] = fm.clone();
+     }
+@@ -567,6 +585,40 @@ const fn placement(placement: xray_config::XhttpPlacement) -> XhttpMetadataPlace
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn test_xhttp_outbound_tlshello_fragment_over_tls() {
++        // A `finalmask` fragment chain over XHTTP + TLS, as Xray-core
++        // accepts: the synth parse must see the TLS carrier, not plain TCP.
++        let stream = json!({
++            "network": "xhttp",
++            "security": "tls",
++            "tlsSettings": {
++                "serverName": "example.com",
++                "fingerprint": "unsafe",
++                "cipherSuites": "TLS_CHACHA20_POLY1305_SHA256",
++                "alpn": ["h2", "http/1.1"]
++            },
++            "xhttpSettings": {
++                "host": "example.com",
++                "path": "/api/1",
++                "mode": "auto"
++            },
++            "finalmask": {
++                "tcp": [
++                    {"type": "fragment", "settings": {
++                        "packets": "tlshello", "lengths": ["0", "104", "1"],
++                        "delays": ["0"], "maxSplit": "0"}},
++                    {"type": "fragment", "settings": {
++                        "packets": "1-1", "lengths": ["114", "1"],
++                        "delays": ["1"], "maxSplit": "11"}}
++                ]
++            }
++        });
++        let (layer, down) = transport(&stream, "example.com").unwrap();
++        assert!(down.is_none());
++        assert!(matches!(layer, TransportLayer::Xhttp(_)));
++    }
++
+     #[test]
+     fn test_xhttp_outbound_h3() {
+         let stream = json!({
+diff --git a/crates/xray-transport/src/dialer.rs b/crates/xray-transport/src/dialer.rs
+index 12e72de..aa32786 100644
+--- a/crates/xray-transport/src/dialer.rs
++++ b/crates/xray-transport/src/dialer.rs
+@@ -766,8 +766,9 @@ impl TransportDialer {
+                         .await?;
+                     if self.has_wire_mask() {
+                         let stream = self.masked_direct_carrier(stream, peer).await?;
+-                        let stream = crate::fragment::FragmentStream::new(stream, fragment.clone());
+-                        return prepared.complete_over_stream(Box::new(stream)).await;
++                        let stream =
++                            crate::fragment::FragmentStream::wrap(stream, fragment.clone());
++                        return prepared.complete_over_stream(stream).await;
+                     }
+                     let mut stream = stream;
+                     self.direct_header_custom_handshake(&mut stream, peer)
+@@ -867,7 +868,7 @@ impl TransportDialer {
+ 
+     fn mask_tcp_carrier(&self, stream: BoxedTransportStream) -> BoxedTransportStream {
+         match &self.tcp_fragment {
+-            Some(config) => Box::new(crate::fragment::FragmentStream::new(stream, config.clone())),
++            Some(config) => crate::fragment::FragmentStream::wrap(stream, config.clone()),
+             None => stream,
+         }
+     }
+diff --git a/crates/xray-transport/src/fragment.rs b/crates/xray-transport/src/fragment.rs
+index 2cfd7b9..c134e37 100644
+--- a/crates/xray-transport/src/fragment.rs
++++ b/crates/xray-transport/src/fragment.rs
+@@ -40,6 +40,9 @@ pub struct TcpFragmentConfig {
+     lengths: Vec<RangeInclusive<u32>>,
+     delays_ms: Vec<RangeInclusive<u32>>,
+     max_split: RangeInclusive<u32>,
++    /// Further fragment masks listed after this one in `finalmask.tcp`,
++    /// in list order, as Xray-core applies every mask in the list.
++    chained: Vec<TcpFragmentConfig>,
+ }
+ 
+ impl TcpFragmentConfig {
+@@ -48,14 +51,19 @@ impl TcpFragmentConfig {
+         delays_ms: Vec<RangeInclusive<u32>>,
+         max_split: RangeInclusive<u32>,
+     ) -> io::Result<Self> {
+-        let valid = |ranges: &[RangeInclusive<u32>], min: u32, max: u32| {
+-            (1..=16).contains(&ranges.len())
+-                && ranges
+-                    .iter()
+-                    .all(|r| !r.is_empty() && *r.start() >= min && *r.end() <= max)
+-        };
+-        if !valid(&lengths, 1, MAX_RECORD as u32)
+-            || !valid(&delays_ms, 0, 1000)
++        // Lengths follow Xray-core's `FragmentMask.Build`: a 0 is legal in
++        // any entry but the last (it emits an empty segment and moves on);
++        // the last entry clamps every later segment, so its min cannot be 0
++        // or the loop would never advance.
++        let lengths_valid = (1..=16).contains(&lengths.len())
++            && lengths
++                .iter()
++                .all(|r| !r.is_empty() && *r.end() <= MAX_RECORD as u32)
++            && lengths.last().is_some_and(|r| *r.start() >= 1);
++        let delays_valid = (1..=16).contains(&delays_ms.len())
++            && delays_ms.iter().all(|r| !r.is_empty() && *r.end() <= 1000);
++        if !lengths_valid
++            || !delays_valid
+             || max_split.is_empty()
+             || *max_split.end() > MAX_SPLITS as u32
+         {
+@@ -68,9 +76,21 @@ impl TcpFragmentConfig {
+             lengths,
+             delays_ms,
+             max_split,
++            chained: Vec::new(),
+         })
+     }
+ 
++    /// Attaches the fragment masks listed after this one in `finalmask.tcp`.
++    /// Each must be a plain mask from [`TcpFragmentConfig::new`]; nesting
++    /// deeper than the list itself is flattened by the stream wrapper.
++    pub fn with_chained(mut self, chained: Vec<TcpFragmentConfig>) -> io::Result<Self> {
++        if chained.len() > 16 {
++            return Err(invalid("too many chained fragment masks"));
++        }
++        self.chained = chained;
++        Ok(self)
++    }
++
+     /// Selects the writes the mask cuts, [`FragmentPackets::TlsHello`] unless
+     /// set. Write numbers start at one, and their range is not reversed.
+     pub fn with_packets(mut self, packets: FragmentPackets) -> io::Result<Self> {
+@@ -339,6 +359,30 @@ impl FragmentStream {
+         }
+     }
+ 
++    /// Wraps `inner` in every mask of a (possibly chained) fragment config.
++    /// Xray-core applies its TCP masks in list order on the write path, the
++    /// first listed outermost, so the last mask wraps the socket first.
++    pub(crate) fn wrap(
++        inner: BoxedTransportStream,
++        config: Arc<TcpFragmentConfig>,
++    ) -> BoxedTransportStream {
++        fn collect(config: &TcpFragmentConfig, layers: &mut Vec<TcpFragmentConfig>) {
++            let mut layer = config.clone();
++            layer.chained.clear();
++            layers.push(layer);
++            for next in &config.chained {
++                collect(next, layers);
++            }
++        }
++        let mut layers = Vec::new();
++        collect(&config, &mut layers);
++        let mut stream = inner;
++        for layer in layers.into_iter().rev() {
++            stream = Box::new(FragmentStream::new(stream, Arc::new(layer)));
++        }
++        stream
++    }
++
+     /// Sends what is staged. Every task that waits here is woken as the
+     /// drain moves, whichever of them the timer or socket wakes.
+     fn poll_drain(&mut self, cx: &mut Context<'_>, side: Side) -> Poll<io::Result<()>> {
+@@ -861,6 +905,11 @@ mod tests {
+     #[test]
+     fn planned_work_is_bounded_before_any_socket_write() {
+         assert!(TcpFragmentConfig::new(vec![0..=1], vec![0..=0], 0..=0).is_err());
++        // A 0 length is legal before the last entry, as in Xray-core: it
++        // emits an empty segment and moves to the next entry. Only the last
++        // entry's min cannot be 0.
++        assert!(TcpFragmentConfig::new(vec![0..=0, 104..=104, 1..=1], vec![0..=0], 0..=0).is_ok());
++        assert!(TcpFragmentConfig::new(vec![104..=104, 0..=0], vec![0..=0], 0..=0).is_err());
+         assert!(TcpFragmentConfig::new(vec![1..=2; 17], vec![0..=0], 0..=0).is_err());
+         assert!(TcpFragmentConfig::new(vec![1..=2], vec![1001..=1001], 0..=0).is_err());
+         assert!(TcpFragmentConfig::new(vec![1..=2], vec![0..=0], 4097..=4097).is_err());
+@@ -873,6 +922,43 @@ mod tests {
+         assert_eq!(limited.plan(&large).unwrap().unwrap().wire, large);
+     }
+ 
++    #[tokio::test]
++    async fn zero_length_entry_emits_an_empty_tls_record() {
++        let config = TcpFragmentConfig::new(vec![0..=0, 2..=2], vec![0..=0], 0..=0).unwrap();
++        let (mut stream, capture) = stream(config, usize::MAX);
++        let payload = b"abcd";
++        stream.write_all(&record(payload)).await.unwrap();
++        stream.flush().await.unwrap();
++        let emitted = payloads(&bytes(&capture));
++        assert_eq!(emitted.iter().map(Vec::len).collect::<Vec<_>>(), [0, 2, 2]);
++        assert_eq!(emitted.concat(), payload);
++    }
++
++    #[tokio::test]
++    async fn chained_masks_apply_in_list_order() {
++        // Outer (first listed) cuts write 1 into 3-byte pieces; the chained
++        // mask cuts only its own first write, into 2-byte pieces.
++        let inner = cutting(FragmentPackets::Writes(1..=1), 2..=2, 0..=0, 0..=0);
++        let outer = cutting(FragmentPackets::Writes(1..=1), 3..=3, 0..=0, 0..=0)
++            .with_chained(vec![inner])
++            .unwrap();
++        let capture = Arc::new(Mutex::new(Capture::default()));
++        let mut stream = FragmentStream::wrap(
++            Box::new(Sink {
++                capture: capture.clone(),
++                chunk: usize::MAX,
++                silent: false,
++            }),
++            Arc::new(outer),
++        );
++        stream.write_all(b"abcdef").await.unwrap();
++        stream.flush().await.unwrap();
++        assert_eq!(
++            writes(&capture),
++            [b"ab".to_vec(), b"c".to_vec(), b"def".to_vec()]
++        );
++    }
++
+     #[tokio::test]
+     async fn selected_writes_go_as_raw_pieces_and_the_others_unchanged() {
+         let config = cutting(FragmentPackets::Writes(2..=3), 2..=2, 0..=0, 0..=0);
+diff --git a/crates/xray-transport/src/reality_rustls.rs b/crates/xray-transport/src/reality_rustls.rs
+index cbcf424..5b80ea9 100644
+--- a/crates/xray-transport/src/reality_rustls.rs
++++ b/crates/xray-transport/src/reality_rustls.rs
+@@ -526,8 +526,9 @@ impl RealityTlsSession for RustlsRealityTlsSession {
+         mldsa65_verify: Option<Vec<u8>>,
+         fragment: Arc<crate::TcpFragmentConfig>,
+     ) -> Result<BoxedTransportStream, TransportError> {
+-        let stream = crate::fragment::FragmentStream::new(Box::new(tcp_stream), fragment);
+-        self.complete_over(stream, prepared, mldsa65_verify).await
++        let stream = crate::fragment::FragmentStream::wrap(Box::new(tcp_stream), fragment);
++        self.complete_over_stream(stream, prepared, mldsa65_verify)
++            .await
+     }
+     async fn complete_over_stream(
+         self: Box<Self>,

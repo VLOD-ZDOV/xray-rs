@@ -202,7 +202,7 @@ fn unsupported_masks_and_unbounded_values_fail_closed() {
         ("length", json!(0)),
         ("length", json!(-1)),
         ("length", json!(16385)),
-        ("lengths", json!([0, 1])),
+        ("lengths", json!([1, 0])),
         ("lengths", json!(vec![1; 17])),
         ("delay", json!(1001)),
         ("maxSplit", json!(4097)),
@@ -214,11 +214,7 @@ fn unsupported_masks_and_unbounded_values_fail_closed() {
         let raw = profile(value_settings).to_string();
         assert!(parse_xray_json(&raw).is_err(), "{raw}");
     }
-    for mask in [
-        json!({}),
-        json!([{"type":"noise"}]),
-        json!([{"type":"fragment","settings":settings()},{"type":"fragment","settings":settings()}]),
-    ] {
+    for mask in [json!({}), json!([{"type":"noise"}])] {
         let mut config = profile(settings());
         config["outbounds"][0]["streamSettings"]["finalmask"]["tcp"] = mask;
         assert!(parse_xray_json(&config.to_string()).is_err());
@@ -324,4 +320,59 @@ fn raw_pieces_need_a_tcp_carrier_but_no_tls() {
     let mut freedom = settings();
     freedom["packets"] = json!("1-2");
     assert!(parse_xray_json(&profile(freedom).to_string()).is_ok());
+}
+
+/// Xray-core's `FragmentMask.Build` rejects only a last `lengths` entry
+/// whose min is 0; a 0 earlier in the list emits an empty segment and the
+/// loop moves to the next entry.
+#[test]
+fn a_zero_length_is_legal_before_the_last_entry() {
+    let mut fragment = settings();
+    fragment["lengths"] = json!(["0", "104", "1"]);
+    let parsed = parse_xray_json(&profile(fragment).to_string()).unwrap();
+    let fragment = parsed.config.outbounds[0]
+        .stream
+        .tcp_fragment
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        fragment.lengths,
+        [
+            FragmentRange { from: 0, to: 0 },
+            FragmentRange { from: 104, to: 104 },
+            FragmentRange { from: 1, to: 1 }
+        ]
+    );
+}
+
+/// Xray-core keeps every mask in `finalmask.tcp`: two `fragment` masks are
+/// applied in list order, the first listed outermost on the write path.
+#[test]
+fn two_fragment_masks_chain_in_list_order() {
+    let first =
+        json!({"packets":"tlshello","lengths":["0","104","1"],"delays":["0"],"maxSplit":"0"});
+    let second = json!({"packets":"1-1","lengths":["114","1"],"delays":["1"],"maxSplit":"11"});
+    let config = json!({"outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"192.0.2.1","port":443,"users":[{"id":"00010203-0405-0607-0809-0a0b0c0d0e0f","encryption":"none"}]}]},
+        "streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"example.com"},
+        "xhttpSettings":{"host":"example.com","path":"/api/1","mode":"auto"},
+        "finalmask":{"tcp":[{"type":"fragment","settings":first},{"type":"fragment","settings":second}]}}}]});
+    let parsed = parse_xray_json(&config.to_string()).unwrap();
+    let fragment = parsed.config.outbounds[0]
+        .stream
+        .tcp_fragment
+        .as_ref()
+        .unwrap();
+    assert_eq!(fragment.packets, FragmentPackets::TlsHello);
+    assert_eq!(fragment.chained.len(), 1);
+    assert_eq!(
+        fragment.chained[0].packets,
+        FragmentPackets::Writes { from: 1, to: 1 }
+    );
+    assert_eq!(
+        fragment.chained[0].lengths,
+        [
+            FragmentRange { from: 114, to: 114 },
+            FragmentRange { from: 1, to: 1 }
+        ]
+    );
 }

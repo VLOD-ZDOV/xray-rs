@@ -71,10 +71,20 @@ impl Parser<'_> {
             self.fragment_ranges(raw.get("delays"), &format!("{path}.delays"), delay)?
         };
         let max_split = self.fragment_range(raw.get("maxSplit"), &format!("{path}.maxSplit"))?;
-        if lengths.iter().any(|r| r.from == 0 || r.to > 16_384) {
+        if lengths.iter().any(|r| r.to > 16_384) {
             self.error(
                 format!("{path}.length"),
                 "fragment lengths must be in 1..=16384 bytes",
+            );
+        }
+        // Xray-core's only lengths check (`FragmentMask.Build`): the last
+        // entry's min cannot be 0, because the segment loop clamps to the
+        // last entry and would never advance. A 0 earlier in the list is
+        // legal there: it emits an empty segment and moves to the next entry.
+        if lengths.last().is_some_and(|r| r.from == 0) {
+            self.error(
+                format!("{path}.length"),
+                "last lengths entry min can't be 0",
             );
         }
         if delays_ms.iter().any(|r| r.to > 1000) {
@@ -94,6 +104,7 @@ impl Parser<'_> {
             lengths,
             delays_ms,
             max_split,
+            chained: Vec::new(),
             folded_final_rules: None,
         })
     }

@@ -40,6 +40,9 @@ pub struct TcpFragmentConfig {
     lengths: Vec<RangeInclusive<u32>>,
     delays_ms: Vec<RangeInclusive<u32>>,
     max_split: RangeInclusive<u32>,
+    /// Further fragment masks listed after this one in `finalmask.tcp`,
+    /// in list order, as Xray-core applies every mask in the list.
+    chained: Vec<TcpFragmentConfig>,
 }
 
 impl TcpFragmentConfig {
@@ -48,14 +51,19 @@ impl TcpFragmentConfig {
         delays_ms: Vec<RangeInclusive<u32>>,
         max_split: RangeInclusive<u32>,
     ) -> io::Result<Self> {
-        let valid = |ranges: &[RangeInclusive<u32>], min: u32, max: u32| {
-            (1..=16).contains(&ranges.len())
-                && ranges
-                    .iter()
-                    .all(|r| !r.is_empty() && *r.start() >= min && *r.end() <= max)
-        };
-        if !valid(&lengths, 1, MAX_RECORD as u32)
-            || !valid(&delays_ms, 0, 1000)
+        // Lengths follow Xray-core's `FragmentMask.Build`: a 0 is legal in
+        // any entry but the last (it emits an empty segment and moves on);
+        // the last entry clamps every later segment, so its min cannot be 0
+        // or the loop would never advance.
+        let lengths_valid = (1..=16).contains(&lengths.len())
+            && lengths
+                .iter()
+                .all(|r| !r.is_empty() && *r.end() <= MAX_RECORD as u32)
+            && lengths.last().is_some_and(|r| *r.start() >= 1);
+        let delays_valid = (1..=16).contains(&delays_ms.len())
+            && delays_ms.iter().all(|r| !r.is_empty() && *r.end() <= 1000);
+        if !lengths_valid
+            || !delays_valid
             || max_split.is_empty()
             || *max_split.end() > MAX_SPLITS as u32
         {
@@ -68,7 +76,19 @@ impl TcpFragmentConfig {
             lengths,
             delays_ms,
             max_split,
+            chained: Vec::new(),
         })
+    }
+
+    /// Attaches the fragment masks listed after this one in `finalmask.tcp`.
+    /// Each must be a plain mask from [`TcpFragmentConfig::new`]; nesting
+    /// deeper than the list itself is flattened by the stream wrapper.
+    pub fn with_chained(mut self, chained: Vec<TcpFragmentConfig>) -> io::Result<Self> {
+        if chained.len() > 16 {
+            return Err(invalid("too many chained fragment masks"));
+        }
+        self.chained = chained;
+        Ok(self)
     }
 
     /// Selects the writes the mask cuts, [`FragmentPackets::TlsHello`] unless
@@ -337,6 +357,30 @@ impl FragmentStream {
             split: Split::default(),
             waiters: Arc::default(),
         }
+    }
+
+    /// Wraps `inner` in every mask of a (possibly chained) fragment config.
+    /// Xray-core applies its TCP masks in list order on the write path, the
+    /// first listed outermost, so the last mask wraps the socket first.
+    pub(crate) fn wrap(
+        inner: BoxedTransportStream,
+        config: Arc<TcpFragmentConfig>,
+    ) -> BoxedTransportStream {
+        fn collect(config: &TcpFragmentConfig, layers: &mut Vec<TcpFragmentConfig>) {
+            let mut layer = config.clone();
+            layer.chained.clear();
+            layers.push(layer);
+            for next in &config.chained {
+                collect(next, layers);
+            }
+        }
+        let mut layers = Vec::new();
+        collect(&config, &mut layers);
+        let mut stream = inner;
+        for layer in layers.into_iter().rev() {
+            stream = Box::new(FragmentStream::new(stream, Arc::new(layer)));
+        }
+        stream
     }
 
     /// Sends what is staged. Every task that waits here is woken as the
@@ -861,6 +905,11 @@ mod tests {
     #[test]
     fn planned_work_is_bounded_before_any_socket_write() {
         assert!(TcpFragmentConfig::new(vec![0..=1], vec![0..=0], 0..=0).is_err());
+        // A 0 length is legal before the last entry, as in Xray-core: it
+        // emits an empty segment and moves to the next entry. Only the last
+        // entry's min cannot be 0.
+        assert!(TcpFragmentConfig::new(vec![0..=0, 104..=104, 1..=1], vec![0..=0], 0..=0).is_ok());
+        assert!(TcpFragmentConfig::new(vec![104..=104, 0..=0], vec![0..=0], 0..=0).is_err());
         assert!(TcpFragmentConfig::new(vec![1..=2; 17], vec![0..=0], 0..=0).is_err());
         assert!(TcpFragmentConfig::new(vec![1..=2], vec![1001..=1001], 0..=0).is_err());
         assert!(TcpFragmentConfig::new(vec![1..=2], vec![0..=0], 4097..=4097).is_err());
@@ -871,6 +920,43 @@ mod tests {
         let limited = TcpFragmentConfig::new(vec![1..=1], vec![0..=0], 1..=1).unwrap();
         let large = record(&vec![1; MAX_RECORD]);
         assert_eq!(limited.plan(&large).unwrap().unwrap().wire, large);
+    }
+
+    #[tokio::test]
+    async fn zero_length_entry_emits_an_empty_tls_record() {
+        let config = TcpFragmentConfig::new(vec![0..=0, 2..=2], vec![0..=0], 0..=0).unwrap();
+        let (mut stream, capture) = stream(config, usize::MAX);
+        let payload = b"abcd";
+        stream.write_all(&record(payload)).await.unwrap();
+        stream.flush().await.unwrap();
+        let emitted = payloads(&bytes(&capture));
+        assert_eq!(emitted.iter().map(Vec::len).collect::<Vec<_>>(), [0, 2, 2]);
+        assert_eq!(emitted.concat(), payload);
+    }
+
+    #[tokio::test]
+    async fn chained_masks_apply_in_list_order() {
+        // Outer (first listed) cuts write 1 into 3-byte pieces; the chained
+        // mask cuts only its own first write, into 2-byte pieces.
+        let inner = cutting(FragmentPackets::Writes(1..=1), 2..=2, 0..=0, 0..=0);
+        let outer = cutting(FragmentPackets::Writes(1..=1), 3..=3, 0..=0, 0..=0)
+            .with_chained(vec![inner])
+            .unwrap();
+        let capture = Arc::new(Mutex::new(Capture::default()));
+        let mut stream = FragmentStream::wrap(
+            Box::new(Sink {
+                capture: capture.clone(),
+                chunk: usize::MAX,
+                silent: false,
+            }),
+            Arc::new(outer),
+        );
+        stream.write_all(b"abcdef").await.unwrap();
+        stream.flush().await.unwrap();
+        assert_eq!(
+            writes(&capture),
+            [b"ab".to_vec(), b"c".to_vec(), b"def".to_vec()]
+        );
     }
 
     #[tokio::test]

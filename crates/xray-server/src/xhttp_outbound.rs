@@ -64,6 +64,24 @@ pub fn transport(
         "network": "xhttp",
         "xhttpSettings": xhttp_settings,
     });
+    // The parser validates the finalmask against the carrier, so the synth
+    // stream must carry the outbound's real security: without it a
+    // `tlshello` fragment over TLS is refused as if the carrier were plain
+    // TCP, which Xray-core accepts. Only the fields that validation reads
+    // go across: the security type, the TLS ALPN (an `h3` ALPN makes the
+    // carrier QUIC, which no TCP mask can cut) and the REALITY settings.
+    // The rest of `tlsSettings` stays out: the synth parse would reject
+    // combinations the server's own TLS stack applies, such as
+    // `cipherSuites` with fingerprint `unsafe`.
+    if let Some(security) = stream.get("security") {
+        synth_stream["security"] = security.clone();
+    }
+    if let Some(alpn) = stream.pointer("/tlsSettings/alpn") {
+        synth_stream["tlsSettings"] = json!({ "alpn": alpn });
+    }
+    if let Some(reality) = stream.get("realitySettings") {
+        synth_stream["realitySettings"] = reality.clone();
+    }
     if let Some(fm) = stream.get("finalmask") {
         synth_stream["finalmask"] = fm.clone();
     }
@@ -566,6 +584,40 @@ const fn placement(placement: xray_config::XhttpPlacement) -> XhttpMetadataPlace
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_xhttp_outbound_tlshello_fragment_over_tls() {
+        // A `finalmask` fragment chain over XHTTP + TLS, as Xray-core
+        // accepts: the synth parse must see the TLS carrier, not plain TCP.
+        let stream = json!({
+            "network": "xhttp",
+            "security": "tls",
+            "tlsSettings": {
+                "serverName": "example.com",
+                "fingerprint": "unsafe",
+                "cipherSuites": "TLS_CHACHA20_POLY1305_SHA256",
+                "alpn": ["h2", "http/1.1"]
+            },
+            "xhttpSettings": {
+                "host": "example.com",
+                "path": "/api/1",
+                "mode": "auto"
+            },
+            "finalmask": {
+                "tcp": [
+                    {"type": "fragment", "settings": {
+                        "packets": "tlshello", "lengths": ["0", "104", "1"],
+                        "delays": ["0"], "maxSplit": "0"}},
+                    {"type": "fragment", "settings": {
+                        "packets": "1-1", "lengths": ["114", "1"],
+                        "delays": ["1"], "maxSplit": "11"}}
+                ]
+            }
+        });
+        let (layer, down) = transport(&stream, "example.com").unwrap();
+        assert!(down.is_none());
+        assert!(matches!(layer, TransportLayer::Xhttp(_)));
+    }
 
     #[test]
     fn test_xhttp_outbound_h3() {

@@ -290,7 +290,7 @@ fn the_mask_list_takes_a_fragment_first_then_header_custom() {
         ),
         (
             json!([header.clone(), header.clone()]),
-            "only one fragment, one header-custom and one sudoku",
+            "only one header-custom and one sudoku",
         ),
         (
             json!([{"type": "sudoku"}, header.clone()]),
