@@ -87,65 +87,91 @@ use config::{
 // 3x-ui reads the second word of `-version` output as the core version.
 pub(crate) const COMPAT_VERSION: &str = "26.11.9";
 
+/// Writes to stdout, ignoring a closed pipe (`xray-server ... | head`).
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("test-route") {
+    let first = args.first().map(String::as_str);
+    let first_command = first.map(|arg| arg.trim_start_matches('-'));
+    if first == Some("test-route") {
         return run_test_route(&args[1..]);
     }
-    if args.first().map(|s| s.trim_start_matches('-')) == Some("x25519") {
-        return run_x25519(&args[1..]);
+    match first_command {
+        Some("x25519") => return run_x25519(&args[1..]),
+        Some("uuid") => return run_uuid(&args[1..]),
+        Some("version") => {
+            print_version();
+            return ExitCode::SUCCESS;
+        }
+        Some("h") | Some("help") => {
+            print_usage();
+            return ExitCode::SUCCESS;
+        }
+        Some("run") => {}
+        Some(other) if first.is_some_and(|arg| !arg.starts_with('-')) => {
+            eprintln!("{} {other}: unknown command", program_name());
+            eprintln!("run `{} help` for usage", program_name());
+            return ExitCode::from(2u8);
+        }
+        _ => {}
     }
+
     let mut config_path = None;
     let mut test_only = false;
     let mut iter = args.iter().map(String::as_str);
     while let Some(arg) = iter.next() {
+        // Positional arguments after `run` are ignored, as Xray does.
+        if !arg.starts_with('-') {
+            continue;
+        }
         match arg.trim_start_matches('-') {
-            "version" => {
-                println!(
-                    "Xray {COMPAT_VERSION} (xray-rs {})",
-                    env!("CARGO_PKG_VERSION")
-                );
+            "h" | "help" => {
+                print_usage();
                 return ExitCode::SUCCESS;
             }
-            "uuid" => {
-                println!("{}", uuid::Uuid::new_v4());
-                return ExitCode::SUCCESS;
-            }
-            "run" if !arg.starts_with('-') => {}
             "t" | "test" => test_only = true,
             "c" | "config" => match iter.next() {
                 Some(value) => config_path = Some(value.to_owned()),
                 None => {
-                    eprintln!("flag needs an argument: {arg}");
-                    return ExitCode::FAILURE;
+                    return usage_error(
+                        format!("flag needs an argument: {arg}"),
+                        &format!("{} run [-c config.json]", program_name()),
+                    );
                 }
             },
             other if other.starts_with("config=") || other.starts_with("c=") => {
                 config_path = other.split_once('=').map(|(_, v)| v.to_owned());
             }
             _ => {
-                eprintln!("unsupported argument: {arg}");
-                return ExitCode::FAILURE;
+                return usage_error(
+                    format!("flag provided but not defined: {arg}"),
+                    &format!("{} run [-c config.json]", program_name()),
+                );
             }
         }
     }
     let config_path = config_path.unwrap_or_else(|| "config.json".to_owned());
 
+    // Xray prints its version before touching the config, including on failure.
+    print_version();
     let config = match config::load(&config_path) {
         Ok(config) => config,
-        Err(e) => {
-            crate::log::error!("failed to load config: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail_start(e),
     };
     for (k, v) in &config.env {
         std::env::set_var(k, v);
     }
     if let Err(e) = log::init(&config.log) {
-        log::error(e);
-        return ExitCode::FAILURE;
+        return fail_start(e);
     }
-    // Build TLS and REALITY up front so `-test` rejects bad certificates/keys like Xray does.
+    // Build TLS acceptors up front so `-test` rejects bad certificates and keys
+    // like Xray does. REALITY is validated while parsing and built per inbound.
     let tls: Result<Vec<_>, String> = config
         .inbounds
         .iter()
@@ -160,34 +186,10 @@ fn main() -> ExitCode {
         .collect();
     let tls = match tls {
         Ok(tls) => tls,
-        Err(e) => {
-            log::error(e);
-            return ExitCode::FAILURE;
-        }
-    };
-    let realities: Result<Vec<_>, String> = config
-        .inbounds
-        .iter()
-        .map(|i| {
-            let is_xhttp = matches!(i.transport, InboundTransport::Xhttp(_));
-            let is_grpc = matches!(i.transport, InboundTransport::Grpc(_));
-            i.reality
-                .as_ref()
-                .map(|r| {
-                    reality::RealityServer::new(r.clone(), i.port, is_grpc, is_xhttp).map(Arc::new)
-                })
-                .transpose()
-        })
-        .collect();
-    let realities = match realities {
-        Ok(r) => r,
-        Err(e) => {
-            log::error(e);
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail_start(e),
     };
     if test_only {
-        println!("Configuration OK.");
+        outln!("Configuration OK.");
         return ExitCode::SUCCESS;
     }
 
@@ -201,13 +203,65 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(config, tls, realities)) {
+    match runtime.block_on(run(config, tls)) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            log::error(e);
-            ExitCode::FAILURE
-        }
+        Err(e) => fail_runtime(e),
     }
+}
+
+fn program_name() -> String {
+    std::env::args()
+        .next()
+        .and_then(|path| {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "xray-server".to_owned())
+}
+
+fn print_version() {
+    outln!(
+        "Xray {COMPAT_VERSION} (xray-rs {})",
+        env!("CARGO_PKG_VERSION")
+    );
+}
+
+fn print_usage() {
+    let name = program_name();
+    outln!("Usage: {name} run [-c <config.json>] [-test]");
+    outln!("       {name} -c <config.json> [-test]");
+    outln!("       {name} -version");
+    outln!("       {name} uuid [-i <text>]");
+    outln!("       {name} x25519 [-i <private-key>] [--std-encoding]");
+    outln!("       {name} test-route -c <config.json> [OPTIONS]");
+    outln!();
+    outln!("Options:");
+    outln!("  -c, -config <FILE>  Configuration file (default: config.json)");
+    outln!("  -t, -test           Test the configuration and exit");
+    outln!("  -h, -help           Show this help");
+}
+
+/// Xray's configuration errors exit with code 23 so systemd does not restart
+/// the service in a loop, and always print the reason on stdout.
+fn fail_start(message: impl std::fmt::Display) -> ExitCode {
+    outln!("Failed to start: {message}");
+    ExitCode::from(23)
+}
+
+/// Errors after the configuration was accepted (bind failures and the like).
+fn fail_runtime(message: impl std::fmt::Display) -> ExitCode {
+    outln!("Failed to start: {message}");
+    ExitCode::from(255u8)
+}
+
+/// Flag errors exit with code 2 in Xray (Go's `flag` package).
+fn usage_error(message: impl std::fmt::Display, usage: &str) -> ExitCode {
+    let name = program_name();
+    eprintln!("{message}");
+    eprintln!("usage: {usage}");
+    eprintln!("run `{name} -h` for details.");
+    ExitCode::from(2u8)
 }
 
 /// Both ALPN variants of one inbound's TLS acceptor. Go's crypto/tls keeps
@@ -263,11 +317,7 @@ enum InboundHandler {
     VlessXhttp(Arc<xhttp::Handler>),
 }
 
-async fn run(
-    config: Config,
-    tls: Vec<Option<TlsAcceptors>>,
-    _realities: Vec<Option<Arc<reality::RealityServer>>>,
-) -> Result<(), String> {
+async fn run(config: Config, tls: Vec<Option<TlsAcceptors>>) -> Result<(), String> {
     start_ocsp_stapling();
     crate::log::info!("xray-rs {} started", env!("CARGO_PKG_VERSION"));
     stats::init(config.stats);
@@ -2316,84 +2366,97 @@ fn run_test_route(args: &[String]) -> ExitCode {
     let mut is_udp = false;
     let mut inbound = "in".to_string();
     let mut sniffed_proto_str: Option<String> = None;
+    let usage = format!("{} test-route -c <config.json> [OPTIONS]", program_name());
 
     let mut iter = args.iter().map(String::as_str);
     while let Some(arg) = iter.next() {
+        macro_rules! value {
+            () => {
+                match iter.next() {
+                    Some(value) => value,
+                    None => {
+                        return usage_error(format!("flag needs an argument: {arg}"), &usage);
+                    }
+                }
+            };
+        }
         match arg {
-            "-c" | "--config" => {
-                if let Some(c) = iter.next() {
-                    config_path = c.to_string();
-                }
-            }
-            "--ip" => {
-                if let Some(i) = iter.next() {
-                    ip_str = Some(i.to_string());
-                }
-            }
-            "--domain" => {
-                if let Some(d) = iter.next() {
-                    domain = Some(d.to_string());
-                }
-            }
+            "-c" | "--config" => config_path = value!().to_string(),
+            "--ip" => ip_str = Some(value!().to_string()),
+            "--domain" => domain = Some(value!().to_string()),
             "--port" => {
-                if let Some(p) = iter.next().and_then(|p| p.parse().ok()) {
-                    port = p;
-                }
+                let text = value!();
+                port = match text.parse::<u16>() {
+                    Ok(port) => port,
+                    Err(_) => {
+                        return usage_error(
+                            format!("invalid --port {text:?}: expected 0-65535"),
+                            &usage,
+                        );
+                    }
+                };
             }
-            "--source" => {
-                if let Some(s) = iter.next() {
-                    source_str = s.to_string();
-                }
-            }
+            "--source" => source_str = value!().to_string(),
             "--protocol" | "--network" => {
-                if let Some(proto) = iter.next() {
-                    is_udp = proto.eq_ignore_ascii_case("udp");
+                let text = value!();
+                if text.eq_ignore_ascii_case("udp") {
+                    is_udp = true;
+                } else if text.eq_ignore_ascii_case("tcp") {
+                    is_udp = false;
+                } else {
+                    return usage_error(
+                        format!("invalid --protocol {text:?}: expected tcp or udp"),
+                        &usage,
+                    );
                 }
             }
             "--sniff" | "--sniffed" | "--protocol-l7" => {
-                if let Some(proto) = iter.next() {
-                    sniffed_proto_str = Some(proto.to_string());
-                }
+                sniffed_proto_str = Some(value!().to_string())
             }
-            "--inbound" => {
-                if let Some(inb) = iter.next() {
-                    inbound = inb.to_string();
-                }
-            }
+            "--inbound" => inbound = value!().to_string(),
             "--help" | "-h" => {
-                println!("Usage: xray-server test-route -c <config.json> [OPTIONS]");
-                println!();
-                println!("Options:");
-                println!("  -c, --config <FILE>     Configuration file (default: config.json)");
-                println!("  --ip <IP>               Destination IP address");
-                println!("  --domain <DOMAIN>       Destination domain name");
-                println!("  --port <PORT>           Destination port (default: 443)");
-                println!("  --source <IP:PORT>      Source socket address (default: 127.0.0.1:0)");
-                println!("  --protocol <tcp|udp>    L4 protocol / network (default: tcp)");
-                println!("  --sniff <tls|http|quic> Sniffed L7 application protocol");
-                println!("  --inbound <TAG>         Inbound tag (default: first inbound or 'in')");
+                outln!("Usage: {usage}");
+                outln!();
+                outln!("Options:");
+                outln!("  -c, --config <FILE>     Configuration file (default: config.json)");
+                outln!("  --ip <IP>               Destination IP address");
+                outln!("  --domain <DOMAIN>       Destination domain name");
+                outln!("  --port <PORT>           Destination port (default: 443)");
+                outln!("  --source <IP:PORT>      Source socket address (default: 127.0.0.1:0)");
+                outln!("  --protocol <tcp|udp>    L4 protocol / network (default: tcp)");
+                outln!("  --sniff <tls|http|quic> Sniffed L7 application protocol");
+                outln!("  --inbound <TAG>         Inbound tag (default: in)");
                 return ExitCode::SUCCESS;
             }
-            _ => {}
+            other => {
+                return usage_error(format!("flag provided but not defined: {other}"), &usage);
+            }
         }
     }
 
+    let ip = match ip_str.as_deref() {
+        Some(text) => match text.parse::<std::net::IpAddr>() {
+            Ok(ip) => Some(ip),
+            Err(e) => {
+                return usage_error(format!("invalid --ip {text:?}: {e}"), &usage);
+            }
+        },
+        None => None,
+    };
+    let source: std::net::SocketAddr = match source_str.parse() {
+        Ok(source) => source,
+        Err(e) => {
+            return usage_error(format!("invalid --source {:?}: {e}", source_str), &usage);
+        }
+    };
+
     let config = match config::load(&config_path) {
         Ok(c) => c,
-        Err(e) => {
-            eprintln!("Failed to load config: {e}");
-            return ExitCode::FAILURE;
-        }
+        Err(e) => return fail_start(e),
     };
 
     let router = config.router;
 
-    let ip = ip_str
-        .as_deref()
-        .and_then(|s| s.parse::<std::net::IpAddr>().ok());
-    let source: std::net::SocketAddr = source_str
-        .parse()
-        .unwrap_or_else(|_| "127.0.0.1:0".parse().unwrap());
     let network = if is_udp {
         xray_config::Network::Udp
     } else {
@@ -2426,59 +2489,148 @@ fn run_test_route(args: &[String]) -> ExitCode {
     };
 
     let explanation = router.explain(&query);
-    println!("{explanation}");
+    outln!("{explanation}");
+    ExitCode::SUCCESS
+}
+
+fn run_uuid(args: &[String]) -> ExitCode {
+    let mut input = None;
+    let mut iter = args.iter().map(String::as_str);
+    while let Some(arg) = iter.next() {
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let name = arg.trim_start_matches('-');
+        if name == "i" {
+            match iter.next() {
+                Some(value) => input = Some(value.to_owned()),
+                None => {
+                    return usage_error(
+                        format!("flag needs an argument: {arg}"),
+                        &format!("{} uuid [-i \"example\"]", program_name()),
+                    );
+                }
+            }
+        } else if let Some(value) = name.strip_prefix("i=") {
+            input = Some(value.to_owned());
+        } else {
+            return usage_error(
+                format!("flag provided but not defined: {arg}"),
+                &format!("{} uuid [-i \"example\"]", program_name()),
+            );
+        }
+    }
+    // Mirrors Xray's uuid command: no input is random, up to 30 bytes becomes a
+    // name-based UUIDv5 in the nil namespace, anything longer is refused.
+    let value = match input.as_deref() {
+        None | Some("") => uuid::Uuid::new_v4().to_string(),
+        Some(text) if text.len() <= 30 => {
+            uuid::Uuid::new_v5(&uuid::Uuid::nil(), text.as_bytes()).to_string()
+        }
+        Some(_) => {
+            outln!("Input must be within 30 bytes.");
+            return ExitCode::SUCCESS;
+        }
+    };
+    outln!("{value}");
     ExitCode::SUCCESS
 }
 
 fn run_x25519(args: &[String]) -> ExitCode {
     match generate_or_derive_x25519(args) {
-        Ok((msg, pub_key)) => {
-            println!("{msg}");
-            println!("Public key: {pub_key}");
+        Ok((private, public, hash)) => {
+            outln!("PrivateKey: {private}");
+            outln!("Password (PublicKey): {public}");
+            outln!("Hash32: {hash}");
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("{e}");
-            ExitCode::FAILURE
+        Err(X25519Error::Message(message)) => {
+            outln!("{message}");
+            ExitCode::SUCCESS
         }
+        Err(X25519Error::Usage(message)) => usage_error(
+            message,
+            &format!(
+                "{} x25519 [-i \"private key\"] [--std-encoding]",
+                program_name()
+            ),
+        ),
     }
 }
 
-fn generate_or_derive_x25519(args: &[String]) -> Result<(String, String), String> {
-    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+#[derive(Debug)]
+enum X25519Error {
+    /// Xray prints invalid keys and exits successfully; keep that for scripts.
+    Message(String),
+    Usage(String),
+}
+
+fn generate_or_derive_x25519(args: &[String]) -> Result<(String, String, String), X25519Error> {
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use base64::Engine;
 
     let mut custom_i = None;
+    let mut std_encoding = false;
     let mut iter = args.iter().map(String::as_str);
     while let Some(arg) = iter.next() {
-        match arg.trim_start_matches('-') {
-            "i" => {
-                custom_i = iter.next().map(str::to_string);
-            }
-            other if other.starts_with("i=") => {
-                custom_i = other.split_once('=').map(|(_, v)| v.to_string());
-            }
-            _ => {
-                return Err(format!("unsupported argument for x25519: {arg}"));
-            }
+        if !arg.starts_with('-') {
+            continue;
+        }
+        let name = arg.trim_start_matches('-');
+        if name == "i" {
+            let Some(value) = iter.next() else {
+                return Err(X25519Error::Usage(format!("flag needs an argument: {arg}")));
+            };
+            // An empty value means "generate a fresh key", as in Xray.
+            custom_i = (!value.is_empty()).then(|| value.to_string());
+        } else if let Some(value) = name.strip_prefix("i=") {
+            custom_i = (!value.is_empty()).then(|| value.to_string());
+        } else if name == "std-encoding" {
+            std_encoding = true;
+        } else {
+            return Err(X25519Error::Usage(format!(
+                "flag provided but not defined: {arg}"
+            )));
         }
     }
 
-    if let Some(custom) = custom_i {
-        let priv_bytes = config::decode_base64_32(&custom)
-            .map_err(|e| format!("failed to parse private key: {e}"))?;
-        let secret = x25519_dalek::StaticSecret::from(priv_bytes);
-        let public = x25519_dalek::PublicKey::from(&secret);
-        let msg = format!("Custom private key: {}", URL_SAFE_NO_PAD.encode(priv_bytes));
-        let pub_str = URL_SAFE_NO_PAD.encode(public.as_bytes());
-        Ok((msg, pub_str))
+    let encoding = if std_encoding {
+        &STANDARD
     } else {
-        let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
-        let public = x25519_dalek::PublicKey::from(&secret);
-        let msg = format!("Private key: {}", URL_SAFE_NO_PAD.encode(secret.to_bytes()));
-        let pub_str = URL_SAFE_NO_PAD.encode(public.as_bytes());
-        Ok((msg, pub_str))
+        &URL_SAFE_NO_PAD
+    };
+    let mut private = [0u8; 32];
+    match custom_i {
+        Some(custom) => {
+            let Ok(decoded) = encoding.decode(custom.as_bytes()) else {
+                return Err(X25519Error::Message(
+                    "Invalid length of X25519 private key.".into(),
+                ));
+            };
+            if decoded.len() != 32 {
+                return Err(X25519Error::Message(
+                    "Invalid length of X25519 private key.".into(),
+                ));
+            }
+            private.copy_from_slice(&decoded);
+        }
+        None => {
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut private);
+        }
     }
+    // The same clamping Xray applies before printing the private key.
+    private[0] &= 248;
+    private[31] &= 127;
+    private[31] |= 64;
+    let secret = x25519_dalek::StaticSecret::from(private);
+    let public = x25519_dalek::PublicKey::from(&secret);
+    let hash = blake3::hash(public.as_bytes());
+    Ok((
+        encoding.encode(private),
+        encoding.encode(public.as_bytes()),
+        encoding.encode(hash.as_bytes()),
+    ))
 }
 
 #[cfg(test)]
@@ -2644,18 +2796,30 @@ mod tests {
 
     #[test]
     fn test_x25519_generation_and_derivation() {
-        let (msg1, pub1) = generate_or_derive_x25519(&[]).unwrap();
-        assert!(msg1.starts_with("Private key: "));
-        let priv1 = msg1.strip_prefix("Private key: ").unwrap();
+        let (priv1, pub1, hash1) = generate_or_derive_x25519(&[]).unwrap();
         assert_eq!(priv1.len(), 43);
         assert_eq!(pub1.len(), 43);
+        assert_eq!(hash1.len(), 43);
 
-        let args = vec!["-i".to_string(), priv1.to_string()];
-        let (msg2, pub2) = generate_or_derive_x25519(&args).unwrap();
-        assert!(msg2.starts_with("Custom private key: "));
+        let args = vec!["-i".to_string(), priv1.clone()];
+        let (priv2, pub2, hash2) = generate_or_derive_x25519(&args).unwrap();
+        assert_eq!(priv2, priv1);
         assert_eq!(pub2, pub1);
+        assert_eq!(hash2, hash1);
 
         let bad_args = vec!["-i".to_string(), "not-a-valid-key".to_string()];
-        assert!(generate_or_derive_x25519(&bad_args).is_err());
+        assert!(matches!(
+            generate_or_derive_x25519(&bad_args),
+            Err(X25519Error::Message(_))
+        ));
+    }
+
+    #[test]
+    fn uuid_matches_xray_short_input_rules() {
+        // Xray hashes short input with the nil namespace.
+        assert_eq!(
+            uuid::Uuid::new_v5(&uuid::Uuid::nil(), b"example").to_string(),
+            "feb54431-301b-52bb-a6dd-e1e93e81bb9e"
+        );
     }
 }
