@@ -21,10 +21,10 @@ pub(super) struct TcpMasks {
 }
 
 impl Parser<'_> {
-    /// `finalmask.tcp`: at most one `fragment`, one `header-custom` and one
-    /// `sudoku` or `xmc` mask. The fragment and `header-custom` may stand
-    /// together only with the fragment first: Xray-core fragments just the
-    /// first write through it, which after `header-custom` is the handshake
+    /// `finalmask.tcp`: any number of `fragment` masks, one `header-custom`
+    /// and one `sudoku` or `xmc` mask. The fragments and `header-custom` may
+    /// stand together only with the fragments first: Xray-core fragments just
+    /// the first write through it, which after `header-custom` is the handshake
     /// rather than the TLS ClientHello. Any number of filters may stand
     /// anywhere: Xray-core's client wraps nothing in them, and no TCP mask
     /// has to be outermost there.
@@ -42,7 +42,7 @@ impl Parser<'_> {
             self.error(path, "finalmask.tcp must be an array or null");
             return found;
         };
-        let mut fragment = None;
+        let mut fragments: Vec<TcpFragmentSettings> = Vec::new();
         let mut header = None;
         let mut sudoku = None;
         let mut xmc = None;
@@ -70,10 +70,15 @@ impl Parser<'_> {
             match kind.as_deref() {
                 Some("sudoku") => sudoku = Some(self.parse_sudoku(settings, &settings_path)),
                 Some("xmc") => xmc = Some(self.parse_xmc(settings, &settings_path)),
-                Some("fragment") if fragment.is_none() && header.is_none() => {
-                    fragment = Some(self.parse_tcp_fragment(settings, &settings_path, false));
+                // Xray-core keeps every fragment mask in the list and
+                // applies them in order, so a second one is not an error.
+                Some("fragment") if header.is_none() => {
+                    if let Some(fragment) = self.parse_tcp_fragment(settings, &settings_path, false)
+                    {
+                        fragments.push(fragment);
+                    }
                 }
-                Some("fragment") if fragment.is_none() => self.error(
+                Some("fragment") => self.error(
                     &mask_path,
                     "a fragment mask after header-custom would cut the header-custom handshake, which is not supported here; put it first",
                 ),
@@ -82,11 +87,15 @@ impl Parser<'_> {
                 }
                 _ => self.error(
                     &mask_path,
-                    "only one fragment, one header-custom and one sudoku or xmc TCP mask are supported",
+                    "only one header-custom and one sudoku or xmc TCP mask are supported",
                 ),
             }
         }
-        found.fragment = fragment.flatten();
+        if !fragments.is_empty() {
+            let mut first = fragments.remove(0);
+            first.chained = fragments;
+            found.fragment = Some(first);
+        }
         found.header = header.flatten();
         found.sudoku = sudoku.flatten();
         found.xmc = xmc.flatten();

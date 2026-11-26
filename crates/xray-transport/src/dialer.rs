@@ -766,8 +766,9 @@ impl TransportDialer {
                         .await?;
                     if self.has_wire_mask() {
                         let stream = self.masked_direct_carrier(stream, peer).await?;
-                        let stream = crate::fragment::FragmentStream::new(stream, fragment.clone());
-                        return prepared.complete_over_stream(Box::new(stream)).await;
+                        let stream =
+                            crate::fragment::FragmentStream::wrap(stream, fragment.clone());
+                        return prepared.complete_over_stream(stream).await;
                     }
                     let mut stream = stream;
                     self.direct_header_custom_handshake(&mut stream, peer)
@@ -867,7 +868,7 @@ impl TransportDialer {
 
     fn mask_tcp_carrier(&self, stream: BoxedTransportStream) -> BoxedTransportStream {
         match &self.tcp_fragment {
-            Some(config) => Box::new(crate::fragment::FragmentStream::new(stream, config.clone())),
+            Some(config) => crate::fragment::FragmentStream::wrap(stream, config.clone()),
             None => stream,
         }
     }

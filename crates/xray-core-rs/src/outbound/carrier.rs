@@ -953,25 +953,37 @@ pub(super) fn fragment_config(
         .tcp_fragment
         .as_ref()
         .map(|settings| {
-            let packets = match settings.packets {
-                xray_config::FragmentPackets::TlsHello => xray_transport::FragmentPackets::TlsHello,
-                xray_config::FragmentPackets::AllWrites => {
-                    xray_transport::FragmentPackets::AllWrites
-                }
-                xray_config::FragmentPackets::Writes { from, to } => {
-                    xray_transport::FragmentPackets::Writes(u64::from(from)..=u64::from(to))
-                }
-            };
-            xray_transport::TcpFragmentConfig::new(
-                settings.lengths.iter().map(|r| r.from..=r.to).collect(),
-                settings.delays_ms.iter().map(|r| r.from..=r.to).collect(),
-                settings.max_split.from..=settings.max_split.to,
-            )
-            .and_then(|config| config.with_packets(packets))
-            .map(Arc::new)
-            .map_err(|_| CoreError::UnsupportedOutboundNetwork)
+            build_fragment_config(settings)
+                .map(Arc::new)
+                .map_err(|_| CoreError::UnsupportedOutboundNetwork)
         })
         .transpose()
+}
+
+/// One fragment mask, with the masks listed after it in `finalmask.tcp`
+/// attached as its chain, in list order.
+fn build_fragment_config(
+    settings: &xray_config::TcpFragmentSettings,
+) -> io::Result<xray_transport::TcpFragmentConfig> {
+    let packets = match settings.packets {
+        xray_config::FragmentPackets::TlsHello => xray_transport::FragmentPackets::TlsHello,
+        xray_config::FragmentPackets::AllWrites => xray_transport::FragmentPackets::AllWrites,
+        xray_config::FragmentPackets::Writes { from, to } => {
+            xray_transport::FragmentPackets::Writes(u64::from(from)..=u64::from(to))
+        }
+    };
+    let chained = settings
+        .chained
+        .iter()
+        .map(build_fragment_config)
+        .collect::<io::Result<Vec<_>>>()?;
+    xray_transport::TcpFragmentConfig::new(
+        settings.lengths.iter().map(|r| r.from..=r.to).collect(),
+        settings.delays_ms.iter().map(|r| r.from..=r.to).collect(),
+        settings.max_split.from..=settings.max_split.to,
+    )
+    .and_then(|config| config.with_packets(packets))
+    .and_then(|config| config.with_chained(chained))
 }
 
 #[cfg(test)]
